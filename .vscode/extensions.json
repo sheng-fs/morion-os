@@ -1,8 +1,0 @@
-{
-    "recommendations": [
-        "rust-lang.rust-analyzer",
-        "EditorConfig.EditorConfig",
-        "xaver.clang-format",
-        "ms-vscode.cpptools"
-    ]
-}
