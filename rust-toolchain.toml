@@ -1,0 +1,16 @@
+# Morion OS — Rust 工具链配置
+#
+# 使用 nightly 编译器以获得:
+#   - build-std     : 为自定义目标构建 core/alloc
+#   - abi_efiapi    : UEFI 调用约定支持
+#   - inline asm    : 内联汇编 (x86_64 底层操作)
+#   - naked_functions : 裸函数 (中断入口)
+
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools-preview"]
+targets = [
+    "x86_64-unknown-none",
+    "x86_64-unknown-uefi",
+]
+profile = "minimal"

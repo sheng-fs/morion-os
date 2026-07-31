@@ -1,0 +1,14 @@
+# UEFI 目标平台配置
+# 编译命令: cargo build --target x86_64-unknown-uefi
+
+[build]
+target = "x86_64-unknown-uefi"
+
+[target.x86_64-unknown-uefi]
+rustflags = [
+    "-C", "link-arg=/ENTRY:efi_main",
+    "-C", "link-arg=/SUBSYSTEM:EFI_APPLICATION",
+    "-C", "link-arg=/NODEFAULTLIB",
+    "-C", "no-redzone=y",
+    "-C", "code-model=small",
+]

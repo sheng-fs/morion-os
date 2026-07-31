@@ -1,0 +1,31 @@
+# 图片素材（大量logo、壁纸、图形资源）
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.svg
+
+# 编译产出、内核构建文件
+/build/
+/out/
+/obj/
+/bin/
+*.o
+*.elf
+*.iso
+*.img
+
+# 临时文件、缓存、日志
+*.log
+*.tmp
+*.cache
+.DS_Store
+.venv/
+__pycache__/
+
+# 大型资源文件夹（如果你统一存放素材）
+/assets/
+/resources/
+/logo/

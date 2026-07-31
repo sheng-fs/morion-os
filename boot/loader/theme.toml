@@ -1,0 +1,123 @@
+[theme]
+name = "default"
+author = "Morion OS"
+version = "1.0.0"
+description = "Declarative immutable micro-bootloader theme"
+
+[render]
+resolution = "auto"
+force_gop = true
+fallback_text_mode = true
+acrylic_blur_strength = 3
+ui_scale = 1.0
+animation_enabled = true
+animation_speed = 1.0
+
+[splash]
+background = "resources/splash/background.png"
+logo = "resources/splash/logo.png"
+align = "center"
+duration_ms = 1200
+fade_in_ms = 300
+fade_out_ms = 200
+
+[logo]
+horizontal = "resources/logo/horizontal.png"
+square = "resources/logo/square.png"
+monochrome = "resources/logo/monochrome.png"
+position = "top-center"
+margin_top = 32
+
+[background]
+default = "resources/background/default.png"
+dark = "resources/background/dark.png"
+light = "resources/background/light.png"
+acrylic_mask = "resources/background/mask.png"
+
+[menu]
+width = 800
+height = 540
+position_x = "center"
+position_y = "center"
+radius = 16
+alpha = 0.85
+item_height = 60
+spacing = 8
+text_color = "#ffffff"
+font_size = 18
+
+[menu.highlight]
+color = "#3a6aff"
+alpha = 0.9
+text_color = "#ffffff"
+icon = "resources/icons/ui/selected.png"
+
+[scroll]
+up = "resources/icons/ui/arrow_up.png"
+down = "resources/icons/ui/arrow_down.png"
+size = 32
+
+[cursor]
+default = "resources/cursor/default.png"
+hover = "resources/cursor/hover.png"
+loading = "resources/cursor/loading.png"
+size = 24
+
+[loading]
+frames = 6
+pattern = "resources/animation/loading/frame_%02d.png"
+interval_ms = 100
+
+[progress]
+background = "resources/progress/bar_bg.png"
+fill = "resources/progress/bar_fill.png"
+height = 12
+width = 700
+radius = 6
+
+[security]
+secure_boot = "resources/icons/security/secure_boot.png"
+tpm = "resources/icons/security/tpm.png"
+verify_ok = "resources/icons/security/verify_ok.png"
+warn = "resources/icons/security/warn.png"
+error = "resources/icons/security/error.png"
+lock = "resources/icons/security/lock.png"
+enclave = "resources/icons/security/enclave.png"
+
+[dialog]
+bg = "resources/icons/dialog/bg.png"
+overlay = "resources/icons/dialog/overlay.png"
+overlay_alpha = 0.6
+warning = "resources/icons/dialog/warning.png"
+error = "resources/icons/dialog/error.png"
+info = "resources/icons/dialog/info.png"
+
+[icons.system]
+latest = "resources/icons/system/latest.png"
+default = "resources/icons/system/default.png"
+old = "resources/icons/system/old.png"
+rescue = "resources/icons/system/rescue.png"
+windows = "resources/icons/system/windows.png"
+linux = "resources/icons/system/linux.png"
+efi_fallback = "resources/icons/system/efi_fallback.png"
+uefi_settings = "resources/icons/system/uefi_settings.png"
+
+[icons.ui]
+settings = "resources/icons/ui/settings.png"
+about = "resources/icons/ui/about.png"
+refresh = "resources/icons/ui/refresh.png"
+console = "resources/icons/ui/console.png"
+log = "resources/icons/ui/log.png"
+rollback = "resources/icons/ui/rollback.png"
+
+[power]
+shutdown = "resources/icons/power/shutdown.png"
+reboot = "resources/icons/power/reboot.png"
+kexec = "resources/icons/power/kexec.png"
+
+[timeout]
+enable = true
+default = 5
+text = "Automatic boot in {sec} seconds..."
+color = "#cccccc"
+font_size = 16

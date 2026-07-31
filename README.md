@@ -140,18 +140,34 @@
 
 ```
 .
+├── boot/
+│   └── loader/
+│       └── theme.toml     # 引导加载器主题配置
 ├── docs/
 │   └── architecture.md    # 架构设计文档
 ├── resources/
-│   └── images/            # 图片资源
-│       ├── boot/          #   启动画面 (.bmp)
-│       ├── device/        #   设备图标 (.ico)
-│       ├── file/          #   文件类型图标 (.ico)
-│       ├── github/        #   GitHub 封面 (.png)
-│       ├── icons/         #   通用 UI 图标 (.ico)
-│       ├── logo/          #   系统 Logo (.ico, .svg)
-│       ├── service/       #   服务图标 (.ico)
-│       └── terminal/      #   终端背景 (.raw)
+│   ├── animation/         # 动画资源
+│   │   └── loading/       #   加载帧动画 (.png)
+│   ├── background/        # 背景图 (dark/light/default/mask)
+│   ├── cursor/            # 光标 (default/hover/loading)
+│   ├── icons/             # 分类图标 (PNG)
+│   │   ├── dialog/        #   对话框 (bg/error/info/overlay/warning)
+│   │   ├── power/         #   电源 (kexec/reboot/shutdown)
+│   │   ├── security/      #   安全 (enclave/lock/secure_boot/tpm/...)
+│   │   ├── system/        #   系统 (default/linux/windows/uefi_settings/...)
+│   │   └── ui/            #   界面 (about/console/log/refresh/rollback/...)
+│   ├── images/            # 图片资源
+│   │   ├── boot/          #   启动画面 (.bmp)
+│   │   ├── device/        #   设备图标 (.ico)
+│   │   ├── file/          #   文件类型图标 (.ico)
+│   │   ├── github/        #   GitHub 封面 (.png)
+│   │   ├── icons/         #   通用 UI 图标 (.ico)
+│   │   ├── logo/          #   系统 Logo (.ico, .svg, .png)
+│   │   ├── service/       #   服务图标 (.ico)
+│   │   └── terminal/      #   终端背景 (.raw)
+│   ├── logo/              # Logo 变体 (horizontal/monochrome/square)
+│   ├── progress/          # 进度条 (bar_bg/bar_fill)
+│   └── splash/            # 启动闪屏 (background/logo)
 ├── .gitattributes
 ├── .gitignore
 ├── LICENSE

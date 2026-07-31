@@ -1,0 +1,62 @@
+[package]
+name = "morion-boot"
+version = "0.1.0"
+edition = "2021"
+description = "Morion OS 声明式微引导加载器 — 基于 UEFI + Rust 的最小可信链引导系统"
+authors = ["Morion OS Team"]
+license = "MIT"
+
+[lib]
+name = "morion_boot"
+crate-type = ["lib"]
+
+[[bin]]
+name = "morion-boot"
+path = "src/main.rs"
+
+[[bin]]
+name = "gop-test"
+path = "src/gop_test.rs"
+
+# UEFI 应用不需要 std
+[profile.dev]
+panic = "abort"
+opt-level = 1
+lto = false
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+# UEFI 基础运行时 (不使用 std), 启用 alloc 支持
+uefi = { version = "0.26", features = ["alloc"] }
+
+# 无 std 环境下的数据结构
+bitflags = { version = "2", default-features = false }
+log = { version = "0.4", default-features = false }
+
+# 声明式配置解析 (TOML, 在 no_std 下解析)
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+# 密码学与安全 — 暂时注释, curve25519-dalek SIMD 在 UEFI 交叉编译中崩溃
+# 后续通过 feature flag 按需启用
+# sha2 = { version = "0.10", default-features = false }
+# ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+
+# 无浮点的 2D 图形运算
+# 使用整数运算实现亚克力毛玻璃效果
+
+[features]
+default = []
+# 启用 Secure Boot 签名验证
+secure-boot = []
+# 启用 TPM 2.0 测量
+tpm-measure = []
+# 启用 kexec 热启动
+kexec = []
+# 启用动画效果
+animation = ["default"]

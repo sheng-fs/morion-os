@@ -1,0 +1,69 @@
+# Morion OS — Rust Workspace
+#
+# 项目结构:
+#   kernel/  - 微内核 (最小可信基)
+#   boot/    - UEFI 声明式引导加载器
+#   services/ - 用户态系统服务 (文件系统、网络等)
+#   libs/    - 共享库 (libvfs, IPC 等)
+
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "boot",
+]
+
+# 未来添加:
+#   "services/ext4_srv",
+#   "services/netstack_srv",
+#   "services/auth_srv",
+#   "services/gui_srv",
+#   "libs/libvfs",
+#   "libs/libdevice",
+#   "libs/libipc",
+#   "libs/libruntime",
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Morion OS Team"]
+license = "MIT"
+repository = "https://github.com/morion-os/morion-os"
+
+[workspace.dependencies]
+# --- UEFI 引导 ---
+uefi = "0.26"
+
+# --- 内核 ---
+# 极简 no_std 依赖
+bitflags = { version = "2", default-features = false }
+log = { version = "0.4", default-features = false }
+
+# --- 配置解析 ---
+toml = { version = "0.8", default-features = false }
+
+# --- 安全/密码学 ---
+sha2 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false }
+
+# --- x86_64 底层 ---
+x86_64 = "0.15"
+volatile = "0.5"
+spin = "0.9"
+
+# --- 序列化 (用户态服务) ---
+# serde = { version = "1", default-features = false, features = ["derive"] }
+
+# ============================================================
+# Profile 配置
+# ============================================================
+[profile.release]
+opt-level = "s"     # 体积优化 (OS 内核需要紧凑)
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1       # 开发时也有轻度优化
+panic = "abort"

@@ -1,0 +1,64 @@
+# Morion OS 微内核
+#
+# 这是最小可信计算基 (TCB)。
+# 仅包含: 地址空间管理、IPC、CPU调度、能力强制。
+# 所有其他功能 (文件系统、网络、驱动) 均为用户态服务。
+
+[package]
+name = "morion-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Morion OS 微内核 — 最小可信计算基 (TCB)"
+
+[lib]
+name = "morion_kernel"
+crate-type = ["staticlib"]   # 静态库, 便于与汇编入口链接
+
+[[bin]]
+name = "morion-kernel"
+path = "src/main.rs"
+# 自定义链接脚本
+# 在 .cargo/config.toml 中配置 link-arg
+
+[features]
+default = []
+# 启用内联汇编 (x86_64)
+x86_64 = ["dep:x86_64"]
+# 启用 APIC 中断控制
+apic = []
+# 启用 SMP 多核
+smp = []
+# 性能飞地支持 (VT-x/VT-d)
+enclave = []
+
+[dependencies]
+# --- 工作区共享依赖 ---
+bitflags.workspace = true
+log.workspace = true
+
+# --- x86_64 底层操作 ---
+x86_64 = { workspace = true, optional = true, default-features = true }
+volatile.workspace = true
+spin.workspace = true
+
+# --- 极简内存分配 ---
+linked_list_allocator = "0.10"
+
+# --- 能力模型 (内核内部) ---
+# 能力表、端点等使用自定义实现
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# x86_64 特化
+raw-cpuid = "11"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
