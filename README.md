@@ -1,215 +1,210 @@
-# 墨渊操作系统 (Moyuan OS)
+<div align="center">
 
-墨渊操作系统是一个基于 Rust 语言开发的现代操作系统，旨在提供安全、高效、可靠的计算环境。
+# 墨渊操作系统 · Morion OS
 
-## 项目状态
+[中文](./README.md) | [English](./README.en.md)
 
-**当前状态：** 初期开发阶段
+---
 
-**最近更新：** 2026-04-09
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
+[![Arch](https://img.shields.io/badge/arch-x86__64%20|%20AArch64%20|%20RISC--V-brightgreen.svg)]()
+[![Stage](https://img.shields.io/badge/stage-design%20&%20rewrite-yellow.svg)]()
+[![Platform](https://img.shields.io/badge/platform-UEFI-lightgrey.svg)]()
+[![Security](https://img.shields.io/badge/security-CHERI%20|%20IOMMU-red.svg)]()
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)]()
 
-**已实现功能：**
-- 内核基本架构
-- 内存管理
-- 进程管理
-- 中断处理
-- 设备服务
-- 控制台输出（VGA 和串口）
-- UEFI 引导加载器
-- GRUB 引导支持
-- 基本的用户空间工具
-- 飞地核心模块及硬件资源管理
-- PVH 启动支持
-- 网络服务基础架构
-- 安全模块（用户/组管理和文件权限控制）
-- 电源管理功能
-- 调试构建和运行配置
-- 完整的构建和部署流程
+</div>
 
-**开发计划：**
-- 完善文件系统
-- 实现网络协议栈
-- 开发 GUI 系统
-- 增强安全机制
-- 支持更多架构
+---
 
-## 项目结构
+## 概述
+
+墨渊操作系统是一个基于 **Rust** 语言从零构建的现代操作系统。项目当前处于**重新设计与重写阶段**，彻底梳理了前期实现中的架构冲突，重新确立了以 **微内核 + 外核混合架构** 为核心的技术路线。
+
+旧代码已归档（`legacy` 分支），主线重新开始。
+
+### 核心理念
+
+- **微内核可信基**：内核仅暴露 10~20 个系统调用（IPC、地址空间映射、保护域管理等），所有传统内核功能均由用户态服务实现。
+- **外核高性能路径**：通过"性能飞地"机制，利用 IOMMU / CHERI 等硬件能力，让游戏、AI 等高性能应用直接操作硬件，实现零内核陷落、零数据拷贝。
+- **能力安全模型**：抛弃传统 UID/GID 权限体系，以能力（Capability）作为唯一访问凭证，从根本上消除"root 可做任何事"的隐患。
+- **Anykernel 双形态驱动**：同一套驱动源码可编译为用户态服务进程（共享场景）或直通库（高性能场景），共享超过 90% 的代码。
+
+> 详细架构设计见 [docs/architecture.md](./docs/architecture.md)。
+
+---
+
+## 架构概览（目标）
 
 ```
-├── bootloader/       # 引导加载器
-│   ├── bios/         # BIOS 引导相关
-│   ├── grub/         # GRUB 配置
-│   └── uefi/         # UEFI 引导加载器
-├── build/            # 构建输出目录
-├── iso/              # ISO 镜像
+┌──────────────────────────────────────────────────────┐
+│                   普通应用层                          │
+│    POSIX 接口 (libc)  |  高性能直通 API                │
+├──────────────────────────────────────────────────────┤
+│             用户态系统服务                             │
+│  文件系统  │  网络栈  │  设备服务  │  安全服务          │
+│  ext4/vfat │ TCP/IP  │  驱动服务  │  认证/审计         │
+├──────────────────────────────────────────────────────┤
+│        性能飞地 (Enclave) — 可选加速                   │
+│   GPU 直通  │  NPU 直通  │  用户态网卡驱动             │
+│   (IOMMU 强制隔离, CHERI 边界保护)                    │
+├──────────────────────────────────────────────────────┤
+│                    微内核                             │
+│  IPC  │  调度  │  地址空间  │  中断路由  │  能力授权    │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 核心设计
+
+### 微内核原语
+
+内核仅包含不可精简的最小化功能——
+
+| 原语 | 说明 |
+|------|------|
+| `send` / `receive` / `call` | 同步/异步 IPC，支持能力传递 |
+| `map` / `unmap` | 地址空间映射管理 |
+| `create_domain` / `destroy_domain` | 保护域（进程）生命周期 |
+| `schedule` | CPU 调度 |
+| `allocate_frame` / `free_frame` | 物理内存帧管理 |
+| `register_interrupt` / `ack_interrupt` | 中断授权与应答 |
+| `create_enclave` | 硬件隔离飞地创建 |
+
+### 外部页管理器
+
+- 内核仅负责缺页捕获与转发，由用户态分页服务决策页面内容和置换策略
+- 每个进程可指定专属分页器，支持按需分页、压缩内存池、网络存储等
+
+### Anykernel 双形态驱动
+
+| 形态 | 场景 | 特点 |
+|------|------|------|
+| **驱动服务进程** | 普通应用 | 设备共享、安全隔离、通过 IPC 间接访问 |
+| **直通驱动库 (LibDevice)** | 游戏 / AI | 运行时直接链接，零内核陷落操作 MMIO/DMA |
+
+同一套 Rust trait 接口，feature flag 切换编译后端，共享 >90% 代码。
+
+### 性能飞地 (Enclave)
+
+1. IOMMU 将设备 MMIO、DMA 窗口映射进进程地址空间
+2. 链接 LibDevice 直通驱动库
+3. GPU/NPU 命令直接提交，零内核干预
+
+破坏半径被硬件锁死在飞地资源范围内。
+
+### 基于能力的安全模型
+
+- 能力为唯一访问凭证，不依赖 UID/GID
+- 新进程默认零能力，由父进程显式授予
+- POSIX 权限 API (`chmod`/`chown`) 由 libc 转译为能力操作
+- 安全策略由用户态策略引擎解释，支持动态更新
+
+### 用户态服务
+
+所有传统内核功能以独立用户态进程运行：
+
+| 服务 | 职责 |
+|------|------|
+| 文件系统服务 | ext4、FAT32、tmpfs 等，通过 libvfs 统一接口 |
+| 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 |
+| 设备服务 | 驱动管理、中断分发 |
+| 安全/审计服务 | 认证、策略引擎、入侵检测 |
+| 飞地管理器 | 飞地生命周期、日志流、迁移与暂停 |
+| 包管理器 | Nix 风格声明式构建、原子切换、版本回滚 |
+| GUI 服务 | 亚克力半透明风格桌面环境，高度可自定义 |
+| Shell 服务 | 命令行解释器 |
+| 音频 / 输入法 / 容器 / 时间 / 电源 / 日志 / 配置服务 | 系统基础支撑 |
+
+### 虚拟化
+
+- 微内核同时作为 Hypervisor（Intel VT-x / AMD-V）
+- 支持 unikernel 及未经修改的 Linux/Windows 客户机
+- PCIe 设备直通 (VT-d / IOMMU)、嵌套飞地
+
+### 启动加载
+
+- 基于 UEFI 原生运行，跳过传统实模式
+- GOP 高分辨率引导菜单，亚克力主题
+- Nix 闭包存储启动项，支持原子切换与回滚
+- TPM 2.0 测量 + Secure Boot 验签
+- kexec 热启动、多系统共存
+
+---
+
+## 仓库结构
+
+### 当前实际结构
+
+```
+.
+├── docs/
+│   └── architecture.md    # 架构设计文档
+├── resources/
+│   └── images/            # 图片资源
+│       ├── boot/          #   启动画面 (.bmp)
+│       ├── device/        #   设备图标 (.ico)
+│       ├── file/          #   文件类型图标 (.ico)
+│       ├── github/        #   GitHub 封面 (.png)
+│       ├── icons/         #   通用 UI 图标 (.ico)
+│       ├── logo/          #   系统 Logo (.ico, .svg)
+│       ├── service/       #   服务图标 (.ico)
+│       └── terminal/      #   终端背景 (.raw)
+├── .gitattributes
+├── .gitignore
+├── LICENSE
+├── README.md
+└── README.en.md
+```
+
+### 目标开发结构
+
+```
+├── bootloader/       # 引导加载器 (UEFI)
 ├── kernel/           # 内核源码
-│   ├── arch/         # 架构相关代码
-│   ├── compatible_kernels/ # 兼容层
-│   ├── core_microkernel/ # 核心微内核
-│   └── security/     # 安全相关代码
-├── resources/        # 资源文件
-├── services/         # 系统服务
-│   ├── audio/        # 音频服务
-│   ├── config_service/ # 配置服务
-│   ├── container_service/ # 容器服务
-│   ├── device_service/ # 设备服务
-│   ├── fs_service/   # 文件系统服务
-│   ├── gui_service/  # GUI 服务
-│   ├── init/         # 初始化服务
-│   ├── input_method/ # 输入法服务
-│   ├── log_service/  # 日志服务
-│   ├── network_service/ # 网络服务
-│   ├── power_service/ # 电源服务
-│   ├── security_service/ # 安全服务
-│   ├── shell_service/ # Shell 服务
-│   └── time_service/ # 时间服务
+│   ├── arch/         #   架构相关 (x86_64 / AArch64 / RISC-V)
+│   ├── core/         #   微内核核心 (IPC, 调度, 地址空间, 能力)
+│   └── compat/       #   兼容层 (POSIX / Linux / RTOS)
+├── services/         # 用户态系统服务
+│   ├── fs/           #   文件系统服务
+│   ├── net/          #   网络协议栈
+│   ├── device/       #   设备服务 + 驱动
+│   ├── security/     #   安全 / 认证 / 审计服务
+│   ├── enclave/      #   飞地管理器
+│   ├── gui/          #   GUI 服务
+│   ├── shell/        #   Shell 服务
+│   ├── audio/        #   音频服务
+│   ├── ime/          #   输入法服务
+│   └── ...           #   更多服务
 ├── userland/         # 用户空间
-│   ├── bin/          # 二进制文件
-│   ├── browser/      # 浏览器
-│   ├── libs/         # 库文件
-│   └── shell/        # Shell
-├── Cargo.toml        # Rust 项目配置
-├── Makefile          # 构建脚本
-└── README.md         # 项目说明
+│   ├── libs/         #   libc, libvfs, libdevice 等
+│   └── bin/          #   基本命令 (ls, cat, mkdir, rm)
+├── resources/        # 资源文件
+├── docs/             # 文档
+└── pkg/              # 包管理 (Nix 风格)
 ```
 
-## 主要特性
+---
 
-- **基于 Rust 语言**：利用 Rust 的内存安全特性，提供更安全的系统环境
-- **微内核设计**：核心功能最小化，其他功能通过服务实现
-- **多架构支持**：支持 x86_64、AArch64 和 RISC-V 架构
-- **模块化设计**：系统组件高度模块化，便于扩展和维护
-- **安全优先**：内置安全机制，保护系统和用户数据
-- **现代化服务**：提供容器、网络、GUI 等现代操作系统服务
-- **多引导方式**：支持 UEFI、GRUB 和直接内核启动
+## 开发路线
 
-## 系统要求
+- [ ] **阶段一**：微内核核心 — IPC、调度、地址空间、能力系统
+- [ ] **阶段二**：基础服务 — 文件系统、设备驱动、Shell
+- [ ] **阶段三**：性能飞地 — IOMMU 直通、LibDevice、飞地管理器
+- [ ] **阶段四**：网络与安全 — TCP/IP 协议栈、能力审计、策略引擎
+- [ ] **阶段五**：GUI 与生态 — 桌面环境、包管理、虚拟化
 
-- Rust 工具链（nightly 版本）
-- NASM 汇编器
-- QEMU 模拟器（用于测试）
-- GCC 编译器（用于某些组件）
-- GRUB 工具（用于创建 ISO 镜像）
-
-## 构建和运行
-
-### 构建项目
-
-```bash
-# 构建整个项目（内核 + UEFI 引导加载器 + ISO）
-make all
-
-# 仅构建内核
-make kernel
-
-# 仅构建 UEFI 引导加载器
-make uefi_bootloader
-
-# 构建 ISO 镜像
-make iso
-```
-
-### 运行项目
-
-```bash
-# 运行内核（直接内核启动）
-make run
-
-# 运行测试内核
-make run_test
-
-# 运行 UEFI 模拟器
-make run_uefi
-
-# 运行 GRUB 模拟器
-make run_grub
-```
-
-### 调试项目
-
-```bash
-# 运行调试环境（直接内核启动）
-make debug
-
-# 运行 UEFI 调试环境
-make debug_uefi
-
-# 运行 GRUB 调试环境
-make debug_grub
-
-# 运行调试测试
-make debug_test
-```
-
-### 清理构建产物
-
-```bash
-make clean
-```
-
-## 核心组件
-
-### 内核
-
-- **核心微内核**：提供进程管理、内存管理、中断处理等基础功能
-- **架构支持**：支持 x86_64、AArch64 和 RISC-V 架构
-- **兼容层**：提供 POSIX、Linux 和 RTOS 兼容层
-- **飞地核心**：硬件隔离和安全执行环境
-- **网络栈**：基础网络协议支持
-
-### 系统服务
-
-- **初始化服务**：系统启动和初始化
-- **设备服务**：设备管理和驱动
-- **文件系统服务**：文件系统管理
-- **网络服务**：网络协议栈和管理
-- **安全服务**：安全策略和访问控制
-- **Shell 服务**：命令行界面
-- **GUI 服务**：图形用户界面
-- **容器服务**：容器管理
-- **时间服务**：时间管理
-- **电源服务**：电源管理
-- **日志服务**：系统日志
-- **配置服务**：系统配置
-- **音频服务**：音频处理和播放
-- **输入法服务**：输入法支持
-
-### 用户空间
-
-- **标准库**：提供用户程序所需的库函数
-- **基本工具**：包括 ls、cat、mkdir、rm 等基本命令
-- **浏览器**：Web 浏览功能
-- **Shell**：命令行解释器
-- **应用程序**：用户应用程序
-
-## 开发指南
-
-### 代码风格
-
-- 遵循 Rust 官方代码风格
-- 使用 4 空格缩进
-- 文件名使用 snake_case
-- 模块名使用 snake_case
-- 结构体和枚举使用 PascalCase
-- 函数和变量使用 snake_case
-
-### 贡献流程
-
-1. Fork 项目仓库
-2. 创建功能分支
-3. 提交代码
-4. 推送分支
-5. 创建 Pull Request
+---
 
 ## 许可证
 
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
+本项目采用 [MIT 许可证](./LICENSE)。
+
+---
 
 ## 联系方式
 
-- 项目主页：[https://github.com/sheng-fs/moyuan-os](https://github.com/sheng-fs/moyuan-os)
-- 邮件：<3555679134@qq.com>
-
-## 致谢
-
-感谢所有为墨渊操作系统做出贡献的开发者和支持者！
+- 项目主页：[github.com/sheng-fs/morion-os](https://github.com/sheng-fs/morion-os)
+- 邮箱：3555679134@qq.com
