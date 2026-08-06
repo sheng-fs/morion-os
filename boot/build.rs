@@ -20,7 +20,7 @@ fn main() {
     let asm_path = asm_dir.join("boot_stub.asm");
     if asm_path.exists() {
         let asm_output = out_dir.join("boot_stub.o");
-        let target = "x86_64-unknown-uefi";
+        let _target = "x86_64-unknown-uefi";
 
         // 使用 NASM 编译为 x86_64 UEFI COFF 目标
         let status = std::process::Command::new("nasm")
