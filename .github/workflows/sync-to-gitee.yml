@@ -1,0 +1,40 @@
+# ============================================================
+# 配置说明：在 GitHub 仓库添加 Gitee 令牌
+# ------------------------------------------------------------
+# 1. 登录 Gitee → 设置 → 私人令牌 → 生成新令牌（勾选 projects 权限）
+# 2. GitHub 仓库 → Settings → Secrets and variables → Actions
+# 3. 点击 "New repository secret"
+# 4. Name 填: GITEE_TOKEN
+# 5. Secret 填: 第1步生成的 Gitee 令牌
+# ============================================================
+
+name: Sync to Gitee
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史，确保镜像完整
+
+      - name: Mirror to Gitee
+        uses: Yikun/hub-mirror-action@v1.5
+        with:
+          src: github/sheng-fs
+          dst: gitee/sheng_jheng
+          dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
+          dst_token: ${{ secrets.GITEE_TOKEN }}
+          account_type: user
+          # 只同步当前仓库
+          static_list: "morion-os"
+          force_update: true
+          debug: true
