@@ -10,8 +10,9 @@
 use core::panic::PanicInfo;
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
-use uefi::table::boot::{BootServices, OpenProtocolAttributes, OpenProtocolParams, SearchType};
+use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::Identify;
+use morion_boot::boot::loader::{Elf64Header, Elf64ProgramHeader};
 
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
@@ -416,6 +417,81 @@ struct BootEntry<'a> {
 // 嵌入 BMP 图片资源 (编译时打包)
 static LOGO_BMP: &[u8] = include_bytes!("../loader/resources/logo/square.bmp");
 
+// 嵌入测试内核 ELF (编译时打包)
+static KERNEL_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-none/release/morion-kernel-test");
+
+// Boot Info 结构 — 传递给内核
+#[repr(C)]
+struct BootInfo {
+    magic: u32,
+    version: u32,
+    fb_addr: u64,
+    fb_width: u32,
+    fb_height: u32,
+    fb_stride: u32,
+    fb_bpp: u32,
+}
+
+fn boot_kernel(fb: &Fb) -> ! {
+    // 设置 Boot Info 到 0x7000
+    let boot_info = BootInfo {
+        magic: 0x4D4F5249, // "MORI"
+        version: 1,
+        fb_addr: fb.base as u64,
+        fb_width: fb.w,
+        fb_height: fb.h,
+        fb_stride: fb.stride,
+        fb_bpp: 32,
+    };
+    unsafe {
+        let ptr = 0x7000 as *mut BootInfo;
+        core::ptr::write(ptr, boot_info);
+    }
+
+    // 解析 ELF 并加载段
+    let header = unsafe { &*(KERNEL_ELF.as_ptr() as *const Elf64Header) };
+    let entry_point = header.entry;
+
+    // 遍历程序头，加载段
+    let phoff = header.phoff as usize;
+    let phentsize = header.phentsize as usize;
+    let phnum = header.phnum as usize;
+
+    for i in 0..phnum {
+        let ph_offset = phoff + i * phentsize;
+        if ph_offset + 80 > KERNEL_ELF.len() { break; }
+        let ph = unsafe { &*(KERNEL_ELF.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+
+        if ph.ptype == 1 && ph.memsz > 0 {
+            // PT_LOAD — 复制到物理地址
+            let load_addr = ph.paddr;
+            let file_size = ph.filesz as usize;
+            let mem_size = ph.memsz as usize;
+
+            if file_size > 0 {
+                let file_start = ph.offset as usize;
+                let file_end = file_start + file_size;
+                if file_end <= KERNEL_ELF.len() {
+                    unsafe {
+                        let dst = core::slice::from_raw_parts_mut(load_addr as *mut u8, file_size);
+                        dst.copy_from_slice(&KERNEL_ELF[file_start..file_end]);
+                    }
+                }
+            }
+            // 零填充 BSS
+            if mem_size > file_size {
+                unsafe {
+                    core::ptr::write_bytes((load_addr + file_size as u64) as *mut u8, 0, mem_size - file_size);
+                }
+            }
+        }
+    }
+
+    // 跳转到内核
+    let kernel_entry: extern "C" fn() -> ! = unsafe { core::mem::transmute(entry_point) };
+    kernel_entry();
+}
+
 fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) {
     let tw = theme.menu_w;
     let th = theme.menu_h;
@@ -530,9 +606,13 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
                 Key::Special(ScanCode::HOME) => { sel = 0; }
                 Key::Special(ScanCode::END) => { sel = entries.len() - 1; }
                 Key::Printable(c) if c == uefi::Char16::try_from('\r').unwrap() => {
-                    draw_text(&mut fb, "Booting...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
-                    for _ in 0..50_000_000 { core::hint::spin_loop(); }
-                    return Status::SUCCESS;
+                    if sel == 0 {
+                        draw_text(&mut fb, "Loading kernel...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
+                        boot_kernel(&fb);
+                    } else {
+                        draw_text(&mut fb, "Not implemented", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
+                        for _ in 0..50_000_000 { core::hint::spin_loop(); }
+                    }
                 }
                 Key::Special(ScanCode::ESCAPE) => { return Status::SUCCESS; }
                 Key::Special(ScanCode::FUNCTION_10) => { return Status::SUCCESS; }

@@ -14,7 +14,7 @@ description = "Morion OS 微内核 — 最小可信计算基 (TCB)"
 
 [lib]
 name = "morion_kernel"
-crate-type = ["staticlib"]   # 静态库, 便于与汇编入口链接
+crate-type = ["staticlib", "lib"]   # staticlib 用于最终链接; lib (rlib) 用于 cargo check/test
 
 [[bin]]
 name = "morion-kernel"

@@ -1,23 +1,7 @@
 # Morion OS 工作区级 cargo 配置
 #
-# 内核目标: x86_64-unknown-none (自定义 bare-metal)
 # 引导器目标: x86_64-unknown-uefi
-
-# ============================================================
-# 微内核构建配置
-# ============================================================
-[target.x86_64-unknown-none]
-# 链接脚本
-rustflags = [
-    "-C", "link-arg=-T../../linker.ld",
-    "-C", "link-arg=-z", "max-page-size=0x1000",
-    # 禁用 SSE 自动生成 (内核不依赖 SSE)
-    "-C", "target-feature=-sse,-sse2,-mmx",
-    # 禁止红区 (中断不安全)
-    "-C", "no-redzone=y",
-    # 小代码模型 (内核在 -2GB 区域)
-    "-C", "code-model=kernel",
-]
+# 内核目标: x86_64-unknown-none (暂未启用)
 
 # ============================================================
 # UEFI 引导器构建配置
@@ -32,8 +16,18 @@ rustflags = [
 ]
 
 # ============================================================
-# 构建标准库 (所有目标)
+# 内核构建配置 (x86_64-unknown-none)
 # ============================================================
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel_test/linker.ld",
+    "-C", "link-arg=-nostdlib",
+    "-C", "no-redzone=y",
+    "-C", "code-model=small",
+    "-C", "relocation-model=static",
+]
+
+# ============================================================
+# 构建标准库 — 仅在需要时通过 Makefile 传递 -Z build-std
+# 内核 (x86_64-unknown-none) 需要; UEFI 引导器有预编译 std
+# ============================================================

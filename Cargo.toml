@@ -9,8 +9,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "kernel",
     "boot",
+    "kernel_test",
 ]
 
 # 未来添加:

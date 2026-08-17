@@ -38,7 +38,7 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # ============================================================
 OUT_DIR       := build
 ISO_DIR       := $(OUT_DIR)/iso
-KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel.elf
+KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel-test
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 
@@ -61,17 +61,17 @@ all: iso
 .PHONY: kernel
 kernel: $(KERNEL_ELF)
 
-$(KERNEL_ELF): kernel/
-	@echo "==> 构建 Morion 微内核..."
+$(KERNEL_ELF): kernel_test/
+	@echo "==> 构建测试内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
 		--target $(KERNEL_TARGET) \
-		--package morion-kernel \
+		--package morion-kernel-test \
 		--release \
-		-Z build-std=core,alloc,compiler_builtins \
+		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
-	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel $@
-	@echo "  ✓ 内核构建完成: $@"
+	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel-test $@
+	@echo "  ✓ 测试内核构建完成: $@"
 
 # ============================================================
 # UEFI 引导器构建
@@ -85,9 +85,7 @@ $(BOOT_EFI): boot/
 	$(CARGO) build \
 		--target $(BOOT_TARGET) \
 		--package morion-boot \
-		--release \
-		-Z build-std=core,compiler_builtins,alloc \
-		-Z build-std-features=compiler-builtins-mem
+		--release
 	$(CP) target/$(BOOT_TARGET)/release/morion-boot.efi $@
 	@echo "  ✓ 引导器构建完成: $@"
 
@@ -102,7 +100,7 @@ $(ISO_IMAGE):
 	$(MKDIR) $(ISO_DIR)
 	$(MKDIR) $(ISO_DIR)/EFI/BOOT
 	$(MKDIR) $(ISO_DIR)/EFI/morion/loader/entries
-	$(MKDIR) $(ISO_DIR)/EFI/morion/resources
+	$(MKDIR) $(ISO_DIR)/EFI/morion/loader/resources
 
 	# 复制 EFI 引导器 (UEFI 默认路径)
 	# 可注册方式: EFI/morion/morion-boot.efi + efibootmgr
@@ -116,6 +114,9 @@ $(ISO_IMAGE):
 	$(CP) boot/loader/loader.conf $(ISO_DIR)/EFI/morion/loader/
 	$(CP) boot/loader/theme.toml $(ISO_DIR)/EFI/morion/loader/
 	$(CP) boot/loader/entries/morion.conf $(ISO_DIR)/EFI/morion/loader/entries/
+
+	# 复制引导器资源 (主题图片)
+	$(CP) -r boot/loader/resources/* $(ISO_DIR)/EFI/morion/loader/resources/
 
 	# 创建 initrd 占位 (后续用 Nix 生成实际 initramfs)
 	@echo "{}" > $(ISO_DIR)/EFI/morion/initrd.img
@@ -155,16 +156,11 @@ endef
 run: iso
 	@echo "==> 启动 QEMU..."
 	$(QEMU) \
-		-machine q35,accel=$(QEMU_ACCEL) \
-		-cpu host \
+		-machine pc \
 		-m $(QEMU_MEM) \
-		-smp $(QEMU_SMP) \
-		-bios $(OVMF_CODE) \
-		-drive file=$(ISO_IMAGE),format=raw,if=none,id=drive0 \
-		-device virtio-blk-pci,drive=drive0 \
-		-serial stdio \
-		-display gtk,gl=on \
-		-device virtio-vga-gl \
+		-bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-drive file=$(ISO_IMAGE),format=raw \
+		-vga virtio \
 		-no-reboot \
 		-d guest_errors
 
@@ -172,13 +168,10 @@ run: iso
 .PHONY: run-nokvm
 run-nokvm: iso
 	$(QEMU) \
-		-machine q35 \
+		-machine pc \
 		-m $(QEMU_MEM) \
-		-smp $(QEMU_SMP) \
-		-bios $(OVMF_CODE) \
-		-drive file=$(ISO_IMAGE),format=raw,if=none,id=drive0 \
-		-device virtio-blk-pci,drive=drive0 \
-		-serial stdio \
+		-bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-drive file=$(ISO_IMAGE),format=raw \
 		-vga virtio \
 		-no-reboot
 
