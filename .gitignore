@@ -41,3 +41,6 @@ build/
 # Windows相关
 Thumbs.db
 .DS_Store
+
+# 个人记事/草稿文件
+记事.txt
