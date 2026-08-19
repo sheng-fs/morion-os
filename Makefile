@@ -39,7 +39,10 @@ BOOT_TARGET    := x86_64-unknown-uefi
 OUT_DIR       := build
 ISO_DIR       := $(OUT_DIR)/iso
 KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel-test
+# 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
+KERNEL_EMBED  := boot/loader/morion-kernel.elf
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
+EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 
 # QEMU 配置
@@ -55,13 +58,20 @@ OVMF_VARS     ?= /usr/share/edk2/x64/OVMF_VARS.fd
 .PHONY: all
 all: iso
 
+# ISO 无依赖输入, 且必须从最新 kernel/boot 重新生成, 故标记为伪目标强制重建
+.PHONY: $(ISO_IMAGE)
+
+# 源文件集合: 用于 make 层面的重建触发 (cargo 内部另有指纹追踪)。
+KERNEL_SRC := $(shell find kernel_test -type f 2>/dev/null)
+BOOT_SRC   := $(shell find boot/src boot/loader -type f 2>/dev/null) boot/build.rs boot/Cargo.toml
+
 # ============================================================
 # 微内核构建
 # ============================================================
 .PHONY: kernel
 kernel: $(KERNEL_ELF)
 
-$(KERNEL_ELF): kernel_test/
+$(KERNEL_ELF): $(KERNEL_SRC)
 	@echo "==> 构建测试内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -73,13 +83,20 @@ $(KERNEL_ELF): kernel_test/
 	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel-test $@
 	@echo "  ✓ 测试内核构建完成: $@"
 
+# 将内核 ELF 拷贝到引导器资源目录, 供 boot/src/main.rs include_bytes! 嵌入
+$(KERNEL_EMBED): $(KERNEL_ELF)
+	@echo "==> 拷贝测试内核到引导器资源目录..."
+	$(MKDIR) $(dir $@)
+	$(CP) $(KERNEL_ELF) $@
+	@echo "  ✓ 已更新: $@"
+
 # ============================================================
 # UEFI 引导器构建
 # ============================================================
 .PHONY: boot
 boot: $(BOOT_EFI)
 
-$(BOOT_EFI): boot/
+$(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED)
 	@echo "==> 构建 Morion 引导器..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -121,33 +138,30 @@ $(ISO_IMAGE):
 	# 创建 initrd 占位 (后续用 Nix 生成实际 initramfs)
 	@echo "{}" > $(ISO_DIR)/EFI/morion/initrd.img
 
-	# 生成 ISO (FAT32 EFI 分区)
+	# 生成 FAT32 ESP 引导镜像。
+	# OVMF 要求 El Torito 的 EFI 启动映像是一个 FAT 文件系统，
+	# 而非直接指向 BOOTX64.EFI；故先用 mtools 制作 fat 镜像。
+	@echo "==> 生成 FAT32 ESP 引导镜像..."
+	dd if=/dev/zero of=$(EFIBOOT_IMG) bs=1M count=64 status=none
+	mformat -i $(EFIBOOT_IMG) -F ::
+	mmd -i $(EFIBOOT_IMG) ::/EFI
+	mmd -i $(EFIBOOT_IMG) ::/EFI/BOOT
+	mcopy -i $(EFIBOOT_IMG) $(BOOT_EFI) ::/EFI/BOOT/BOOTX64.EFI
+	$(CP) $(EFIBOOT_IMG) $(ISO_DIR)/efiboot.img
+
+	# 生成 ISO (EFI El Torito 启动, 指向 ESP 镜像)
 	xorriso -as mkisofs \
 		-iso-level 3 \
 		-full-iso9660-filenames \
 		-volid "MORION_OS" \
 		-eltorito-alt-boot \
-		-e EFI/BOOT/BOOTX64.EFI \
+		-e efiboot.img \
 		-no-emul-boot \
 		-o $(ISO_IMAGE) \
-		$(ISO_DIR) 2>/dev/null || \
-		(echo "  ! xorriso 不可用, 尝试 mtools 方式..." && \
-		 fallback_iso)
+		$(ISO_DIR)
 
 	@echo "  ✓ ISO 镜像: $(ISO_IMAGE)"
-	@ls -lh $(ISO_IMAGE) 2>/dev/null || echo "  ! ISO 生成失败, 请安装 xorriso"
-
-# mtools 回退方案
-define fallback_iso
-	$(MKDIR) $(OUT_DIR)/fat
-	dd if=/dev/zero of=$(OUT_DIR)/fat.img bs=1M count=50 2>/dev/null
-	mformat -i $(OUT_DIR)/fat.img -F ::
-	mmd -i $(OUT_DIR)/fat.img ::/EFI
-	mmd -i $(OUT_DIR)/fat.img ::/EFI/BOOT
-	mcopy -i $(OUT_DIR)/fat.img $(BOOT_EFI) ::/EFI/BOOT/BOOTX64.EFI
-	$(CP) $(OUT_DIR)/fat.img $(ISO_IMAGE)
-	$(RM) $(OUT_DIR)/fat.img
-endef
+	@ls -lh $(ISO_IMAGE) 2>/dev/null || echo "  ! ISO 生成失败, 请安装 xorriso 与 mtools"
 
 # ============================================================
 # 运行 (QEMU)
@@ -159,7 +173,7 @@ run: iso
 		-machine pc \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=$(ISO_IMAGE),format=raw \
+		-cdrom $(ISO_IMAGE) \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
@@ -171,7 +185,7 @@ run-nokvm: iso
 		-machine pc \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=$(ISO_IMAGE),format=raw \
+		-cdrom $(ISO_IMAGE) \
 		-vga virtio \
 		-no-reboot
 
@@ -183,7 +197,7 @@ debug: iso
 		-m $(QEMU_MEM) \
 		-smp 1 \
 		-bios $(OVMF_CODE) \
-		-drive file=$(ISO_IMAGE),format=raw \
+		-cdrom $(ISO_IMAGE) \
 		-serial stdio \
 		-vga virtio \
 		-s -S \

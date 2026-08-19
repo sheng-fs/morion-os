@@ -2,6 +2,9 @@
 target/
 build/
 
+# 引导器内嵌的编译后内核 ELF (由 make kernel 生成)
+boot/loader/morion-kernel.elf
+
 # IDE和编辑器文件
 .idea/
 .vscode/*

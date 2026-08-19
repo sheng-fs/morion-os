@@ -80,29 +80,43 @@ impl Fb {
         unsafe { *self.base.add(off)=c.b; *self.base.add(off+1)=c.g; *self.base.add(off+2)=c.r; *self.base.add(off+3)=c.a; }
     }
 
+    fn get_pixel(&self, x: i32, y: i32) -> Color {
+        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 { return Color::rgb(0, 0, 0); }
+        let off = (y as usize * self.stride as usize + x as usize) * 4;
+        if off + 4 > self.size { return Color::rgb(0, 0, 0); }
+        unsafe { Color { r: *self.base.add(off+2), g: *self.base.add(off+1), b: *self.base.add(off), a: *self.base.add(off+3) } }
+    }
+
+    // 半透明填充: 按 alpha 将前景色混合到已有背景像素 (真正的 alpha blending)。
     fn fill_rect(&mut self, r: Rect, c: Color) {
+        let a = c.a as u32;
         for y in r.y.max(0)..((r.y+r.h as i32).min(self.h as i32)) {
             for x in r.x.max(0)..((r.x+r.w as i32).min(self.w as i32)) {
-                unsafe {
-                    let off = (y as usize * self.stride as usize + x as usize) * 4;
-                    *self.base.add(off)=c.b; *self.base.add(off+1)=c.g; *self.base.add(off+2)=c.r; *self.base.add(off+3)=c.a;
-                }
+                let bg = self.get_pixel(x, y);
+                let rr = (c.r as u32 * a + bg.r as u32 * (255 - a)) / 255;
+                let gg = (c.g as u32 * a + bg.g as u32 * (255 - a)) / 255;
+                let bb = (c.b as u32 * a + bg.b as u32 * (255 - a)) / 255;
+                self.pixel(x, y, Color::rgb(rr as u8, gg as u8, bb as u8));
             }
         }
     }
 
+    // 半透明圆角填充 (alpha blending)。
     fn fill_rounded(&mut self, r: Rect, radius: u32, c: Color) {
         let r2 = (radius * radius) as i32;
+        let a = c.a as u32;
         for y in r.y.max(0)..((r.y+r.h as i32).min(self.h as i32)) {
             for x in r.x.max(0)..((r.x+r.w as i32).min(self.w as i32)) {
-                let (cx, cy) = (r.x + radius as i32, r.y + radius as i32);
+                let cx = r.x + radius as i32;
+                let cy = r.y + radius as i32;
                 let dx = if x < cx { cx - x - 1 } else if x >= r.x + r.w as i32 - radius as i32 { x - (r.x + r.w as i32 - radius as i32) } else { 0 };
                 let dy = if y < cy { cy - y - 1 } else if y >= r.y + r.h as i32 - radius as i32 { y - (r.y + r.h as i32 - radius as i32) } else { 0 };
                 if dx*dx + dy*dy <= r2 {
-                    unsafe {
-                        let off = (y as usize * self.stride as usize + x as usize) * 4;
-                        *self.base.add(off)=c.b; *self.base.add(off+1)=c.g; *self.base.add(off+2)=c.r; *self.base.add(off+3)=c.a;
-                    }
+                    let bg = self.get_pixel(x, y);
+                    let rr = (c.r as u32 * a + bg.r as u32 * (255 - a)) / 255;
+                    let gg = (c.g as u32 * a + bg.g as u32 * (255 - a)) / 255;
+                    let bb = (c.b as u32 * a + bg.b as u32 * (255 - a)) / 255;
+                    self.pixel(x, y, Color::rgb(rr as u8, gg as u8, bb as u8));
                 }
             }
         }
@@ -294,6 +308,28 @@ fn draw_bmp(fb: &mut Fb, bmp: &BmpImage, x: i32, y: i32) {
     }
 }
 
+// 等比 cover 缩放铺满全屏: 保持宽高比, 放大到覆盖整个画面, 多余部分居中裁剪。
+fn draw_bmp_cover(fb: &mut Fb, bmp: &BmpImage) {
+    if bmp.w == 0 || bmp.h == 0 { return; }
+    let sx = fb.w as f32 / bmp.w as f32;
+    let sy = fb.h as f32 / bmp.h as f32;
+    let scale = if sx > sy { sx } else { sy };
+    let ox = ((fb.w as f32 - bmp.w as f32 * scale) * 0.5) as i32;
+    let oy = ((fb.h as f32 - bmp.h as f32 * scale) * 0.5) as i32;
+
+    for dy in 0..fb.h as i32 {
+        for dx in 0..fb.w as i32 {
+            let tx = ((dx - ox) as f32 / scale) as i32;
+            let ty = ((dy - oy) as f32 / scale) as i32;
+            if tx < 0 || ty < 0 || tx >= bmp.w as i32 || ty >= bmp.h as i32 { continue; }
+            let c = bmp.pixel(tx as u32, ty as u32);
+            if c.a > 0 {
+                fb.pixel(dx, dy, c);
+            }
+        }
+    }
+}
+
 // ============================================================
 //  主题配置 (从 theme.toml 解析)
 // ============================================================
@@ -411,14 +447,43 @@ struct BootEntry<'a> {
 }
 
 // ============================================================
-//  PCH / 事件循环
+//  嵌入资源 (编译期打包)
 // ============================================================
+//
+//  所有图片以 32-bit BGRA BMP 格式嵌入 (BI_RGB 无压缩)，
+//  由 build 阶段从同名 PNG 自动生成。
 
-// 嵌入 BMP 图片资源 (编译时打包)
-static LOGO_BMP: &[u8] = include_bytes!("../loader/resources/logo/square.bmp");
+// --- 桌面背景 (splash 背景铺满全屏) ---
+static BG_BMP: &[u8] = include_bytes!("../loader/resources/splash/background.bmp");
+
+// --- 系统 Logo (菜单右侧) ---
+static SYSTEM_LOGO_BMP: &[u8] = include_bytes!("../loader/resources/logo/system.bmp");
+
+// --- 滚动箭头 ---
+static ARROW_UP_BMP:   &[u8] = include_bytes!("../loader/resources/icons/ui/arrow_up.bmp");
+static ARROW_DOWN_BMP: &[u8] = include_bytes!("../loader/resources/icons/ui/arrow_down.bmp");
+
+// --- 选中指示图标 ---
+static SELECTED_BMP: &[u8] = include_bytes!("../loader/resources/icons/ui/selected.bmp");
+
+// --- 对话框背景 ---
+static DIALOG_BG_BMP: &[u8] = include_bytes!("../loader/resources/icons/dialog/bg.bmp");
+
+// --- 加载动画帧 (6 帧 128x128) ---
+static LOADING_FRAMES: [&[u8]; 6] = [
+    include_bytes!("../loader/resources/animation/loading/frame_00.bmp"),
+    include_bytes!("../loader/resources/animation/loading/frame_01.bmp"),
+    include_bytes!("../loader/resources/animation/loading/frame_02.bmp"),
+    include_bytes!("../loader/resources/animation/loading/frame_03.bmp"),
+    include_bytes!("../loader/resources/animation/loading/frame_04.bmp"),
+    include_bytes!("../loader/resources/animation/loading/frame_05.bmp"),
+];
 
 // 嵌入测试内核 ELF (编译时打包)
-static KERNEL_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-none/release/morion-kernel-test");
+// Makefile 的 kernel 目标会把编译好的测试内核 ELF 拷贝到
+// boot/loader/morion-kernel.elf, 再由这里 include_bytes! 嵌入。
+static KERNEL_ELF: &[u8] = include_bytes!("../loader/morion-kernel.elf");
+
 
 // Boot Info 结构 — 传递给内核
 #[repr(C)]
@@ -432,7 +497,24 @@ struct BootInfo {
     fb_bpp: u32,
 }
 
-fn boot_kernel(fb: &Fb) -> ! {
+fn boot_kernel(fb: &mut Fb) -> ! {
+    // ELF 校验 — 如果不是真正的 ELF (缺少魔数 / 长度不足)，
+    // 显示提示后循环休眠，不要破坏内存。
+    let is_valid_elf = KERNEL_ELF.len() >= 64
+        && KERNEL_ELF.get(0) == Some(&0x7F)
+        && KERNEL_ELF.get(1) == Some(&b'E')
+        && KERNEL_ELF.get(2) == Some(&b'L')
+        && KERNEL_ELF.get(3) == Some(&b'F')
+        && KERNEL_ELF.get(4) == Some(&2); // 64-bit class
+
+    if !is_valid_elf {
+        let msg = "Kernel image invalid — rebuild the kernel, then rebuild bootloader";
+        draw_text(fb, msg, 40, 40, Color::rgb(0xFF, 0xCC, 0x66));
+        let tip = "(expected a valid x86_64 ELF at boot/loader/morion-kernel.elf)";
+        draw_text(fb, tip, 40, 60, Color::rgb(0xAA, 0xAA, 0xAA));
+        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+    }
+
     // 设置 Boot Info 到 0x7000
     let boot_info = BootInfo {
         magic: 0x4D4F5249, // "MORI"
@@ -492,18 +574,39 @@ fn boot_kernel(fb: &Fb) -> ! {
     kernel_entry();
 }
 
+// 顶栏: 左侧系统名称文字, 右侧系统 logo。
+fn render_header(fb: &mut Fb, _theme: &ThemeConfig) {
+    // 顶部淡色遮罩, 提升文字/logo 在亮背景上的可读性 (区间自适应高度)。
+    let bar_h = 200u32.min(fb.h / 3);
+    fb.fill_rect(Rect::new(0, 0, fb.w, bar_h), Color::rgba(0x05, 0x08, 0x12, 80));
+
+    // 左侧: 系统名称 + 副标题
+    draw_text(fb, "Morion OS", 48, 40, Color::rgb(0xFF, 0xFF, 0xFF));
+    draw_text(fb, "Immutable Micro-OS Bootloader", 48, 64, Color::rgb(0x9A, 0xA6, 0xB8));
+
+    // 菜单正上方中央: 系统 Logo (水平居中, 略靠上)
+    if let Some(logo) = BmpImage::parse(SYSTEM_LOGO_BMP) {
+        let lx = (fb.w as i32 - logo.w as i32) / 2;
+        let ly = 12;
+        draw_bmp(fb, &logo, lx, ly);
+    }
+}
+
+// 整屏渲染: 背景 (cover) -> 顶栏 -> 菜单。每次选择变化都从背景重画,
+// 避免半透明叠加 (double-blend) 导致面板越画越暗。
+fn render_screen(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) {
+    if let Some(bg) = BmpImage::parse(BG_BMP) {
+        draw_bmp_cover(fb, &bg);
+    }
+    render_header(fb, theme);
+    render_menu(fb, theme, entries, sel);
+}
+
 fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) {
     let tw = theme.menu_w;
     let th = theme.menu_h;
     let tx = theme.menu_x;
     let ty = theme.menu_y;
-
-    // 渲染 Logo (屏幕顶端正中央)
-    if let Some(logo) = BmpImage::parse(LOGO_BMP) {
-        let logo_x = (fb.w as i32 - logo.w as i32) / 2;
-        let logo_y = theme.logo_margin_top as i32;
-        draw_bmp(fb, &logo, logo_x, logo_y);
-    }
 
     // 亚克力毛玻璃效果: 菜单区域上层暗色铺底
     let overlay_a = (theme.menu_alpha * 0.3 * 255.0) as u8;
@@ -530,6 +633,21 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
     draw_text(fb, footer, tx + (tw as i32 - text_width(footer))/2, ty + th as i32 - 44,
         Color::rgb(0x77, 0x79, 0x8A));
 
+    // 如果条目数量超出菜单显示区域, 绘制上下滚动箭头
+    let visible_count = (th - 100) / (theme.item_height + theme.spacing);
+    if entries.len() > visible_count as usize {
+        if let Some(arrow_up) = BmpImage::parse(ARROW_UP_BMP) {
+            let ax = tx + tw as i32 - arrow_up.w as i32 - 16;
+            let ay = line_y + 8;
+            draw_bmp(fb, &arrow_up, ax, ay);
+        }
+        if let Some(arrow_down) = BmpImage::parse(ARROW_DOWN_BMP) {
+            let ax = tx + tw as i32 - arrow_down.w as i32 - 16;
+            let ay = ty + th as i32 - arrow_down.h as i32 - 48;
+            draw_bmp(fb, &arrow_down, ax, ay);
+        }
+    }
+
     // 渲染每个菜单项
     let item_start_y = ty + 58;
     for i in 0..entries.len() {
@@ -539,6 +657,12 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
         if i == sel {
             let hl_c = Color::rgba(theme.hl_color.r, theme.hl_color.g, theme.hl_color.b, (theme.hl_alpha * 255.0) as u8);
             fb.fill_rounded(ir, 8, hl_c);
+            // 选中项：在高亮左边绘制 selected 图标 (蓝色对勾/方形 32x32)
+            if let Some(sel_bmp) = BmpImage::parse(SELECTED_BMP) {
+                let ix = ir.x - 4;
+                let iy_img = iy + (theme.item_height as i32 - sel_bmp.h as i32) / 2;
+                draw_bmp(fb, &sel_bmp, ix, iy_img);
+            }
         } else {
             // 非选中项：用面板底色覆盖（清除可能的高亮残留）
             fb.fill_rounded(ir, 8, panel_c);
@@ -546,8 +670,8 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 
         let entry = &entries[i];
         let tc = if i == sel { theme.hl_text_color } else { theme.text_color };
-        draw_text(fb, entry.icon, ir.x + 12, iy + (theme.item_height as i32 - 16)/2 + 2, tc);
-        draw_text(fb, entry.title, ir.x + 40, iy + (theme.item_height as i32 - 16)/2 + 2, tc);
+        draw_text(fb, entry.icon, ir.x + 40, iy + (theme.item_height as i32 - 16)/2 + 2, tc);
+        draw_text(fb, entry.title, ir.x + 72, iy + (theme.item_height as i32 - 16)/2 + 2, tc);
         let info_w = text_width(entry.info);
         draw_text(fb, entry.info, ir.x + ir.w as i32 - info_w - 16, iy + (theme.item_height as i32 - 16)/2 + 2,
             Color::rgb(0x88, 0x88, 0x88));
@@ -588,11 +712,8 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
     let mut sel: usize = 0;
 
     // 4. 主循环
-    // 一次性填充全屏背景 (此后不再填充，消除闪烁)
-    let bg_color = Color::rgb(0x08, 0x0A, 0x12);
-    fb.fill_rect(Rect::new(0, 0, fb.w, fb.h), bg_color);
-    // 初始渲染菜单
-    render_menu(&mut fb, &theme, &entries[..], sel);
+    // 初始整屏渲染 (背景 + 顶栏 + 菜单)
+    render_screen(&mut fb, &theme, &entries[..], sel);
 
     loop {
         let prev_sel = sel;
@@ -608,7 +729,7 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
                 Key::Printable(c) if c == uefi::Char16::try_from('\r').unwrap() => {
                     if sel == 0 {
                         draw_text(&mut fb, "Loading kernel...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
-                        boot_kernel(&fb);
+                        boot_kernel(&mut fb);
                     } else {
                         draw_text(&mut fb, "Not implemented", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
                         for _ in 0..50_000_000 { core::hint::spin_loop(); }
@@ -620,9 +741,9 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
             }
         }
 
-        // 选择变化时重绘菜单
+        // 选择变化时整屏重绘 (背景 + 顶栏 + 菜单)
         if sel != prev_sel {
-            render_menu(&mut fb, &theme, &entries[..], sel);
+            render_screen(&mut fb, &theme, &entries[..], sel);
         }
 
         // 延时减少 CPU 占用
