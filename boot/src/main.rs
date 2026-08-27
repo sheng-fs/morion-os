@@ -7,7 +7,6 @@
 #![no_main]
 #![allow(invalid_reference_casting)]
 
-use core::panic::PanicInfo;
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams, SearchType};
@@ -43,6 +42,7 @@ struct Rect { x: i32, y: i32, w: u32, h: u32 }
 
 impl Rect {
     const fn new(x: i32, y: i32, w: u32, h: u32) -> Self { Self { x, y, w, h } }
+    #[allow(dead_code)]
     fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.x + self.w as i32 && py >= self.y && py < self.y + self.h as i32
     }
@@ -122,6 +122,7 @@ impl Fb {
         }
     }
 
+    #[allow(dead_code)]
     fn vline(&mut self, x: i32, y0: i32, y1: i32, c: Color) {
         for y in y0..=y1 { self.pixel(x, y, c); }
     }
@@ -467,9 +468,11 @@ static ARROW_DOWN_BMP: &[u8] = include_bytes!("../loader/resources/icons/ui/arro
 static SELECTED_BMP: &[u8] = include_bytes!("../loader/resources/icons/ui/selected.bmp");
 
 // --- 对话框背景 ---
+#[allow(dead_code)]
 static DIALOG_BG_BMP: &[u8] = include_bytes!("../loader/resources/icons/dialog/bg.bmp");
 
 // --- 加载动画帧 (6 帧 128x128) ---
+#[allow(dead_code)]
 static LOADING_FRAMES: [&[u8]; 6] = [
     include_bytes!("../loader/resources/animation/loading/frame_00.bmp"),
     include_bytes!("../loader/resources/animation/loading/frame_01.bmp"),
@@ -682,8 +685,9 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 //  UEFI 入口点
 // ============================================================
 
+#[cfg(target_os = "uefi")]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! { loop { core::hint::spin_loop(); } }
+fn panic(_info: &core::panic::PanicInfo) -> ! { loop { core::hint::spin_loop(); } }
 
 #[entry]
 fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {

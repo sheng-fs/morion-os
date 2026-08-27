@@ -20,7 +20,6 @@ rustflags = [
 # ============================================================
 [target.x86_64-unknown-none]
 rustflags = [
-    "-C", "link-arg=-Tkernel_test/linker.ld",
     "-C", "link-arg=-nostdlib",
     "-C", "no-redzone=y",
     "-C", "code-model=small",

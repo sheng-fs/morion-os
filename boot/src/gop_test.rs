@@ -6,7 +6,6 @@
 #![no_main]
 #![allow(invalid_reference_casting)]
 
-use core::panic::PanicInfo;
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::table::boot::{BootServices, OpenProtocolAttributes, OpenProtocolParams, SearchType};
@@ -135,8 +134,9 @@ fn draw_text(fb: &mut Fb, text: &str, cx: u32, cy: u32, fg: Color) {
     }
 }
 
+#[cfg(target_os = "uefi")]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop { core::hint::spin_loop(); }
 }
 

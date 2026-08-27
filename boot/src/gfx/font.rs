@@ -110,7 +110,7 @@ impl BitmapFont {
     ) -> u32 {
         let mut cursor_x = x;
         let gw = self.metrics.glyph_width as i32;
-        let gh = self.metrics.glyph_height as i32;
+        let _gh = self.metrics.glyph_height as i32;
 
         for ch in text.chars() {
             if ch == '\n' {

@@ -38,7 +38,7 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # ============================================================
 OUT_DIR       := build
 ISO_DIR       := $(OUT_DIR)/iso
-KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel-test
+KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
 KERNEL_EMBED  := boot/loader/morion-kernel.elf
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
@@ -62,7 +62,7 @@ all: iso
 .PHONY: $(ISO_IMAGE)
 
 # 源文件集合: 用于 make 层面的重建触发 (cargo 内部另有指纹追踪)。
-KERNEL_SRC := $(shell find kernel_test -type f 2>/dev/null)
+KERNEL_SRC := $(shell find kernel -type f 2>/dev/null)
 BOOT_SRC   := $(shell find boot/src boot/loader -type f 2>/dev/null) boot/build.rs boot/Cargo.toml
 
 # ============================================================
@@ -72,20 +72,20 @@ BOOT_SRC   := $(shell find boot/src boot/loader -type f 2>/dev/null) boot/build.
 kernel: $(KERNEL_ELF)
 
 $(KERNEL_ELF): $(KERNEL_SRC)
-	@echo "==> 构建测试内核..."
+	@echo "==> 构建微内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
 		--target $(KERNEL_TARGET) \
-		--package morion-kernel-test \
+		--package morion-kernel \
 		--release \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
-	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel-test $@
-	@echo "  ✓ 测试内核构建完成: $@"
+	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel $@
+	@echo "  ✓ 微内核构建完成: $@"
 
 # 将内核 ELF 拷贝到引导器资源目录, 供 boot/src/main.rs include_bytes! 嵌入
 $(KERNEL_EMBED): $(KERNEL_ELF)
-	@echo "==> 拷贝测试内核到引导器资源目录..."
+	@echo "==> 拷贝内核到引导器资源目录..."
 	$(MKDIR) $(dir $@)
 	$(CP) $(KERNEL_ELF) $@
 	@echo "  ✓ 已更新: $@"

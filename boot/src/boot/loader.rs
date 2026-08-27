@@ -11,7 +11,7 @@
 
 use crate::config::entries::BootEntry;
 use crate::security::{ImageHasher, SignatureVerifier, TpmMeasurer};
-use uefi::table::boot::{BootServices, MemoryType};
+use uefi::table::boot::BootServices;
 use alloc::string::String;
 
 /// ELF64 文件头
@@ -50,6 +50,7 @@ pub struct Elf64ProgramHeader {
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELF_CLASS_64: u8 = 2;
 const PT_LOAD: u32 = 1;
+#[allow(dead_code)]
 const PT_PHDR: u32 = 6;
 
 /// 内核加载结果
@@ -67,6 +68,7 @@ pub struct KernelImage {
 }
 
 /// 内核加载器
+#[allow(dead_code)]
 pub struct KernelLoader<'a> {
     boot_services: &'a BootServices,
     hasher: ImageHasher,
@@ -94,7 +96,7 @@ impl<'a> KernelLoader<'a> {
         &mut self,
         data: &[u8],
         cmdline: &str,
-        entry: &BootEntry,
+        _entry: &BootEntry,
         tpm: &mut TpmMeasurer,
     ) -> Result<KernelImage, &'static str> {
         if data.len() < core::mem::size_of::<Elf64Header>() {
@@ -163,7 +165,7 @@ impl<'a> KernelLoader<'a> {
         let image_size = highest_addr - lowest_addr;
 
         // 计算哈希
-        let mut hash = [0u8; 32];
+        let hash = [0u8; 32];
         // hash = self.hasher.finalize().bytes;
 
         Ok(KernelImage {
@@ -218,9 +220,9 @@ impl<'a> KernelLoader<'a> {
 ///
 /// 参照 Linux 内核文档 Documentation/x86/boot.rst
 pub fn prepare_linux_boot_params(
-    kernel_data: &[u8],
-    cmdline: &str,
-    initrd_data: Option<&[u8]>,
+    _kernel_data: &[u8],
+    _cmdline: &str,
+    _initrd_data: Option<&[u8]>,
 ) -> Result<u64, &'static str> {
     // Linux bzImage 格式：
     //   偏移 0x1F1: setup_sects (1 字节)

@@ -213,7 +213,7 @@ impl GenerationManager {
     ///
     /// 扫描 `<config_dir>/entries/*.conf`，
     /// 解析每个文件为一个 BootEntry。
-    pub fn from_config_dir(config_dir: &str) -> Self {
+    pub fn from_config_dir(_config_dir: &str) -> Self {
         let mut mgr = Self::new();
 
         // 默认创建救援模式和固件设置条目

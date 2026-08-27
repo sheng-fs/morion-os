@@ -102,6 +102,7 @@ pub struct ScreenSize {
 }
 
 /// UEFI GOP 帧缓冲抽象
+#[allow(dead_code)]
 pub struct FrameBuffer {
     base: *mut u8,
     size: usize,

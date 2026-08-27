@@ -42,7 +42,7 @@ impl KexecBoot {
     /// 准备 kexec 跳转上下文 (桩)
     pub fn prepare_context(
         &self,
-        boot_services: &BootServices,
+        _boot_services: &BootServices,
         runtime_services: &RuntimeServices,
         kernel: &KernelImage,
         _initrd_data: Option<&[u8]>,
@@ -85,6 +85,7 @@ impl KexecBoot {
         );
         // 显式永不返回终止点 — asm(options=noreturn) 对 rust-analyzer 在部分 target 下不可见,
         // 追加 loop{} 作为 rust-analyzer 可见的 -> ! 保证 (永远不会被实际执行)
+        #[allow(unreachable_code)]
         loop { core::hint::spin_loop(); }
     }
 }

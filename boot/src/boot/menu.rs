@@ -5,7 +5,7 @@
 //!   2. 菜单选择逻辑
 //!   3. 超时自动启动
 
-use crate::config::entries::{BootEntry, GenerationManager};
+use crate::config::entries::GenerationManager;
 use crate::gfx::Renderer;
 
 /// 菜单操作结果
@@ -106,7 +106,7 @@ impl MenuUI {
     }
 
     /// 更新超时 (每 100ms 调用一次)
-    pub fn update_timeout(&mut self, enabled: bool, total_secs: u32) -> MenuAction {
+    pub fn update_timeout(&mut self, enabled: bool, _total_secs: u32) -> MenuAction {
         if !self.counting_down || !enabled {
             return MenuAction::None;
         }
@@ -159,8 +159,8 @@ impl MenuUI {
     /// 渲染菜单
     pub fn render(
         &mut self,
-        renderer: &mut Renderer,
-        entries: &GenerationManager,
+        _renderer: &mut Renderer,
+        _entries: &GenerationManager,
     ) {
         // 渲染由 menu::ui 模块处理
         // 这里只是一个钩子点

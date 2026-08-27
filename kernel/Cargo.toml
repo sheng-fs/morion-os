@@ -14,7 +14,7 @@ description = "Morion OS 微内核 — 最小可信计算基 (TCB)"
 
 [lib]
 name = "morion_kernel"
-crate-type = ["staticlib", "lib"]   # staticlib 用于最终链接; lib (rlib) 用于 cargo check/test
+crate-type = ["lib"]   # rlib, 由 bin (src/main.rs) 链接为最终内核
 
 [[bin]]
 name = "morion-kernel"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 # 在 .cargo/config.toml 中配置 link-arg
 
 [features]
-default = []
+default = ["x86_64"]
 # 启用内联汇编 (x86_64)
 x86_64 = ["dep:x86_64"]
 # 启用 APIC 中断控制
@@ -39,7 +39,7 @@ bitflags.workspace = true
 log.workspace = true
 
 # --- x86_64 底层操作 ---
-x86_64 = { workspace = true, optional = true, default-features = true }
+x86_64 = { workspace = true, optional = true, features = ["abi_x86_interrupt"] }
 volatile.workspace = true
 spin.workspace = true
 
@@ -52,13 +52,3 @@ linked_list_allocator = "0.10"
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 # x86_64 特化
 raw-cpuid = "11"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = "s"
-lto = true
-codegen-units = 1
-strip = true

@@ -6,7 +6,6 @@
 
 use crate::gfx::framebuffer::Color;
 use alloc::string::String;
-use alloc::vec::Vec;
 
 /// 主题配置顶层结构 — 完全映射 theme.toml 的所有 section
 #[derive(Debug, Clone)]

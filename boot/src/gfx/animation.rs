@@ -6,8 +6,7 @@
 //!   - 渐变过渡 (淡入/淡出)
 //!   - 基于 UEFI 定时器事件的帧更新
 
-use crate::gfx::framebuffer::{Color, FrameBuffer, Rect};
-use uefi::table::boot::BootServices;
+use crate::gfx::framebuffer::{Color, FrameBuffer};
 
 /// 动画帧
 pub struct AnimationFrame<'a> {

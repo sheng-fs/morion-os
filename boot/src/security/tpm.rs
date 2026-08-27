@@ -4,6 +4,7 @@
 //! 当前版本使用桩实现，不依赖 TCG2 协议。
 
 /// TPM 2.0 测量器
+#[allow(dead_code)]
 pub struct TpmMeasurer {
     enabled: bool,
     tcg2_available: bool,
