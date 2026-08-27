@@ -26,15 +26,9 @@ jobs:
         with:
           fetch-depth: 0  # 获取完整历史，确保镜像完整
 
-      - name: Mirror to Gitee
-        uses: Yikun/hub-mirror-action@v1.5
-        with:
-          src: github/sheng-fs
-          dst: gitee/sheng_jheng
-          dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
-          dst_token: ${{ secrets.GITEE_TOKEN }}
-          account_type: user
-          # 只同步当前仓库
-          static_list: "morion-os"
-          force_update: true
-          debug: true
+      - name: Push to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          git remote add gitee "https://sheng_jheng:${GITEE_TOKEN}@gitee.com/sheng_jheng/morion-os.git"
+          git push --force gitee main:main
