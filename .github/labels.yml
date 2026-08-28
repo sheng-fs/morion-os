@@ -1,0 +1,68 @@
+# Morion OS Issue 标签规划
+# 使用 github-label-sync 或手动在仓库 Settings → Labels 中创建。
+# 格式: name / color (不带 #) / description
+
+# ---- 类型 (type) ----
+- name: bug
+  color: d73a4a
+  description: 缺陷或异常行为
+- name: feat
+  color: 0e8a16
+  description: 新功能或增强
+- name: docs
+  color: 0075ca
+  description: 文档相关
+- name: refactor
+  color: fbca04
+  description: 代码重构，不改变外部行为
+- name: perf
+  color: c5def5
+  description: 性能优化
+- name: chore
+  color: bfdadc
+  description: 构建、依赖、杂项维护
+- name: test
+  color: 5319e7
+  description: 测试相关
+
+# ---- 组件 (area) ----
+- name: boot
+  color: 1d76db
+  description: UEFI 引导加载器 (boot/)
+- name: kernel
+  color: 2c3e50
+  description: 微内核 (kernel/)
+- name: ui-assets
+  color: f9d0c4
+  description: UI 素材与主题资源 (resources/)
+- name: security
+  color: b60205
+  description: 安全、能力模型、Secure Boot、TPM
+- name: ci
+  color: e99695
+  description: 构建系统与 CI/CD
+
+# ---- 优先级 (priority) ----
+- name: priority-high
+  color: d93f0b
+  description: 高优先级
+- name: priority-medium
+  color: fbca04
+  description: 中优先级
+- name: priority-low
+  color: 0e8a16
+  description: 低优先级
+
+# ---- 状态 (status) ----
+- name: good-first-issue
+  color: 7057ff
+  description: 适合新手入门
+- name: help-wanted
+  color: 008672
+  description: 需要帮助
+- name: question
+  color: d876e3
+  description: 疑问或讨论
+- name: wontfix
+  color: ffffff
+  description: 暂不处理

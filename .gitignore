@@ -47,3 +47,26 @@ Thumbs.db
 
 # 个人记事/草稿文件
 记事.txt
+
+# Trae IDE 本地状态
+.trae/
+
+# Nix 构建产物
+result
+result-*
+
+# direnv 缓存
+.direnv/
+
+# 编译器/链接器中间产物
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+
+# 核心转储
+core
+core.*
+*.core

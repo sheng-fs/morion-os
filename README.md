@@ -138,38 +138,71 @@
 
 ### 当前实际结构
 
+> 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`kernel_test` 三个 crate。
+> UI 素材统一按用途归档：引导期资源在 `boot/loader/resources/`，系统全局资源在 `resources/system/`。
+
 ```
 .
-├── boot/
-│   └── loader/
-│       └── theme.toml     # 引导加载器主题配置
-├── docs/
-│   └── architecture.md    # 架构设计文档
+├── .github/
+│   ├── workflows/            # GitHub Actions (自动同步到 Gitee)
+│   ├── ISSUE_TEMPLATE/       # Issue 模板
+│   └── PULL_REQUEST_TEMPLATE.md
+├── boot/                     # UEFI 引导加载器 (morion-boot)
+│   ├── asm/
+│   │   └── boot_stub.asm     #   引导入口汇编存根
+│   ├── loader/               # 引导期资源与配置
+│   │   ├── entries/          #   启动项配置 (.conf)
+│   │   │   └── morion.conf
+│   │   ├── resources/        #   引导器主题资源 (BMP/PNG)
+│   │   │   ├── animation/    #     加载动画帧
+│   │   │   ├── background/   #     背景图 (dark/light/default/mask)
+│   │   │   ├── icons/        #     分类图标 (dialog/power/security/system/ui)
+│   │   │   ├── logo/         #     Logo 变体 (horizontal/monochrome/square/system)
+│   │   │   ├── progress/     #     进度条 (bar_bg/bar_fill)
+│   │   │   └── splash/       #     启动闪屏 (background/logo)
+│   │   ├── kernel_placeholder.bin
+│   │   ├── loader.conf       #   引导加载器配置
+│   │   └── theme.toml        #   亚克力主题配置
+│   └── src/
+│       ├── boot/             #   引导流程 (loader/menu/kexec)
+│       ├── config/           #   配置解析 (entries/theme)
+│       ├── gfx/              #   图形渲染 (framebuffer/font/renderer/animation)
+│       ├── security/         #   安全 (hash/secure_boot/tpm)
+│       ├── lib.rs
+│       └── main.rs
+├── kernel/                   # 微内核 (morion-kernel, 最小可信基)
+│   └── src/
+│       ├── arch/             #   x86_64 架构 (gdt/idt/pic/pit/keyboard)
+│       ├── memory/           #   内存管理 (paging/frame_allocator)
+│       ├── scheduler/        #   调度器 (context)
+│       ├── video/            #   早期视频输出 (framebuffer/font)
+│       ├── bootinfo.rs
+│       ├── domain.rs         #   保护域 (进程)
+│       ├── ipc.rs            #   进程间通信
+│       ├── lib.rs
+│       └── main.rs
+├── kernel_test/              # 引导器联调用测试内核 (临时)
+│   └── src/main.rs
 ├── resources/
-│   ├── animation/         # 动画资源
-│   │   └── loading/       #   加载帧动画 (.png)
-│   ├── background/        # 背景图 (dark/light/default/mask)
-│   ├── cursor/            # 光标 (default/hover/loading)
-│   ├── icons/             # 分类图标 (PNG)
-│   │   ├── dialog/        #   对话框 (bg/error/info/overlay/warning)
-│   │   ├── power/         #   电源 (kexec/reboot/shutdown)
-│   │   ├── security/      #   安全 (enclave/lock/secure_boot/tpm/...)
-│   │   ├── system/        #   系统 (default/linux/windows/uefi_settings/...)
-│   │   └── ui/            #   界面 (about/console/log/refresh/rollback/...)
-│   ├── images/            # 图片资源
-│   │   ├── boot/          #   启动画面 (.bmp)
-│   │   ├── device/        #   设备图标 (.ico)
-│   │   ├── file/          #   文件类型图标 (.ico)
-│   │   ├── github/        #   GitHub 封面 (.png)
-│   │   ├── icons/         #   通用 UI 图标 (.ico)
-│   │   ├── logo/          #   系统 Logo (.ico, .svg, .png)
-│   │   ├── service/       #   服务图标 (.ico)
-│   │   └── terminal/      #   终端背景 (.raw)
-│   ├── logo/              # Logo 变体 (horizontal/monochrome/square)
-│   ├── progress/          # 进度条 (bar_bg/bar_fill)
-│   └── splash/            # 启动闪屏 (background/logo)
+│   └── system/               # 全局系统资源
+│       ├── device/           #   设备图标 (.ico)
+│       ├── file/             #   文件类型图标 (.ico)
+│       ├── github/           #   GitHub 封面 (.png)
+│       ├── icons/            #   通用 UI 图标 (.ico)
+│       ├── logo/             #   系统 Logo (.ico/.svg/.png)
+│       ├── service/          #   服务图标 (.ico)
+│       └── terminal/         #   终端背景 (.raw)
+├── docs/
+│   └── architecture.md       # 架构设计文档
+├── Cargo.toml                # Rust workspace (boot/kernel/kernel_test)
+├── Cargo.lock
+├── Makefile                  # 构建系统 (make iso/run/debug)
+├── flake.nix                 # Nix 构建集成
+├── rust-toolchain.toml       # Rust nightly 工具链
+├── linker.ld                 # 内核链接脚本
 ├── .gitattributes
 ├── .gitignore
+├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md
 └── README.en.md

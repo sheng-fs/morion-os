@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 项目主页
+    url: https://github.com/sheng-fs/morion-os
+    about: 查看项目详情与文档
+  - name: 架构设计文档
+    url: https://github.com/sheng-fs/morion-os/blob/main/docs/architecture.md
+    about: 了解 Morion OS 的架构与技术路线

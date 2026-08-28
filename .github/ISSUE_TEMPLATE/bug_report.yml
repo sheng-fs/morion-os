@@ -1,0 +1,64 @@
+name: 🐞 Bug 报告
+description: 报告缺陷或异常行为
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 所属模块
+      description: 问题出现在哪个模块？
+      options:
+        - boot (引导加载器)
+        - kernel (微内核)
+        - ui-assets (UI 素材/资源)
+        - security (安全)
+        - ci (构建/CI)
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: describe
+    attributes:
+      label: 问题描述
+      description: 清晰描述发生了什么
+      placeholder: 详细说明…
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 如何复现该问题
+      placeholder: |
+        1. 执行 make ...
+        2. ...
+        3. 观察到的错误
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 预期应该发生什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境信息
+      description: 工具链版本、QEMU 版本、目标三元组等
+      placeholder: |
+        - Rust: nightly-xxxx-xx-xx
+        - QEMU: 8.x
+        - 目标: x86_64-unknown-uefi / x86_64-unknown-none
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志 / 截图
+      description: 粘贴相关错误日志或截图链接
