@@ -44,6 +44,11 @@ pub fn init(info: &BootInfo) {
     let entry_size = info.mmap_entry_size as usize;
     let kernel_end = unsafe { &_kernel_end as *const u8 as usize };
 
+    // 帧缓冲占用的物理帧区间 (按页对齐), 防止被当作空闲帧分配后覆盖屏幕。
+    let fb_bytes = info.fb_height as u64 * info.fb_stride as u64 * (info.fb_bpp as u64 / 8);
+    let fb_start_frame = info.fb_addr / FRAME_SIZE as u64;
+    let fb_end_frame = (info.fb_addr + fb_bytes + FRAME_SIZE as u64 - 1) / FRAME_SIZE as u64;
+
     // 白名单策略: 全部标记为占用
     unsafe {
         FRAME_BITMAP.fill(0xFF);
@@ -71,6 +76,10 @@ pub fn init(info: &BootInfo) {
             }
             // 保留低内存与内核镜像本身
             if (frame_addr as usize) < kernel_end {
+                continue;
+            }
+            // 保留帧缓冲占用的帧, 防止被分配后覆盖屏幕
+            if (idx as u64) >= fb_start_frame && (idx as u64) < fb_end_frame {
                 continue;
             }
             bitmap_clear(idx);

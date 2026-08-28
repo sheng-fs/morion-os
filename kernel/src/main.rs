@@ -5,13 +5,13 @@
 #![no_std]
 #![no_main]
 
-use morion_kernel::{arch, bootinfo, memory, video};
+use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, scheduler, video};
 
 extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use x86_64::instructions::{hlt, interrupts};
+use x86_64::instructions::interrupts;
 
 // 链接脚本 (.stack 段) 导出的内核栈顶
 extern "C" {
@@ -121,14 +121,91 @@ pub extern "C" fn _start() -> ! {
     arch::pic::init();
     arch::pit::init();
     video::println("[OK] PIC remapped + PIT timer started (100 Hz)");
-    video::println("");
-    video::println("Interrupts enabled. Timer prints a tick every ~1s,");
-    video::println("press keys to see their scancodes.");
 
-    // 开启中断并进入 idle 循环 (由时钟 / 键盘中断唤醒)
+    // ============================================================
+    //  阶段八: 能力系统 (无能力即不可访问)
+    // ============================================================
+    video::println("");
+    video::println("Stage 8: Capability system (least privilege)");
+    scheduler::init();
+    let domain_prod = domain::create();   // 域 0: 生产者
+    let domain_cons = domain::create();   // 域 1: 消费者
+    let domain_cap = domain::create();    // 域 2: 能力管理器
+    ipc::init(3);
+    cap::init(3);
+    video::println("[OK] 3 domains + capability tables initialized");
+    // 最小权限: 域 0 初始不持有 SendTo(1) 能力。
+    scheduler::spawn(task_idle, domain_prod);        // 域 0: 空闲兜底
+    scheduler::spawn(task_producer, domain_prod);    // 域 0: 生产者
+    scheduler::spawn(task_consumer, domain_cons);    // 域 1: 消费者
+    scheduler::spawn(task_cap_manager, domain_cap);  // 域 2: 能力管理器
+    video::println("[OK] producer(0) consumer(1) cap-manager(2)");
+    video::println("");
+    video::println("Producer tries send without capability first (denied),");
+    video::println("then cap-manager grants SendTo(1) after about 1s (succeeds).");
+    video::println("");
+
+    // 交给调度器。首次切换在中断关闭下进行, 避免 enable 与首次调度之间
+    // 的竞态 (否则定时器中断会在 run 完成前触发 schedule 抢走主执行流)。
+    scheduler::run();
+}
+
+/// 空闲任务 (域 0): 当其他任务都阻塞/睡眠时兜底运行, 停机等待中断。
+extern "C" fn task_idle() {
+    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
     interrupts::enable();
     loop {
-        hlt();
+        x86_64::instructions::hlt();
+    }
+}
+
+/// 生产者 (域 0): 每 200ms 尝试发送到域 1, 无能力时被内核拒绝。
+extern "C" fn task_producer() {
+    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
+    interrupts::enable();
+    let mut seq = 0u64;
+    loop {
+        let payload = [0u8; ipc::PAYLOAD_LEN];
+        let ok = ipc::send(1, seq, &payload);
+        video::print("[send] #");
+        video::print_u64(seq);
+        if ok {
+            video::println("");
+        } else {
+            video::println(" denied (no capability)");
+        }
+        seq += 1;
+        scheduler::sleep(200);
+    }
+}
+
+/// 消费者 (域 1): 阻塞接收消息并打印。
+extern "C" fn task_consumer() {
+    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
+    interrupts::enable();
+    loop {
+        let msg = ipc::receive();
+        video::print("[recv] #");
+        video::print_u64(msg.tag);
+        video::print(" from domain ");
+        video::print_u64(msg.from);
+        video::println("");
+    }
+}
+
+/// 能力管理器 (域 2): 运行约 1 秒后向域 0 授予 SendTo(1) 能力。
+extern "C" fn task_cap_manager() {
+    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
+    interrupts::enable();
+    scheduler::sleep(1000);
+    let ok = cap::grant(0, cap::Capability::SendTo(1));
+    if ok {
+        video::println("[cap] granted SendTo(1) to domain 0");
+    } else {
+        video::println("[cap] grant failed (table full?)");
+    }
+    loop {
+        x86_64::instructions::hlt();
     }
 }
 

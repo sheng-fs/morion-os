@@ -74,6 +74,10 @@ fn new_line() {
 
 /// 打印字符串 (支持 '\n' 换行与滚动)
 pub fn print(s: &str) {
+    // 关中断执行, 避免抢占切换时多个任务竞争共享的光标 / 像素状态
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
     for ch in s.bytes() {
         match ch {
             b'\n' => new_line(),
@@ -85,6 +89,10 @@ pub fn print(s: &str) {
                 CURSOR_X += font::CHAR_WIDTH;
             },
         }
+    }
+
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
     }
 }
 

@@ -1,22 +1,18 @@
-//! IDT (中断描述符表) — CPU 异常向量 0..=31 的处理
+//! IDT (中断描述符表) — CPU 异常向量 0..=31 与硬件中断的处理
 //!
-//! 阶段一只注册三个关键异常用于诊断:
+//! 注册的处理器:
 //!   - breakpoint (#BP, 向量 3)     : 用于验证 IDT 是否工作
 //!   - double fault (#DF, 向量 8)   : 栈溢出等致命错误, 使用独立 IST 栈
-//!   - page fault (#PF, 向量 14)    : 后续内存管理的核心异常
-//!
-//! 其余异常暂用默认 (缺省门), 硬件中断 (IRQ) 在后续阶段接入。
+//!   - page fault (#PF, 向量 14)    : 内存管理核心异常
+//!   - timer (IRQ0, 向量 32)        : 时钟中断, 驱动抢占式调度
+//!   - keyboard (IRQ1, 向量 33)     : 键盘中断, 打印 scancode
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use super::gdt::DOUBLE_FAULT_IST_INDEX;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
-
-/// 时钟中断累计 tick 数 (由 IRQ0 递增)
-static TICKS: AtomicU64 = AtomicU64::new(0);
 
 extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
     crate::video::println("[IDT] Breakpoint exception (#BP) caught");
@@ -46,16 +42,12 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::halt();
 }
 
-/// 时钟中断 (IRQ0, 向量 32)
+/// 时钟中断 (IRQ0, 向量 32) — 抢占式调度的时钟心跳
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    // 每 100 tick (约 1 秒) 打印一次, 避免刷屏
-    if tick % 100 == 0 {
-        crate::video::print("[timer] tick = ");
-        crate::video::print_u64(tick);
-        crate::video::println("");
-    }
+    // 先结束中断再切换: 否则被切走任务的 send_eoi 尚未执行,
+    // 而首次进入的新任务不会补发 EOI, 会导致后续 IRQ0 被屏蔽。
     super::pic::send_eoi();
+    crate::scheduler::tick();
 }
 
 /// 键盘中断 (IRQ1, 向量 33)

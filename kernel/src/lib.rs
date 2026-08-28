@@ -11,9 +11,15 @@
 #![feature(abi_x86_interrupt)]
 #![allow(static_mut_refs)]
 
+extern crate alloc;
+
 pub mod arch;
 pub mod bootinfo;
+pub mod cap;
+pub mod domain;
+pub mod ipc;
 pub mod memory;
+pub mod scheduler;
 pub mod video;
 
 /// 停机 CPU (hlt 循环, 永不返回)。
