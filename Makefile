@@ -78,7 +78,7 @@ $(KERNEL_ELF): $(KERNEL_SRC)
 		--target $(KERNEL_TARGET) \
 		--package morion-kernel \
 		--release \
-		-Z build-std=core,compiler_builtins \
+		-Z build-std=core,alloc,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
 	$(CP) target/$(KERNEL_TARGET)/release/morion-kernel $@
 	@echo "  ✓ 微内核构建完成: $@"

@@ -9,7 +9,7 @@
 
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
-use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams, SearchType};
+use uefi::table::boot::{MemoryDescriptor, MemoryType, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::Identify;
 use morion_boot::boot::loader::{Elf64Header, Elf64ProgramHeader};
 
@@ -488,19 +488,24 @@ static LOADING_FRAMES: [&[u8]; 6] = [
 static KERNEL_ELF: &[u8] = include_bytes!("../loader/morion-kernel.elf");
 
 
-// Boot Info 结构 — 传递给内核
+// Boot Info 结构 — 传递给内核 (物理地址 0x7000)
+//
+// 内存图 (mmap) 复制到物理地址 0x8000, 内核据此初始化物理内存管理。
 #[repr(C)]
 struct BootInfo {
-    magic: u32,
-    version: u32,
-    fb_addr: u64,
+    magic: u32,            // 0x4D4F5249 = "MORI"
+    version: u32,          // 2
+    fb_addr: u64,          // 帧缓冲物理地址
     fb_width: u32,
     fb_height: u32,
     fb_stride: u32,
     fb_bpp: u32,
+    mmap_addr: u64,        // 内存图数据物理地址 (0x8000)
+    mmap_entry_count: u64, // 内存图条目数
+    mmap_entry_size: u64,  // 单个条目字节数 (40)
 }
 
-fn boot_kernel(fb: &mut Fb) -> ! {
+fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
     // ELF 校验 — 如果不是真正的 ELF (缺少魔数 / 长度不足)，
     // 显示提示后循环休眠，不要破坏内存。
     let is_valid_elf = KERNEL_ELF.len() >= 64
@@ -521,12 +526,15 @@ fn boot_kernel(fb: &mut Fb) -> ! {
     // 设置 Boot Info 到 0x7000
     let boot_info = BootInfo {
         magic: 0x4D4F5249, // "MORI"
-        version: 1,
+        version: 2,
         fb_addr: fb.base as u64,
         fb_width: fb.w,
         fb_height: fb.h,
         fb_stride: fb.stride,
         fb_bpp: 32,
+        mmap_addr: 0,
+        mmap_entry_count: 0,
+        mmap_entry_size: 0,
     };
     unsafe {
         let ptr = 0x7000 as *mut BootInfo;
@@ -570,6 +578,26 @@ fn boot_kernel(fb: &mut Fb) -> ! {
                 }
             }
         }
+    }
+
+    // 退出引导服务并获取 UEFI 内存图
+    let (_rt, mmap) = st.exit_boot_services(MemoryType::LOADER_DATA);
+
+    // 复制内存图到物理地址 0x8000 (内核已知位置)
+    let entry_size = core::mem::size_of::<MemoryDescriptor>();
+    let mut count: usize = 0;
+    for desc in mmap.entries() {
+        let dst = (0x8000 + count * entry_size) as *mut MemoryDescriptor;
+        unsafe { core::ptr::write(dst, *desc); }
+        count += 1;
+    }
+
+    // 更新 Boot Info 的内存图字段
+    unsafe {
+        let ptr = 0x7000 as *mut BootInfo;
+        (*ptr).mmap_addr = 0x8000;
+        (*ptr).mmap_entry_count = count as u64;
+        (*ptr).mmap_entry_size = entry_size as u64;
     }
 
     // 跳转到内核
@@ -733,7 +761,7 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
                 Key::Printable(c) if c == uefi::Char16::try_from('\r').unwrap() => {
                     if sel == 0 {
                         draw_text(&mut fb, "Loading kernel...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
-                        boot_kernel(&mut fb);
+                        boot_kernel(st, &mut fb);
                     } else {
                         draw_text(&mut fb, "Not implemented", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
                         for _ in 0..50_000_000 { core::hint::spin_loop(); }

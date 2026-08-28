@@ -14,10 +14,6 @@ crate-type = ["lib"]
 name = "morion-boot"
 path = "src/main.rs"
 
-[[bin]]
-name = "gop-test"
-path = "src/gop_test.rs"
-
 # UEFI 应用不需要 std
 [profile.dev]
 panic = "abort"
@@ -34,13 +30,6 @@ strip = true
 [dependencies]
 # UEFI 基础运行时 (不使用 std), 启用 alloc 支持
 uefi = { version = "0.26", features = ["alloc"] }
-
-# 无 std 环境下的数据结构
-bitflags = { version = "2", default-features = false }
-log = { version = "0.4", default-features = false }
-
-# 声明式配置解析 (TOML, 在 no_std 下解析)
-toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 # 密码学与安全 — 暂时注释, curve25519-dalek SIMD 在 UEFI 交叉编译中崩溃
 # 后续通过 feature flag 按需启用

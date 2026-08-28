@@ -12,6 +12,10 @@ static mut CURSOR_X: u32 = 0;
 static mut CURSOR_Y: u32 = 0;
 
 const MARGIN: u32 = 16;
+/// 行高 (字符高 + 行间距)
+const LINE_HEIGHT: u32 = font::CHAR_HEIGHT + 4;
+/// 背景色 (与清屏颜色一致)
+const BACKGROUND: u32 = 0x08102A;
 
 /// 从 Boot Info 初始化帧缓冲并清屏
 pub fn init(info: &BootInfo) {
@@ -20,7 +24,7 @@ pub fn init(info: &BootInfo) {
         CURSOR_X = MARGIN;
         CURSOR_Y = MARGIN;
     }
-    clear(0x08102A);
+    clear(BACKGROUND);
 }
 
 /// 帧缓冲是否可用 (panic/异常处理在打印前检查)
@@ -49,30 +53,37 @@ pub fn set_cursor(x: u32, y: u32) {
     }
 }
 
-/// 打印字符串 (支持 '\n' 换行)
+/// 向上滚动一行 (memmove 内容上移 + 清空底部)
+fn scroll_up() {
+    unsafe {
+        FB.scroll_up(MARGIN, LINE_HEIGHT, BACKGROUND);
+    }
+}
+
+/// 换行: 光标下移一行, 超出底部时滚动
+fn new_line() {
+    unsafe {
+        CURSOR_X = MARGIN;
+        CURSOR_Y += LINE_HEIGHT;
+        if CURSOR_Y + font::CHAR_HEIGHT >= FB.height() {
+            scroll_up();
+            CURSOR_Y -= LINE_HEIGHT;
+        }
+    }
+}
+
+/// 打印字符串 (支持 '\n' 换行与滚动)
 pub fn print(s: &str) {
     for ch in s.bytes() {
         match ch {
-            b'\n' => {
-                unsafe {
-                    CURSOR_X = MARGIN;
-                    CURSOR_Y += font::CHAR_HEIGHT + 4;
+            b'\n' => new_line(),
+            _ => unsafe {
+                if CURSOR_X + font::CHAR_WIDTH >= FB.width() {
+                    new_line();
                 }
-            }
-            _ => {
-                unsafe {
-                    if CURSOR_X + font::CHAR_WIDTH >= FB.width() {
-                        CURSOR_X = MARGIN;
-                        CURSOR_Y += font::CHAR_HEIGHT + 4;
-                    }
-                    if CURSOR_Y + font::CHAR_HEIGHT >= FB.height() {
-                        // 越界时回卷到顶部
-                        CURSOR_Y = MARGIN;
-                    }
-                    font::draw_char(&mut FB, CURSOR_X, CURSOR_Y, ch, 0xFFFFFF);
-                    CURSOR_X += font::CHAR_WIDTH;
-                }
-            }
+                font::draw_char(&mut FB, CURSOR_X, CURSOR_Y, ch, 0xFFFFFF);
+                CURSOR_X += font::CHAR_WIDTH;
+            },
         }
     }
 }

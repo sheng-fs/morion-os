@@ -49,6 +49,31 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// 向上滚动: 把 [top + line_height, height) 上移到 [top, height - line_height),
+    /// 并清空底部 [height - line_height, height) 为背景色。
+    pub fn scroll_up(&mut self, top: u32, line_height: u32, background: u32) {
+        if self.height <= top + line_height {
+            return;
+        }
+        let bpp = 4;
+        let stride = self.stride as usize;
+        let top = top as usize;
+        let line = line_height as usize;
+        let height = self.height as usize;
+
+        unsafe {
+            let src = self.base.add((top + line) * stride * bpp);
+            let dst = self.base.add(top * stride * bpp);
+            core::ptr::copy(src, dst, (height - top - line) * stride * bpp);
+        }
+
+        for y in (self.height - line_height)..self.height {
+            for x in 0..self.width {
+                self.pixel(x, y, background);
+            }
+        }
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }
