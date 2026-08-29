@@ -33,6 +33,7 @@ pub enum TaskState {
     Running,
     Sleeping,
     Blocked,
+    Terminated,
 }
 
 /// 内核任务控制块 (TCB)。
@@ -44,6 +45,12 @@ pub struct Task {
     pub cr3: u64,
     /// 所属域 id (用于 IPC 消息路由)。
     pub domain: u64,
+    /// 内核栈顶虚拟地址 (Ring3 中断 / syscall 切换栈使用)。
+    kernel_stack_top: u64,
+    /// 用户态入口地址 (Ring 3 任务), 内核态任务为 0。
+    user_entry: u64,
+    /// 用户栈顶虚拟地址, 内核态任务为 0。
+    user_stack: u64,
     /// 睡眠唤醒的 tick 时刻 (仅 `Sleeping` 状态有效)。
     sleep_until: u64,
     /// 阻塞等待的域 id (仅 `Blocked` 状态有效)。
@@ -82,8 +89,27 @@ impl Scheduler {
         }
     }
 
-    /// 创建一个新任务 (归属指定域), 返回其任务表索引。
+    /// 创建一个新内核任务 (归属指定域), 返回其任务表索引。
     fn spawn(&mut self, entry: extern "C" fn(), domain: u64) -> usize {
+        self.spawn_inner(entry, domain, 0, 0)
+    }
+
+    /// 创建一个新用户态任务 (Ring 3), 返回其任务表索引。
+    ///
+    /// `entry` / `user_stack` 为用户空间虚拟地址; 首次调度时经 `switch_to_user`
+    /// 构造中断返回帧切入 Ring 3。内核栈仍由调度器分配, 供中断 / syscall 使用。
+    fn spawn_user(&mut self, entry: u64, user_stack: u64, domain: u64) -> usize {
+        self.spawn_inner(user_trampoline, domain, entry, user_stack)
+    }
+
+    /// 任务创建的公共实现: 分配内核栈, 构造初始上下文。
+    fn spawn_inner(
+        &mut self,
+        entry: extern "C" fn(),
+        domain: u64,
+        user_entry: u64,
+        user_stack: u64,
+    ) -> usize {
         let slot = self
             .tasks
             .iter()
@@ -92,6 +118,8 @@ impl Scheduler {
 
         let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
         let ctx = unsafe { TaskContext::from_entry(entry, &mut stack) };
+        // 内核栈顶须与 `TaskContext::from_entry` 的对齐方式一致, 供 RSP0 / syscall 使用。
+        let kernel_stack_top = (stack.as_ptr() as u64 + stack.len() as u64) & !0xF;
         let cr3 = crate::domain::pml4_of(domain);
 
         self.tasks[slot] = Some(Task {
@@ -100,6 +128,9 @@ impl Scheduler {
             ctx,
             cr3,
             domain,
+            kernel_stack_top,
+            user_entry,
+            user_stack,
             sleep_until: 0,
             wait_on: 0,
             _stack: stack,
@@ -138,6 +169,32 @@ pub fn spawn(entry: extern "C" fn(), domain: u64) {
         .spawn(entry, domain);
 }
 
+/// 创建一个用户态任务 (Ring 3, 归属指定域)。
+///
+/// `entry` / `user_stack` 为用户空间虚拟地址, 其所在页须已由
+/// `memory::paging::map_user_page` 映射到该域 (USER 权限)。
+pub fn spawn_user(entry: u64, user_stack: u64, domain: u64) {
+    SCHEDULER
+        .lock()
+        .as_mut()
+        .expect("scheduler not initialized")
+        .spawn_user(entry, user_stack, domain);
+}
+
+/// 用户态任务的内核入口蹦床: 首次调度时被 `ret` 跳入, 读取当前任务的
+/// 用户入口 / 用户栈, 再经 `switch_to_user` 构造中断返回帧切入 Ring 3。
+extern "C" fn user_trampoline() {
+    let (entry, stack, domain) = {
+        let guard = SCHEDULER.lock();
+        let sched = guard.as_ref().expect("scheduler not initialized");
+        let t = sched.tasks[sched.current]
+            .as_ref()
+            .expect("scheduler: no current task");
+        (t.user_entry, t.user_stack, t.domain)
+    };
+    unsafe { crate::syscall::switch_to_user(entry, stack, domain) };
+}
+
 /// 将当前任务标记为 `current_state` 并切换到下一个就绪任务。
 ///
 /// 调用前必须已关闭中断 (IF=0)。单核 + 关中断下, 锁的临界区原子。
@@ -167,6 +224,11 @@ fn schedule_next(current_state: TaskState) {
 
         sched.current = next;
         sched.tasks[next].as_mut().unwrap().state = TaskState::Running;
+
+        // 更新 Ring3 → Ring0 中断 / syscall 使用的新任务内核栈顶。
+        let next_kstack = sched.tasks[next].as_ref().unwrap().kernel_stack_top;
+        crate::arch::gdt::set_rsp0(next_kstack);
+        crate::syscall::set_current_kernel_stack_top(next_kstack);
 
         drop(guard);
         switch(old, new);
@@ -278,8 +340,22 @@ pub fn run() -> ! {
     sched.current = first;
     sched.tasks[first].as_mut().unwrap().state = TaskState::Running;
 
+    // 更新首个任务的 RSP0 / 内核栈顶 (Ring3 中断与 syscall 依赖)。
+    let first_kstack = sched.tasks[first].as_ref().unwrap().kernel_stack_top;
+    crate::arch::gdt::set_rsp0(first_kstack);
+    crate::syscall::set_current_kernel_stack_top(first_kstack);
+
     drop(guard);
     unsafe { switch(old, new) };
 
     unreachable!("scheduler::run returned unexpectedly");
+}
+
+/// 终止当前任务并切换到下一个就绪任务 (永不返回)。
+///
+/// 由 `SYS_EXIT` 系统调用调用 (syscall 已清 IF)。当前任务被标记为
+/// `Terminated`, 之后不再被调度。
+pub fn exit_current() -> ! {
+    schedule_next(TaskState::Terminated);
+    unreachable!("scheduler::exit_current: schedule_next returned");
 }

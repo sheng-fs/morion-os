@@ -12,6 +12,7 @@ members = [
     "boot",
     "kernel",
     "kernel_test",
+    "user",
 ]
 
 # 未来添加:

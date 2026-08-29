@@ -42,6 +42,9 @@ KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
 KERNEL_EMBED  := boot/loader/morion-kernel.elf
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
+# 用户态测试程序 (kernel/src/main.rs 用 include_bytes! 嵌入)
+USER_ELF      := $(OUT_DIR)/user/morion-user
+USER_BIN      := $(OUT_DIR)/user/user.bin
 EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 
@@ -64,6 +67,7 @@ all: iso
 # 源文件集合: 用于 make 层面的重建触发 (cargo 内部另有指纹追踪)。
 KERNEL_SRC := $(shell find kernel -type f 2>/dev/null)
 BOOT_SRC   := $(shell find boot/src boot/loader -type f 2>/dev/null) boot/build.rs boot/Cargo.toml
+USER_SRC   := $(shell find user -type f 2>/dev/null)
 
 # ============================================================
 # 微内核构建
@@ -71,7 +75,7 @@ BOOT_SRC   := $(shell find boot/src boot/loader -type f 2>/dev/null) boot/build.
 .PHONY: kernel
 kernel: $(KERNEL_ELF)
 
-$(KERNEL_ELF): $(KERNEL_SRC)
+$(KERNEL_ELF): $(KERNEL_SRC) $(USER_BIN)
 	@echo "==> 构建微内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -89,6 +93,31 @@ $(KERNEL_EMBED): $(KERNEL_ELF)
 	$(MKDIR) $(dir $@)
 	$(CP) $(KERNEL_ELF) $@
 	@echo "  ✓ 已更新: $@"
+
+# ============================================================
+# 用户态测试程序构建 (内核运行时加载)
+# ============================================================
+.PHONY: user
+user: $(USER_BIN)
+
+$(USER_ELF): $(USER_SRC)
+	@echo "==> 构建用户态测试程序..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-user \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-user $@
+	@echo "  ✓ 用户程序构建完成: $@"
+
+$(USER_BIN): $(USER_ELF)
+	@echo "==> 生成用户程序扁平二进制..."
+	$(MKDIR) $(dir $@)
+	objcopy -O binary $(USER_ELF) $(USER_BIN)
+	@echo "  ✓ 用户程序二进制: $@"
 
 # ============================================================
 # UEFI 引导器构建

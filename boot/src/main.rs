@@ -5,7 +5,6 @@
 
 #![no_std]
 #![no_main]
-#![allow(invalid_reference_casting)]
 
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
@@ -64,12 +63,14 @@ impl Fb {
                     OpenProtocolAttributes::GetProtocol,
                 ).map_err(|_| Status::UNSUPPORTED)?;
 
-            let gop = &*gop_handle;
-            let mode = gop.current_mode_info();
-            let (w, h) = mode.resolution();
-            let gop_mut = &mut *(gop as *const GraphicsOutput as *mut GraphicsOutput);
+            let ((w, h), stride) = {
+                let gop = gop_handle.get().ok_or(Status::UNSUPPORTED)?;
+                let mode = gop.current_mode_info();
+                (mode.resolution(), mode.stride())
+            };
+            let gop_mut = gop_handle.get_mut().ok_or(Status::UNSUPPORTED)?;
             let mut fbb = gop_mut.frame_buffer();
-            Ok(Fb { base: fbb.as_mut_ptr(), size: fbb.size(), w: w as u32, h: h as u32, stride: mode.stride() as u32 })
+            Ok(Fb { base: fbb.as_mut_ptr(), size: fbb.size(), w: w as u32, h: h as u32, stride: stride as u32 })
         }
     }
 

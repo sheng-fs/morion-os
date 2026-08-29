@@ -19,6 +19,9 @@ use crate::memory::frame_allocator;
 /// 物理内存 offset 映射的虚拟地址偏移
 pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
+/// 用户空间基址 (P4[1], 512 GiB), 与内核的恒等/offset 映射分离。
+pub const USER_SPACE_BASE: u64 = 0x0000_0080_0000_0000;
+
 /// 内核堆起始虚拟地址 (未使用的上半区地址)
 const HEAP_START: u64 = 0x4444_4444_0000;
 /// 内核堆大小
@@ -153,4 +156,27 @@ pub fn heap_start() -> usize {
 /// 内核堆大小 (字节)。
 pub fn heap_size() -> usize {
     HEAP_SIZE
+}
+
+/// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限)。
+///
+/// 用户空间使用独立的 PML4 条目 (P4[1], 基址见 `USER_SPACE_BASE`), 不干扰内核的
+/// 恒等/offset 映射。中间页表 (PDPT/PD/PT) 缺失时自动分配并清零。
+pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
+    let pml4 = crate::domain::pml4_of(domain_id);
+    // 通过 offset 映射访问目标域的 PML4。
+    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
+    let mut mapper = unsafe { OffsetPageTable::new(&mut *pml4_virt, VirtAddr::new(PHYS_OFFSET)) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+    let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    let mut allocator = KernelFrameAllocator;
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut allocator)
+            .expect("map_user_page: map failed")
+            .flush();
+    }
 }

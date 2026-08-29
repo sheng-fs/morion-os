@@ -1,0 +1,17 @@
+# Morion OS 用户态测试程序 (Ring 3)
+#
+# 编译为独立扁平二进制, 由内核在运行时加载到用户空间。
+# 与内核同一 target (x86_64-unknown-none), 但使用自己的链接脚本,
+# 链接到用户空间基址 USER_SPACE_BASE (P4[1])。
+
+[package]
+name = "morion-user"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Morion OS 用户态测试程序 (Ring 3)"
+
+[[bin]]
+name = "morion-user"
+path = "src/main.rs"

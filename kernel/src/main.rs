@@ -5,17 +5,68 @@
 #![no_std]
 #![no_main]
 
-use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, scheduler, video};
+use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, scheduler, syscall, video};
 
 extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use x86_64::instructions::interrupts;
-
 // 链接脚本 (.stack 段) 导出的内核栈顶
 extern "C" {
     static _stack_end: u8;
+}
+
+// ---------------------------------------------------------------------------
+// 阶段十: 用户程序加载 (编译产物, 替代阶段九的手写机器码)
+// ---------------------------------------------------------------------------
+/// 用户程序基址 (P4[1] 用户空间基址), 与 user/linker.ld 的链接地址一致。
+const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
+/// 用户栈页虚拟地址 (程序镜像上方一页)。
+const USER_STACK_ADDR: u64 = USER_BASE + 0x1000;
+/// 用户栈顶虚拟地址 (栈向下增长)。
+const USER_STACK_TOP: u64 = USER_STACK_ADDR + 0x1000;
+/// 页大小。
+const PAGE_SIZE: u64 = 4096;
+
+/// 编译期嵌入的用户程序扁平二进制 (由 Makefile 先构建 user, 再 objcopy 产出)。
+const USER_PROGRAM: &[u8] = include_bytes!("../../build/user/user.bin");
+
+/// 把用户程序加载到指定域: 分配连续物理帧, 映射到 `USER_BASE` 起, 拷贝镜像,
+/// 并映射一页用户栈。
+fn load_user_program(domain_id: u64) {
+    let bytes = USER_PROGRAM;
+    let pages = (bytes.len() as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    for i in 0..pages {
+        let frame =
+            memory::frame_allocator::allocate_frame().expect("allocate user program frame");
+        let vaddr = USER_BASE + i * PAGE_SIZE;
+        memory::paging::map_user_page(domain_id, vaddr, frame);
+
+        let start = (i * PAGE_SIZE) as usize;
+        let end = core::cmp::min(start + PAGE_SIZE as usize, bytes.len());
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(start),
+                frame as *mut u8,
+                end - start,
+            );
+        }
+    }
+
+    // 用户栈页。
+    let stack_frame =
+        memory::frame_allocator::allocate_frame().expect("allocate user stack frame");
+    memory::paging::map_user_page(domain_id, USER_STACK_ADDR, stack_frame);
+}
+
+/// 空闲任务: 当用户任务退出后兜底运行, 停机等待中断。
+extern "C" fn task_idle() {
+    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启。
+    x86_64::instructions::interrupts::enable();
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 /// 内核入口 — 引导器通过 `jmp` 进入, Boot Info 指针在 rdi
@@ -123,90 +174,53 @@ pub extern "C" fn _start() -> ! {
     video::println("[OK] PIC remapped + PIT timer started (100 Hz)");
 
     // ============================================================
-    //  阶段八: 能力系统 (无能力即不可访问)
+    //  阶段十: 用户态运行库 + 可加载用户程序
     // ============================================================
     video::println("");
-    video::println("Stage 8: Capability system (least privilege)");
+    video::println("Stage 10: libuser + loadable user program");
+    syscall::init();
+    video::println("[OK] syscall/sysret enabled (EFER.SCE + STAR + LSTAR)");
+
+    // ============================================================
+    //  阶段十一: IPC + 能力系统
+    // ============================================================
     scheduler::init();
-    let domain_prod = domain::create();   // 域 0: 生产者
-    let domain_cons = domain::create();   // 域 1: 消费者
-    let domain_cap = domain::create();    // 域 2: 能力管理器
+
+    // 创建 3 个保护域:
+    //   0 = sender   (持有 SendTo(1) 能力)
+    //   1 = receiver (接收消息)
+    //   2 = isolated (sender 无能力向其发送, 用于演示能力拒绝)
+    let sender_domain = domain::create();
+    let receiver_domain = domain::create();
+    let _isolated_domain = domain::create();
+
+    // 初始化 IPC 邮箱与能力表 (数量 = 域数量)。
     ipc::init(3);
     cap::init(3);
-    video::println("[OK] 3 domains + capability tables initialized");
-    // 最小权限: 域 0 初始不持有 SendTo(1) 能力。
-    scheduler::spawn(task_idle, domain_prod);        // 域 0: 空闲兜底
-    scheduler::spawn(task_producer, domain_prod);    // 域 0: 生产者
-    scheduler::spawn(task_consumer, domain_cons);    // 域 1: 消费者
-    scheduler::spawn(task_cap_manager, domain_cap);  // 域 2: 能力管理器
-    video::println("[OK] producer(0) consumer(1) cap-manager(2)");
+
+    // 授权: sender 可向 receiver 发送; 不授予向 isolated 发送的能力。
+    cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
+    video::println("[OK] IPC + capability initialized (3 domains)");
+
+    // 加载用户程序到 sender / receiver 域 (isolated 域仅存在, 不运行任务)。
+    load_user_program(sender_domain);
+    load_user_program(receiver_domain);
+    video::println("[OK] user program loaded into domains 0 & 1");
+
+    // 域 0 / 1 各起一个用户任务 (同一镜像, 经 domain_id 参数区分角色)。
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
+    // 空闲任务兜底 (归属 sender 域)。
+    scheduler::spawn(task_idle, sender_domain);
+    video::println("[OK] sender + receiver + idle tasks spawned");
     video::println("");
-    video::println("Producer tries send without capability first (denied),");
-    video::println("then cap-manager grants SendTo(1) after about 1s (succeeds).");
+    video::println("Expected: sender sends to receiver (granted), and is");
+    video::println("denied sending to isolated domain (no capability).");
     video::println("");
 
     // 交给调度器。首次切换在中断关闭下进行, 避免 enable 与首次调度之间
     // 的竞态 (否则定时器中断会在 run 完成前触发 schedule 抢走主执行流)。
     scheduler::run();
-}
-
-/// 空闲任务 (域 0): 当其他任务都阻塞/睡眠时兜底运行, 停机等待中断。
-extern "C" fn task_idle() {
-    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
-    interrupts::enable();
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
-
-/// 生产者 (域 0): 每 200ms 尝试发送到域 1, 无能力时被内核拒绝。
-extern "C" fn task_producer() {
-    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
-    interrupts::enable();
-    let mut seq = 0u64;
-    loop {
-        let payload = [0u8; ipc::PAYLOAD_LEN];
-        let ok = ipc::send(1, seq, &payload);
-        video::print("[send] #");
-        video::print_u64(seq);
-        if ok {
-            video::println("");
-        } else {
-            video::println(" denied (no capability)");
-        }
-        seq += 1;
-        scheduler::sleep(200);
-    }
-}
-
-/// 消费者 (域 1): 阻塞接收消息并打印。
-extern "C" fn task_consumer() {
-    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
-    interrupts::enable();
-    loop {
-        let msg = ipc::receive();
-        video::print("[recv] #");
-        video::print_u64(msg.tag);
-        video::print(" from domain ");
-        video::print_u64(msg.from);
-        video::println("");
-    }
-}
-
-/// 能力管理器 (域 2): 运行约 1 秒后向域 0 授予 SendTo(1) 能力。
-extern "C" fn task_cap_manager() {
-    // 首次进入时中断仍关闭 (run 未开启中断), 在此开启; 之后由中断帧恢复
-    interrupts::enable();
-    scheduler::sleep(1000);
-    let ok = cap::grant(0, cap::Capability::SendTo(1));
-    if ok {
-        video::println("[cap] granted SendTo(1) to domain 0");
-    } else {
-        video::println("[cap] grant failed (table full?)");
-    }
-    loop {
-        x86_64::instructions::hlt();
-    }
 }
 
 #[cfg(target_os = "none")]

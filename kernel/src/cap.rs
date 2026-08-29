@@ -38,6 +38,9 @@ pub fn has(domain: u64, cap: Capability) -> bool {
 
 /// 向某域授予能力 (占用一个空槽)。
 pub fn grant(domain: u64, cap: Capability) -> bool {
+    // 保存/恢复中断状态: boot 期 (IF=0) 调用时不能提前开启中断,
+    // 否则 PIT 会在调度器尚未就绪时触发 schedule 导致 panic。
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut table = CAP_TABLE.lock();
     let mut ok = false;
@@ -48,12 +51,15 @@ pub fn grant(domain: u64, cap: Capability) -> bool {
             break;
         }
     }
-    x86_64::instructions::interrupts::enable();
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
     ok
 }
 
 /// 撤销某域的指定能力。
 pub fn revoke(domain: u64, cap: Capability) -> bool {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut table = CAP_TABLE.lock();
     let mut ok = false;
@@ -64,6 +70,8 @@ pub fn revoke(domain: u64, cap: Capability) -> bool {
             break;
         }
     }
-    x86_64::instructions::interrupts::enable();
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
     ok
 }
