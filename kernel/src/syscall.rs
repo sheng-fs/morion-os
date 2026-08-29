@@ -121,6 +121,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
         SYS_RECV => crate::ipc::receive().tag,
         SYS_ALLOC_PAGE => {
             // 分配一个物理帧并映射到当前域的 `vaddr` (a1)。
+            // 仅允许用户空间地址: 否则 `map_user_page` 的 `map_to` 会命中内核
+            // 映射区 (恒等 huge page 等) 而 panic, 用户态可借此直接打挂内核。
+            if !crate::memory::paging::is_user_address(a1) {
+                return 0;
+            }
             let paddr = match crate::memory::frame_allocator::allocate_frame() {
                 Some(p) => p,
                 None => return 0,
@@ -132,6 +137,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
         SYS_SHARE_PAGE => {
             // 把当前域 `vaddr` (a1) 的页共享映射进 `a2` 域同一地址, 需 MapInto 能力。
             let from = crate::scheduler::current_domain();
+            // 仅允许共享用户空间地址: `resolve_user_page` 只校验 PRESENT, 会解析到
+            // 复制进各域 PML4 的内核映射; 随后 `map_user_page` 会以 USER 权限重映射
+            // 内核物理帧 (越权), 或命中已存在条目/huge-page 父项而 panic。
+            if !crate::memory::paging::is_user_address(a1) {
+                return 0;
+            }
             if !crate::cap::has(from, crate::cap::Capability::MapInto(a2)) {
                 0
             } else {

@@ -7,6 +7,7 @@
 //!   2. 加载 CR3
 //!   3. 用 OffsetPageTable 把内核堆映射到高位虚拟地址, 并初始化全局分配器
 
+#[cfg(target_os = "none")]
 use linked_list_allocator::LockedHeap;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -41,6 +42,11 @@ unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
 }
 
 /// 全局内核堆分配器
+///
+/// 仅在内核目标 (target_os = "none") 下注册为全局分配器: 内核无 std, 须自行
+/// 提供堆。host 单元测试由 std 提供系统分配器, 若注册此空 `LockedHeap` 会在
+/// 测试框架首次分配时空指针解引用 (SIGSEGV), 故用 cfg 关闭。
+#[cfg(target_os = "none")]
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -48,6 +54,7 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 pub fn init() {
     let pml4_phys = setup_page_tables();
     load_cr3(pml4_phys);
+    #[cfg(target_os = "none")]
     init_heap(pml4_phys);
 }
 
@@ -115,6 +122,7 @@ fn load_cr3(pml4_phys: PhysAddr) {
 }
 
 /// 映射内核堆到高位虚拟地址并初始化全局分配器。
+#[cfg(target_os = "none")]
 fn init_heap(pml4_phys: PhysAddr) {
     // 通过 offset 映射访问 PML4, 构造 OffsetPageTable
     let pml4_virt = (PHYS_OFFSET + pml4_phys.as_u64()) as *mut PageTable;
@@ -156,6 +164,16 @@ pub fn heap_start() -> usize {
 /// 内核堆大小 (字节)。
 pub fn heap_size() -> usize {
     HEAP_SIZE
+}
+
+/// 判断虚拟地址是否落在用户空间 (P4[1], 即 `USER_SPACE_BASE` 起的 512 GiB)。
+///
+/// 用户空间与内核映射 (恒等 P4[0]、offset P4[256]、内核堆 P4[136] 等) 分离:
+/// 后者虽被复制进各域 PML4, 但不带 USER 权限。用此函数在系统调用边界拒绝
+/// 内核地址, 可防止把内核页以 USER 权限重映射进域 (越权读写内核内存),
+/// 也可避免 `map_user_page` 的 `map_to` 命中已存在条目/huge-page 父项而 panic。
+pub fn is_user_address(vaddr: u64) -> bool {
+    ((vaddr >> 39) & 0x1FF) == (USER_SPACE_BASE >> 39)
 }
 
 /// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限)。
@@ -221,4 +239,32 @@ pub fn resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
         return None;
     }
     Some(pte.addr().as_u64() + (vaddr & 0xFFF))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 覆盖 `is_user_address`: 系统调用边界必须只放行用户空间 (P4[1]) 地址,
+    /// 拒绝内核映射区, 否则 `SYS_ALLOC_PAGE`/`SYS_SHARE_PAGE` 会把内核页以
+    /// USER 权限重映射进域或命中 huge-page 父项而 panic。
+    #[test]
+    fn is_user_address_accepts_p4_1_only() {
+        // 用户空间 P4[1]: USER_SPACE_BASE 及其上方 512 GiB 内均合法。
+        assert!(is_user_address(USER_SPACE_BASE));
+        assert!(is_user_address(USER_SPACE_BASE + 0x3000)); // 现有用户程序使用的地址
+        assert!(is_user_address(USER_SPACE_BASE + (1 << 39) - 1));
+
+        // 内核恒等映射 P4[0] — 包括零地址, 必须拒绝 (否则触发 panic/越权)。
+        assert!(!is_user_address(0));
+        assert!(!is_user_address(0x100000));
+        assert!(!is_user_address(USER_SPACE_BASE - 1));
+
+        // 内核 offset / 高半区 (P4[256]) 与内核堆 (P4[136]) 必须拒绝。
+        assert!(!is_user_address(0xFFFF_8000_0000_0000));
+        assert!(!is_user_address(0x4444_4444_0000));
+
+        // P4[2] 不属于用户空间。
+        assert!(!is_user_address(USER_SPACE_BASE * 2));
+    }
 }
