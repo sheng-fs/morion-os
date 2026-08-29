@@ -14,6 +14,8 @@ pub const SYS_SEND: u64 = 2;
 pub const SYS_RECV: u64 = 3;
 pub const SYS_PUTS: u64 = 4;
 pub const SYS_EXIT: u64 = 5;
+pub const SYS_ALLOC_PAGE: u64 = 6;
+pub const SYS_SHARE_PAGE: u64 = 7;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -21,9 +23,12 @@ unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     asm!(
         "syscall",
         inlateout("rax") n => ret,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
+        // rdi/rsi/rdx 是 syscall 参数寄存器, 内核 syscall_entry 会改写它们
+        // (rdi←编号, rsi←a1, rdx←a2), 故须用 inout 声明并丢弃输出, 否则
+        // 编译器会假设它们跨 syscall 不变 (复用 rdi 作写地址导致页错误)。
+        inout("rdi") a1 => _,
+        inout("rsi") a2 => _,
+        inout("rdx") a3 => _,
         // rcx/r11 被 syscall 指令本身改写; r8/r9/r10 是 caller-saved,
         // 内核 syscall_entry 并不保存它们 (会经 syscall_dispatch 被破坏)。
         // 必须声明为 clobber, 否则编译器会假设它们跨 syscall 不变。
@@ -55,6 +60,14 @@ pub fn sys_send(to: u64, tag: u64) -> u64 {
 
 pub fn sys_recv() -> u64 {
     unsafe { syscall(SYS_RECV, 0, 0, 0) }
+}
+
+pub fn sys_alloc_page(vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_ALLOC_PAGE, vaddr, 0, 0) }
+}
+
+pub fn sys_share_page(vaddr: u64, to: u64) -> u64 {
+    unsafe { syscall(SYS_SHARE_PAGE, vaddr, to, 0) }
 }
 
 pub fn sys_puts(s: &str) {

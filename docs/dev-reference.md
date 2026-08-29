@@ -74,10 +74,12 @@ UEFI 固件
 | --- | --- | --- | --- |
 | 0 | `SYS_YIELD` | — | 主动让出 CPU |
 | 1 | `SYS_SLEEP` | `rdi=ms` | 睡眠毫秒 |
-| 2 | `SYS_SEND` | `rdi=to, rsi=tag` | 发送 IPC 消息 |
-| 3 | `SYS_RECV` | — | 接收 IPC 消息，返回 `tag` |
+| 2 | `SYS_SEND` | `rdi=to, rsi=tag` | 发送 IPC 消息；需 `Capability::SendTo(to)`，返回 1 成功 / 0 失败 |
+| 3 | `SYS_RECV` | — | 接收 IPC 消息（阻塞），返回 `tag` |
 | 4 | `SYS_PUTS` | `rdi=ptr, rsi=len` | 打印用户字符串 |
 | 5 | `SYS_EXIT` | — | 终止当前用户任务（标记 `Terminated`） |
+| 6 | `SYS_ALLOC_PAGE` | `rdi=vaddr` | 分配一物理帧映射到本域 `vaddr`，返回 1 成功 / 0 失败 |
+| 7 | `SYS_SHARE_PAGE` | `rdi=vaddr, rsi=to` | 把本域 `vaddr` 的页映射进 `to` 域同地址；需 `Capability::MapInto(to)`，返回 1/0 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -87,6 +89,12 @@ UEFI 固件
 | `STAR` | sysret CS=4 / SS=3 (RPL3)，syscall CS=1 / SS=2 (RPL0) | 段基址 |
 | `LSTAR` | `syscall_entry` | syscall 入口 |
 | `SFMASK` | `INTERRUPT_FLAG` | 进入时清 IF |
+
+### Ring3 切入与上下文（`syscall.rs`）
+
+- `switch_to_user(entry: u64, stack_top: u64, arg: u64) -> !`：构造 iret 帧首次切入 Ring 3；`arg` 经 `rdi` 传入用户 `_start(domain_id)`（传递所属域 id）。
+- `syscall_entry` 用 `r10` 暂存用户 `rsp` 并保留 `rbx`（`r10` 为 caller-saved 且不在 syscall ABI 中；`rbx` 为 callee-saved，用户态跨 syscall 复用）。
+- 用户态 syscall 封装（[user/src/syscall.rs](../../user/src/syscall.rs)）声明 `rcx/r11/r8/r9/r10` clobber，且参数寄存器 `rdi/rsi/rdx` 用 `inout(..) => _`（内核 `syscall_entry` 会改写它们，仅 `in` 会让编译器误以为跨 syscall 不变）。
 
 ## 6. 模块 API 索引
 
@@ -110,6 +118,7 @@ UEFI 固件
 
 - `init()`
 - `map_user_page(domain_id: u64, vaddr: u64, paddr: u64)`（USER 权限映射）
+- `resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（遍历页表把 vaddr 反查为物理地址）
 - `heap_start() / heap_size()`
 
 ### 域（[kernel/src/domain.rs](../../kernel/src/domain.rs)）
@@ -144,7 +153,8 @@ UEFI 固件
 - `has(domain: u64, cap: Capability) -> bool`
 - `grant(domain: u64, cap: Capability) -> bool`
 - `revoke(domain: u64, cap: Capability) -> bool`
-- `Capability::SendTo(u64)`，每域 `CAP_SLOTS = 16`
+- `grant` / `revoke` 保存并恢复中断使能状态，避免 boot 期（IF=0）被提前开中断。
+- `Capability::SendTo(u64)` / `Capability::MapInto(u64)`，每域 `CAP_SLOTS = 16`
 
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
@@ -173,6 +183,7 @@ UEFI 固件
 
 - 自定义 target：`user/x86_64-morion-user.json`（`code-model=large` + `rustc-abi=softfloat` + `relocation-model=static`），解决用户基址 `0x8000_0000_0000` 超出 32 位重定位范围的问题。
 - 链接脚本：`user/linker.ld`，`ENTRY(_start)`，链接到 `0x8000000000`，`_start` 置于镜像最前端。
+- 入口 `_start(domain_id: u64)` 接收内核经 `rdi` 传入的域 id，据此分流角色（当前用于 sender/receiver 演示）。
 - 构建链：`cargo build --target user/x86_64-morion-user.json ... -Z json-target-spec` → `objcopy -O binary` → `build/user/user.bin`。
 - 内核经 `include_bytes!("../../build/user/user.bin")` 在编译期嵌入，运行期按页映射到 `USER_SPACE_BASE` 加载。
 
@@ -198,3 +209,5 @@ UEFI 固件
 | 8 | 能力系统（最小权限） | ✅ |
 | 9 | 用户态运行模型（Ring 3）+ 系统调用 ABI | ✅ |
 | 10 | libuser + 可加载用户程序（`user/` crate + `SYS_EXIT`） | ✅ |
+| 11 | IPC + 能力系统整合（多域授权 + 用户态 sender/receiver 演示） | ✅ |
+| 12 | 跨域共享内存（`MapInto` 能力 + `SYS_ALLOC_PAGE`/`SYS_SHARE_PAGE`） | ✅ |

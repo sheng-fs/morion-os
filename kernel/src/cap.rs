@@ -13,6 +13,8 @@ use spin::Mutex;
 pub enum Capability {
     /// 向指定域发送 IPC 消息的能力。
     SendTo(u64),
+    /// 把内存页映射进指定域的能力。
+    MapInto(u64),
 }
 
 /// 每域能力槽数量。

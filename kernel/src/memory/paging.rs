@@ -180,3 +180,45 @@ pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
             .flush();
     }
 }
+
+/// 遍历指定域的 4 级页表, 把用户虚拟地址 `vaddr` 反查为物理地址。
+///
+/// 用户空间映射使用 4 KiB 页 (由 `map_user_page` 建立), 故按 PML4 → PDPT →
+/// PD → PT 逐级解析; 兼容 2 MiB 大页 (返回大页基址 + 页内偏移)。
+pub fn resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
+    let pml4 = crate::domain::pml4_of(domain_id);
+    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
+    let pml4 = unsafe { &*pml4_virt };
+
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let pml4e = &pml4[p4];
+    if !pml4e.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    let pdpt = unsafe { &*((PHYS_OFFSET + pml4e.addr().as_u64()) as *mut PageTable) };
+
+    let pdpte = &pdpt[p3];
+    if !pdpte.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    let pd = unsafe { &*((PHYS_OFFSET + pdpte.addr().as_u64()) as *mut PageTable) };
+
+    let pde = &pd[p2];
+    if !pde.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    if pde.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some(pde.addr().as_u64() + (vaddr & 0x1F_FFFF));
+    }
+    let pt = unsafe { &*((PHYS_OFFSET + pde.addr().as_u64()) as *mut PageTable) };
+
+    let pte = &pt[p1];
+    if !pte.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    Some(pte.addr().as_u64() + (vaddr & 0xFFF))
+}

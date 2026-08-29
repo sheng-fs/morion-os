@@ -200,6 +200,7 @@ pub extern "C" fn _start() -> ! {
 
     // 授权: sender 可向 receiver 发送; 不授予向 isolated 发送的能力。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
+    cap::grant(sender_domain, cap::Capability::MapInto(receiver_domain));
     video::println("[OK] IPC + capability initialized (3 domains)");
 
     // 加载用户程序到 sender / receiver 域 (isolated 域仅存在, 不运行任务)。

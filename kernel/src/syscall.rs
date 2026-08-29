@@ -24,6 +24,8 @@ pub const SYS_SEND: u64 = 2;
 pub const SYS_RECV: u64 = 3;
 pub const SYS_PUTS: u64 = 4;
 pub const SYS_EXIT: u64 = 5;
+pub const SYS_ALLOC_PAGE: u64 = 6;
+pub const SYS_SHARE_PAGE: u64 = 7;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -117,6 +119,31 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
         }
         SYS_SEND => crate::ipc::send(a1, a2, &[]) as u64,
         SYS_RECV => crate::ipc::receive().tag,
+        SYS_ALLOC_PAGE => {
+            // 分配一个物理帧并映射到当前域的 `vaddr` (a1)。
+            let paddr = match crate::memory::frame_allocator::allocate_frame() {
+                Some(p) => p,
+                None => return 0,
+            };
+            let domain = crate::scheduler::current_domain();
+            crate::memory::paging::map_user_page(domain, a1, paddr);
+            1
+        }
+        SYS_SHARE_PAGE => {
+            // 把当前域 `vaddr` (a1) 的页共享映射进 `a2` 域同一地址, 需 MapInto 能力。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::MapInto(a2)) {
+                0
+            } else {
+                match crate::memory::paging::resolve_user_page(from, a1) {
+                    Some(paddr) => {
+                        crate::memory::paging::map_user_page(a2, a1, paddr);
+                        1
+                    }
+                    None => 0,
+                }
+            }
+        }
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
