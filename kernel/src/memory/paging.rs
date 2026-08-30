@@ -24,8 +24,10 @@ pub const USER_SPACE_BASE: u64 = 0x0000_0080_0000_0000;
 
 /// 内核堆起始虚拟地址 (未使用的上半区地址)
 const HEAP_START: u64 = 0x4444_4444_0000;
-/// 内核堆大小
-const HEAP_SIZE: usize = 256 * 1024; // 256 KiB
+/// 内核堆大小 (至少容纳 7 个 32 KiB 内核栈 + 调度器/IPC/Cap/分页器/分配器元数据)
+///   7 × 32 KiB = 224 KiB 仅栈; 加上分配器头 + 容器扩容 + 域/任务结构, 256 KiB 不够,
+///   放 1 MiB 给将来扩展 (VFS / 更多域) 留余量。
+const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 
 /// 可管理的物理内存上限 (前 4 GiB, 覆盖 QEMU 2 GiB 内存)
 const MANAGED_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
