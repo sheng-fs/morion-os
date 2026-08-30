@@ -10,6 +10,7 @@
 
 use core::arch::global_asm;
 
+use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::gdt::SegmentSelector;
@@ -26,6 +27,23 @@ pub const SYS_PUTS: u64 = 4;
 pub const SYS_EXIT: u64 = 5;
 pub const SYS_ALLOC_PAGE: u64 = 6;
 pub const SYS_SHARE_PAGE: u64 = 7;
+pub const SYS_UNMAP: u64 = 8;
+pub const SYS_MAP_ANON: u64 = 9;
+pub const SYS_PAGE_FAULT_REPLY: u64 = 10;
+pub const SYS_CALL: u64 = 12;
+pub const SYS_REPLY: u64 = 13;
+pub const SYS_REGISTER_IRQ: u64 = 14;
+pub const SYS_SCROLL_UP: u64 = 15;
+pub const SYS_SCROLL_DOWN: u64 = 16;
+pub const SYS_BACKSPACE: u64 = 17;
+pub const SYS_TERM_PUT: u64 = 18;
+pub const SYS_TERM_LEFT: u64 = 19;
+pub const SYS_TERM_RIGHT: u64 = 20;
+pub const SYS_MAP_MMIO: u64 = 21;
+pub const SYS_PORT_IN8: u64 = 22;
+pub const SYS_PORT_IN16: u64 = 23;
+pub const SYS_PORT_OUT8: u64 = 24;
+pub const SYS_PORT_OUT16: u64 = 25;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -118,15 +136,39 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             0
         }
         SYS_SEND => crate::ipc::send(a1, a2, &[]) as u64,
-        SYS_RECV => crate::ipc::receive().tag,
+        SYS_RECV => {
+            // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
+            // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
+            let msg = crate::ipc::receive();
+            if a1 != 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &msg as *const crate::ipc::Message as *const u8,
+                        a1 as *mut u8,
+                        core::mem::size_of::<crate::ipc::Message>(),
+                    );
+                }
+            }
+            msg.tag
+        }
+        SYS_CALL => {
+            // 同步调用: 发送请求到 `a1` (to) 并阻塞等待回复, 返回回复 tag。
+            // 失败 (无 SendTo 能力) 时返回 u64::MAX。
+            crate::ipc::call(a1, a2, &[]).tag
+        }
+        SYS_REPLY => {
+            // 回复当前任务最近 `receive` 到的调用者, tag 为 `a1`。
+            crate::ipc::reply(a1, &[]) as u64
+        }
         SYS_ALLOC_PAGE => {
-            // 分配一个物理帧并映射到当前域的 `vaddr` (a1)。
+            // 分配一个物理帧并映射到当前域的 `vaddr` (a1), 引用计数置 1。
             let paddr = match crate::memory::frame_allocator::allocate_frame() {
                 Some(p) => p,
                 None => return 0,
             };
             let domain = crate::scheduler::current_domain();
             crate::memory::paging::map_user_page(domain, a1, paddr);
+            crate::memory::frame_allocator::inc_ref(paddr);
             1
         }
         SYS_SHARE_PAGE => {
@@ -138,11 +180,127 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
                 match crate::memory::paging::resolve_user_page(from, a1) {
                     Some(paddr) => {
                         crate::memory::paging::map_user_page(a2, a1, paddr);
+                        crate::memory::frame_allocator::inc_ref(paddr);
                         1
                     }
                     None => 0,
                 }
             }
+        }
+        SYS_UNMAP => {
+            // 解除当前域 `vaddr` (a1) 的映射, 引用计数递减, 归零时释放帧。
+            let domain = crate::scheduler::current_domain();
+            match crate::memory::paging::unmap_user_page(domain, a1) {
+                Some(paddr) => {
+                    if crate::memory::frame_allocator::dec_ref(paddr) {
+                        crate::memory::frame_allocator::free_frame(paddr);
+                    }
+                    1
+                }
+                None => 0,
+            }
+        }
+        SYS_MAP_ANON => {
+            // 分页器: 给指定域 `a1` 的 `a2` (vaddr) 映射一个匿名零帧, 需 MapInto 能力。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::MapInto(a1)) {
+                0
+            } else {
+                match crate::memory::frame_allocator::allocate_frame() {
+                    Some(p) => {
+                        // 匿名帧必须清零: 分配器不保证新帧内容为 0, 若不清理,
+                        // 用户态读到的会是上一任占用者释放后残留的数据。
+                        // 物理地址 < 4 GiB, 位于恒等映射内, 可直接按虚拟地址写。
+                        unsafe {
+                            core::ptr::write_bytes(
+                                p as *mut u8,
+                                0,
+                                crate::memory::frame_allocator::FRAME_SIZE,
+                            );
+                        }
+                        crate::memory::paging::map_user_page(a1, a2, p);
+                        crate::memory::frame_allocator::inc_ref(p);
+                        1
+                    }
+                    None => 0,
+                }
+            }
+        }
+        SYS_PAGE_FAULT_REPLY => {
+            // 分页器回复: 唤醒因缺页阻塞的域。回复目标由 `receive` 记录
+            // (即缺页消息的 from 域), 无需分页器显式传入域 id。
+            let target = crate::scheduler::current_reply_target();
+            if target != u64::MAX {
+                crate::scheduler::wake_one(target);
+                1
+            } else {
+                0
+            }
+        }
+        SYS_REGISTER_IRQ => {
+            // 注册当前域接收 `a1` (IRQ), 需持有 `Capability::Irq(irq)`。
+            let domain = crate::scheduler::current_domain();
+            let irq = a1 as u8;
+            if crate::cap::has(domain, crate::cap::Capability::Irq(irq)) {
+                crate::irq::register(irq, domain);
+                1
+            } else {
+                0
+            }
+        }
+        SYS_SCROLL_UP => {
+            crate::video::scroll_view_up();
+            1
+        }
+        SYS_SCROLL_DOWN => {
+            crate::video::scroll_view_down();
+            1
+        }
+        SYS_BACKSPACE => {
+            crate::video::term_backspace();
+            1
+        }
+        SYS_TERM_PUT => {
+            crate::video::term_put(a1 as u8);
+            1
+        }
+        SYS_TERM_LEFT => {
+            crate::video::term_left();
+            1
+        }
+        SYS_TERM_RIGHT => {
+            crate::video::term_right();
+            1
+        }
+        SYS_MAP_MMIO => {
+            // 把物理 MMIO 页 (a1, 页对齐) 映射到当前域 a2 虚拟地址, 需 Mmio 能力。
+            let domain = crate::scheduler::current_domain();
+            let bar = a1 & !0xFFF;
+            if crate::cap::has(domain, crate::cap::Capability::Mmio(bar)) {
+                crate::memory::paging::map_mmio(domain, a2, bar);
+                1
+            } else {
+                0
+            }
+        }
+        SYS_PORT_IN8 => {
+            // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            let port = a1 as u16;
+            unsafe { Port::<u8>::new(port).read() as u64 }
+        }
+        SYS_PORT_IN16 => {
+            let port = a1 as u16;
+            unsafe { Port::<u16>::new(port).read() as u64 }
+        }
+        SYS_PORT_OUT8 => {
+            let port = a1 as u16;
+            unsafe { Port::<u8>::new(port).write(a2 as u8) };
+            0
+        }
+        SYS_PORT_OUT16 => {
+            let port = a1 as u16;
+            unsafe { Port::<u16>::new(port).write(a2 as u16) };
+            0
         }
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。

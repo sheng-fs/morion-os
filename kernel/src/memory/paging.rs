@@ -181,6 +181,31 @@ pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
     }
 }
 
+/// 把物理 MMIO 区域 `paddr` (页对齐) 映射到指定域的 `vaddr` (USER + 非缓存)。
+///
+/// 与 `map_user_page` 的区别在于额外置 `NO_CACHE` (PCD), 避免 CPU 缓存
+/// 设备寄存器读写。用于 NVMe 等 MMIO 设备 BAR 的映射。
+pub fn map_mmio(domain_id: u64, vaddr: u64, paddr: u64) {
+    let pml4 = crate::domain::pml4_of(domain_id);
+    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
+    let mut mapper = unsafe { OffsetPageTable::new(&mut *pml4_virt, VirtAddr::new(PHYS_OFFSET)) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+    let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_CACHE;
+
+    let mut allocator = KernelFrameAllocator;
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, &mut allocator)
+            .expect("map_mmio: map failed")
+            .flush();
+    }
+}
+
 /// 遍历指定域的 4 级页表, 把用户虚拟地址 `vaddr` 反查为物理地址。
 ///
 /// 用户空间映射使用 4 KiB 页 (由 `map_user_page` 建立), 故按 PML4 → PDPT →
@@ -221,4 +246,19 @@ pub fn resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
         return None;
     }
     Some(pte.addr().as_u64() + (vaddr & 0xFFF))
+}
+
+/// 解除指定域中 `vaddr` 的用户页映射, 返回被解映射的物理帧地址。
+///
+/// 调用方负责在返回的帧上做引用计数 / 释放处理。
+pub fn unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
+    let pml4 = crate::domain::pml4_of(domain_id);
+    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
+    let mut mapper = unsafe { OffsetPageTable::new(&mut *pml4_virt, VirtAddr::new(PHYS_OFFSET)) };
+
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+    let (frame, flush) = mapper.unmap(page).ok()?;
+    let paddr = frame.start_address().as_u64();
+    flush.flush();
+    Some(paddr)
 }

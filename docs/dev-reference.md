@@ -75,11 +75,23 @@ UEFI 固件
 | 0 | `SYS_YIELD` | — | 主动让出 CPU |
 | 1 | `SYS_SLEEP` | `rdi=ms` | 睡眠毫秒 |
 | 2 | `SYS_SEND` | `rdi=to, rsi=tag` | 发送 IPC 消息；需 `Capability::SendTo(to)`，返回 1 成功 / 0 失败 |
-| 3 | `SYS_RECV` | — | 接收 IPC 消息（阻塞），返回 `tag` |
+| 3 | `SYS_RECV` | `rdi=ptr`（可空） | 接收 IPC 消息（阻塞）；`ptr` 非空时把完整 `Message` 写回用户缓冲区，返回 `tag` |
 | 4 | `SYS_PUTS` | `rdi=ptr, rsi=len` | 打印用户字符串 |
 | 5 | `SYS_EXIT` | — | 终止当前用户任务（标记 `Terminated`） |
 | 6 | `SYS_ALLOC_PAGE` | `rdi=vaddr` | 分配一物理帧映射到本域 `vaddr`，返回 1 成功 / 0 失败 |
 | 7 | `SYS_SHARE_PAGE` | `rdi=vaddr, rsi=to` | 把本域 `vaddr` 的页映射进 `to` 域同地址；需 `Capability::MapInto(to)`，返回 1/0 |
+| 8 | `SYS_UNMAP` | `rdi=vaddr` | 解除本域 `vaddr` 映射并递减引用计数，归零时释放物理帧，返回 1/0 |
+| 9 | `SYS_MAP_ANON` | `rdi=domain, rsi=vaddr` | 分页器：给 `domain` 的 `vaddr` 映射匿名零帧；需 `Capability::MapInto(domain)`，返回 1/0 |
+| 10 | `SYS_PAGE_FAULT_REPLY` | — | 分页器：唤醒最近一次 `SYS_RECV` 到的缺页域（回复目标由内核记录），返回 1/0 |
+| 12 | `SYS_CALL` | `rdi=to, rsi=tag` | 同步调用：发送请求并阻塞等回复，返回回复 `tag`；需 `Capability::SendTo(to)`，失败返回 `u64::MAX` |
+| 13 | `SYS_REPLY` | `rdi=tag` | 回复当前任务最近一次 `SYS_RECV` 到的调用者（回复目标由内核在 `receive` 时记录），返回 1/0 |
+| 14 | `SYS_REGISTER_IRQ` | `rdi=irq` | 注册当前域接收 `irq`；需 `Capability::Irq(irq)`，返回 1/0 |
+| 15 | `SYS_SCROLL_UP` | — | 控制台历史向上滚动一屏，返回 1 |
+| 16 | `SYS_SCROLL_DOWN` | — | 控制台历史向下滚动一屏，返回 1 |
+| 17 | `SYS_BACKSPACE` | — | 退格：删除输入行光标前一个字符，返回 1 |
+| 18 | `SYS_TERM_PUT` | `rdi=ch` | 在输入行光标处插入字符 `ch`（`ch=0x0A` 提交当前行），返回 1 |
+| 19 | `SYS_TERM_LEFT` | — | 输入行光标左移，返回 1 |
+| 20 | `SYS_TERM_RIGHT` | — | 输入行光标右移，返回 1 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -105,12 +117,15 @@ UEFI 固件
 - `print_hex(v: u64)` / `print_u64(v: u64)`
 - `clear(color: u32)` / `set_cursor(x: u32, y: u32)`
 - `width() -> u32` / `height() -> u32`
+- `term_put(c)` / `term_backspace()` / `term_left()` / `term_right()`（终端编辑：光标处插入 / 删光标前 / 左右移动光标）
+- `scroll_view_up()` / `scroll_view_down()`（控制台行历史回滚）
 
 ### 物理帧分配（[kernel/src/memory/frame_allocator.rs](../../kernel/src/memory/frame_allocator.rs)）
 
 - `init(info: &BootInfo)` / `print_stats()`
 - `allocate_frame() -> Option<u64>`（返回物理地址）
 - `free_frame(addr: u64)`
+- `inc_ref(addr: u64)` / `dec_ref(addr: u64) -> bool`（共享帧引用计数；`dec_ref` 归零返回 `true`）
 - `total_frames() / free_frames() / total_memory_bytes() / free_memory_bytes()`
 - `FRAME_SIZE = 4096`
 
@@ -119,6 +134,7 @@ UEFI 固件
 - `init()`
 - `map_user_page(domain_id: u64, vaddr: u64, paddr: u64)`（USER 权限映射）
 - `resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（遍历页表把 vaddr 反查为物理地址）
+- `unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（解除映射并返回原物理地址）
 - `heap_start() / heap_size()`
 
 ### 域（[kernel/src/domain.rs](../../kernel/src/domain.rs)）
@@ -135,6 +151,7 @@ UEFI 固件
 - `tick()` / `yield_now()` / `sleep(ms: u64)`
 - `block_current(on_domain: u64)` / `wake_one(domain: u64)`
 - `current_domain() -> u64`
+- `set_current_reply_target(target: u64)` / `current_reply_target() -> u64`（`reply` 回复目标追踪；`u64::MAX` 表示无）
 - `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口）
 
 任务表常量：`MAX_TASKS = 8`，内核栈 `STACK_SIZE = 4096 * 8`（32 KiB）。
@@ -143,9 +160,12 @@ UEFI 固件
 
 - `init(domain_count: usize)`
 - `send(to: u64, tag: u64, payload: &[u8]) -> bool`（非阻塞）
-- `receive() -> Message`（阻塞）
+- `deliver(from: u64, to: u64, tag: u64, payload: &[u8]) -> bool`（内核内部投递，绕过能力检查，用于缺页等异常转发）
+- `receive() -> Message`（阻塞，记录回复目标供 `reply` 使用）
+- `call(to: u64, tag: u64, payload: &[u8]) -> Message`（同步调用：发送请求 + 阻塞等回复）
+- `reply(tag: u64, payload: &[u8]) -> bool`（回复最近一次 `receive` 到的调用者）
 - `PAYLOAD_LEN = 32`，邮箱容量 `MAILBOX_CAP = 16`
-- `Message { from, to, tag, payload }`
+- `Message { from, to, tag, payload }`（`#[repr(C)]`，与用户态同布局）
 
 ### 能力系统（[kernel/src/cap.rs](../../kernel/src/cap.rs)）
 
@@ -154,7 +174,25 @@ UEFI 固件
 - `grant(domain: u64, cap: Capability) -> bool`
 - `revoke(domain: u64, cap: Capability) -> bool`
 - `grant` / `revoke` 保存并恢复中断使能状态，避免 boot 期（IF=0）被提前开中断。
-- `Capability::SendTo(u64)` / `Capability::MapInto(u64)`，每域 `CAP_SLOTS = 16`
+- `Capability::SendTo(u64)` / `Capability::MapInto(u64)` / `Capability::Irq(u8)`，每域 `CAP_SLOTS = 16`
+
+### 分页器（[kernel/src/pager.rs](../../kernel/src/pager.rs)）
+
+- `init(domain_count: usize, pager_domain: u64)`（每域统一登记 `pager_domain` 为其分页器）
+- `of(domain: u64) -> u64`（查询某域的分页器域 id）
+- `deliver_fault(pager: u64, info: PageFaultInfo)`（把缺页信息序列化进 IPC 消息 payload，经 `ipc::deliver` 投递并 `wake_one` 分页器）
+- `PageFaultInfo { fault_domain, fault_addr, error_code }`（`#[repr(C)]`，24 字节，与用户态同布局）
+- `FAULT_TAG`（缺页消息 tag 标记，区分普通 IPC）
+
+缺页流程：`page_fault_handler` 读 CR2 → `deliver_fault`（投递 IPC 消息到分页器邮箱）→ `block_current(fault_domain)`；分页器经 `SYS_RECV` 取消息、从 payload 解出 `PageFaultInfo` → `SYS_MAP_ANON` 映射零帧 → `SYS_PAGE_FAULT_REPLY` 唤醒缺页域（回复目标由 `receive` 记录）。
+
+### IRQ 转发（[kernel/src/irq.rs](../../kernel/src/irq.rs)）
+
+- `register(irq: u8, domain: u64)`（登记某域为 `irq` 的驱动域；调用者须先通过 `SYS_REGISTER_IRQ` 校验 `Capability::Irq(irq)`）
+- `dispatch(irq: u8, data: u64)`（把中断数据作为 IPC 消息 tag 转发给注册域；从 IRQ 处理器 IF=0 调用，非阻塞、不改变中断位）
+- 最多支持 16 个 IRQ（PIC master 8 + slave 8）；`HANDLERS` 为 `[Option<u64>; 16]`。
+
+「中断即 IPC」模型：硬件 IRQ 处理器读设备数据（如键盘 scancode）→ `irq::dispatch` 投递到驱动域邮箱 → 驱动域循环 `SYS_RECV` 接收并处理，再 `send_eoi`。
 
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
@@ -183,7 +221,7 @@ UEFI 固件
 
 - 自定义 target：`user/x86_64-morion-user.json`（`code-model=large` + `rustc-abi=softfloat` + `relocation-model=static`），解决用户基址 `0x8000_0000_0000` 超出 32 位重定位范围的问题。
 - 链接脚本：`user/linker.ld`，`ENTRY(_start)`，链接到 `0x8000000000`，`_start` 置于镜像最前端。
-- 入口 `_start(domain_id: u64)` 接收内核经 `rdi` 传入的域 id，据此分流角色（当前用于 sender/receiver 演示）。
+- 入口 `_start(domain_id: u64)` 接收内核经 `rdi` 传入的域 id，据此分流角色：0=sender、1=receiver、2=pager、3=echo、4=kbd（键盘驱动）。
 - 构建链：`cargo build --target user/x86_64-morion-user.json ... -Z json-target-spec` → `objcopy -O binary` → `build/user/user.bin`。
 - 内核经 `include_bytes!("../../build/user/user.bin")` 在编译期嵌入，运行期按页映射到 `USER_SPACE_BASE` 加载。
 
@@ -211,3 +249,7 @@ UEFI 固件
 | 10 | libuser + 可加载用户程序（`user/` crate + `SYS_EXIT`） | ✅ |
 | 11 | IPC + 能力系统整合（多域授权 + 用户态 sender/receiver 演示） | ✅ |
 | 12 | 跨域共享内存（`MapInto` 能力 + `SYS_ALLOC_PAGE`/`SYS_SHARE_PAGE`） | ✅ |
+| 13 | 内存管理完善（`SYS_UNMAP` + 共享帧引用计数 `inc_ref`/`dec_ref`） | ✅ |
+| 14 | 按需分页（外部页管理器模型）：缺页捕获转发 + 匿名零帧映射 + 分页器域 | ✅ |
+| 15 | 同步 IPC（`call`/`reply`）：回复目标追踪 + echo 服务演示 + 匿名零帧清零 | ✅ |
+| 16 | 用户态中断/驱动框架（`Irq` 能力 + `irq::dispatch` + 键盘驱动迁到用户态） | ✅ |

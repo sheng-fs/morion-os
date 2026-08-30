@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 
 pub const SYS_YIELD: u64 = 0;
 pub const SYS_SLEEP: u64 = 1;
@@ -16,6 +17,23 @@ pub const SYS_PUTS: u64 = 4;
 pub const SYS_EXIT: u64 = 5;
 pub const SYS_ALLOC_PAGE: u64 = 6;
 pub const SYS_SHARE_PAGE: u64 = 7;
+pub const SYS_UNMAP: u64 = 8;
+pub const SYS_MAP_ANON: u64 = 9;
+pub const SYS_PAGE_FAULT_REPLY: u64 = 10;
+pub const SYS_CALL: u64 = 12;
+pub const SYS_REPLY: u64 = 13;
+pub const SYS_REGISTER_IRQ: u64 = 14;
+pub const SYS_SCROLL_UP: u64 = 15;
+pub const SYS_SCROLL_DOWN: u64 = 16;
+pub const SYS_BACKSPACE: u64 = 17;
+pub const SYS_TERM_PUT: u64 = 18;
+pub const SYS_TERM_LEFT: u64 = 19;
+pub const SYS_TERM_RIGHT: u64 = 20;
+pub const SYS_MAP_MMIO: u64 = 21;
+pub const SYS_PORT_IN8: u64 = 22;
+pub const SYS_PORT_IN16: u64 = 23;
+pub const SYS_PORT_OUT8: u64 = 24;
+pub const SYS_PORT_OUT16: u64 = 25;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -62,12 +80,94 @@ pub fn sys_recv() -> u64 {
     unsafe { syscall(SYS_RECV, 0, 0, 0) }
 }
 
+/// 阻塞接收一条消息, 把完整消息 (56 字节) 写入 `buf`, 返回消息 tag。
+pub fn sys_recv_msg(buf: *mut u8) -> u64 {
+    unsafe { syscall(SYS_RECV, buf as u64, 0, 0) }
+}
+
+pub fn sys_call(to: u64, tag: u64) -> u64 {
+    unsafe { syscall(SYS_CALL, to, tag, 0) }
+}
+
+pub fn sys_reply(tag: u64) -> u64 {
+    unsafe { syscall(SYS_REPLY, tag, 0, 0) }
+}
+
+pub fn sys_register_irq(irq: u64) -> u64 {
+    unsafe { syscall(SYS_REGISTER_IRQ, irq, 0, 0) }
+}
+
+pub fn sys_scroll_up() -> u64 {
+    unsafe { syscall(SYS_SCROLL_UP, 0, 0, 0) }
+}
+
+pub fn sys_scroll_down() -> u64 {
+    unsafe { syscall(SYS_SCROLL_DOWN, 0, 0, 0) }
+}
+
+pub fn sys_backspace() -> u64 {
+    unsafe { syscall(SYS_BACKSPACE, 0, 0, 0) }
+}
+
+pub fn sys_term_put(c: u8) -> u64 {
+    unsafe { syscall(SYS_TERM_PUT, c as u64, 0, 0) }
+}
+
+pub fn sys_term_left() -> u64 {
+    unsafe { syscall(SYS_TERM_LEFT, 0, 0, 0) }
+}
+
+pub fn sys_term_right() -> u64 {
+    unsafe { syscall(SYS_TERM_RIGHT, 0, 0, 0) }
+}
+
 pub fn sys_alloc_page(vaddr: u64) -> u64 {
     unsafe { syscall(SYS_ALLOC_PAGE, vaddr, 0, 0) }
 }
 
 pub fn sys_share_page(vaddr: u64, to: u64) -> u64 {
     unsafe { syscall(SYS_SHARE_PAGE, vaddr, to, 0) }
+}
+
+pub fn sys_unmap(vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_UNMAP, vaddr, 0, 0) }
+}
+
+pub fn sys_map_anon(domain: u64, vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_MAP_ANON, domain, vaddr, 0) }
+}
+
+pub fn sys_page_fault_reply() -> u64 {
+    unsafe { syscall(SYS_PAGE_FAULT_REPLY, 0, 0, 0) }
+}
+
+/// 把物理 MMIO 页 (`bar_paddr`, 页对齐) 映射到本域 `vaddr`, 需 Mmio 能力。
+pub fn sys_map_mmio(bar_paddr: u64, vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_MAP_MMIO, bar_paddr, vaddr, 0) }
+}
+
+/// 从 I/O 端口 `port` 读一个字节。
+pub fn sys_port_in8(port: u16) -> u8 {
+    unsafe { syscall(SYS_PORT_IN8, port as u64, 0, 0) as u8 }
+}
+
+/// 从 I/O 端口 `port` 读一个 16 位字。
+pub fn sys_port_in16(port: u16) -> u16 {
+    unsafe { syscall(SYS_PORT_IN16, port as u64, 0, 0) as u16 }
+}
+
+/// 向 I/O 端口 `port` 写一个字节。
+pub fn sys_port_out8(port: u16, value: u8) {
+    unsafe {
+        syscall(SYS_PORT_OUT8, port as u64, value as u64, 0);
+    }
+}
+
+/// 向 I/O 端口 `port` 写一个 16 位字。
+pub fn sys_port_out16(port: u16, value: u16) {
+    unsafe {
+        syscall(SYS_PORT_OUT16, port as u64, value as u64, 0);
+    }
 }
 
 pub fn sys_puts(s: &str) {
@@ -88,13 +188,61 @@ pub fn sys_exit() -> ! {
 // 极简打印辅助 (core-only, 无分配器)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 行缓冲打印
+// ---------------------------------------------------------------------------
+// 各域地址空间独立, 每个域有各自的缓冲; 单核下同一时刻仅一个域运行, 无需锁。
+// 把「一行 = 多次 SYS_PUTS」合并为「一行 = 一次 SYS_PUTS」, 消除多域并发打印
+// 在多次 syscall 之间被调度打断而造成的字符交错。
+
+/// 可在 `static` 中存放可变数据的包装: 手动标记 `Sync`。
+/// 安全前提: 单核 + 各域地址空间独立, 实际不存在对同一 static 的并发访问。
+struct StaticCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for StaticCell<T> {}
+
+impl<T> StaticCell<T> {
+    const fn new(value: T) -> Self {
+        StaticCell(UnsafeCell::new(value))
+    }
+    fn borrow_mut(&self) -> &mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+static PRINT_BUF: StaticCell<[u8; 256]> = StaticCell::new([0; 256]);
+static PRINT_LEN: StaticCell<usize> = StaticCell::new(0);
+
+/// 把字符串追加到行缓冲 (超出部分丢弃)。
+fn print_push(s: &str) {
+    let buf = PRINT_BUF.borrow_mut();
+    let len = PRINT_LEN.borrow_mut();
+    for &b in s.as_bytes() {
+        if *len < buf.len() {
+            buf[*len] = b;
+            *len += 1;
+        }
+    }
+}
+
+/// 提交当前行缓冲 (整行一次 syscall), 然后清空。
+fn print_flush() {
+    let len = PRINT_LEN.borrow_mut();
+    if *len > 0 {
+        let buf = PRINT_BUF.borrow_mut();
+        let s = unsafe { core::str::from_utf8_unchecked(&buf[..*len]) };
+        sys_puts(s);
+        *len = 0;
+    }
+}
+
 pub fn print(s: &str) {
-    sys_puts(s);
+    print_push(s);
 }
 
 pub fn println(s: &str) {
-    sys_puts(s);
-    sys_puts("\n");
+    print_push(s);
+    print_push("\n");
+    print_flush();
 }
 
 /// 以十进制打印无符号整数。
@@ -110,5 +258,22 @@ pub fn print_u64(mut v: u64) {
         }
     }
     let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-    sys_puts(s);
+    print_push(s);
+}
+
+/// 以十六进制打印无符号整数。
+pub fn print_hex(mut v: u64) {
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        let d = (v & 0xF) as u8;
+        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    print_push(s);
 }

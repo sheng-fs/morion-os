@@ -54,6 +54,10 @@ QEMU_SMP      ?= 4
 QEMU_ACCEL    ?= kvm
 OVMF_CODE     ?= /usr/share/edk2/x64/OVMF_CODE.fd
 OVMF_VARS     ?= /usr/share/edk2/x64/OVMF_VARS.fd
+# 文件系统阶段: NVMe 磁盘镜像 (宿主机 mkfs.fat 生成)
+NVME_IMG      ?= $(OUT_DIR)/nvme.img
+# 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
+DISK_IMG      ?= $(OUT_DIR)/disk.img
 
 # ============================================================
 # 默认目标
@@ -217,6 +221,59 @@ run-nokvm: iso
 		-cdrom $(ISO_IMAGE) \
 		-vga virtio \
 		-no-reboot
+
+# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + -device nvme)
+.PHONY: run-nvme
+run-nvme: iso $(NVME_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe)..."
+	$(QEMU) \
+		-machine q35 \
+		-m $(QEMU_MEM) \
+		-bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-cdrom $(ISO_IMAGE) \
+		-drive file=$(NVME_IMG),if=none,id=nvme0,format=raw \
+		-device nvme,serial=MORION,drive=nvme0 \
+		-vga virtio \
+		-no-reboot \
+		-d guest_errors
+
+# 文件系统阶段: 挂载 IDE 磁盘运行 (Legacy PIO 读扇区, 不依赖 DMA/MSI-X)
+.PHONY: run-ide
+run-ide: iso $(DISK_IMG)
+	@echo "==> 启动 QEMU (IDE PIO)..."
+	$(QEMU) \
+		-machine pc \
+		-m $(QEMU_MEM) \
+		-bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-cdrom $(ISO_IMAGE) \
+		-drive file=$(DISK_IMG),if=ide,format=raw \
+		-vga virtio \
+		-no-reboot \
+		-d guest_errors,int \
+		-D $(OUT_DIR)/qemu.log
+
+# 创建 NVMe 磁盘镜像并格式化为 FAT32 (供阶段 1 read_lba 校验 0x55AA BPB 特征)
+$(NVME_IMG):
+	@echo "==> 创建 NVMe 磁盘镜像 (FAT32)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
+	mkfs.fat -F 32 $(NVME_IMG) >/dev/null 2>&1
+	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
+
+# 创建 IDE 磁盘镜像并格式化为 FAT32
+$(DISK_IMG):
+	@echo "==> 创建 IDE 磁盘镜像 (FAT32)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=1024 status=none
+	mkfs.fat -F 32 $(DISK_IMG) >/dev/null 2>&1
+	@printf 'Hello from FAT32!\nThis is a test file.\n' > $(OUT_DIR)/hello.txt
+	mcopy -i $(DISK_IMG) $(OUT_DIR)/hello.txt ::/HELLO.TXT
+	mmd -i $(DISK_IMG) ::/DIR1
+	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
+	mcopy -i $(DISK_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
+	@i=1; while [ $$i -le 250 ]; do printf 'Line %04d: cross-cluster large file read test.\n' $$i; i=$$((i+1)); done > $(OUT_DIR)/big.txt
+	mcopy -i $(DISK_IMG) $(OUT_DIR)/big.txt ::/BIG.TXT
+	@echo "  ✓ IDE 镜像: $(DISK_IMG)"
 
 # GDB 调试
 .PHONY: debug

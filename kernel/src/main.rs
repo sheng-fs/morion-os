@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, scheduler, syscall, video};
+use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, pager, scheduler, syscall, video};
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -21,8 +21,12 @@ extern "C" {
 // ---------------------------------------------------------------------------
 /// 用户程序基址 (P4[1] 用户空间基址), 与 user/linker.ld 的链接地址一致。
 const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
-/// 用户栈页虚拟地址 (程序镜像上方一页)。
-const USER_STACK_ADDR: u64 = USER_BASE + 0x1000;
+/// 用户栈页虚拟地址。
+///
+/// 不能紧邻程序镜像 (程序已超 1 页, 会与镜像第二页重叠); 也不得占用
+/// `USER_BASE + 0x3000` (用户态 sender/receiver 共享页演示) 与
+/// `USER_BASE + 0x10000` 起的 NVMe 配置/MMIO/DMA 区域。故预留 0x8000 起。
+const USER_STACK_ADDR: u64 = USER_BASE + 0x8000;
 /// 用户栈顶虚拟地址 (栈向下增长)。
 const USER_STACK_TOP: u64 = USER_STACK_ADDR + 0x1000;
 /// 页大小。
@@ -171,7 +175,29 @@ pub extern "C" fn _start() -> ! {
     video::println("Stage 4: Hardware interrupts");
     arch::pic::init();
     arch::pit::init();
+    arch::keyboard::init();
     video::println("[OK] PIC remapped + PIT timer started (100 Hz)");
+
+    // ============================================================
+    //  阶段 4.5: PCI 枚举 (文件系统阶段 0)
+    // ============================================================
+    video::println("");
+    video::println("Stage 4.5: PCI enumeration");
+    let pci_devices = arch::pci::enumerate();
+    video::print("[OK] PCI devices found: ");
+    video::print_u64(pci_devices.len() as u64);
+    video::println("");
+    for d in &pci_devices {
+        video::print("  ");
+        video::print_hex(((d.bus as u64) << 8) | ((d.dev as u64) << 3) | d.func as u64);
+        video::print("  vend ");
+        video::print_hex(d.vendor as u64);
+        video::print("  dev ");
+        video::print_hex(d.device as u64);
+        video::print("  class ");
+        video::print_hex(((d.class as u64) << 16) | ((d.subclass as u64) << 8) | d.progif as u64);
+        video::println("");
+    }
 
     // ============================================================
     //  阶段十: 用户态运行库 + 可加载用户程序
@@ -186,37 +212,68 @@ pub extern "C" fn _start() -> ! {
     // ============================================================
     scheduler::init();
 
-    // 创建 3 个保护域:
-    //   0 = sender   (持有 SendTo(1) 能力)
-    //   1 = receiver (接收消息)
-    //   2 = isolated (sender 无能力向其发送, 用于演示能力拒绝)
+    // 创建 6 个保护域:
+    //   0 = sender    (持有 SendTo(1)+MapInto(1) 能力, 触发按需分页 + call 演示)
+    //   1 = receiver  (接收消息)
+    //   2 = pager     (分页器, 服务所有域的缺页)
+    //   3 = echo      (同步 IPC 服务: recv → reply 回显)
+    //   4 = kbd       (用户态键盘驱动, 注册接收 IRQ1)
+    //   5 = disk      (用户态 IDE PIO 块设备驱动服务)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
-    let _isolated_domain = domain::create();
+    let pager_domain = domain::create();
+    let echo_domain = domain::create();
+    let kbd_domain = domain::create();
+    let disk_domain = domain::create();
 
-    // 初始化 IPC 邮箱与能力表 (数量 = 域数量)。
-    ipc::init(3);
-    cap::init(3);
+    // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
+    ipc::init(6);
+    cap::init(6);
+    pager::init(6, pager_domain);
 
-    // 授权: sender 可向 receiver 发送; 不授予向 isolated 发送的能力。
+    // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
     cap::grant(sender_domain, cap::Capability::MapInto(receiver_domain));
-    video::println("[OK] IPC + capability initialized (3 domains)");
+    // 授权: sender 可向 echo 服务发起同步调用 (Stage 15)。
+    cap::grant(sender_domain, cap::Capability::SendTo(echo_domain));
+    // 授权: 分页器是全部域的分页器, 授予其向每个域映射匿名帧的能力 (按需分页)。
+    for d in [
+        sender_domain,
+        receiver_domain,
+        pager_domain,
+        echo_domain,
+        kbd_domain,
+        disk_domain,
+    ] {
+        cap::grant(pager_domain, cap::Capability::MapInto(d));
+    }
+    // 授权: 键盘驱动域注册接收 IRQ1 (Stage 16)。
+    cap::grant(kbd_domain, cap::Capability::Irq(1));
+    // disk 域走 IDE PIO (固定 I/O 端口), 无需 DMA/MMIO/能力授权。
+    video::println("[OK] IPC + capability + pager initialized (6 domains)");
 
-    // 加载用户程序到 sender / receiver 域 (isolated 域仅存在, 不运行任务)。
+    // 加载用户程序到六个域 (同一镜像, 经 domain_id 参数区分角色)。
     load_user_program(sender_domain);
     load_user_program(receiver_domain);
-    video::println("[OK] user program loaded into domains 0 & 1");
+    load_user_program(pager_domain);
+    load_user_program(echo_domain);
+    load_user_program(kbd_domain);
+    load_user_program(disk_domain);
+    video::println("[OK] user program loaded into domains 0 & 1 & 2 & 3 & 4 & 5");
 
-    // 域 0 / 1 各起一个用户任务 (同一镜像, 经 domain_id 参数区分角色)。
+    // 域 0 / 1 / 2 / 3 / 4 / 5 各起一个用户任务。
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, pager_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, echo_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, kbd_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, disk_domain);
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] sender + receiver + idle tasks spawned");
+    video::println("[OK] sender + receiver + pager + echo + kbd + disk + idle tasks spawned");
     video::println("");
-    video::println("Expected: sender sends to receiver (granted), and is");
-    video::println("denied sending to isolated domain (no capability).");
+    video::println("Expected: sender shares memory with receiver, then");
+    video::println("touches an unmapped page to trigger demand paging.");
     video::println("");
 
     // 交给调度器。首次切换在中断关闭下进行, 避免 enable 与首次调度之间

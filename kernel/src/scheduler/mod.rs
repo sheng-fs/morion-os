@@ -55,6 +55,9 @@ pub struct Task {
     sleep_until: u64,
     /// 阻塞等待的域 id (仅 `Blocked` 状态有效)。
     wait_on: u64,
+    /// 最近一次 `receive` 到的消息来源域 id (用于 `reply` 路由回调用者)。
+    /// `u64::MAX` 表示尚无有效回复目标。
+    reply_target: u64,
     /// 持有任务栈的所有权, 防止其被释放 (栈地址记录在 `ctx.rsp` 中)。
     _stack: Box<[u8]>,
 }
@@ -133,6 +136,7 @@ impl Scheduler {
             user_stack,
             sleep_until: 0,
             wait_on: 0,
+            reply_target: u64::MAX,
             _stack: stack,
         });
         slot
@@ -289,6 +293,26 @@ pub fn current_domain() -> u64 {
         .as_ref()
         .expect("scheduler: no current task")
         .domain
+}
+
+/// 记录当前任务最近一次 `receive` 到的消息来源域 id (供 `reply` 路由)。
+pub fn set_current_reply_target(target: u64) {
+    let mut guard = SCHEDULER.lock();
+    let sched = guard.as_mut().expect("scheduler not initialized");
+    sched.tasks[sched.current]
+        .as_mut()
+        .expect("scheduler: no current task")
+        .reply_target = target;
+}
+
+/// 返回当前任务最近一次 `receive` 到的消息来源域 id; `u64::MAX` 表示无。
+pub fn current_reply_target() -> u64 {
+    let guard = SCHEDULER.lock();
+    let sched = guard.as_ref().expect("scheduler not initialized");
+    sched.tasks[sched.current]
+        .as_ref()
+        .expect("scheduler: no current task")
+        .reply_target
 }
 
 /// 阻塞当前任务: 标记为 `Blocked`, 记录等待的域, 切换到下一就绪任务。
