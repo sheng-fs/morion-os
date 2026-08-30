@@ -310,6 +310,36 @@ pub fn scroll_view_down() {
 /// 输出互斥锁: 串行化各域的打印, 防止并发下字符交错 (多核防御)。
 static PRINT_LOCK: Mutex<()> = Mutex::new(());
 
+/// 串口 16550 (COM1, 0x3F8) 单字符输出 — 用于 QEMU `-serial stdio` 抓日志。
+/// 不做硬件初始化，依赖 QEMU 默认已准备好 COM1。
+///
+/// 注意: 串口是 I/O 端口, 必须用 x86 IN/OUT 指令访问. 绝对不能对 0x3F8 做
+/// 内存 load/store (那是访问"虚拟/物理地址 0x3F8"的 DRAM, 不是串口寄存器).
+#[inline]
+fn serial_put(ch: u8) {
+    unsafe {
+        // 轮询 LSR@0x3FD bit5 = THR 空
+        let mut lsr: u8;
+        for _ in 0..1_000_000u32 {
+            core::arch::asm!(
+                "in al, dx",
+                in("dx") 0x3FDu16,
+                out("al") lsr,
+                options(nomem, nostack, preserves_flags),
+            );
+            if lsr & 0x20 != 0 {
+                break;
+            }
+        }
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") ch,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// 打印字符串 (支持 '\n' 换行; 日志追加到输入行末尾)
 pub fn print(s: &str) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
@@ -317,6 +347,9 @@ pub fn print(s: &str) {
     let guard = PRINT_LOCK.lock();
 
     for ch in s.bytes() {
+        // 同步写串口: 在加锁成功 & 写屏幕前先打串口，保证屏幕打印成功的行
+        // 一定能在串口里看到 (triple fault 后串口缓冲区还会被 QEMU 刷出)。
+        serial_put(ch);
         match ch {
             b'\n' => commit_line(),
             _ => unsafe {

@@ -719,67 +719,13 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 fn panic(_info: &core::panic::PanicInfo) -> ! { loop { core::hint::spin_loop(); } }
 
 #[entry]
-fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
-    // 先获取 stdin (需要 &mut st)，获取后立即转为裸指针释放借用
-    let stdin_ptr: *mut uefi::proto::console::text::Input = st.stdin() as *mut _;
-    let stdin = unsafe { &mut *stdin_ptr };
-    // 然后再获取 boot_services (只需要 &st)
+fn efi_main(_image: uefi::Handle, st: SystemTable<Boot>) -> Status {
     let bs = st.boot_services();
 
-    // 1. 初始化 GOP
+    // 1. 初始化 GOP (内核 video::init 需要帧缓冲信息)
     let mut fb = match Fb::from_gop(bs) { Ok(f) => f, Err(_) => return Status::UNSUPPORTED };
 
-    // 2. 加载主题
-    let mut theme = ThemeConfig::load();
-    theme.menu_x = (fb.w - theme.menu_w) as i32 / 2;
-    theme.menu_y = (fb.h - theme.menu_h) as i32 / 2;
-
-    // 3. 引导条目
-    let entries = [
-        BootEntry { icon: "[*]", title: "Morion OS  (current generation)", info: "Gen 42" },
-        BootEntry { icon: "[ ]", title: "Morion OS  gen 41  (rollback)",    info: "Gen 41" },
-        BootEntry { icon: "[R]", title: "Rescue Mode",                       info: "recovery" },
-        BootEntry { icon: "[F]", title: "UEFI Firmware Settings",             info: "setup" },
-    ];
-
-    let mut sel: usize = 0;
-
-    // 4. 主循环
-    // 初始整屏渲染 (背景 + 顶栏 + 菜单)
-    render_screen(&mut fb, &theme, &entries[..], sel);
-
-    loop {
-        let prev_sel = sel;
-
-        // 键盘
-        if let Ok(Some(key)) = stdin.read_key() {
-            use uefi::proto::console::text::{Key, ScanCode};
-            match key {
-                Key::Special(ScanCode::UP) => { sel = sel.saturating_sub(1); }
-                Key::Special(ScanCode::DOWN) => { sel = (sel + 1).min(entries.len() - 1); }
-                Key::Special(ScanCode::HOME) => { sel = 0; }
-                Key::Special(ScanCode::END) => { sel = entries.len() - 1; }
-                Key::Printable(c) if c == uefi::Char16::try_from('\r').unwrap() => {
-                    if sel == 0 {
-                        draw_text(&mut fb, "Loading kernel...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
-                        boot_kernel(st, &mut fb);
-                    } else {
-                        draw_text(&mut fb, "Not implemented", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
-                        for _ in 0..50_000_000 { core::hint::spin_loop(); }
-                    }
-                }
-                Key::Special(ScanCode::ESCAPE) => { return Status::SUCCESS; }
-                Key::Special(ScanCode::FUNCTION_10) => { return Status::SUCCESS; }
-                _ => {}
-            }
-        }
-
-        // 选择变化时整屏重绘 (背景 + 顶栏 + 菜单)
-        if sel != prev_sel {
-            render_screen(&mut fb, &theme, &entries[..], sel);
-        }
-
-        // 延时减少 CPU 占用
-        for _ in 0..500_000 { core::hint::spin_loop(); }
-    }
+    // 调试环境快速启动: 直接跳过菜单 / splash / 动画，立即加载默认条目启动内核。
+    // 避免 UEFI 在 TCG 下浪费数秒在按键轮询 & 菜单绘制上。
+    boot_kernel(st, &mut fb)
 }
