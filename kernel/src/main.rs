@@ -167,6 +167,7 @@ pub extern "C" fn _start() -> ! {
 
     video::println("");
     video::println("Stage 3 complete.");
+    memory::paging::dump_kernel_pagetable("stage3");
 
     // ============================================================
     //  阶段四: 硬件中断框架
@@ -177,6 +178,7 @@ pub extern "C" fn _start() -> ! {
     arch::pit::init();
     arch::keyboard::init();
     video::println("[OK] PIC remapped + PIT timer started (100 Hz)");
+    memory::paging::dump_kernel_pagetable("stage4");
 
     // ============================================================
     //  阶段 4.5: PCI 枚举 (文件系统阶段 0)
@@ -198,6 +200,7 @@ pub extern "C" fn _start() -> ! {
         video::print_hex(((d.class as u64) << 16) | ((d.subclass as u64) << 8) | d.progif as u64);
         video::println("");
     }
+    memory::paging::dump_kernel_pagetable("stage45");
 
     // ============================================================
     //  阶段十: 用户态运行库 + 可加载用户程序
@@ -206,30 +209,37 @@ pub extern "C" fn _start() -> ! {
     video::println("Stage 10: libuser + loadable user program");
     syscall::init();
     video::println("[OK] syscall/sysret enabled (EFER.SCE + STAR + LSTAR)");
+    memory::paging::dump_kernel_pagetable("stage10");
 
     // ============================================================
     //  阶段十一: IPC + 能力系统
     // ============================================================
     scheduler::init();
+    memory::paging::raw_dump_kernel_pagetable();
+    memory::paging::dump_kernel_pagetable("sched");
 
-    // 创建 6 个保护域:
+    // 创建 8 个保护域:
     //   0 = sender    (持有 SendTo(1)+MapInto(1) 能力, 触发按需分页 + call 演示)
     //   1 = receiver  (接收消息)
     //   2 = pager     (分页器, 服务所有域的缺页)
     //   3 = echo      (同步 IPC 服务: recv → reply 回显)
     //   4 = kbd       (用户态键盘驱动, 注册接收 IRQ1)
-    //   5 = disk      (用户态 IDE PIO 块设备驱动服务)
+    //   5 = block_srv (IDE PIO 块设备服务)
+    //   6 = fat32_srv (FAT32 文件服务)
+    //   7 = app       (测试应用, 经 libvfs 读文件)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
     let pager_domain = domain::create();
     let echo_domain = domain::create();
     let kbd_domain = domain::create();
-    let disk_domain = domain::create();
+    let block_domain = domain::create();
+    let fat32_domain = domain::create();
+    let app_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(6);
-    cap::init(6);
-    pager::init(6, pager_domain);
+    ipc::init(8);
+    cap::init(8);
+    pager::init(8, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -243,34 +253,45 @@ pub extern "C" fn _start() -> ! {
         pager_domain,
         echo_domain,
         kbd_domain,
-        disk_domain,
+        block_domain,
+        fat32_domain,
+        app_domain,
     ] {
         cap::grant(pager_domain, cap::Capability::MapInto(d));
     }
     // 授权: 键盘驱动域注册接收 IRQ1 (Stage 16)。
     cap::grant(kbd_domain, cap::Capability::Irq(1));
-    // disk 域走 IDE PIO (固定 I/O 端口), 无需 DMA/MMIO/能力授权。
-    video::println("[OK] IPC + capability + pager initialized (6 domains)");
+    // 授权: fat32_srv 经 IPC 调 block_srv (SendTo) 并共享缓冲页 (MapInto)。
+    cap::grant(fat32_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(fat32_domain, cap::Capability::MapInto(block_domain));
+    // 授权: app 经 IPC 调 fat32_srv 读文件 (阶段 C), 并共享结果页 (MapInto)。
+    cap::grant(app_domain, cap::Capability::SendTo(fat32_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(fat32_domain));
+    video::println("[OK] IPC + capability + pager initialized (8 domains)");
 
-    // 加载用户程序到六个域 (同一镜像, 经 domain_id 参数区分角色)。
+    // 加载用户程序到八个域 (同一镜像, 经 domain_id 参数区分角色)。
     load_user_program(sender_domain);
     load_user_program(receiver_domain);
     load_user_program(pager_domain);
     load_user_program(echo_domain);
     load_user_program(kbd_domain);
-    load_user_program(disk_domain);
-    video::println("[OK] user program loaded into domains 0 & 1 & 2 & 3 & 4 & 5");
+    load_user_program(block_domain);
+    load_user_program(fat32_domain);
+    load_user_program(app_domain);
+    video::println("[OK] user program loaded into domains 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7");
 
-    // 域 0 / 1 / 2 / 3 / 4 / 5 各起一个用户任务。
+    // 域 0..7 各起一个用户任务。
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, pager_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, echo_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, kbd_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, disk_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, block_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, fat32_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, app_domain);
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] sender + receiver + pager + echo + kbd + disk + idle tasks spawned");
+    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + idle tasks spawned");
     video::println("");
     video::println("Expected: sender shares memory with receiver, then");
     video::println("touches an unmapped page to trigger demand paging.");
@@ -283,12 +304,18 @@ pub extern "C" fn _start() -> ! {
 
 #[cfg(target_os = "none")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
     if video::ready() {
         video::clear(0x000033);
-        video::set_cursor(20, 20);
+        video::set_cursor(2, 2);
         video::println("KERNEL PANIC");
-        video::println("An unrecoverable error occurred.");
+        // 打印 panic 位置与消息, 便于定位崩溃点 (黑匣子)。
+        if let Some(loc) = info.location() {
+            let s = alloc::format!("  at {}:{}:{}", loc.file(), loc.line(), loc.column());
+            video::println(&s);
+        }
+        let s = alloc::format!("  {}", info.message());
+        video::println(&s);
     }
     morion_kernel::halt();
 }

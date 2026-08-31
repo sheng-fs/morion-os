@@ -22,7 +22,7 @@ use x86_64::PhysAddr;
 use context::{switch, TaskContext};
 
 /// 最大任务数 (固定大小任务表)。
-const MAX_TASKS: usize = 8;
+const MAX_TASKS: usize = 16;
 /// 每任务内核栈大小 (32 KiB, 足以容纳中断帧 + 若干层函数调用)。
 const STACK_SIZE: usize = 4096 * 8;
 

@@ -52,8 +52,58 @@ static mut CUR_ROW: usize = 0;
 /// 光标在历史区行的列位置 (CUR_ROW > 0 时使用, 0..=该行长度)
 static mut CUR_COL: usize = 0;
 
+// ---------------------------------------------------------------------------
+// COM1 串口输出 (headless 调试用)
+// ---------------------------------------------------------------------------
+// 内核当前只把日志写到 GOP 帧缓冲, 无显示器时无法观察启动进度。此处在 COM1
+// (0x3F8) 镜像一份输出, 供 QEMU `-serial file:` 捕获启动日志, 定位崩溃点。
+
+const COM1: u16 = 0x3F8;
+
+/// 初始化 COM1 串口 (115200 8N1)。
+fn serial_init() {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut data: Port<u8> = Port::new(COM1);
+        let mut ier: Port<u8> = Port::new(COM1 + 1);
+        let mut fcr: Port<u8> = Port::new(COM1 + 2);
+        let mut lcr: Port<u8> = Port::new(COM1 + 3);
+        let mut mcr: Port<u8> = Port::new(COM1 + 4);
+
+        ier.write(0x00); // 禁用中断
+        lcr.write(0x80); // 使能 DLAB (设置分频)
+        data.write(0x03); // 分频低字节 (115200)
+        ier.write(0x00); // 分频高字节 0
+        lcr.write(0x03); // 8N1
+        fcr.write(0xC7); // 使能并清空 FIFO
+        mcr.write(0x0B); // DTR | RTS | OUT2
+    }
+}
+
+/// 向 COM1 写一个字节 (忙等发送缓冲空)。
+fn serial_putc(c: u8) {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut status: Port<u8> = Port::new(COM1 + 5);
+        while status.read() & 0x20 == 0 {}
+        let mut data: Port<u8> = Port::new(COM1);
+        data.write(c);
+    }
+}
+
+/// 向 COM1 写一段字符串 (`\n` 扩展为 `\r\n`)。
+fn serial_write(s: &str) {
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            serial_putc(b'\r');
+        }
+        serial_putc(b);
+    }
+}
+
 /// 从 Boot Info 初始化帧缓冲并清屏
 pub fn init(info: &BootInfo) {
+    serial_init();
     unsafe {
         FB = Framebuffer::init(info.fb_addr, info.fb_width, info.fb_height, info.fb_stride);
         CURSOR_X = MARGIN;
@@ -315,6 +365,9 @@ pub fn print(s: &str) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let guard = PRINT_LOCK.lock();
+
+    // 镜像到 COM1 串口, 供 headless 调试捕获。
+    serial_write(s);
 
     for ch in s.bytes() {
         match ch {

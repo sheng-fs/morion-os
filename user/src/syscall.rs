@@ -76,6 +76,17 @@ pub fn sys_send(to: u64, tag: u64) -> u64 {
     unsafe { syscall(SYS_SEND, to, tag, 0) }
 }
 
+/// 消息 payload 固定大小 (与内核 `ipc::PAYLOAD_LEN` 一致)。
+const PAYLOAD_LEN: usize = 32;
+
+/// 发送带 payload 的消息 (payload 最多 32 字节, 超出部分截断)。
+pub fn sys_send_payload(to: u64, tag: u64, payload: &[u8]) -> u64 {
+    let mut buf = [0u8; PAYLOAD_LEN];
+    let n = payload.len().min(PAYLOAD_LEN);
+    buf[..n].copy_from_slice(&payload[..n]);
+    unsafe { syscall(SYS_SEND, to, tag, buf.as_ptr() as u64) }
+}
+
 pub fn sys_recv() -> u64 {
     unsafe { syscall(SYS_RECV, 0, 0, 0) }
 }
@@ -87,6 +98,14 @@ pub fn sys_recv_msg(buf: *mut u8) -> u64 {
 
 pub fn sys_call(to: u64, tag: u64) -> u64 {
     unsafe { syscall(SYS_CALL, to, tag, 0) }
+}
+
+/// 同步调用带 payload 的消息, 返回回复 tag。
+pub fn sys_call_payload(to: u64, tag: u64, payload: &[u8]) -> u64 {
+    let mut buf = [0u8; PAYLOAD_LEN];
+    let n = payload.len().min(PAYLOAD_LEN);
+    buf[..n].copy_from_slice(&payload[..n]);
+    unsafe { syscall(SYS_CALL, to, tag, buf.as_ptr() as u64) }
 }
 
 pub fn sys_reply(tag: u64) -> u64 {
@@ -212,15 +231,19 @@ impl<T> StaticCell<T> {
 static PRINT_BUF: StaticCell<[u8; 256]> = StaticCell::new([0; 256]);
 static PRINT_LEN: StaticCell<usize> = StaticCell::new(0);
 
-/// 把字符串追加到行缓冲 (超出部分丢弃)。
+/// 把字符串追加到行缓冲 (缓冲满时先提交当前行, 再继续写入)。
 fn print_push(s: &str) {
-    let buf = PRINT_BUF.borrow_mut();
-    let len = PRINT_LEN.borrow_mut();
     for &b in s.as_bytes() {
-        if *len < buf.len() {
-            buf[*len] = b;
-            *len += 1;
+        let buf = PRINT_BUF.borrow_mut();
+        let len = PRINT_LEN.borrow_mut();
+        if *len >= buf.len() {
+            // 缓冲已满: 先提交当前行, 避免后续字节被静默丢弃。
+            let line = unsafe { core::str::from_utf8_unchecked(&buf[..*len]) };
+            sys_puts(line);
+            *len = 0;
         }
+        buf[*len] = b;
+        *len += 1;
     }
 }
 

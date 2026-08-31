@@ -744,6 +744,14 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
 
     let mut sel: usize = 0;
 
+    // 自动启动倒计时 (配置来自 theme.toml 的 [timeout] 段, 默认 5 秒)
+    let timeout_us: u64 = if theme.timeout_enable {
+        (theme.timeout_seconds as u64).saturating_mul(1_000_000)
+    } else {
+        u64::MAX
+    };
+    let mut remaining_us: u64 = timeout_us;
+
     // 4. 主循环
     // 初始整屏渲染 (背景 + 顶栏 + 菜单)
     render_screen(&mut fb, &theme, &entries[..], sel);
@@ -751,7 +759,7 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
     loop {
         let prev_sel = sel;
 
-        // 键盘
+        // 键盘 (非阻塞轮询)
         if let Ok(Some(key)) = stdin.read_key() {
             use uefi::proto::console::text::{Key, ScanCode};
             match key {
@@ -772,6 +780,8 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
                 Key::Special(ScanCode::FUNCTION_10) => { return Status::SUCCESS; }
                 _ => {}
             }
+            // 用户有按键输入, 重置自动启动倒计时
+            remaining_us = timeout_us;
         }
 
         // 选择变化时整屏重绘 (背景 + 顶栏 + 菜单)
@@ -779,7 +789,12 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
             render_screen(&mut fb, &theme, &entries[..], sel);
         }
 
-        // 延时减少 CPU 占用
-        for _ in 0..500_000 { core::hint::spin_loop(); }
+        // 倒计时步进: 每轮休眠 10ms
+        st.boot_services().stall(10_000);
+        if remaining_us <= 10_000 {
+            draw_text(&mut fb, "Booting automatically...", theme.menu_x + 24, theme.menu_y + theme.menu_h as i32 - 64, Color::rgb(0, 255, 0));
+            boot_kernel(st, &mut fb);
+        }
+        remaining_us -= 10_000;
     }
 }

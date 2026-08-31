@@ -176,9 +176,15 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     // 阻塞等待回复; 被 `reply` 唤醒后回到此处, 从自己邮箱取回复。
     crate::scheduler::block_current(me);
 
+    // 邮箱里可能同时排着其它域发来的请求 (本域既是 client 又是 server, 如
+    // fat32 同时服务于 app 的 vfs_read 并作为 client 调用 block_srv)。直接
+    // `pop_front` 会把排在回复之前的请求误当作回复, 故按 `from == to` 精确匹配
+    // 回复来源。
     let reply = {
         let mut boxes = MAILBOXES.lock();
-        boxes[me as usize].pop_front()
+        let mbox = &mut boxes[me as usize];
+        let idx = mbox.iter().position(|m| m.from == to);
+        idx.and_then(|i| mbox.remove(i))
     };
     x86_64::instructions::interrupts::enable();
 

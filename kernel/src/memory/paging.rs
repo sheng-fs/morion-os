@@ -7,6 +7,7 @@
 //!   2. 加载 CR3
 //!   3. 用 OffsetPageTable 把内核堆映射到高位虚拟地址, 并初始化全局分配器
 
+#[cfg(target_os = "none")]
 use linked_list_allocator::LockedHeap;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -42,7 +43,8 @@ unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
     }
 }
 
-/// 全局内核堆分配器
+/// 全局内核堆分配器 (仅内核目标; host 单测由 libtest 的 std 分配器承担)。
+#[cfg(target_os = "none")]
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
@@ -50,6 +52,7 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 pub fn init() {
     let pml4_phys = setup_page_tables();
     load_cr3(pml4_phys);
+    #[cfg(target_os = "none")]
     init_heap(pml4_phys);
 }
 
@@ -117,6 +120,7 @@ fn load_cr3(pml4_phys: PhysAddr) {
 }
 
 /// 映射内核堆到高位虚拟地址并初始化全局分配器。
+#[cfg(target_os = "none")]
 fn init_heap(pml4_phys: PhysAddr) {
     // 通过 offset 映射访问 PML4, 构造 OffsetPageTable
     let pml4_virt = (PHYS_OFFSET + pml4_phys.as_u64()) as *mut PageTable;
@@ -158,6 +162,15 @@ pub fn heap_start() -> usize {
 /// 内核堆大小 (字节)。
 pub fn heap_size() -> usize {
     HEAP_SIZE
+}
+
+/// 判断虚拟地址是否属于用户空间 (P4[1], 即 `USER_SPACE_BASE` 起的 512 GiB)。
+///
+/// 用于系统调用信任边界: 拒绝用户态传入的内核地址 (恒等 P4[0] / offset P4[256] /
+/// 内核堆 P4[136] 等) 被 `resolve_user_page` / `map_user_page` 解析或重映射,
+/// 否则会因在 2 MiB 大页之上映射 4 KiB 页而触发 `ParentEntryHugePage`, 导致内核 panic。
+pub fn is_user_address(vaddr: u64) -> bool {
+    ((vaddr >> 39) & 0x1FF) == 1
 }
 
 /// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限)。
@@ -263,4 +276,139 @@ pub fn unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
     let paddr = frame.start_address().as_u64();
     flush.flush();
     Some(paddr)
+}
+
+/// 调试自检: 打印内核 PML4 的关键页表项原始值 (P4[0] → PDPT[0] → PD[0][0..2])。
+///
+/// 用于二分定位启动期「恒等映射被破坏」的精确阶段: 每次调用打印当前 CR3、
+/// P4[0] / PDPT[0] / PD[0][0] / PD[0][1] 的原始 64 位值, 观察 present/huge 位。
+/// 通过 offset 映射访问页表帧 (与恒等映射共用 PDPT/PD); 若此处也取指失败,
+/// 说明该层帧已被写坏。
+pub fn dump_kernel_pagetable(tag: &str) {
+    crate::video::print("[PT:");
+    crate::video::print(tag);
+    crate::video::print("]");
+
+    let (kernel_frame, _) = Cr3::read();
+    let pml4_phys = kernel_frame.start_address().as_u64();
+    crate::video::print(" cr3=");
+    crate::video::print_hex(pml4_phys);
+
+    let pml4 = unsafe { &*((PHYS_OFFSET + pml4_phys) as *const PageTable) };
+    let p4_raw = unsafe { core::ptr::read_volatile(pml4 as *const PageTable as *const u64) };
+    crate::video::print(" P4[0]=");
+    crate::video::print_hex(p4_raw);
+
+    // 仅当 P4[0] present 时才继续走下一层, 否则 addr 无意义 (会解引用野地址)。
+    if pml4[0].flags().contains(PageTableFlags::PRESENT) {
+        let pdpt_phys = pml4[0].addr().as_u64();
+        let pdpt = unsafe { &*((PHYS_OFFSET + pdpt_phys) as *const PageTable) };
+        let pdpte_raw = unsafe { core::ptr::read_volatile(pdpt as *const PageTable as *const u64) };
+        crate::video::print(" PDPT[0]=");
+        crate::video::print_hex(pdpte_raw);
+
+        if pdpt[0].flags().contains(PageTableFlags::PRESENT) {
+            let pd_phys = pdpt[0].addr().as_u64();
+            let pd = unsafe { &*((PHYS_OFFSET + pd_phys) as *const PageTable) };
+            let pd_ptr = pd as *const PageTable as *const u64;
+            let pde0_raw = unsafe { core::ptr::read_volatile(pd_ptr) };
+            let pde1_raw = unsafe { core::ptr::read_volatile(pd_ptr.add(1)) };
+            crate::video::print(" PD[0][0]=");
+            crate::video::print_hex(pde0_raw);
+            crate::video::print(" PD[0][1]=");
+            crate::video::print_hex(pde1_raw);
+        }
+    }
+    crate::video::println("");
+}
+
+/// 直接向 COM1 串口写一个字节, 完全绕过 `video::print` (不读 .rodata 字符串,
+/// 不依赖恒等映射)。用于在恒等映射已被破坏时仍能观察页表原始值。
+fn raw_putc(c: u8) {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        let mut status: Port<u8> = Port::new(0x3FD);
+        while status.read() & 0x20 == 0 {}
+        let mut data: Port<u8> = Port::new(0x3F8);
+        data.write(c);
+    }
+}
+
+/// 直接串口输出 16 位十六进制 (不依赖任何字符串字面量)。
+fn raw_hex(v: u64) {
+    for i in 0..16 {
+        let nib = ((v >> (60 - i * 4)) & 0xF) as u8;
+        raw_putc(if nib < 10 { b'0' + nib } else { b'A' + nib - 10 });
+    }
+}
+
+/// 调试自检 (原始串口版): 通过 offset 映射读取页表关键项, 用直接串口输出。
+///
+/// 当恒等映射 (P4[0]) 被破坏、`video::print` 自身都无法读取 .rodata 字符串时,
+/// 仍可借由 P4[256] (offset) 读取页表帧并观察 P4[0] 的原始值。
+/// 输出格式: `<R> cr3 P4[0] P4[256] PDPT[0] PD[0][0] PD[0][1]\n`
+pub fn raw_dump_kernel_pagetable() {
+    // 先通过 offset 映射一次性读取所有关键项 (在任何串口输出之前),
+    // 避免「边打印边观察」时打印本身改变/触发被观察状态。
+    let (kernel_frame, _) = Cr3::read();
+    let pml4_phys = kernel_frame.start_address().as_u64();
+
+    // 通过 offset 映射读取 PML4 (其物理帧可能在恒等映射下已不可达)。
+    let pml4 = unsafe { &*((PHYS_OFFSET + pml4_phys) as *const PageTable) };
+    let p4_ptr = pml4 as *const PageTable as *const u64;
+    let p4_0 = unsafe { core::ptr::read_volatile(p4_ptr) };
+    let p4_256 = unsafe { core::ptr::read_volatile(p4_ptr.add(256)) };
+
+    let mut pdpte_raw: u64 = 0;
+    let mut pde0_raw: u64 = 0;
+    let mut pde1_raw: u64 = 0;
+    if pml4[0].flags().contains(PageTableFlags::PRESENT) {
+        let pdpt = unsafe { &*((PHYS_OFFSET + pml4[0].addr().as_u64()) as *const PageTable) };
+        pdpte_raw = unsafe { core::ptr::read_volatile(pdpt as *const PageTable as *const u64) };
+
+        if pdpt[0].flags().contains(PageTableFlags::PRESENT) {
+            let pd = unsafe { &*((PHYS_OFFSET + pdpt[0].addr().as_u64()) as *const PageTable) };
+            let pd_ptr = pd as *const PageTable as *const u64;
+            pde0_raw = unsafe { core::ptr::read_volatile(pd_ptr) };
+            pde1_raw = unsafe { core::ptr::read_volatile(pd_ptr.add(1)) };
+        }
+    }
+
+    raw_putc(b'<');
+    raw_putc(b'R');
+    raw_putc(b'>');
+    raw_putc(b' ');
+    raw_hex(pml4_phys);
+    raw_putc(b' ');
+    raw_hex(p4_0);
+    raw_putc(b' ');
+    raw_hex(p4_256);
+    raw_putc(b' ');
+    raw_hex(pdpte_raw);
+    raw_putc(b' ');
+    raw_hex(pde0_raw);
+    raw_putc(b' ');
+    raw_hex(pde1_raw);
+    raw_putc(b'\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_user_address, USER_SPACE_BASE};
+
+    /// 编码安全契约: 仅 P4[1] (用户空间) 放行, 其余一律拒绝。
+    #[test]
+    fn is_user_address_accepts_p4_1_only() {
+        // 拒绝: 零地址 / 恒等映射 / 内核堆 / offset 映射 / 高半区。
+        assert!(!is_user_address(0));
+        assert!(!is_user_address(0x0000_0000_0010_0000)); // 恒等映射 (P4[0])
+        assert!(!is_user_address(0x4444_4444_0000)); // 内核堆 (P4[136])
+        assert!(!is_user_address(0xFFFF_8000_0000_0000)); // offset 映射 (P4[256])
+        assert!(!is_user_address(0xFFFF_FFFF_FFFF_F000)); // 高半区 (P4[511])
+
+        // 放行: USER_SPACE_BASE 起的 P4[1] 512 GiB 范围。
+        assert!(is_user_address(USER_SPACE_BASE));
+        assert!(is_user_address(USER_SPACE_BASE + 0x3000));
+        assert!(is_user_address(0x0000_00FF_FFFF_FFFF)); // P4[1] 末尾
+    }
 }

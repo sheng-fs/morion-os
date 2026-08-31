@@ -124,8 +124,24 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // 系统调用分发
 // ---------------------------------------------------------------------------
+/// 从用户地址 `ptr` 读取一条固定大小 IPC payload (32 字节)。
+///
+/// `ptr` 为 0 表示无 payload (返回全零); 非用户空间地址同样拒绝 (返回全零),
+/// 避免 syscall 在 Ring0 下读取内核内存 (与 SYS_ALLOC_PAGE 等信任边界一致)。
+fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
+    if ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
+        return [0; crate::ipc::PAYLOAD_LEN];
+    }
+    unsafe {
+        let src = core::slice::from_raw_parts(ptr as *const u8, crate::ipc::PAYLOAD_LEN);
+        let mut buf = [0u8; crate::ipc::PAYLOAD_LEN];
+        buf.copy_from_slice(src);
+        buf
+    }
+}
+
 #[no_mangle]
-extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match num {
         SYS_YIELD => {
             crate::scheduler::yield_now();
@@ -135,7 +151,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             crate::scheduler::sleep(a1);
             0
         }
-        SYS_SEND => crate::ipc::send(a1, a2, &[]) as u64,
+        SYS_SEND => {
+            let payload = read_user_payload(a3);
+            crate::ipc::send(a1, a2, &payload) as u64
+        }
         SYS_RECV => {
             // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
@@ -153,8 +172,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
         }
         SYS_CALL => {
             // 同步调用: 发送请求到 `a1` (to) 并阻塞等待回复, 返回回复 tag。
+            // `a3` 为可选 payload 指针 (0 表示无 payload)。
             // 失败 (无 SendTo 能力) 时返回 u64::MAX。
-            crate::ipc::call(a1, a2, &[]).tag
+            let payload = read_user_payload(a3);
+            crate::ipc::call(a1, a2, &payload).tag
         }
         SYS_REPLY => {
             // 回复当前任务最近 `receive` 到的调用者, tag 为 `a1`。
@@ -162,6 +183,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
         }
         SYS_ALLOC_PAGE => {
             // 分配一个物理帧并映射到当前域的 `vaddr` (a1), 引用计数置 1。
+            // 先校验 a1 为用户空间地址, 拒绝内核地址被解析/重映射 (见 paging::is_user_address)。
+            if !crate::memory::paging::is_user_address(a1) {
+                return 0;
+            }
             let paddr = match crate::memory::frame_allocator::allocate_frame() {
                 Some(p) => p,
                 None => return 0,
@@ -175,6 +200,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             // 把当前域 `vaddr` (a1) 的页共享映射进 `a2` 域同一地址, 需 MapInto 能力。
             let from = crate::scheduler::current_domain();
             if !crate::cap::has(from, crate::cap::Capability::MapInto(a2)) {
+                0
+            } else if !crate::memory::paging::is_user_address(a1) {
+                // 拒绝内核地址被 resolve_user_page 反查后重映射。
                 0
             } else {
                 match crate::memory::paging::resolve_user_page(from, a1) {
@@ -204,6 +232,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             // 分页器: 给指定域 `a1` 的 `a2` (vaddr) 映射一个匿名零帧, 需 MapInto 能力。
             let from = crate::scheduler::current_domain();
             if !crate::cap::has(from, crate::cap::Capability::MapInto(a1)) {
+                0
+            } else if !crate::memory::paging::is_user_address(a2) {
+                // 拒绝把内核地址 (0 / 恒等映射 / 内核堆等) 作为缺页目标映射,
+                // 否则会在 2 MiB 大页上映射 4 KiB 页, 触发 ParentEntryHugePage panic。
                 0
             } else {
                 match crate::memory::frame_allocator::allocate_frame() {
@@ -276,7 +308,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> u64 {
             // 把物理 MMIO 页 (a1, 页对齐) 映射到当前域 a2 虚拟地址, 需 Mmio 能力。
             let domain = crate::scheduler::current_domain();
             let bar = a1 & !0xFFF;
-            if crate::cap::has(domain, crate::cap::Capability::Mmio(bar)) {
+            if crate::cap::has(domain, crate::cap::Capability::Mmio(bar))
+                && crate::memory::paging::is_user_address(a2)
+            {
                 crate::memory::paging::map_mmio(domain, a2, bar);
                 1
             } else {

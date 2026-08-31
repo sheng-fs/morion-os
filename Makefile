@@ -271,8 +271,6 @@ $(DISK_IMG):
 	mmd -i $(DISK_IMG) ::/DIR1
 	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
 	mcopy -i $(DISK_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
-	@i=1; while [ $$i -le 250 ]; do printf 'Line %04d: cross-cluster large file read test.\n' $$i; i=$$((i+1)); done > $(OUT_DIR)/big.txt
-	mcopy -i $(DISK_IMG) $(OUT_DIR)/big.txt ::/BIG.TXT
 	@echo "  ✓ IDE 镜像: $(DISK_IMG)"
 
 # GDB 调试
