@@ -813,19 +813,14 @@ fn read_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
 
     // 1. 等控制器就绪: BSY 清零且 DRDY 置位。
     let mut ready = false;
-    let mut last_status = 0u8;
     for _ in 0..100_000 {
         let s = sys_port_in8(IDE_STATUS);
-        last_status = s;
         if s & ATA_BSY == 0 && s & ATA_DRDY != 0 {
             ready = true;
             break;
         }
     }
     if !ready {
-        print("disk: [read] not ready, status=0x");
-        print_hex(last_status as u64);
-        println("");
         return false;
     }
 
@@ -840,17 +835,12 @@ fn read_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
     // 3. 逐扇区等待 DRQ 后读 256 个 16 位字 (512 字节)。
     for i in 0..count as usize {
         let mut got_drq = false;
-        let mut last_status = 0u8;
         for _ in 0..100_000 {
             let s = sys_port_in8(IDE_STATUS);
-            last_status = s;
             if s & ATA_BSY != 0 {
                 continue;
             }
             if s & ATA_ERR != 0 {
-                print("disk: [read] ERR status=0x");
-                print_hex(s as u64);
-                println("");
                 return false;
             }
             if s & ATA_DRQ != 0 {
@@ -859,9 +849,6 @@ fn read_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
             }
         }
         if !got_drq {
-            print("disk: [read] DRQ timeout, status=0x");
-            print_hex(last_status as u64);
-            println("");
             return false;
         }
         let sector = unsafe { buf.add(i * 512) };
@@ -909,11 +896,7 @@ fn block_read(lba: u32, count: u16, buf: *mut u8) -> bool {
             core::mem::size_of::<BlockReq>(),
         )
     };
-    let r = sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload);
-    print("block_read: sys_call_payload returned ");
-    print_u64(r);
-    println("");
-    r == 1
+    sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
 }
 
 /// 读一个 16 位小端无符号整数 (引导扇区字段)。

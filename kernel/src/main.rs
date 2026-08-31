@@ -167,7 +167,6 @@ pub extern "C" fn _start() -> ! {
 
     video::println("");
     video::println("Stage 3 complete.");
-    memory::paging::dump_kernel_pagetable("stage3");
 
     // ============================================================
     //  阶段四: 硬件中断框架
@@ -178,7 +177,6 @@ pub extern "C" fn _start() -> ! {
     arch::pit::init();
     arch::keyboard::init();
     video::println("[OK] PIC remapped + PIT timer started (100 Hz)");
-    memory::paging::dump_kernel_pagetable("stage4");
 
     // ============================================================
     //  阶段 4.5: PCI 枚举 (文件系统阶段 0)
@@ -200,7 +198,6 @@ pub extern "C" fn _start() -> ! {
         video::print_hex(((d.class as u64) << 16) | ((d.subclass as u64) << 8) | d.progif as u64);
         video::println("");
     }
-    memory::paging::dump_kernel_pagetable("stage45");
 
     // ============================================================
     //  阶段十: 用户态运行库 + 可加载用户程序
@@ -209,14 +206,11 @@ pub extern "C" fn _start() -> ! {
     video::println("Stage 10: libuser + loadable user program");
     syscall::init();
     video::println("[OK] syscall/sysret enabled (EFER.SCE + STAR + LSTAR)");
-    memory::paging::dump_kernel_pagetable("stage10");
 
     // ============================================================
     //  阶段十一: IPC + 能力系统
     // ============================================================
     scheduler::init();
-    memory::paging::raw_dump_kernel_pagetable();
-    memory::paging::dump_kernel_pagetable("sched");
 
     // 创建 8 个保护域:
     //   0 = sender    (持有 SendTo(1)+MapInto(1) 能力, 触发按需分页 + call 演示)
