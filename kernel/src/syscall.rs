@@ -44,6 +44,7 @@ pub const SYS_PORT_IN8: u64 = 22;
 pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
+pub const SYS_VIRT_TO_PHYS: u64 = 26;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -335,6 +336,15 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             let port = a1 as u16;
             unsafe { Port::<u16>::new(port).write(a2 as u16) };
             0
+        }
+        SYS_VIRT_TO_PHYS => {
+            // 把当前域用户虚拟地址 `a1` 反查为物理地址 (供 NVMe 等 DMA 驱动填 PRP)。
+            let domain = crate::scheduler::current_domain();
+            if crate::memory::paging::is_user_address(a1) {
+                crate::memory::paging::resolve_user_page(domain, a1).unwrap_or(0)
+            } else {
+                0
+            }
         }
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。

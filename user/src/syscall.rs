@@ -34,6 +34,7 @@ pub const SYS_PORT_IN8: u64 = 22;
 pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
+pub const SYS_VIRT_TO_PHYS: u64 = 26;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -187,6 +188,11 @@ pub fn sys_port_out16(port: u16, value: u16) {
     unsafe {
         syscall(SYS_PORT_OUT16, port as u64, value as u64, 0);
     }
+}
+
+/// 查询本域用户虚拟地址 `vaddr` 对应的物理地址 (供 NVMe PRP 使用), 失败返回 0。
+pub fn sys_virt_to_phys(vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_VIRT_TO_PHYS, vaddr, 0, 0) }
 }
 
 pub fn sys_puts(s: &str) {

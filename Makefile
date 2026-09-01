@@ -120,7 +120,11 @@ $(USER_ELF): $(USER_SRC)
 $(USER_BIN): $(USER_ELF)
 	@echo "==> 生成用户程序扁平二进制..."
 	$(MKDIR) $(dir $@)
-	objcopy -O binary $(USER_ELF) $(USER_BIN)
+	# 默认 objcopy -O binary 不含 NOBITS 的 .bss 段, 导致镜像长度只覆盖 text+data,
+	# 而 .bss 可能落入下一未映射页 (随程序增长反复触发缺页, 破坏控制台/滚动)。
+	# 用 --set-section-flags 把 .bss 标记为有内容, 使其零填充并入扁平二进制,
+	# 令内核按「完整内存占用」映射足够页表。
+	objcopy -O binary --set-section-flags .bss=alloc,load,contents,data $(USER_ELF) $(USER_BIN)
 	@echo "  ✓ 用户程序二进制: $@"
 
 # ============================================================
@@ -252,12 +256,17 @@ run-ide: iso $(DISK_IMG)
 		-d guest_errors,int \
 		-D $(OUT_DIR)/qemu.log
 
-# 创建 NVMe 磁盘镜像并格式化为 FAT32 (供阶段 1 read_lba 校验 0x55AA BPB 特征)
+# 创建 NVMe 磁盘镜像并格式化为 FAT32, 写入与 IDE 镜像一致的测试文件
 $(NVME_IMG):
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
 	mkfs.fat -F 32 $(NVME_IMG) >/dev/null 2>&1
+	@printf 'Hello from FAT32!\nThis is a test file.\n' > $(OUT_DIR)/hello.txt
+	mcopy -i $(NVME_IMG) $(OUT_DIR)/hello.txt ::/HELLO.TXT
+	mmd -i $(NVME_IMG) ::/DIR1
+	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
+	mcopy -i $(NVME_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
 	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
 
 # 创建 IDE 磁盘镜像并格式化为 FAT32

@@ -5,24 +5,24 @@
 
 #![no_std]
 #![no_main]
-// NVMe 驱动暂搁置 (转为死代码保留, 后续文件系统阶段再启用), 故允许 dead_code。
+// 部分预留 syscall 与演示代码暂未使用, 故允许 dead_code。
 #![allow(dead_code)]
 
 mod syscall;
+mod vfs;
 
 use syscall::{
     print, print_hex, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
     sys_call_payload, sys_map_anon, sys_page_fault_reply, sys_port_in16, sys_port_in8,
     sys_port_out8, sys_recv, sys_recv_msg, sys_register_irq, sys_reply, sys_scroll_down,
     sys_scroll_up, sys_send, sys_share_page, sys_term_left, sys_term_put, sys_term_right,
-    sys_unmap,
+    sys_unmap, sys_virt_to_phys,
 };
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
 ///   0 sender / 1 receiver / 2 pager / 3 echo / 4 kbd
 ///   5 block_srv / 6 fat32_srv / 7 app
 const BLOCK_DOMAIN: u64 = 5;
-const FAT32_DOMAIN: u64 = 6;
 const APP_DOMAIN: u64 = 7;
 
 /// 用户程序入口 — 内核已设好用户栈 (rsp) 与用户参数 (rdi=域 id),
@@ -49,7 +49,7 @@ fn sender_main() {
     println("sender (domain 0) starting...");
 
     // 共享内存演示: 申请一页 → 写入 → 共享给域 1 → IPC 通知。
-    let page = 0x8000_0030_00u64;
+    let page = 0x8000_0090_00u64;
     if sys_alloc_page(page) == 1 {
         let msg = "HELLO SHARED";
         unsafe {
@@ -112,7 +112,7 @@ fn receiver_main() {
     println("");
 
     // 直接读共享页 (零拷贝, 数据未经 IPC 传递)。
-    let page = 0x8000_0030_00u64;
+    let page = 0x8000_0090_00u64;
     let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
     let s = unsafe { core::str::from_utf8_unchecked(bytes) };
     print("receiver: read from shared page -> \"");
@@ -439,8 +439,8 @@ struct Cqe {
     dw1: u32,
     sqhd: u16,
     sqid: u16,
-    sf: u16, // DW3 低 16 位: bit0 = phase, bit1..8 = status code
-    cid: u16,
+    cid: u16, // bytes 12-13: command id (与 Linux/QEMU 布局一致)
+    sf: u16,  // bytes 14-15: status field, bit0 = phase, bit1.. = status code
 }
 
 /// 易失 MMIO 读/写 (寄存器映射为非缓存, 必须用 volatile)。
@@ -455,12 +455,6 @@ fn wr32(addr: u64, val: u32) {
 }
 fn wr64(addr: u64, val: u64) {
     unsafe { core::ptr::write_volatile(addr as *mut u64, val) }
-}
-
-/// 打印一个 ASCII 字节切片 (Identify 的型号/序列号字段)。
-fn print_ascii(bytes: &[u8]) {
-    let s = unsafe { core::str::from_utf8_unchecked(bytes) };
-    print(s);
 }
 
 /// 向指定队列提交一条命令并轮询其完成。返回状态码是否为 0 (成功)。
@@ -499,7 +493,7 @@ fn submit_wait(
                 *phase ^= 1;
             }
             wr32(cq_doorbell, *head);
-            let sc = (cqe.sf >> 1) & 0xFF;
+            let sc = (cqe.sf >> 1) & 0xFFFF;
             if sc != 0 {
                 print("nvme: CQE fail sc=");
                 print_u64(sc as u64);
@@ -507,6 +501,14 @@ fn submit_wait(
                 print_u64(cqe.cid as u64);
                 print(" sqid=");
                 print_u64(cqe.sqid as u64);
+                print(" op=");
+                print_u64(sqe.opcode as u64);
+                print(" cdw10=");
+                print_u64(sqe.cdw10 as u64);
+                print(" cdw11=");
+                print_u64(sqe.cdw11 as u64);
+                print(" prp1=");
+                print_u64(sqe.prp1);
                 println("");
             }
             return sc == 0;
@@ -521,26 +523,88 @@ fn submit_wait(
     print_u64(*tail as u64);
     print(" phase=");
     print_u64(*phase as u64);
-    print(" sqe_cid=");
+    print("sqe_cid=");
     print_u64(sqe.cid as u64);
     println("");
-    // 调试: 逐槽 dump CQ 原始 16 字节 (phase 在 DW3 低 16 位 bit0)。
-    for i in 0..qdepth {
-        let base = cq_vaddr + (i as u64) * 16;
-        let dw0 = rd32(base);
-        let dw3 = rd32(base + 12);
-        print("nvme:   CQ[");
-        print_u64(i as u64);
-        print("] dw0=0x");
-        print_hex(dw0 as u64);
-        print(" dw3=0x");
-        print_hex(dw3 as u64);
-        println("");
-    }
+    // 调试: 转储原始 CQ (槽 0/1) 与 SQ (槽 0/1) 的 16 字节, 判断是「从未投递」还是「phase 不符」。
+    let d0 = unsafe { core::ptr::read_volatile(cq_vaddr as *const u64) };
+    let d1 = unsafe { core::ptr::read_volatile((cq_vaddr + 8) as *const u64) };
+    let d2 = unsafe { core::ptr::read_volatile((cq_vaddr + 16) as *const u64) };
+    let d3 = unsafe { core::ptr::read_volatile((cq_vaddr + 24) as *const u64) };
+    print("    CQ0 lo=");
+    print_u64(d0);
+    print(" hi=");
+    print_u64(d1);
+    println("");
+    print("    CQ1 lo=");
+    print_u64(d2);
+    print(" hi=");
+    print_u64(d3);
+    println("");
+    let s0 = unsafe { core::ptr::read_volatile(sq_vaddr as *const u64) };
+    let s1 = unsafe { core::ptr::read_volatile((sq_vaddr + 64) as *const u64) };
+    print("    SQ0 dw0=");
+    print_u64(s0);
+    print(" SQ1 dw0=");
+    print_u64(s1);
+    println("");
     false
 }
 
-/// 域 5 — NVMe 驱动服务: 复位控制器 → Admin 队列 → Identify → I/O 队列 → read_lba。
+/// 经 NVMe I/O 队列读 `count` 个扇区到 `buf` (页对齐的用户页)。
+///
+/// `buf` 为 fat32 共享给本域的缓冲页虚拟地址, 页对齐且已映射; 先经
+/// `sys_virt_to_phys` 反查物理地址作为 NVMe DMA 的 PRP1。单次 READ 用单
+/// PRP1 页, 最多 8 扇区 (4096 字节, 不跨页); 超过则返回 false (当前 fat32
+/// 最多读一簇 8 扇区, 不会触及)。
+#[allow(clippy::too_many_arguments)]
+fn nvme_read_sectors(
+    cfg: &NvmeConfig,
+    mmio: u64,
+    isq_doorbell: u64,
+    icq_doorbell: u64,
+    lba: u32,
+    count: u16,
+    buf: *mut u8,
+    tail: &mut u32,
+    head: &mut u32,
+    phase: &mut u32,
+) -> bool {
+    if count == 0 || count > 8 {
+        return false;
+    }
+    let paddr = sys_virt_to_phys(buf as u64);
+    if paddr == 0 {
+        print("nvme: read virt_to_phys failed buf=");
+        print_u64(buf as u64);
+        print(" count=");
+        print_u64(count as u64);
+        println("");
+        return false;
+    }
+    let mut sqe = Sqe::zero();
+    sqe.opcode = OP_READ;
+    sqe.cid = 5;
+    sqe.nsid = 1;
+    sqe.prp1 = paddr;
+    sqe.cdw10 = lba;
+    sqe.cdw11 = 0; // SLBA 高 32 位 = 0
+    sqe.cdw12 = (count as u32) - 1; // NLB (0-based)
+    submit_wait(
+        cfg.isq_vaddr,
+        cfg.icq_vaddr,
+        isq_doorbell,
+        icq_doorbell,
+        cfg.io_qdepth as u32,
+        mmio,
+        sqe,
+        tail,
+        head,
+        phase,
+    )
+}
+
+/// 域 5 — NVMe 驱动服务: 复位控制器 → Admin 队列 → Identify → I/O 队列 → 块服务。
 fn nvme_main() {
     println("nvme (domain 5) starting...");
 
@@ -550,30 +614,11 @@ fn nvme_main() {
         return;
     }
     let mmio = cfg.mmio_vaddr;
-    print("nvme: BAR0 mapped at 0x");
-    print_hex(mmio);
-    println("");
 
-    // 1. 读 CAP / VS, 计算门铃 stride。
+    // 1. 读 CAP, 计算门铃 stride (DSTRD 在 CAP 的 bits 32:35, stride = 4 << DSTRD 字节)。
     let cap = rd64(mmio + REG_CAP);
-    // DSTRD 在 CAP 的 bits 32:35 (门铃 stride = 4 << DSTRD 字节)。
     let dstrd = ((cap >> 32) & 0xF) as u64;
     let stride = 4u64 << dstrd;
-    print("nvme: CAP=0x");
-    print_hex(cap);
-    print(" MQES=");
-    print_u64(cap & 0xFFFF);
-    print(" DSTRD=");
-    print_u64(dstrd);
-    println("");
-    let vs = rd32(mmio + REG_VS);
-    print("nvme: version ");
-    print_u64((vs >> 16) as u64);
-    print(".");
-    print_u64(((vs >> 8) & 0xFF) as u64);
-    print(".");
-    print_u64((vs & 0xFF) as u64);
-    println("");
 
     // 2. 禁用控制器 (CC.EN=0), 等 CSTS.RDY 清零。
     wr32(mmio + REG_CC, 0);
@@ -592,8 +637,9 @@ fn nvme_main() {
     wr64(mmio + REG_ASQ, cfg.asq_paddr);
     wr64(mmio + REG_ACQ, cfg.acq_paddr);
 
-    // 4. 使能控制器 (IOSQES=6 => 64B, IOCQES=4 => 16B, MPS=0 => 4KB)。
-    wr32(mmio + REG_CC, 1 | (6 << 20) | (4 << 24));
+    // 4. 使能控制器 (IOSQES=6 => 64B @bits16-19, IOCQES=4 => 16B @bits20-23, MPS=0 => 4KB)。
+    //    与 Linux include/linux/nvme.h 一致: NVME_CC_IOSQES = 6<<16, NVME_CC_IOCQES = 4<<20。
+    wr32(mmio + REG_CC, 1 | (6 << 16) | (4 << 20));
 
     // 5. 等 CSTS.RDY 置位。
     timeout = 0;
@@ -636,22 +682,8 @@ fn nvme_main() {
         println("nvme: Identify Controller FAILED");
         return;
     }
-    let data = cfg.data_vaddr as *const u8;
-    unsafe {
-        print("nvme: model  = \"");
-        print_ascii(core::slice::from_raw_parts(data.add(24), 40));
-        println("\"");
-        print("nvme: serial = \"");
-        print_ascii(core::slice::from_raw_parts(data.add(4), 20));
-        println("\"");
-    }
-    // NN (Number of Namespaces) 在 Identify Controller 数据 offset 0x204 (516)。
-    let nn = unsafe { core::ptr::read_unaligned(data.add(516) as *const u32) };
-    print("nvme: namespaces = ");
-    print_u64(nn as u64);
-    println("");
 
-    // 7. Identify Namespace (CNS=0, NSID=1) → 打印扇区总数。
+    // 7. Identify Namespace (CNS=0, NSID=1) → 扇区总数。
     sqe = Sqe::zero();
     sqe.opcode = OP_IDENTIFY;
     sqe.cid = 2;
@@ -673,10 +705,6 @@ fn nvme_main() {
         println("nvme: Identify Namespace FAILED");
         return;
     }
-    let nsze = unsafe { core::ptr::read_unaligned(data as *const u64) };
-    print("nvme: namespace size = ");
-    print_u64(nsze);
-    println(" sectors");
 
     // 8. Create I/O Completion Queue (qid=1)。
     sqe = Sqe::zero();
@@ -725,7 +753,7 @@ fn nvme_main() {
     }
     println("nvme: I/O queue 1 created");
 
-    // 10. read_lba(0): 读第 0 扇区到 data 缓冲, 校验 FAT32 BPB 特征 (0x55AA)。
+    // 10. 进入块设备服务循环: 经 IPC 接收 BlockReq, 用 NVMe I/O 队列读扇区。
     let isq_doorbell = mmio + DOORBELL_BASE + 2 * stride;
     let icq_doorbell = mmio + DOORBELL_BASE + 3 * stride;
     let mut io_tail: u32 = 0;
@@ -733,45 +761,59 @@ fn nvme_main() {
     // 与 Admin 队列同理: 首条 completion 的 phase tag 为 1。
     let mut io_phase: u32 = 1;
 
-    unsafe {
-        core::ptr::write_bytes(cfg.data_vaddr as *mut u8, 0, 512);
-    }
-    sqe = Sqe::zero();
-    sqe.opcode = OP_READ;
-    sqe.cid = 5;
-    sqe.nsid = 1;
-    sqe.prp1 = cfg.data_paddr;
-    sqe.cdw10 = 0; // SLBA 低 32 位 = 0
-    sqe.cdw11 = 0; // SLBA 高 32 位 = 0
-    sqe.cdw12 = 0; // NLB = 0 => 1 块
-    if !submit_wait(
-        cfg.isq_vaddr,
-        cfg.icq_vaddr,
-        isq_doorbell,
-        icq_doorbell,
-        cfg.io_qdepth as u32,
-        mmio,
-        sqe,
-        &mut io_tail,
-        &mut io_head,
-        &mut io_phase,
-    ) {
-        println("nvme: read_lba(0) FAILED");
-        return;
-    }
+    println("nvme: block service ready");
+    loop {
+        let mut msg = Message {
+            from: 0,
+            to: 0,
+            tag: 0,
+            payload: [0; 32],
+        };
+        sys_recv_msg(&mut msg as *mut Message as *mut u8);
 
-    let b0 = unsafe { core::ptr::read_volatile(data.add(510)) };
-    let b1 = unsafe { core::ptr::read_volatile(data.add(511)) };
-    print("nvme: sector 0 signature = 0x");
-    print_hex(b0 as u64);
-    print_hex(b1 as u64);
-    if b0 == 0x55 && b1 == 0xAA {
-        println(" (FAT32 BPB OK)");
-    } else {
-        println(" (not a FAT32 boot sector)");
-    }
+        if msg.tag != BLOCK_REQ_TAG {
+            print("nvme: unexpected tag=");
+            print_u64(msg.tag);
+            println("");
+            sys_reply(0);
+            continue;
+        }
+        let req: BlockReq =
+            unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
+        print("nvme: block req op=");
+        print_u64(req.op as u64);
+        print(" lba=");
+        print_u64(req.lba);
+        print(" count=");
+        print_u64(req.count);
+        print(" buf=0x");
+        print_u64(req.buf);
+        println("");
 
-    println("nvme done.");
+        match req.op {
+            0 => {
+                let ok = nvme_read_sectors(
+                    &cfg,
+                    mmio,
+                    isq_doorbell,
+                    icq_doorbell,
+                    req.lba as u32,
+                    req.count as u16,
+                    req.buf as *mut u8,
+                    &mut io_tail,
+                    &mut io_head,
+                    &mut io_phase,
+                );
+                print("nvme: read result=");
+                print_u64(ok as u64);
+                println("");
+                sys_reply(if ok { 1 } else { 0 });
+            }
+            _ => {
+                sys_reply(0);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -861,12 +903,6 @@ fn read_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
 
 /// 块设备请求 tag (block_srv 据此识别读/写请求)。
 const BLOCK_REQ_TAG: u64 = 0x424C_4F43; // "BLOC"
-
-/// 文件读取请求 tag (fat32_srv 据此识别文件读取请求)。
-const FILE_READ_TAG: u64 = 0x4649_4C45; // "FILE"
-
-/// 文件读取结果页虚拟地址 (app 分配并共享给 fat32_srv, 约定地址)。
-const RESULT_BUF: u64 = 0x0000_0080_0000_9000;
 
 /// 块设备请求 (序列化进 IPC payload, 32 字节, 与内核 `PAYLOAD_LEN` 一致)。
 /// `buf` 为数据缓冲页虚拟地址, 须已由调用方共享映射进 block_srv 地址空间。
@@ -1003,132 +1039,152 @@ fn print_sanitized(s: &str) {
     }
 }
 
-/// 沿 FAT 链逐簇读取整个文件并安全打印内容。
-///
-/// 文件可能跨越多个簇: 每读一簇只输出 `remaining` 个有效字节, 最后一簇按
-/// `file_size` 截断, 避免把簇尾残留的旧数据当作文件内容输出 (这是 NUVARS
-/// 等二进制文件尾部垃圾导致串口控制字符的根源)。
-fn read_file(
+/// 从文件 (首簇 `start_cluster`, 大小 `file_size`) 的 `offset` 处读最多 `count`
+/// 字节到 `out` (须 >= min(count, file_size-offset) 字节)。返回实际读取字节数;
+/// 读盘失败返回 u64::MAX。
+fn read_file_range(
     bpb: &Fat32Bpb,
     start_cluster: u32,
     file_size: u32,
-    fat_buf: *mut u8,
-    file_buf: *mut u8,
-) {
-    let cluster_bytes = bpb.cluster_bytes() as usize;
-    let mut remaining = file_size as usize;
-    let mut cluster = start_cluster;
-
-    while remaining > 0 {
-        if !read_cluster(bpb, cluster, file_buf) {
-            println("disk: [file] read_cluster FAILED");
-            return;
-        }
-        let take = core::cmp::min(remaining, cluster_bytes);
-        let content = unsafe { core::slice::from_raw_parts(file_buf, take) };
-        let s = unsafe { core::str::from_utf8_unchecked(content) };
-        print_sanitized(s);
-        remaining -= take;
-
-        if remaining > 0 {
-            let next = read_fat_entry(bpb, cluster, fat_buf);
-            if next >= 0x0FFF_FFF8 {
-                // 文件声明还有数据, 但 FAT 链已到 EOF: 数据不完整, 提前结束。
-                return;
-            }
-            cluster = next;
-        }
-    }
-}
-
-/// 沿 FAT 链把整个文件读入 `out` 缓冲 (须 >= file_size 字节)。
-/// 经 `file_buf` 逐簇中转拷贝, 最后一簇按 `file_size` 截断, 返回是否成功。
-fn read_file_into(
-    bpb: &Fat32Bpb,
-    start_cluster: u32,
-    file_size: u32,
+    offset: u32,
+    count: u32,
     fat_buf: *mut u8,
     file_buf: *mut u8,
     out: *mut u8,
-) -> bool {
+) -> u64 {
+    if offset >= file_size {
+        return 0;
+    }
+    let want = core::cmp::min(count, file_size - offset) as usize;
     let cluster_bytes = bpb.cluster_bytes() as usize;
-    let mut remaining = file_size as usize;
     let mut cluster = start_cluster;
-    let mut off = 0usize;
+    let mut absolute = 0usize; // 当前簇首字节在文件内的偏移
+    let mut copied = 0usize;
 
-    while remaining > 0 {
+    // 1. 跳过 offset 之前的整簇。
+    while absolute + cluster_bytes <= offset as usize {
+        absolute += cluster_bytes;
+        let next = read_fat_entry(bpb, cluster, fat_buf);
+        if next >= 0x0FFF_FFF8 {
+            return 0;
+        }
+        cluster = next;
+    }
+
+    // 2. 逐簇拷贝与 [offset, offset+want) 重叠的部分。
+    while copied < want {
         if !read_cluster(bpb, cluster, file_buf) {
-            return false;
+            return u64::MAX;
         }
-        let take = core::cmp::min(remaining, cluster_bytes);
+        let skip = (offset as usize).saturating_sub(absolute);
+        let take = core::cmp::min(want - copied, cluster_bytes - skip);
         unsafe {
-            core::ptr::copy_nonoverlapping(file_buf, out.add(off), take);
+            core::ptr::copy_nonoverlapping(file_buf.add(skip), out.add(copied), take);
         }
-        off += take;
-        remaining -= take;
+        copied += take;
+        absolute += cluster_bytes;
 
-        if remaining > 0 {
+        if copied < want {
             let next = read_fat_entry(bpb, cluster, fat_buf);
             if next >= 0x0FFF_FFF8 {
-                return false; // FAT 链提前结束, 数据不完整
+                break; // FAT 链提前结束: 数据不完整, 返回已读部分
             }
             cluster = next;
         }
     }
-    true
+    copied as u64
 }
 
-/// 打印定长字段, 去掉尾随空格 (用于 8.3 文件名)。
-fn print_padded(bytes: &[u8]) {
-    let mut end = bytes.len();
-    while end > 0 && bytes[end - 1] == b' ' {
-        end -= 1;
-    }
-    if end == 0 {
-        return;
-    }
-    let s = unsafe { core::str::from_utf8_unchecked(&bytes[..end]) };
-    print(s);
+/// 简单的字节缓冲写入器 (无分配器, 用于把目录列表写进结果页)。
+struct BufWriter {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
 }
 
-/// 打印目录项的 8.3 文件名 (主名 + '.' + 扩展名)。
-fn print_dir_name(entry: *const u8) {
+impl BufWriter {
+    fn new(ptr: *mut u8, cap: usize) -> Self {
+        BufWriter { ptr, len: 0, cap }
+    }
+
+    fn put(&mut self, b: u8) {
+        if self.len < self.cap {
+            unsafe {
+                core::ptr::write(self.ptr.add(self.len), b);
+            }
+            self.len += 1;
+        }
+    }
+
+    fn write(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            self.put(b);
+        }
+    }
+
+    fn write_u64(&mut self, mut v: u64) {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        for &b in &buf[i..] {
+            self.put(b);
+        }
+    }
+}
+
+/// 把目录项的 8.3 文件名 (主名 + '.' + 扩展名, 去尾随空格) 写入缓冲。
+fn write_dir_name(w: &mut BufWriter, entry: *const u8) {
     let name = unsafe { core::slice::from_raw_parts(entry, 8) };
     let ext = unsafe { core::slice::from_raw_parts(entry.add(8), 3) };
-    print_padded(name);
+
+    let mut end = name.len();
+    while end > 0 && name[end - 1] == b' ' {
+        end -= 1;
+    }
+    for &b in &name[..end] {
+        w.put(b);
+    }
+
     if ext[0] != b' ' {
-        print(".");
-        print_padded(ext);
+        w.put(b'.');
+        let mut eend = ext.len();
+        while eend > 0 && ext[eend - 1] == b' ' {
+            eend -= 1;
+        }
+        for &b in &ext[..eend] {
+            w.put(b);
+        }
     }
 }
 
-/// 遍历目录 (从 `dir_cluster` 起), 打印条目并读取普通文件内容。
-/// 当前为单层遍历 (不递归子目录); 文件内容沿 FAT 链跨簇完整读取。
-fn list_directory(
+/// 把目录 `dir_cluster` 的条目列表 (文本) 写入 `out`, 返回写入字节数; 失败返回 u64::MAX。
+fn readdir_into(
     bpb: &Fat32Bpb,
     dir_cluster: u32,
     dir_buf: *mut u8,
     fat_buf: *mut u8,
-    file_buf: *mut u8,
-) {
+    out: *mut u8,
+) -> u64 {
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
+    let mut w = BufWriter::new(out, 4096);
 
     loop {
-        print("disk: [dir] read cluster ");
-        print_u64(cluster as u64);
-        println("");
         if !read_cluster(bpb, cluster, dir_buf) {
-            println("disk: [dir] read_cluster FAILED");
-            return;
+            return u64::MAX;
         }
-        println("disk: [dir] cluster read OK");
-
         for i in 0..entries_per_cluster {
             let entry = unsafe { dir_buf.add(i * 32) };
             let first = unsafe { *entry };
             if first == 0x00 {
-                return; // 目录结束
+                return w.len as u64; // 目录结束
             }
             if first == 0xE5 {
                 continue; // 已删除
@@ -1141,9 +1197,6 @@ fn list_directory(
                 continue; // 卷标
             }
 
-            let cluster_hi = read_u16(unsafe { entry.add(20) }) as u32;
-            let cluster_lo = read_u16(unsafe { entry.add(26) }) as u32;
-            let start_cluster = (cluster_hi << 16) | cluster_lo;
             let file_size = read_u32(unsafe { entry.add(28) });
 
             if attr & ATTR_DIRECTORY != 0 {
@@ -1151,32 +1204,22 @@ fn list_directory(
                 if first == b'.' {
                     continue;
                 }
-                print("  [DIR]  ");
-                print_dir_name(entry);
-                println("");
+                w.write("[DIR]  ");
+                write_dir_name(&mut w, entry);
+                w.write("\n");
             } else {
-                print("  [FILE] ");
-                print_dir_name(entry);
-                print("  size=");
-                print_u64(file_size as u64);
-                println("");
-
-                // 读取并打印文件内容 (沿 FAT 链跨簇读取, 按 file_size 截断)。
-                if file_size > 0 && start_cluster >= 2 {
-                    print("        content: \"");
-                    read_file(bpb, start_cluster, file_size, fat_buf, file_buf);
-                    println("\"");
-                }
+                w.write("[FILE] ");
+                write_dir_name(&mut w, entry);
+                w.write(" size=");
+                w.write_u64(file_size as u64);
+                w.write("\n");
             }
         }
 
-        // 读下一个簇。
+        // 跨簇: 读下一个目录簇。
         let next = read_fat_entry(bpb, cluster, fat_buf);
-        print("disk: [fat] next=");
-        print_hex(next as u64);
-        println("");
         if next >= 0x0FFF_FFF8 {
-            break;
+            return w.len as u64;
         }
         cluster = next;
     }
@@ -1333,45 +1376,39 @@ fn resolve_path(
     None
 }
 
-/// 按正斜杠路径读取整个文件并安全打印内容 (沿 FAT 链跨簇读取)。
-fn read_file_by_path(
+/// 解析 open 路径: 空路径或单个 "/" 视为根目录, 其余按正斜杠路径解析。
+fn resolve_open_path(
     bpb: &Fat32Bpb,
     path: &str,
     dir_buf: *mut u8,
     fat_buf: *mut u8,
-    file_buf: *mut u8,
-) {
-    print("disk: resolve path \"");
-    print(path);
-    println("\"");
-    match resolve_path(bpb, path, dir_buf, fat_buf) {
-        None => {
-            println("  -> NOT FOUND");
-        }
-        Some(info) => {
-            if info.attr & ATTR_DIRECTORY != 0 {
-                println("  -> is a directory (no content)");
-                return;
-            }
-            print("  -> cluster=");
-            print_u64(info.start_cluster as u64);
-            print(" size=");
-            print_u64(info.file_size as u64);
-            println("");
-            if info.file_size > 0 && info.start_cluster >= 2 {
-                print("  content: \"");
-                read_file(bpb, info.start_cluster, info.file_size, fat_buf, file_buf);
-                println("\"");
-            }
-        }
+) -> Option<DirEntryInfo> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Some(DirEntryInfo {
+            start_cluster: bpb.root_cluster,
+            file_size: 0,
+            attr: ATTR_DIRECTORY,
+        });
     }
+    resolve_path(bpb, path, dir_buf, fat_buf)
 }
 
-/// 域 5 — 块设备服务 (block_srv): 封装 IDE PIO, 经 IPC 提供 read_lba。
+/// 域 5 — 块设备服务: 优先 NVMe (若内核已配置), 否则 IDE PIO 回退。
 ///
 /// 接收 `BlockReq` (op/lba/count/buf), 读扇区写入调用方共享的缓冲页,
 /// 回复状态 tag (1=成功, 0=失败)。数据经共享页零拷贝回传, IPC 仅传控制信息。
 fn block_main() {
+    let magic = unsafe { core::ptr::read_volatile(NVME_CFG_VADDR as *const u64) };
+    if magic == NVME_CONFIG_MAGIC {
+        nvme_main();
+    } else {
+        ide_block_main();
+    }
+}
+
+/// 域 5 — IDE PIO 块设备服务 (无 NVMe 控制器时回退)。
+fn ide_block_main() {
     println("block (domain 5) starting...");
 
     loop {
@@ -1384,9 +1421,6 @@ fn block_main() {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
 
         if msg.tag != BLOCK_REQ_TAG {
-            print("block: recv unknown tag=0x");
-            print_hex(msg.tag);
-            println("");
             sys_reply(0);
             continue;
         }
@@ -1394,15 +1428,6 @@ fn block_main() {
         // 从 payload 解出块设备请求。
         let req: BlockReq =
             unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
-        print("block: req op=");
-        print_u64(req.op);
-        print(" lba=");
-        print_u64(req.lba);
-        print(" count=");
-        print_u64(req.count);
-        print(" buf=0x");
-        print_hex(req.buf);
-        println("");
 
         match req.op {
             0 => {
@@ -1418,8 +1443,65 @@ fn block_main() {
     }
 }
 
+/// fat32_srv 打开节点描述符表 (静态, 单任务独占访问, 无需锁)。
+const MAX_FD: usize = 16;
+
+#[derive(Clone, Copy)]
+struct OpenNode {
+    is_dir: bool,
+    start_cluster: u32,
+    file_size: u32,
+}
+
+static mut FD_TABLE: [Option<OpenNode>; MAX_FD] = [None; MAX_FD];
+
+/// 分配一个空闲 fd 槽位, 返回 fd (0..MAX_FD), 表满返回 u64::MAX。
+fn fd_alloc(is_dir: bool, start_cluster: u32, file_size: u32) -> u64 {
+    unsafe {
+        let base = core::ptr::addr_of_mut!(FD_TABLE).cast::<Option<OpenNode>>();
+        for i in 0..MAX_FD {
+            let slot = base.add(i);
+            if (*slot).is_none() {
+                *slot = Some(OpenNode {
+                    is_dir,
+                    start_cluster,
+                    file_size,
+                });
+                return i as u64;
+            }
+        }
+    }
+    u64::MAX
+}
+
+/// 查询 fd 对应的节点描述符。
+fn fd_lookup(fd: u32) -> Option<OpenNode> {
+    if (fd as usize) >= MAX_FD {
+        return None;
+    }
+    unsafe { *core::ptr::addr_of!(FD_TABLE).cast::<Option<OpenNode>>().add(fd as usize) }
+}
+
+/// 释放 fd, 成功返回 1, 失败返回 0。
+fn fd_free(fd: u32) -> u64 {
+    if (fd as usize) >= MAX_FD {
+        return 0;
+    }
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(FD_TABLE)
+            .cast::<Option<OpenNode>>()
+            .add(fd as usize);
+        if (*slot).is_some() {
+            *slot = None;
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// 域 6 — FAT32 文件服务 (fat32_srv): 经 IPC 请求 block_srv 读扇区,
-/// 解析 BPB / FAT / 目录 / 路径, 提供文件读取能力。
+/// 解析 BPB / FAT / 目录 / 路径, 提供 open/read/readdir/close。
 fn fat32_main() {
     println("fat32 (domain 6) starting...");
 
@@ -1437,7 +1519,6 @@ fn fat32_main() {
         println("fat32: alloc buffer FAILED");
         return;
     }
-    println("fat32: [1] buffers allocated");
 
     // 把缓冲页共享给 block_srv (同地址映射), 使其能直接写入读到的扇区数据。
     if sys_share_page(bpb_buf, BLOCK_DOMAIN) != 1
@@ -1448,75 +1529,22 @@ fn fat32_main() {
         println("fat32: share buffer FAILED");
         return;
     }
-    println("fat32: [2] buffers shared with block_srv");
 
     // 经 block_srv 读 LBA 0 并解析 BPB。
     if !block_read(0, 1, bpb_buf as *mut u8) {
         println("fat32: read LBA 0 FAILED");
         return;
     }
-    println("fat32: [3] LBA0 read OK");
     let bpb = Fat32Bpb::parse(bpb_buf as *const u8);
-    println("fat32: [4] BPB parsed");
 
     // 引导签名校验 (offset 510 = 0x55, 511 = 0xAA)。
     let sig = read_u16((bpb_buf + 510) as *const u8);
-    print("fat32: sector 0 signature = 0x");
-    print_hex(sig as u64);
-    if sig == 0xAA55 {
-        println(" (boot signature OK)");
-    } else {
-        println(" (not a boot sector)");
+    if sig != 0xAA55 {
+        println("fat32: not a boot sector");
         return;
     }
-    println("fat32: [5] signature OK");
 
-    // BPB 摘要。
-    print("fat32: bps=");
-    print_u64(bpb.bytes_per_sector as u64);
-    print(" spc=");
-    print_u64(bpb.sectors_per_cluster as u64);
-    print(" rsvd=");
-    print_u64(bpb.reserved_sectors as u64);
-    print(" fats=");
-    print_u64(bpb.num_fats as u64);
-    print(" fat_size=");
-    print_u64(bpb.fat_size as u64);
-    print(" root_cluster=");
-    print_u64(bpb.root_cluster as u64);
-    println("");
-    println("fat32: [6] about to list_directory");
-
-    // 遍历根目录, 列出文件并读取内容。
-    list_directory(
-        &bpb,
-        bpb.root_cluster,
-        dir_buf as *mut u8,
-        fat_buf as *mut u8,
-        file_buf as *mut u8,
-    );
-
-    println("fat32: [7] list_directory returned");
-
-    // 路径解析演示: 正斜杠定位文件 (含子目录递归)。
-    println("fat32: [8] path resolution demo");
-    read_file_by_path(
-        &bpb,
-        "/HELLO.TXT",
-        dir_buf as *mut u8,
-        fat_buf as *mut u8,
-        file_buf as *mut u8,
-    );
-    read_file_by_path(
-        &bpb,
-        "/DIR1/NESTED.TXT",
-        dir_buf as *mut u8,
-        fat_buf as *mut u8,
-        file_buf as *mut u8,
-    );
-
-    // 服务循环: 接收文件读取请求 (payload 为 null 结尾路径), 读文件到共享
-    // 结果页 RESULT_BUF, 回复文件大小 (失败回复 u64::MAX)。
+    // 服务循环: 经 IPC 提供 open / read / readdir / close (见 vfs.rs 协议)。
     loop {
         let mut msg = Message {
             from: 0,
@@ -1526,26 +1554,57 @@ fn fat32_main() {
         };
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
 
-        if msg.tag != FILE_READ_TAG {
-            sys_reply(u64::MAX);
-            continue;
-        }
-
-        // payload 为 null 结尾的路径字符串。
-        let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(32);
-        let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
-
-        match resolve_path(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8) {
-            Some(info) if info.attr & ATTR_DIRECTORY == 0 && info.start_cluster >= 2 => {
-                let ok = read_file_into(
-                    &bpb,
-                    info.start_cluster,
-                    info.file_size,
-                    fat_buf as *mut u8,
-                    file_buf as *mut u8,
-                    RESULT_BUF as *mut u8,
-                );
-                sys_reply(if ok { info.file_size as u64 } else { u64::MAX });
+        match msg.tag {
+            vfs::VFS_OPEN_TAG => {
+                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(32);
+                let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
+                let fd = match resolve_open_path(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8)
+                {
+                    Some(info) => fd_alloc(
+                        info.attr & ATTR_DIRECTORY != 0,
+                        info.start_cluster,
+                        info.file_size,
+                    ),
+                    None => u64::MAX,
+                };
+                sys_reply(fd);
+            }
+            vfs::VFS_READ_TAG => {
+                let req: vfs::ReadReq = unsafe {
+                    core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
+                };
+                let n = match fd_lookup(req.fd) {
+                    Some(node) if !node.is_dir => read_file_range(
+                        &bpb,
+                        node.start_cluster,
+                        node.file_size,
+                        req.offset,
+                        req.count,
+                        fat_buf as *mut u8,
+                        file_buf as *mut u8,
+                        vfs::RESULT_BUF as *mut u8,
+                    ),
+                    _ => u64::MAX,
+                };
+                sys_reply(n);
+            }
+            vfs::VFS_READDIR_TAG => {
+                let fd = read_u32(msg.payload.as_ptr()) as u32;
+                let n = match fd_lookup(fd) {
+                    Some(node) if node.is_dir => readdir_into(
+                        &bpb,
+                        node.start_cluster,
+                        dir_buf as *mut u8,
+                        fat_buf as *mut u8,
+                        vfs::RESULT_BUF as *mut u8,
+                    ),
+                    _ => u64::MAX,
+                };
+                sys_reply(n);
+            }
+            vfs::VFS_CLOSE_TAG => {
+                let fd = read_u32(msg.payload.as_ptr()) as u32;
+                sys_reply(fd_free(fd));
             }
             _ => {
                 sys_reply(u64::MAX);
@@ -1554,42 +1613,58 @@ fn fat32_main() {
     }
 }
 
-/// 域 7 — 测试应用: 经 libvfs 请求 fat32_srv 读取文件。
+/// 域 7 — 测试应用: 经 libvfs 请求 fat32_srv 读取文件与列出目录。
 fn app_main() {
     println("app (domain 7) starting...");
 
-    // 分配结果页并共享给 fat32_srv (同地址映射), 供其写入文件内容。
-    if sys_alloc_page(RESULT_BUF) != 1 {
+    // 分配结果页并共享给 fat32_srv (同地址映射), 供其写入文件/目录内容。
+    if sys_alloc_page(vfs::RESULT_BUF) != 1 {
         println("app: alloc result buf FAILED");
         return;
     }
-    if sys_share_page(RESULT_BUF, FAT32_DOMAIN) != 1 {
+    if sys_share_page(vfs::RESULT_BUF, vfs::FAT32_DOMAIN) != 1 {
         println("app: share result buf FAILED");
         return;
     }
 
-    // 经 libvfs 读文件 (路径经 IPC payload 传递, 内容经共享页零拷贝回传)。
-    let size = vfs_read("/HELLO.TXT");
+    // 1. open -> read -> close: 读整个文件。
+    let fd = vfs::open("/HELLO.TXT");
+    if fd == u64::MAX {
+        println("app: open \"/HELLO.TXT\" -> NOT FOUND");
+        return;
+    }
+    let size = vfs::read(fd, 0, 4096);
     if size == u64::MAX {
-        println("app: read \"/HELLO.TXT\" -> NOT FOUND");
+        println("app: read \"/HELLO.TXT\" -> FAILED");
     } else {
-        let content = unsafe { core::slice::from_raw_parts(RESULT_BUF as *const u8, size as usize) };
+        let content =
+            unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, size as usize) };
         let s = unsafe { core::str::from_utf8_unchecked(content) };
         print("app: read \"/HELLO.TXT\" = \"");
         print_sanitized(s);
         println("\"");
     }
+    vfs::close(fd);
+
+    // 2. open("/") -> readdir -> close: 列出根目录。
+    let dfd = vfs::open("/");
+    if dfd == u64::MAX {
+        println("app: open \"/\" -> FAILED");
+        return;
+    }
+    let n = vfs::readdir(dfd);
+    if n == u64::MAX {
+        println("app: readdir \"/\" -> FAILED");
+    } else {
+        println("app: readdir \"/\" ->");
+        let listing =
+            unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, n as usize) };
+        print(unsafe { core::str::from_utf8_unchecked(listing) });
+        println("");
+    }
+    vfs::close(dfd);
 
     println("app done, exiting...");
-}
-
-/// libvfs 客户端: 经 fat32_srv 读取文件, 返回文件大小 (失败返回 u64::MAX)。
-/// 文件内容写入共享结果页 RESULT_BUF。
-fn vfs_read(path: &str) -> u64 {
-    let mut payload = [0u8; 32];
-    let n = path.len().min(31);
-    payload[..n].copy_from_slice(&path.as_bytes()[..n]);
-    sys_call_payload(FAT32_DOMAIN, FILE_READ_TAG, &payload)
 }
 
 #[cfg(target_os = "none")]

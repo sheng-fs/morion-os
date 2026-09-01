@@ -189,10 +189,18 @@ pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
 
     let mut allocator = KernelFrameAllocator;
     unsafe {
-        mapper
-            .map_to(page, frame, flags, &mut allocator)
-            .expect("map_user_page: map failed")
-            .flush();
+        let result = mapper.map_to(page, frame, flags, &mut allocator);
+        if let Err(ref e) = result {
+            let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+            let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+            let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+            let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+            panic!(
+                "map_user_page: map failed {:?} dom={} vaddr=0x{:x} paddr=0x{:x} p4/p3/p2/p1={}/{}/{}/{}",
+                e, domain_id, vaddr, paddr, p4, p3, p2, p1
+            );
+        }
+        result.unwrap().flush();
     }
 }
 

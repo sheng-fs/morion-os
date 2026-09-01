@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, pager, scheduler, syscall, video};
+use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, nvme, pager, scheduler, syscall, video};
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -23,8 +23,8 @@ extern "C" {
 const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
 /// 用户栈页虚拟地址。
 ///
-/// 不能紧邻程序镜像 (程序已超 1 页, 会与镜像第二页重叠); 也不得占用
-/// `USER_BASE + 0x3000` (用户态 sender/receiver 共享页演示) 与
+/// 不能紧邻程序镜像 (程序已超 1 页, 会与镜像后续页重叠); 也不得占用
+/// `USER_BASE + 0x9000` (用户态 sender/receiver 共享页演示) 与
 /// `USER_BASE + 0x10000` 起的 NVMe 配置/MMIO/DMA 区域。故预留 0x8000 起。
 const USER_STACK_ADDR: u64 = USER_BASE + 0x8000;
 /// 用户栈顶虚拟地址 (栈向下增长)。
@@ -262,6 +262,21 @@ pub extern "C" fn _start() -> ! {
     cap::grant(app_domain, cap::Capability::SendTo(fat32_domain));
     cap::grant(app_domain, cap::Capability::MapInto(fat32_domain));
     video::println("[OK] IPC + capability + pager initialized (8 domains)");
+
+    // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
+    // 找到则映射 BAR0/队列/DMA 并授权 Mmio; 否则降级 (magic=0), block 回退 IDE PIO。
+    match arch::pci::find_nvme(&pci_devices) {
+        Some((_bus, _dev, _func, bar0)) => {
+            nvme::setup(block_domain, bar0);
+            video::print("[OK] NVMe controller BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+        }
+        None => {
+            nvme::setup_empty(block_domain);
+            video::println("[OK] no NVMe controller, block falls back to IDE PIO");
+        }
+    }
 
     // 加载用户程序到八个域 (同一镜像, 经 domain_id 参数区分角色)。
     load_user_program(sender_domain);

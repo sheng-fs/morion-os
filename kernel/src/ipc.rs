@@ -173,27 +173,26 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     }
     crate::scheduler::wake_one(to);
 
-    // 阻塞等待回复; 被 `reply` 唤醒后回到此处, 从自己邮箱取回复。
-    crate::scheduler::block_current(me);
+    // 阻塞等待回复。本域可能既是 client (向 `to` 发请求) 又是 server (接收
+    // 其它域的请求), 发往本域的无关消息也会经 `wake_one(me)` 提前唤醒当前任务;
+    // 故须循环阻塞, 直到真正收到来自 `to` 的回复为止。被无关消息唤醒时, 该消息
+    // 仍留在本域邮箱, 交由后续 `receive` 处理。
+    loop {
+        crate::scheduler::block_current(me);
 
-    // 邮箱里可能同时排着其它域发来的请求 (本域既是 client 又是 server, 如
-    // fat32 同时服务于 app 的 vfs_read 并作为 client 调用 block_srv)。直接
-    // `pop_front` 会把排在回复之前的请求误当作回复, 故按 `from == to` 精确匹配
-    // 回复来源。
-    let reply = {
-        let mut boxes = MAILBOXES.lock();
-        let mbox = &mut boxes[me as usize];
-        let idx = mbox.iter().position(|m| m.from == to);
-        idx.and_then(|i| mbox.remove(i))
-    };
-    x86_64::instructions::interrupts::enable();
+        let reply = {
+            let mut boxes = MAILBOXES.lock();
+            let mbox = &mut boxes[me as usize];
+            let idx = mbox.iter().position(|m| m.from == to);
+            idx.and_then(|i| mbox.remove(i))
+        };
 
-    reply.unwrap_or(Message {
-        from: 0,
-        to: 0,
-        tag: u64::MAX,
-        payload: [0; PAYLOAD_LEN],
-    })
+        if let Some(r) = reply {
+            x86_64::instructions::interrupts::enable();
+            return r;
+        }
+        // 被无关消息唤醒: 继续阻塞, 等待真正的回复。
+    }
 }
 
 /// 回复当前任务最近一次 `receive` 到的调用者 (回复目标由 `receive` 记录)。
