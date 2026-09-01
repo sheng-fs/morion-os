@@ -5,6 +5,7 @@
 //! `CONVENTIONAL` 且位于内核镜像之后的帧标记为空闲。
 
 use crate::bootinfo::{BootInfo, MemoryDescriptor, MEMORY_CONVENTIONAL};
+use spin::Mutex;
 
 /// 帧大小 (4 KiB)
 pub const FRAME_SIZE: usize = 4096;
@@ -16,6 +17,9 @@ const MAX_MANAGED_FRAMES: usize = BITMAP_SIZE * 8;
 static mut FRAME_BITMAP: [u8; BITMAP_SIZE] = [0; BITMAP_SIZE];
 static mut TOTAL_FRAMES: usize = 0;
 static mut FREE_FRAMES: usize = 0;
+
+/// 保护位图与引用计数表的自旋锁 (须在关中断或原子上下文中使用)。
+static FRAME_LOCK: Mutex<()> = Mutex::new(());
 
 // 链接脚本导出的内核镜像结束地址
 extern "C" {
@@ -96,6 +100,7 @@ pub fn init(info: &BootInfo) {
 
 /// 分配一个空闲物理帧, 返回其物理地址。
 pub fn allocate_frame() -> Option<u64> {
+    let _guard = FRAME_LOCK.lock();
     for idx in 0..MAX_MANAGED_FRAMES {
         if !bitmap_test(idx) {
             bitmap_set(idx);
@@ -114,6 +119,7 @@ pub fn allocate_frames(count: usize) -> Option<u64> {
     if count == 0 {
         return None;
     }
+    let _guard = FRAME_LOCK.lock();
     let mut run = 0usize;
     let mut run_start = 0usize;
     for idx in 0..MAX_MANAGED_FRAMES {
@@ -138,6 +144,7 @@ pub fn allocate_frames(count: usize) -> Option<u64> {
 
 /// 释放一个物理帧。
 pub fn free_frame(addr: u64) {
+    let _guard = FRAME_LOCK.lock();
     let idx = (addr / FRAME_SIZE as u64) as usize;
     if idx < MAX_MANAGED_FRAMES && bitmap_test(idx) {
         bitmap_clear(idx);
@@ -153,29 +160,36 @@ pub fn free_frame(addr: u64) {
 // 镜像页与栈帧 (load_user_program) 不纳入, 其生命周期随任务。
 const MAX_SHARED_FRAMES: usize = 64;
 
-static mut SHARED_FRAMES: [(u64, u8); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
+static mut SHARED_FRAMES: [(u64, u16); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
 
 /// 增加某物理帧的引用计数 (已存在则递增, 否则插入新槽位)。
-pub fn inc_ref(addr: u64) {
+/// 返回 `false` 表示引用计数表已满或溢出, 调用方应回滚已分配的帧。
+pub fn inc_ref(addr: u64) -> bool {
+    let _guard = FRAME_LOCK.lock();
     unsafe {
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.0 == addr && slot.1 > 0 {
-                slot.1 += 1;
-                return;
+                if slot.1 < u16::MAX {
+                    slot.1 += 1;
+                    return true;
+                }
+                return false; // 溢出保护
             }
         }
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.1 == 0 {
                 slot.0 = addr;
                 slot.1 = 1;
-                return;
+                return true;
             }
         }
     }
+    false // 表已满
 }
 
 /// 减少某物理帧的引用计数; 返回是否降为 0 (即应真正释放)。
 pub fn dec_ref(addr: u64) -> bool {
+    let _guard = FRAME_LOCK.lock();
     unsafe {
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.0 == addr && slot.1 > 0 {

@@ -261,6 +261,10 @@ pub extern "C" fn _start() -> ! {
     }
     // 授权: 键盘驱动域注册接收 IRQ1 (Stage 16)。
     cap::grant(kbd_domain, cap::Capability::Irq(1));
+    // 授权: block_srv 访问 IDE PIO 端口 (0x1F0..=0x1F7)。
+    for port in 0x1F0..=0x1F7 {
+        cap::grant(block_domain, cap::Capability::IoPort(port));
+    }
     // 授权: fat32_srv 经 IPC 调 block_srv (SendTo) 并共享缓冲页 (MapInto)。
     cap::grant(fat32_domain, cap::Capability::SendTo(block_domain));
     cap::grant(fat32_domain, cap::Capability::MapInto(block_domain));

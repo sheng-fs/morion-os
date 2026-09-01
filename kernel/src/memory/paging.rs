@@ -411,4 +411,26 @@ mod tests {
         assert!(is_user_address(USER_SPACE_BASE + 0x3000));
         assert!(is_user_address(0x0000_00FF_FFFF_FFFF)); // P4[1] 末尾
     }
+
+    /// 边界测试: P4[1] 范围外的邻近地址必须被拒绝。
+    #[test]
+    fn is_user_address_rejects_nearby_kernel_addresses() {
+        // P4[0] 的最高地址 (紧邻 P4[1] 下方)。
+        assert!(!is_user_address(USER_SPACE_BASE - 1));
+        // P4[2] 的起始地址 (紧邻 P4[1] 上方)。
+        assert!(!is_user_address(0x0000_0100_0000_0000));
+        // 非 canonical 地址 (bit47=1 但不在高半区)。
+        assert!(!is_user_address(0x0000_9000_0000_0000));
+    }
+
+    /// 安全回归: 确保内核关键地址不被误识别为用户地址。
+    #[test]
+    fn is_user_address_rejects_critical_kernel_addresses() {
+        // 帧缓冲通常位于低 4 GiB 恒等映射区。
+        assert!(!is_user_address(0x0000_0000_000B_8000)); // VGA 文本缓冲典型地址
+        // 内核镜像起始附近。
+        assert!(!is_user_address(0x0000_0000_0010_0000));
+        // 内核栈 (HEAP_START 附近高位)。
+        assert!(!is_user_address(0x4444_4444_0000));
+    }
 }

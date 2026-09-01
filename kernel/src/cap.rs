@@ -19,6 +19,8 @@ pub enum Capability {
     Irq(u8),
     /// 把指定物理基址 (页对齐) 的 MMIO 区域映射进本域的能力。
     Mmio(u64),
+    /// 访问指定 I/O 端口的能力 (供用户态设备驱动, 如 IDE PIO)。
+    IoPort(u16),
 }
 
 /// 每域能力槽数量。
@@ -80,4 +82,39 @@ pub fn revoke(domain: u64, cap: Capability) -> bool {
         x86_64::instructions::interrupts::enable();
     }
     ok
+}
+
+#[cfg(all(test, target_os = "none"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ioport_capability_grant_and_check() {
+        init(2);
+        assert!(!has(0, Capability::IoPort(0x1F0)));
+        assert!(grant(0, Capability::IoPort(0x1F0)));
+        assert!(has(0, Capability::IoPort(0x1F0)));
+        assert!(!has(0, Capability::IoPort(0x1F1))); // 不同端口视为不同能力
+        assert!(!has(1, Capability::IoPort(0x1F0))); // 不同域不共享
+    }
+
+    #[test]
+    fn ioport_capability_revoke() {
+        init(1);
+        grant(0, Capability::IoPort(0x1F0));
+        assert!(has(0, Capability::IoPort(0x1F0)));
+        assert!(revoke(0, Capability::IoPort(0x1F0)));
+        assert!(!has(0, Capability::IoPort(0x1F0)));
+    }
+
+    #[test]
+    fn capability_slot_limit() {
+        init(1);
+        // 填满 16 个槽
+        for i in 0..CAP_SLOTS {
+            assert!(grant(0, Capability::IoPort(i as u16)));
+        }
+        // 第 17 个应失败
+        assert!(!grant(0, Capability::IoPort(99)));
+    }
 }

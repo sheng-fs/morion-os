@@ -66,12 +66,16 @@ pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {
 
     let ok = {
         let mut boxes = MAILBOXES.lock();
-        let mbox = &mut boxes[to as usize];
-        if mbox.len() >= MAILBOX_CAP {
+        if to as usize >= boxes.len() {
             false
         } else {
-            mbox.push_back(msg);
-            true
+            let mbox = &mut boxes[to as usize];
+            if mbox.len() >= MAILBOX_CAP {
+                false
+            } else {
+                mbox.push_back(msg);
+                true
+            }
         }
     };
 
@@ -169,6 +173,15 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     msg.payload[..n].copy_from_slice(&payload[..n]);
     {
         let mut boxes = MAILBOXES.lock();
+        if to as usize >= boxes.len() {
+            x86_64::instructions::interrupts::enable();
+            return Message {
+                from: 0,
+                to: 0,
+                tag: u64::MAX,
+                payload: [0; PAYLOAD_LEN],
+            };
+        }
         boxes[to as usize].push_back(msg);
     }
     crate::scheduler::wake_one(to);

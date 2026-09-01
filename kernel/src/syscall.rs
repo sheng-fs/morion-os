@@ -160,6 +160,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
             let msg = crate::ipc::receive();
             if a1 != 0 {
+                // 拒绝向内核地址写入, 防止用户态覆盖内核内存。
+                if !crate::memory::paging::is_user_address(a1) {
+                    return 0;
+                }
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         &msg as *const crate::ipc::Message as *const u8,
@@ -193,7 +197,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             };
             let domain = crate::scheduler::current_domain();
             crate::memory::paging::map_user_page(domain, a1, paddr);
-            crate::memory::frame_allocator::inc_ref(paddr);
+            if !crate::memory::frame_allocator::inc_ref(paddr) {
+                // 引用计数表已满: 回滚映射并释放帧, 避免内存泄漏。
+                crate::memory::paging::unmap_user_page(domain, a1);
+                crate::memory::frame_allocator::free_frame(paddr);
+                return 0;
+            }
             1
         }
         SYS_SHARE_PAGE => {
@@ -208,7 +217,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 match crate::memory::paging::resolve_user_page(from, a1) {
                     Some(paddr) => {
                         crate::memory::paging::map_user_page(a2, a1, paddr);
-                        crate::memory::frame_allocator::inc_ref(paddr);
+                        if !crate::memory::frame_allocator::inc_ref(paddr) {
+                            // 引用计数表已满: 回滚映射。
+                            crate::memory::paging::unmap_user_page(a2, a1);
+                            return 0;
+                        }
                         1
                     }
                     None => 0,
@@ -251,7 +264,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                             );
                         }
                         crate::memory::paging::map_user_page(a1, a2, p);
-                        crate::memory::frame_allocator::inc_ref(p);
+                        if !crate::memory::frame_allocator::inc_ref(p) {
+                            // 引用计数表已满: 回滚映射并释放帧。
+                            crate::memory::paging::unmap_user_page(a1, a2);
+                            crate::memory::frame_allocator::free_frame(p);
+                            return 0;
+                        }
                         1
                     }
                     None => 0,
@@ -319,26 +337,48 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_PORT_IN8 => {
             // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            // 须持有 Capability::IoPort(port)。
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).read() as u64 }
+            let domain = crate::scheduler::current_domain();
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u8>::new(port).read() as u64 }
+            } else {
+                0
+            }
         }
         SYS_PORT_IN16 => {
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).read() as u64 }
+            let domain = crate::scheduler::current_domain();
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u16>::new(port).read() as u64 }
+            } else {
+                0
+            }
         }
         SYS_PORT_OUT8 => {
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).write(a2 as u8) };
+            let domain = crate::scheduler::current_domain();
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u8>::new(port).write(a2 as u8) };
+            }
             0
         }
         SYS_PORT_OUT16 => {
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).write(a2 as u16) };
+            let domain = crate::scheduler::current_domain();
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u16>::new(port).write(a2 as u16) };
+            }
             0
         }
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            // 必须校验地址为用户空间, 防止信息泄露; 长度限制在一页避免无界读取。
+            const MAX_PUTS_LEN: u64 = 4096;
+            if !crate::memory::paging::is_user_address(a1) || a2 > MAX_PUTS_LEN {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
             let s = unsafe { core::str::from_utf8_unchecked(slice) };
             crate::video::print(s);
