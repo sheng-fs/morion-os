@@ -19,6 +19,11 @@ pub enum Capability {
     Irq(u8),
     /// 把指定物理基址 (页对齐) 的 MMIO 区域映射进本域的能力。
     Mmio(u64),
+    /// 访问指定 I/O 端口 (x86 IN/OUT) 的能力。
+    ///
+    /// 与 `Mmio` (MMIO 内存映射寄存器) 区分: I/O 端口是独立地址空间,
+    /// 某些设备 (如 PIT / PIC / 传统 IDE PIO) 仅通过 I/O 端口暴露。
+    IoPort(u16),
 }
 
 /// 每域能力槽数量。
@@ -80,4 +85,44 @@ pub fn revoke(domain: u64, cap: Capability) -> bool {
         x86_64::instructions::interrupts::enable();
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capability;
+
+    /// 编码安全契约: IoPort(port) 能力必须能精确区分不同端口, 且与
+    /// Mmio/Irq 等其它能力类型不发生意外的相等匹配。
+    #[test]
+    fn io_port_capability_semantics() {
+        let a = Capability::IoPort(0x1F0);
+        let b = Capability::IoPort(0x1F0);
+        let c = Capability::IoPort(0x1F1);
+        let d = Capability::Mmio(0xF000_0000);
+        let e = Capability::Irq(0);
+
+        // 同端口 → 相等
+        assert_eq!(a, b);
+        // 不同端口 → 不等
+        assert_ne!(a, c);
+        // 与其它能力类型 → 不等
+        assert_ne!(a, d);
+        assert_ne!(a, e);
+
+        // Clone / Copy 必须保留值
+        let a2 = a;
+        assert_eq!(a, a2);
+    }
+
+    /// 同类型不同 payload 的 Capability 不能互相替代 —
+    /// IoPort(0x1F0) != IoPort(0x1F1) 意味着攻击者无法通过持有相邻端口
+    /// 的能力来"扩展"权限范围。
+    #[test]
+    fn capability_payload_is_significant() {
+        assert_ne!(Capability::SendTo(1), Capability::SendTo(2));
+        assert_ne!(Capability::MapInto(1), Capability::MapInto(2));
+        assert_ne!(Capability::Irq(1), Capability::Irq(2));
+        assert_ne!(Capability::Mmio(0x1000), Capability::Mmio(0x2000));
+        assert_ne!(Capability::IoPort(0x1F0), Capability::IoPort(0x1F7));
+    }
 }

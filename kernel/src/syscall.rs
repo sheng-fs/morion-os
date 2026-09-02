@@ -319,23 +319,45 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_PORT_IN8 => {
-            // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            // 从 I/O 端口 a1 读一个字节。
+            // 需持有该端口的 Capability::IoPort(port) — 否则任意域都能读写
+            // PIT/PIC/IDE 等系统级设备寄存器, 破坏隔离边界。
+            let domain = crate::scheduler::current_domain();
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).read() as u64 }
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u8>::new(port).read() as u64 }
+            } else {
+                0 // 无能力, 返回零值而非 panic (用户态无法区分"真读到 0"和"被拒绝")
+            }
         }
         SYS_PORT_IN16 => {
+            let domain = crate::scheduler::current_domain();
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).read() as u64 }
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u16>::new(port).read() as u64 }
+            } else {
+                0
+            }
         }
         SYS_PORT_OUT8 => {
+            let domain = crate::scheduler::current_domain();
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).write(a2 as u8) };
-            0
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u8>::new(port).write(a2 as u8) };
+                0
+            } else {
+                0
+            }
         }
         SYS_PORT_OUT16 => {
+            let domain = crate::scheduler::current_domain();
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).write(a2 as u16) };
-            0
+            if crate::cap::has(domain, crate::cap::Capability::IoPort(port)) {
+                unsafe { Port::<u16>::new(port).write(a2 as u16) };
+                0
+            } else {
+                0
+            }
         }
         SYS_VIRT_TO_PHYS => {
             // 把当前域用户虚拟地址 `a1` 反查为物理地址 (供 NVMe 等 DMA 驱动填 PRP)。
@@ -347,13 +369,36 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_PUTS => {
-            // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
-            // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
-            let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
-            crate::video::print(s);
-            0
-        }
+              // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
+              // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+              //
+              // 信任边界: 必须校验指针落在用户空间且不溢出 / 不越过边界,
+              // 否则恶意域传入内核地址 (恒等映射 / 内核堆 / 内核栈等) 可把
+              // 内核敏感数据泄露到屏幕。
+              let ptr = a1;
+              let len = a2 as usize;
+              if len == 0 {
+                  return 0;
+              }
+              if ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
+                  return 0;
+              }
+              // ptr + len - 1 不得溢出 64 位, 且仍必须落在用户空间
+              let end_ptr = match ptr.checked_add(len as u64) {
+                  Some(v) => v,
+                  None => return 0,
+              };
+              // 检查末尾字节是否仍在用户空间 (跨过 P4[1]/P4[2] 边界即拒绝)
+              if !crate::memory::paging::is_user_address(end_ptr - 1) {
+                  return 0;
+              }
+              // 单次最多 4096 字节, 防止超大分配导致不可控的 I/O 时间
+              let len = len.min(4096);
+              let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+              let s = unsafe { core::str::from_utf8_unchecked(slice) };
+              crate::video::print(s);
+              0
+          }
         SYS_EXIT => crate::scheduler::exit_current(),
         _ => 0,
     }

@@ -261,6 +261,12 @@ pub extern "C" fn _start() -> ! {
     // 授权: app 经 IPC 调 fat32_srv 读文件 (阶段 C), 并共享结果页 (MapInto)。
     cap::grant(app_domain, cap::Capability::SendTo(fat32_domain));
     cap::grant(app_domain, cap::Capability::MapInto(fat32_domain));
+    // 授权: block_srv (域 5) 访问 IDE primary 通道 I/O 端口 (0x1F0-0x1F7),
+    // 用于无 NVMe 控制器时的 IDE PIO 回退路径。NVMe 模式通过 MMIO 访问,
+    // 不使用 I/O 端口, 授予这些能力不影响其他域 (无能力即被拒绝)。
+    for port in 0x1F0u16..=0x1F7 {
+        cap::grant(block_domain, cap::Capability::IoPort(port));
+    }
     video::println("[OK] IPC + capability + pager initialized (8 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
