@@ -43,6 +43,19 @@ pub struct WriteReq {
     pub count: u32,
 }
 
+/// 结构化目录条目 — `readdir` 写入 `RESULT_BUF` 的固定大小记录。
+/// 返回字节数 = 条目数 × `size_of::<DirEntry>()`。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirEntry {
+    /// 原始 8.3 短名: 主名 8 字节 + 扩展名 3 字节, 空格填充 (无 '.' 分隔)。
+    pub name: [u8; 11],
+    /// 文件大小 (目录为 0)。
+    pub size: u32,
+    /// 1 = 目录, 0 = 普通文件。
+    pub is_dir: u32,
+}
+
 /// 打开文件或目录, 成功返回 fd (0..), 失败返回 `u64::MAX`。
 pub fn open(path: &str) -> u64 {
     let mut payload = [0u8; 32];
@@ -90,8 +103,8 @@ pub fn write(fd: u64, offset: u32, data: &[u8]) -> u64 {
     sys_call_payload(FAT32_DOMAIN, VFS_WRITE_TAG, payload)
 }
 
-/// 列出 fd 指向目录的条目, 写入 `RESULT_BUF` (文本)。返回写入字节数,
-/// 失败返回 `u64::MAX`。
+/// 列出 fd 指向目录的条目, 以 `DirEntry` 记录数组写入 `RESULT_BUF`。
+/// 返回写入字节数 (= 条目数 × `size_of::<DirEntry>()`), 失败返回 `u64::MAX`。
 pub fn readdir(fd: u64) -> u64 {
     let payload = (fd as u32).to_le_bytes();
     sys_call_payload(FAT32_DOMAIN, VFS_READDIR_TAG, &payload)

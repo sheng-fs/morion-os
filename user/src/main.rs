@@ -1418,76 +1418,8 @@ fn write_file_range(
     count as u64
 }
 
-/// 简单的字节缓冲写入器 (无分配器, 用于把目录列表写进结果页)。
-struct BufWriter {
-    ptr: *mut u8,
-    len: usize,
-    cap: usize,
-}
-
-impl BufWriter {
-    fn new(ptr: *mut u8, cap: usize) -> Self {
-        BufWriter { ptr, len: 0, cap }
-    }
-
-    fn put(&mut self, b: u8) {
-        if self.len < self.cap {
-            unsafe {
-                core::ptr::write(self.ptr.add(self.len), b);
-            }
-            self.len += 1;
-        }
-    }
-
-    fn write(&mut self, s: &str) {
-        for &b in s.as_bytes() {
-            self.put(b);
-        }
-    }
-
-    fn write_u64(&mut self, mut v: u64) {
-        let mut buf = [0u8; 20];
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        for &b in &buf[i..] {
-            self.put(b);
-        }
-    }
-}
-
-/// 把目录项的 8.3 文件名 (主名 + '.' + 扩展名, 去尾随空格) 写入缓冲。
-fn write_dir_name(w: &mut BufWriter, entry: *const u8) {
-    let name = unsafe { core::slice::from_raw_parts(entry, 8) };
-    let ext = unsafe { core::slice::from_raw_parts(entry.add(8), 3) };
-
-    let mut end = name.len();
-    while end > 0 && name[end - 1] == b' ' {
-        end -= 1;
-    }
-    for &b in &name[..end] {
-        w.put(b);
-    }
-
-    if ext[0] != b' ' {
-        w.put(b'.');
-        let mut eend = ext.len();
-        while eend > 0 && ext[eend - 1] == b' ' {
-            eend -= 1;
-        }
-        for &b in &ext[..eend] {
-            w.put(b);
-        }
-    }
-}
-
-/// 把目录 `dir_cluster` 的条目列表 (文本) 写入 `out`, 返回写入字节数; 失败返回 u64::MAX。
+/// 把目录 `dir_cluster` 的条目以结构化 `vfs::DirEntry` 数组写入 `out`,
+/// 返回写入字节数 (= 条目数 × size_of::<DirEntry>()); 失败返回 u64::MAX。
 fn readdir_into(
     bpb: &Fat32Bpb,
     dir_cluster: u32,
@@ -1497,7 +1429,8 @@ fn readdir_into(
 ) -> u64 {
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
-    let mut w = BufWriter::new(out, 4096);
+    let mut count = 0usize;
+    let dst = out as *mut vfs::DirEntry;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -1507,7 +1440,7 @@ fn readdir_into(
             let entry = unsafe { dir_buf.add(i * 32) };
             let first = unsafe { *entry };
             if first == 0x00 {
-                return w.len as u64; // 目录结束
+                return (count * core::mem::size_of::<vfs::DirEntry>()) as u64; // 目录结束
             }
             if first == 0xE5 {
                 continue; // 已删除
@@ -1520,29 +1453,26 @@ fn readdir_into(
                 continue; // 卷标
             }
 
-            let file_size = read_u32(unsafe { entry.add(28) });
-
-            if attr & ATTR_DIRECTORY != 0 {
-                // "." / ".." 以 '.' 开头, 跳过。
-                if first == b'.' {
-                    continue;
-                }
-                w.write("[DIR]  ");
-                write_dir_name(&mut w, entry);
-                w.write("\n");
-            } else {
-                w.write("[FILE] ");
-                write_dir_name(&mut w, entry);
-                w.write(" size=");
-                w.write_u64(file_size as u64);
-                w.write("\n");
+            let is_dir = attr & ATTR_DIRECTORY != 0;
+            // "." / ".." 以 '.' 开头, 跳过。
+            if is_dir && first == b'.' {
+                continue;
             }
+
+            let file_size = read_u32(unsafe { entry.add(28) });
+            let de = unsafe { &mut *dst.add(count) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(entry, de.name.as_mut_ptr(), 11);
+            }
+            de.size = file_size;
+            de.is_dir = is_dir as u32;
+            count += 1;
         }
 
         // 跨簇: 读下一个目录簇。
         let next = read_fat_entry(bpb, cluster, fat_buf);
         if next >= 0x0FFF_FFF8 {
-            return w.len as u64;
+            return (count * core::mem::size_of::<vfs::DirEntry>()) as u64;
         }
         cluster = next;
     }
@@ -2137,15 +2067,59 @@ fn app_main() {
     if n == u64::MAX {
         println("app: readdir \"/\" -> FAILED");
     } else {
+        let entry_size = core::mem::size_of::<vfs::DirEntry>();
+        let count = n as usize / entry_size;
+        let list = unsafe {
+            core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, count)
+        };
         println("app: readdir \"/\" ->");
-        let listing =
-            unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, n as usize) };
-        print(unsafe { core::str::from_utf8_unchecked(listing) });
-        println("");
+        for de in list {
+            if de.is_dir != 0 {
+                print("  [DIR]  ");
+            } else {
+                print("  [FILE] ");
+            }
+            print_83_name(&de.name);
+            if de.is_dir == 0 {
+                print(" size=");
+                print_u64(de.size as u64);
+            }
+            println("");
+        }
     }
     vfs::close(dfd);
 
     println("app done, exiting...");
+}
+
+/// 把 8.3 短名格式化为 "主名[.扩展]" 并打印 (去尾随空格)。
+fn print_83_name(name: &[u8; 11]) {
+    let mut out = [0u8; 13];
+    let mut n = 0usize;
+
+    let base = &name[..8];
+    let ext = &name[8..11];
+
+    let mut end = 8;
+    while end > 0 && base[end - 1] == b' ' {
+        end -= 1;
+    }
+    out[n..n + end].copy_from_slice(&base[..end]);
+    n += end;
+
+    if ext[0] != b' ' {
+        out[n] = b'.';
+        n += 1;
+        let mut eend = 3;
+        while eend > 0 && ext[eend - 1] == b' ' {
+            eend -= 1;
+        }
+        out[n..n + eend].copy_from_slice(&ext[..eend]);
+        n += eend;
+    }
+
+    let s = unsafe { core::str::from_utf8_unchecked(&out[..n]) };
+    print(s);
 }
 
 #[cfg(target_os = "none")]
