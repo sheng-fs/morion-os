@@ -63,7 +63,7 @@ pub struct KernelImage {
     pub image_size: u64,
     /// 内核命令行参数
     pub cmdline: String,
-    /// 映像的 SHA-256 哈希
+    /// 映像的 SM3 哈希
     pub hash: [u8; 32],
 }
 
@@ -90,7 +90,7 @@ impl<'a> KernelLoader<'a> {
     ///   1. 读取 ELF 文件头，验证魔数和架构
     ///   2. 遍历程序头表，将每个 PT_LOAD 段加载到内存
     ///   3. 根据段对齐要求分配物理内存
-    ///   4. 计算并记录 SHA-256 哈希 (同时流式测量到 TPM PCR[8])
+    ///   4. 计算并记录 SM3 哈希 (同时流式测量到 TPM PCR[8])
     ///   5. 返回入口点
     pub fn load_elf64(
         &mut self,
@@ -164,9 +164,9 @@ impl<'a> KernelLoader<'a> {
 
         let image_size = highest_addr - lowest_addr;
 
-        // 计算哈希
-        let hash = [0u8; 32];
-        // hash = self.hasher.finalize().bytes;
+        // 计算哈希 (对整个 ELF 映像做流式 SM3)
+        self.hasher.update(data);
+        let hash = self.hasher.finalize().bytes;
 
         Ok(KernelImage {
             entry_point: header.entry,

@@ -20,8 +20,8 @@
 //! path = "/nix/store/abc123-system-boot/initrd.img"
 //!
 //! [entry.security]
-//! signature = "/nix/store/abc123-system-boot/kernel.sig"
-//! pcr_policy = "sha256:0=abc...,4=def..."
+//! signature = "/nix/store/abc123-system-boot/kernel.sm2sig"
+//! pcr_policy = "sm3:0=abc...,4=def..."
 //!
 //! [entry.enclave]
 //! passthrough_devices = ["0000:01:00.0"]

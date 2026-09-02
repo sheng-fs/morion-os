@@ -44,9 +44,9 @@ log = { version = "0.4", default-features = false }
 # --- 配置解析 ---
 toml = { version = "0.8", default-features = false }
 
-# --- 安全/密码学 ---
-sha2 = { version = "0.10", default-features = false }
-ed25519-dalek = { version = "2", default-features = false }
+# --- 安全/密码学 (国密 SM2/SM3, no_std 纯 Rust) ---
+sm3 = { version = "0.4", default-features = false }
+sm2 = { version = "0.13", default-features = false, features = ["alloc", "dsa"] }
 
 # --- x86_64 底层 ---
 x86_64 = "0.15"
