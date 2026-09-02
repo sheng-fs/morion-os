@@ -14,7 +14,7 @@ mod vfs;
 use syscall::{
     print, print_hex, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
     sys_call_payload, sys_map_anon, sys_page_fault_reply, sys_port_in16, sys_port_in8,
-    sys_port_out8, sys_recv, sys_recv_msg, sys_register_irq, sys_reply, sys_scroll_down,
+    sys_port_out8, sys_port_out16, sys_recv, sys_recv_msg, sys_register_irq, sys_reply, sys_scroll_down,
     sys_scroll_up, sys_send, sys_share_page, sys_term_left, sys_term_put, sys_term_right,
     sys_unmap, sys_virt_to_phys,
 };
@@ -384,6 +384,8 @@ const DOORBELL_BASE: u64 = 0x1000;
 
 // Admin / I/O 命令操作码。
 const OP_CREATE_IO_SQ: u8 = 0x01;
+// NVM I/O 命令 Write (0x01)。与 Admin 的 Create I/O SQ 同码, 但用于 I/O 队列。
+const OP_WRITE: u8 = 0x01;
 const OP_READ: u8 = 0x02;
 const OP_CREATE_IO_CQ: u8 = 0x05;
 const OP_IDENTIFY: u8 = 0x06;
@@ -558,7 +560,8 @@ fn submit_wait(
 /// PRP1 页, 最多 8 扇区 (4096 字节, 不跨页); 超过则返回 false (当前 fat32
 /// 最多读一簇 8 扇区, 不会触及)。
 #[allow(clippy::too_many_arguments)]
-fn nvme_read_sectors(
+fn nvme_rw_sectors(
+    opcode: u8,
     cfg: &NvmeConfig,
     mmio: u64,
     isq_doorbell: u64,
@@ -575,15 +578,10 @@ fn nvme_read_sectors(
     }
     let paddr = sys_virt_to_phys(buf as u64);
     if paddr == 0 {
-        print("nvme: read virt_to_phys failed buf=");
-        print_u64(buf as u64);
-        print(" count=");
-        print_u64(count as u64);
-        println("");
         return false;
     }
     let mut sqe = Sqe::zero();
-    sqe.opcode = OP_READ;
+    sqe.opcode = opcode;
     sqe.cid = 5;
     sqe.nsid = 1;
     sqe.prp1 = paddr;
@@ -780,19 +778,12 @@ fn nvme_main() {
         }
         let req: BlockReq =
             unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
-        print("nvme: block req op=");
-        print_u64(req.op as u64);
-        print(" lba=");
-        print_u64(req.lba);
-        print(" count=");
-        print_u64(req.count);
-        print(" buf=0x");
-        print_u64(req.buf);
-        println("");
 
         match req.op {
-            0 => {
-                let ok = nvme_read_sectors(
+            0 | 1 => {
+                let opcode = if req.op == 0 { OP_READ } else { OP_WRITE };
+                let ok = nvme_rw_sectors(
+                    opcode,
                     &cfg,
                     mmio,
                     isq_doorbell,
@@ -804,9 +795,6 @@ fn nvme_main() {
                     &mut io_head,
                     &mut io_phase,
                 );
-                print("nvme: read result=");
-                print_u64(ok as u64);
-                println("");
                 sys_reply(if ok { 1 } else { 0 });
             }
             _ => {
@@ -822,7 +810,6 @@ fn nvme_main() {
 // Legacy IDE (PATA) primary 通道 I/O 端口, 用 ATA PIO 命令读扇区, 不依赖
 // DMA / MMIO / MSI-X / PCI bus master, 是最简单的块设备访问路径。
 const IDE_DATA: u16 = 0x1F0; // 16 位数据寄存器 (读/写)
-const IDE_ERROR: u16 = 0x1F1; // 错误寄存器 (读)
 const IDE_SECT_CNT: u16 = 0x1F2; // 扇区数
 const IDE_LBA_LO: u16 = 0x1F3; // LBA 位 0-7
 const IDE_LBA_MID: u16 = 0x1F4; // LBA 位 8-15
@@ -833,6 +820,8 @@ const IDE_CMD: u16 = 0x1F7; // 命令寄存器 (写)
 
 /// ATA 命令: READ SECTORS (28 位 LBA)。
 const ATA_READ_SECTORS: u8 = 0x20;
+/// ATA 命令: WRITE SECTORS (28 位 LBA)。
+const ATA_WRITE_SECTORS: u8 = 0x30;
 
 /// 状态寄存器位。
 const ATA_BSY: u8 = 0x80; // busy
@@ -844,6 +833,12 @@ const ATA_ERR: u8 = 0x01; // error
 unsafe fn read_sector_word(buf: *mut u8, i: usize) {
     let w = sys_port_in16(IDE_DATA);
     core::ptr::write_unaligned(buf.add(i * 2) as *mut u16, w);
+}
+
+/// 从缓冲区读一个 16 位小端字并写入 I/O 端口 (避开对齐要求)。
+unsafe fn write_sector_word(buf: *const u8, i: usize) {
+    let w = core::ptr::read_unaligned(buf.add(i * 2) as *const u16);
+    sys_port_out16(IDE_DATA, w);
 }
 
 /// 读 LBA 起 `count` 个扇区到 `buf` (28 位 LBA, PIO 模式)。`count` 取值 1..=256
@@ -901,6 +896,61 @@ fn read_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
     true
 }
 
+/// 写 LBA 起 `count` 个扇区 (`buf` 为数据源, 28 位 LBA, PIO 模式)。
+/// `count` 取值 1..=256 (写入 SECT_CNT 时 256 自动回绕为 0)。成功返回 true。
+fn write_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
+    if count == 0 || count > 256 {
+        return false;
+    }
+
+    // 1. 等控制器就绪: BSY 清零且 DRDY 置位。
+    let mut ready = false;
+    for _ in 0..100_000 {
+        let s = sys_port_in8(IDE_STATUS);
+        if s & ATA_BSY == 0 && s & ATA_DRDY != 0 {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        return false;
+    }
+
+    // 2. 写扇区数与 LBA 参数 (28 位 LBA)。
+    sys_port_out8(IDE_SECT_CNT, (count & 0xFF) as u8); // 256 -> 0
+    sys_port_out8(IDE_LBA_LO, (lba & 0xFF) as u8);
+    sys_port_out8(IDE_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+    sys_port_out8(IDE_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+    sys_port_out8(IDE_DRIVE, 0xE0 | ((lba >> 24) & 0x0F) as u8); // master + LBA
+    sys_port_out8(IDE_CMD, ATA_WRITE_SECTORS);
+
+    // 3. 逐扇区等待 DRQ 后写 256 个 16 位字 (512 字节)。
+    for i in 0..count as usize {
+        let mut got_drq = false;
+        for _ in 0..100_000 {
+            let s = sys_port_in8(IDE_STATUS);
+            if s & ATA_BSY != 0 {
+                continue;
+            }
+            if s & ATA_ERR != 0 {
+                return false;
+            }
+            if s & ATA_DRQ != 0 {
+                got_drq = true;
+                break;
+            }
+        }
+        if !got_drq {
+            return false;
+        }
+        let sector = unsafe { buf.add(i * 512) };
+        for w in 0..256usize {
+            unsafe { write_sector_word(sector, w) };
+        }
+    }
+    true
+}
+
 /// 块设备请求 tag (block_srv 据此识别读/写请求)。
 const BLOCK_REQ_TAG: u64 = 0x424C_4F43; // "BLOC"
 
@@ -935,6 +985,23 @@ fn block_read(lba: u32, count: u16, buf: *mut u8) -> bool {
     sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
 }
 
+/// 经 IPC 请求 block_srv 从 `buf` 写 `count` 个扇区到磁盘。成功返回 true。
+fn block_write(lba: u32, count: u16, buf: *mut u8) -> bool {
+    let req = BlockReq {
+        op: 1,
+        lba: lba as u64,
+        count: count as u64,
+        buf: buf as u64,
+    };
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const BlockReq as *const u8,
+            core::mem::size_of::<BlockReq>(),
+        )
+    };
+    sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
+}
+
 /// 读一个 16 位小端无符号整数 (引导扇区字段)。
 fn read_u16(ptr: *const u8) -> u16 {
     unsafe {
@@ -955,6 +1022,33 @@ fn read_u32(ptr: *const u8) -> u32 {
     }
 }
 
+/// 写一个 16 位小端无符号整数 (目录项字段)。
+fn write_u16(ptr: *mut u8, v: u16) {
+    unsafe {
+        core::ptr::write_volatile(ptr, (v & 0xFF) as u8);
+        core::ptr::write_volatile(ptr.add(1), (v >> 8) as u8);
+    }
+}
+
+/// 写一个 32 位小端无符号整数 (目录项 / FAT 表项)。
+fn write_u32(ptr: *mut u8, v: u32) {
+    unsafe {
+        core::ptr::write_volatile(ptr, (v & 0xFF) as u8);
+        core::ptr::write_volatile(ptr.add(1), ((v >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile(ptr.add(2), ((v >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile(ptr.add(3), ((v >> 24) & 0xFF) as u8);
+    }
+}
+
+/// 清零 `len` 字节。
+fn zero_bytes(ptr: *mut u8, len: usize) {
+    for i in 0..len {
+        unsafe {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FAT32 解析与目录遍历
 // ---------------------------------------------------------------------------
@@ -966,6 +1060,7 @@ struct Fat32Bpb {
     reserved_sectors: u16,
     num_fats: u8,
     fat_size: u32, // 单个 FAT 占用的扇区数
+    total_sectors: u32, // BPB_TotSec32 (分区总扇区数)
     root_cluster: u32,
 }
 
@@ -979,6 +1074,7 @@ impl Fat32Bpb {
                 reserved_sectors: read_u16(sector0.add(14)),
                 num_fats: *sector0.add(16),
                 fat_size: read_u32(sector0.add(36)),
+                total_sectors: read_u32(sector0.add(32)),
                 root_cluster: read_u32(sector0.add(44)),
             }
         }
@@ -1002,6 +1098,12 @@ impl Fat32Bpb {
     /// 簇号 -> 起始扇区号 (簇 2 是数据区第一个簇)。
     fn cluster_to_sector(&self, cluster: u32) -> u32 {
         self.data_start_sector() + (cluster - 2) * self.sectors_per_cluster as u32
+    }
+
+    /// 数据区总簇数 (簇号有效范围 2..=total_clusters+1)。
+    fn total_clusters(&self) -> u32 {
+        let data_sectors = self.total_sectors - self.data_start_sector();
+        data_sectors / self.sectors_per_cluster as u32
     }
 }
 
@@ -1093,6 +1195,227 @@ fn read_file_range(
         }
     }
     copied as u64
+}
+
+// ---------------------------------------------------------------------------
+// FAT32 写支持 (覆盖 + 扩展)
+// ---------------------------------------------------------------------------
+
+/// FAT32 链结束标记 (28 位)。
+const FAT_EOC: u32 = 0x0FFF_FFFF;
+
+/// 把 `cluster` 对应的 FAT 表项写为 `value` (低 28 位), 并同步写所有 FAT 副本。
+fn write_fat_entry(bpb: &Fat32Bpb, cluster: u32, value: u32, fat_buf: *mut u8) -> bool {
+    let byte_offset = cluster * 4;
+    let sector_off = byte_offset / 512;
+    let index = (byte_offset % 512) / 4;
+
+    // 读第一个 FAT 的对应扇区, 改 4 字节槽位 (保留高 4 位保留位)。
+    if !block_read(bpb.fat_start_sector() + sector_off, 1, fat_buf) {
+        return false;
+    }
+    let slot = unsafe { fat_buf.add(index as usize * 4) };
+    let old = read_u32(slot);
+    write_u32(slot, (old & 0xF000_0000) | (value & 0x0FFF_FFFF));
+
+    // 同步写所有 FAT 副本。
+    for k in 0..bpb.num_fats as u32 {
+        let sector = bpb.fat_start_sector() + k * bpb.fat_size + sector_off;
+        if !block_write(sector, 1, fat_buf) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 把整簇内容 `buf` (至少一簇大小) 写入簇 `cluster`。
+fn write_cluster(bpb: &Fat32Bpb, cluster: u32, buf: *mut u8) -> bool {
+    let sector = bpb.cluster_to_sector(cluster);
+    block_write(sector, bpb.sectors_per_cluster as u16, buf)
+}
+
+/// 扫描 FAT 表找第一个空闲簇 (表项 == 0), 无空闲返回 None。
+fn find_free_cluster(bpb: &Fat32Bpb, fat_buf: *mut u8) -> Option<u32> {
+    let total = bpb.total_clusters();
+    for cluster in 2..=(total + 1) {
+        if read_fat_entry(bpb, cluster, fat_buf) == 0 {
+            return Some(cluster);
+        }
+    }
+    None
+}
+
+/// 把目录项 (父目录簇 `dir_cluster`, 簇内字节偏移 `entry_offset`) 的
+/// 首簇号与文件大小写回磁盘。
+fn update_dir_entry(
+    bpb: &Fat32Bpb,
+    dir_cluster: u32,
+    entry_offset: u32,
+    start_cluster: u32,
+    file_size: u32,
+    dir_buf: *mut u8,
+) -> bool {
+    let sector = bpb.cluster_to_sector(dir_cluster) + entry_offset / 512;
+    let off = (entry_offset % 512) as usize;
+    if !block_read(sector, 1, dir_buf) {
+        return false;
+    }
+    let e = unsafe { dir_buf.add(off) };
+    write_u16(unsafe { e.add(20) }, (start_cluster >> 16) as u16);
+    write_u16(unsafe { e.add(26) }, (start_cluster & 0xFFFF) as u16);
+    write_u32(unsafe { e.add(28) }, file_size);
+    block_write(sector, 1, dir_buf)
+}
+
+/// 从 `src` (至少 `count` 字节) 取数据, 覆盖/扩展文件 `node`, 从 `offset` 起写
+/// `count` 字节。必要时分配新簇并更新 FAT 链与目录项。返回写入字节数, 失败返回
+/// u64::MAX; 成功时同步更新 `node` 的 start_cluster / file_size。
+fn write_file_range(
+    bpb: &Fat32Bpb,
+    node: &mut OpenNode,
+    offset: u32,
+    count: u32,
+    fat_buf: *mut u8,
+    file_buf: *mut u8,
+    dir_buf: *mut u8,
+    src: *const u8,
+) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let cluster_bytes = bpb.cluster_bytes();
+    let end = offset.saturating_add(count);
+    let new_size = node.file_size.max(end);
+
+    // 1. 沿 FAT 链收集现有簇。
+    const MAX_CHAIN: usize = 256;
+    let mut chain = [0u32; MAX_CHAIN];
+    let mut chain_len = 0usize;
+    let mut cluster = node.start_cluster;
+    while cluster != 0 && cluster < 0x0FFF_FFF8 {
+        if chain_len >= MAX_CHAIN {
+            return u64::MAX;
+        }
+        chain[chain_len] = cluster;
+        chain_len += 1;
+        cluster = read_fat_entry(bpb, cluster, fat_buf);
+        if cluster == 0 {
+            break; // 链中途损坏, 停止收集
+        }
+    }
+    let old_clusters = chain_len;
+
+    // 2. 计算所需簇数, 不足则分配新簇并挂到链尾。
+    let needed = if new_size == 0 {
+        0
+    } else {
+        ((new_size as u64 + cluster_bytes as u64 - 1) / cluster_bytes as u64) as usize
+    };
+    if needed > MAX_CHAIN {
+        return u64::MAX;
+    }
+    while chain_len < needed {
+        let free = match find_free_cluster(bpb, fat_buf) {
+            Some(c) => c,
+            None => return u64::MAX,
+        };
+        if chain_len > 0 {
+            if !write_fat_entry(bpb, chain[chain_len - 1], free, fat_buf) {
+                return u64::MAX;
+            }
+        }
+        if !write_fat_entry(bpb, free, FAT_EOC, fat_buf) {
+            return u64::MAX;
+        }
+        chain[chain_len] = free;
+        chain_len += 1;
+    }
+    let new_start = if needed > 0 { chain[0] } else { 0 };
+
+    // 3. 逐簇写入数据 (覆盖 + 稀疏间隙清零 + 扩展尾清零)。
+    for i in 0..needed {
+        let c = chain[i];
+        let cs = (i as u32) * cluster_bytes;
+        let ce = cs + cluster_bytes;
+
+        // 整个簇落在写区间内 → 直接从 src 拷贝整簇。
+        if cs >= offset && ce <= end {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.add((cs - offset) as usize),
+                    file_buf,
+                    cluster_bytes as usize,
+                );
+            }
+            if !write_cluster(bpb, c, file_buf) {
+                return u64::MAX;
+            }
+            continue;
+        }
+
+        let write_start = cs.max(offset);
+        let write_end = ce.min(end);
+        let has_write = write_start < write_end;
+
+        // 完全在旧数据区且与写区间无交集 → 保持原样。
+        if i < old_clusters && !has_write && ce <= node.file_size {
+            continue;
+        }
+
+        // 读-改-写: 先取旧内容或清零 (新分配的簇)。
+        if i < old_clusters {
+            if !read_cluster(bpb, c, file_buf) {
+                return u64::MAX;
+            }
+        } else {
+            zero_bytes(file_buf, cluster_bytes as usize);
+        }
+
+        // 旧文件末尾与 offset 之间的空隙清零 (稀疏扩展)。
+        if offset > node.file_size {
+            let gap_start = cs.max(node.file_size);
+            let gap_end = ce.min(offset);
+            if gap_start < gap_end {
+                zero_bytes(
+                    unsafe { file_buf.add((gap_start - cs) as usize) },
+                    (gap_end - gap_start) as usize,
+                );
+            }
+        }
+
+        // 覆盖写入区间。
+        if has_write {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.add((write_start - offset) as usize),
+                    file_buf.add((write_start - cs) as usize),
+                    (write_end - write_start) as usize,
+                );
+            }
+        }
+
+        // 末簇超出 new_size 的部分清零 (仅扩展时)。
+        if new_size > node.file_size && i + 1 == needed && new_size < ce {
+            zero_bytes(
+                unsafe { file_buf.add((new_size - cs) as usize) },
+                (ce - new_size) as usize,
+            );
+        }
+
+        if !write_cluster(bpb, c, file_buf) {
+            return u64::MAX;
+        }
+    }
+
+    // 4. 目录项与节点描述符同步 (首簇号可能因从空文件分配而改变)。
+    if node.start_cluster != new_start || node.file_size != new_size {
+        if !update_dir_entry(bpb, node.dir_cluster, node.entry_offset, new_start, new_size, dir_buf) {
+            return u64::MAX;
+        }
+    }
+    node.start_cluster = new_start;
+    node.file_size = new_size;
+    count as u64
 }
 
 /// 简单的字节缓冲写入器 (无分配器, 用于把目录列表写进结果页)。
@@ -1234,6 +1557,10 @@ struct DirEntryInfo {
     start_cluster: u32,
     file_size: u32,
     attr: u8,
+    /// 目录项所在父目录簇 (写回 file_size / start_cluster 用)。
+    dir_cluster: u32,
+    /// 目录项在父目录簇内的字节偏移 (32 字节对齐)。
+    entry_offset: u32,
 }
 
 /// ASCII 大写 (仅处理 a-z)。
@@ -1327,6 +1654,8 @@ fn find_entry(
                 start_cluster,
                 file_size,
                 attr,
+                dir_cluster: cluster,
+                entry_offset: (i * 32) as u32,
             });
         }
         // 跨簇: 读下一个目录簇。
@@ -1389,6 +1718,8 @@ fn resolve_open_path(
             start_cluster: bpb.root_cluster,
             file_size: 0,
             attr: ATTR_DIRECTORY,
+            dir_cluster: bpb.root_cluster,
+            entry_offset: 0,
         });
     }
     resolve_path(bpb, path, dir_buf, fat_buf)
@@ -1435,8 +1766,12 @@ fn ide_block_main() {
                 let ok = read_sectors(req.lba as u32, req.count as u16, req.buf as *mut u8);
                 sys_reply(if ok { 1 } else { 0 });
             }
+            1 => {
+                // write: 从 req.buf 指向的共享页写 count 个扇区到磁盘。
+                let ok = write_sectors(req.lba as u32, req.count as u16, req.buf as *mut u8);
+                sys_reply(if ok { 1 } else { 0 });
+            }
             _ => {
-                // 本轮未实现 write。
                 sys_reply(0);
             }
         }
@@ -1451,12 +1786,22 @@ struct OpenNode {
     is_dir: bool,
     start_cluster: u32,
     file_size: u32,
+    /// 目录项所在父目录簇 (文件写回用)。
+    dir_cluster: u32,
+    /// 目录项在父目录簇内的字节偏移 (文件写回用)。
+    entry_offset: u32,
 }
 
 static mut FD_TABLE: [Option<OpenNode>; MAX_FD] = [None; MAX_FD];
 
 /// 分配一个空闲 fd 槽位, 返回 fd (0..MAX_FD), 表满返回 u64::MAX。
-fn fd_alloc(is_dir: bool, start_cluster: u32, file_size: u32) -> u64 {
+fn fd_alloc(
+    is_dir: bool,
+    start_cluster: u32,
+    file_size: u32,
+    dir_cluster: u32,
+    entry_offset: u32,
+) -> u64 {
     unsafe {
         let base = core::ptr::addr_of_mut!(FD_TABLE).cast::<Option<OpenNode>>();
         for i in 0..MAX_FD {
@@ -1466,6 +1811,8 @@ fn fd_alloc(is_dir: bool, start_cluster: u32, file_size: u32) -> u64 {
                     is_dir,
                     start_cluster,
                     file_size,
+                    dir_cluster,
+                    entry_offset,
                 });
                 return i as u64;
             }
@@ -1480,6 +1827,23 @@ fn fd_lookup(fd: u32) -> Option<OpenNode> {
         return None;
     }
     unsafe { *core::ptr::addr_of!(FD_TABLE).cast::<Option<OpenNode>>().add(fd as usize) }
+}
+
+/// 更新 fd 对应节点的首簇号与文件大小 (写操作后同步)。
+fn fd_update(fd: u32, start_cluster: u32, file_size: u32) {
+    if (fd as usize) >= MAX_FD {
+        return;
+    }
+    unsafe {
+        let slot = core::ptr::addr_of_mut!(FD_TABLE)
+            .cast::<Option<OpenNode>>()
+            .add(fd as usize);
+        if let Some(mut node) = *slot {
+            node.start_cluster = start_cluster;
+            node.file_size = file_size;
+            *slot = Some(node);
+        }
+    }
 }
 
 /// 释放 fd, 成功返回 1, 失败返回 0。
@@ -1506,10 +1870,12 @@ fn fat32_main() {
     println("fat32 (domain 6) starting...");
 
     // 缓冲页: BPB / 目录簇 / FAT 扇区 / 文件内容。
-    let bpb_buf = 0x0000_0080_0000_6000u64;
-    let dir_buf = 0x0000_0080_0000_7000u64;
-    let fat_buf = 0x0000_0080_0000_5000u64;
-    let file_buf = 0x0000_0080_0000_4000u64;
+    // 地址须避开程序镜像 (USER_BASE 起)、用户栈 (0x8000)、sender 共享页 (0x9000)
+    // 与 NVMe 配置/MMIO/DMA 区域 (0x10000 起), 故放到 1MB 偏移处。
+    let bpb_buf = 0x0000_0080_0010_2000u64;
+    let dir_buf = 0x0000_0080_0010_3000u64;
+    let fat_buf = 0x0000_0080_0010_1000u64;
+    let file_buf = 0x0000_0080_0010_0000u64;
 
     if sys_alloc_page(bpb_buf) != 1
         || sys_alloc_page(dir_buf) != 1
@@ -1564,6 +1930,8 @@ fn fat32_main() {
                         info.attr & ATTR_DIRECTORY != 0,
                         info.start_cluster,
                         info.file_size,
+                        info.dir_cluster,
+                        info.entry_offset,
                     ),
                     None => u64::MAX,
                 };
@@ -1584,6 +1952,31 @@ fn fat32_main() {
                         file_buf as *mut u8,
                         vfs::RESULT_BUF as *mut u8,
                     ),
+                    _ => u64::MAX,
+                };
+                sys_reply(n);
+            }
+            vfs::VFS_WRITE_TAG => {
+                let req: vfs::WriteReq = unsafe {
+                    core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::WriteReq)
+                };
+                let n = match fd_lookup(req.fd) {
+                    Some(mut node) if !node.is_dir => {
+                        let written = write_file_range(
+                            &bpb,
+                            &mut node,
+                            req.offset,
+                            req.count,
+                            fat_buf as *mut u8,
+                            file_buf as *mut u8,
+                            dir_buf as *mut u8,
+                            vfs::WRITE_BUF as *const u8,
+                        );
+                        if written != u64::MAX {
+                            fd_update(req.fd, node.start_cluster, node.file_size);
+                        }
+                        written
+                    }
                     _ => u64::MAX,
                 };
                 sys_reply(n);
@@ -1612,6 +2005,9 @@ fn fat32_main() {
         }
     }
 }
+
+/// 大块写测试缓冲 (4KB, 跨簇扩展验证用)。
+static mut BIG_WRITE_BUF: [u8; 4096] = [0u8; 4096];
 
 /// 域 7 — 测试应用: 经 libvfs 请求 fat32_srv 读取文件与列出目录。
 fn app_main() {
@@ -1646,7 +2042,92 @@ fn app_main() {
     }
     vfs::close(fd);
 
-    // 2. open("/") -> readdir -> close: 列出根目录。
+    // 2. 分配并共享写缓冲页, 供 fat32_srv 读取要写入的数据。
+    if sys_alloc_page(vfs::WRITE_BUF) != 1 {
+        println("app: alloc write buf FAILED");
+        return;
+    }
+    if sys_share_page(vfs::WRITE_BUF, vfs::FAT32_DOMAIN) != 1 {
+        println("app: share write buf FAILED");
+        return;
+    }
+
+    // 3. write -> read: 覆盖并扩展 /HELLO.TXT, 再读回验证。
+    let wfd = vfs::open("/HELLO.TXT");
+    if wfd == u64::MAX {
+        println("app: open \"/HELLO.TXT\" for write -> NOT FOUND");
+        return;
+    }
+    let data = b"OVERWRITTEN BY MORION OS WRITE TEST 0123456789";
+    let written = vfs::write(wfd, 0, data);
+    print("app: write \"/HELLO.TXT\" = ");
+    print_u64(written);
+    println(" bytes");
+    if written == u64::MAX {
+        println("app: write -> FAILED");
+    } else {
+        let rsize = vfs::read(wfd, 0, 4096);
+        if rsize == u64::MAX {
+            println("app: read back -> FAILED");
+        } else {
+            let content = unsafe {
+                core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, rsize as usize)
+            };
+            let s = unsafe { core::str::from_utf8_unchecked(content) };
+            print("app: read back = \"");
+            print_sanitized(s);
+            println("\"");
+        }
+    }
+    vfs::close(wfd);
+
+    // 3b. 跨簇扩展: 写满一页 4096 字节, 强制分配多个簇, 再读回逐字节校验。
+    unsafe {
+        for i in 0..4096 {
+            BIG_WRITE_BUF[i] = b'A' + (i % 26) as u8;
+        }
+    }
+    let bfd = vfs::open("/HELLO.TXT");
+    if bfd == u64::MAX {
+        println("app: open \"/HELLO.TXT\" for big write -> NOT FOUND");
+        return;
+    }
+    let bwrite = unsafe {
+        let slice = core::slice::from_raw_parts(
+            core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
+            4096,
+        );
+        vfs::write(bfd, 0, slice)
+    };
+    print("app: big write = ");
+    print_u64(bwrite);
+    println(" bytes");
+    let bread = vfs::read(bfd, 0, 4096);
+    if bread == u64::MAX {
+        println("app: big read back -> FAILED");
+    } else {
+        print("app: big read back = ");
+        print_u64(bread);
+        println(" bytes");
+        let bcontent = unsafe {
+            core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, bread as usize)
+        };
+        let mut ok = true;
+        for i in 0..bread as usize {
+            if bcontent[i] != (b'A' + (i % 26) as u8) {
+                ok = false;
+                break;
+            }
+        }
+        println(if ok {
+            "app: big write verify OK"
+        } else {
+            "app: big write verify MISMATCH"
+        });
+    }
+    vfs::close(bfd);
+
+    // 4. open("/") -> readdir -> close: 列出根目录。
     let dfd = vfs::open("/");
     if dfd == u64::MAX {
         println("app: open \"/\" -> FAILED");

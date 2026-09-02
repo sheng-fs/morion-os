@@ -7,12 +7,3 @@ description = "测试内核 — 验证引导器加载和跳转功能"
 [[bin]]
 name = "morion-kernel-test"
 path = "src/main.rs"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = "s"
-lto = true
-codegen-units = 1

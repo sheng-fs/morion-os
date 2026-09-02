@@ -14,19 +14,6 @@ crate-type = ["lib"]
 name = "morion-boot"
 path = "src/main.rs"
 
-# UEFI 应用不需要 std
-[profile.dev]
-panic = "abort"
-opt-level = 1
-lto = false
-
-[profile.release]
-panic = "abort"
-opt-level = "s"
-lto = true
-codegen-units = 1
-strip = true
-
 [dependencies]
 # UEFI 基础运行时 (不使用 std), 启用 alloc 支持
 uefi = { version = "0.26", features = ["alloc"] }
