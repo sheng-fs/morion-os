@@ -40,6 +40,58 @@ extern "x86-interrupt" fn double_fault_handler(
     crate::halt();
 }
 
+/// 页表逐级 walk, 用于定位内核态缺页时到底是哪一级条目非法。
+/// 通过 offset 映射 (PHYS_OFFSET) 访问页表, 不依赖被破坏的映射本身。
+fn dump_page_walk(addr: u64) {
+    let off = crate::memory::paging::PHYS_OFFSET;
+    let cr3 = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64();
+    let phys_mask = 0x000F_FFFF_FFFF_F000u64;
+
+    let pml4 = (off + cr3) as *const u64;
+    let p4e = unsafe { *pml4.add(((addr >> 39) & 0x1FF) as usize) };
+    crate::video::print("P4E:  0x");
+    crate::video::print_hex(p4e);
+    crate::video::println("");
+    if p4e & 1 == 0 {
+        return;
+    }
+
+    let pdpt = (off + (p4e & phys_mask)) as *const u64;
+    let pdpe = unsafe { *pdpt.add(((addr >> 30) & 0x1FF) as usize) };
+    crate::video::print("PDPE: 0x");
+    crate::video::print_hex(pdpe);
+    crate::video::println("");
+    if pdpe & 1 == 0 {
+        return;
+    }
+    if pdpe & 0x80 != 0 {
+        crate::video::println("(1 GiB 大页)");
+        return;
+    }
+
+    let pd = (off + (pdpe & phys_mask)) as *const u64;
+    let pde = unsafe { *pd.add(((addr >> 21) & 0x1FF) as usize) };
+    crate::video::print("PDE:  0x");
+    crate::video::print_hex(pde);
+    crate::video::println("");
+    if pde & 1 == 0 {
+        return;
+    }
+    if pde & 0x80 != 0 {
+        crate::video::println("(2 MiB 大页)");
+        return;
+    }
+
+    let pt = (off + (pde & phys_mask)) as *const u64;
+    let pte = unsafe { *pt.add(((addr >> 12) & 0x1FF) as usize) };
+    crate::video::print("PTE:  0x");
+    crate::video::print_hex(pte);
+    crate::video::println("");
+}
+
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
@@ -67,6 +119,7 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::video::print("rsp:        0x");
         crate::video::print_hex(stack_frame.stack_pointer.as_u64());
         crate::video::println("");
+        dump_page_walk(fault_addr);
         crate::halt();
     }
 
