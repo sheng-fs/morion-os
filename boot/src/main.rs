@@ -236,7 +236,7 @@ const FONT8X16: [[u8; 16]; 95] = [
 ];
 
 fn draw_char(fb: &mut Fb, ch: u8, x: i32, y: i32, c: Color) {
-    if ch < 0x20 || ch > 0x7E { return; }
+    if !(0x20..=0x7E).contains(&ch) { return; }
     let glyph = &FONT8X16[(ch - 0x20) as usize];
     for row in 0..16i32 {
         let bits = glyph[row as usize];
@@ -270,8 +270,8 @@ struct BmpImage {
 impl BmpImage {
     fn parse(raw: &'static [u8]) -> Option<Self> {
         if raw.len() < 54 { return None; }
-        // .get() 写法规避 rust-analyzer 在 no_std UEFI 目标下无法解析 Index trait 的问题
-        if raw.get(0).copied() != Some(b'B') || raw.get(1).copied() != Some(b'M') { return None; }
+        // 用 `.first()`/`.get()` 写法规避 rust-analyzer 在 no_std UEFI 目标下无法解析 Index trait 的问题
+        if raw.first().copied() != Some(b'B') || raw.get(1).copied() != Some(b'M') { return None; }
         let b = |off: usize| -> u8 { raw.get(off).copied().unwrap_or(0) };
         let read_u32 = |off: usize| u32::from_le_bytes([b(off), b(off+1), b(off+2), b(off+3)]);
         let read_u16 = |off: usize| u16::from_le_bytes([b(off), b(off+1)]);
@@ -286,8 +286,8 @@ impl BmpImage {
     fn pixel(&self, x: u32, y: u32) -> Color {
         if x >= self.w || y >= self.h { return Color::rgb(0, 0, 0); }
         let row = (self.h - 1 - y) as usize; // BMP 自底向上
-        let bpp_bytes = (self.bpp as usize + 7) / 8;
-        let row_size = ((self.w as usize * bpp_bytes + 3) / 4) * 4;
+        let bpp_bytes = (self.bpp as usize).div_ceil(8);
+        let row_size = (self.w as usize * bpp_bytes).div_ceil(4) * 4;
         let off = self.pixel_offset + row * row_size + x as usize * bpp_bytes;
         if off + bpp_bytes > self.data.len() { return Color::rgb(0, 0, 0); }
         let b = |i: usize| -> u8 { self.data.get(i).copied().unwrap_or(0) };
@@ -510,7 +510,7 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
     // ELF 校验 — 如果不是真正的 ELF (缺少魔数 / 长度不足)，
     // 显示提示后循环休眠，不要破坏内存。
     let is_valid_elf = KERNEL_ELF.len() >= 64
-        && KERNEL_ELF.get(0) == Some(&0x7F)
+        && KERNEL_ELF.first() == Some(&0x7F)
         && KERNEL_ELF.get(1) == Some(&b'E')
         && KERNEL_ELF.get(2) == Some(&b'L')
         && KERNEL_ELF.get(3) == Some(&b'F')
@@ -682,7 +682,7 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 
     // 渲染每个菜单项
     let item_start_y = ty + 58;
-    for i in 0..entries.len() {
+    for (i, entry) in entries.iter().enumerate() {
         let iy = item_start_y + i as i32 * (theme.item_height as i32 + theme.spacing as i32);
         let ir = Rect::new(tx + 16, iy, tw - 32, theme.item_height);
 
@@ -700,7 +700,6 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
             fb.fill_rounded(ir, 8, panel_c);
         }
 
-        let entry = &entries[i];
         let tc = if i == sel { theme.hl_text_color } else { theme.text_color };
         draw_text(fb, entry.icon, ir.x + 40, iy + (theme.item_height as i32 - 16)/2 + 2, tc);
         draw_text(fb, entry.title, ir.x + 72, iy + (theme.item_height as i32 - 16)/2 + 2, tc);

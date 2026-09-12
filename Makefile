@@ -56,6 +56,9 @@ OVMF_CODE     ?= /usr/share/edk2/x64/OVMF_CODE.fd
 OVMF_VARS     ?= /usr/share/edk2/x64/OVMF_VARS.fd
 # 文件系统阶段: NVMe 磁盘镜像 (宿主机 mkfs.fat 生成)
 NVME_IMG      ?= $(OUT_DIR)/nvme.img
+# MorionFS (MFS) 磁盘镜像: 纯空白 raw, 由 mfs_srv 首次挂载时自动格式化 (namespace 2)
+MFS_IMG       ?= $(OUT_DIR)/mfs.img
+MFS_MIB       ?= 16
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -226,20 +229,32 @@ run-nokvm: iso
 		-vga virtio \
 		-no-reboot
 
-# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + -device nvme)
+# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + 单控制器双 namespace)
+#   nsid=1 -> $(NVME_IMG) (FAT32, 挂载 /)
+#   nsid=2 -> $(MFS_IMG)  (MorionFS, 挂载 /mfs, 首次挂载自动格式化)
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe)..."
+run-nvme: iso $(NVME_IMG) $(MFS_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS)..."
 	$(QEMU) \
 		-machine q35 \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-cdrom $(ISO_IMAGE) \
-		-drive file=$(NVME_IMG),if=none,id=nvme0,format=raw \
-		-device nvme,serial=MORION,drive=nvme0 \
+		-device nvme,serial=MORION,id=nvme0 \
+		-drive file=$(NVME_IMG),if=none,id=nvme0n1,format=raw \
+		-device nvme-ns,drive=nvme0n1,bus=nvme0,nsid=1 \
+		-drive file=$(MFS_IMG),if=none,id=nvme0n2,format=raw \
+		-device nvme-ns,drive=nvme0n2,bus=nvme0,nsid=2 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
+
+# MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
+$(MFS_IMG):
+	@echo "==> 创建 MFS 磁盘镜像 (空白 raw $(MFS_MIB)MiB, 首次挂载自动格式化)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(MFS_IMG) bs=1M count=$(MFS_MIB) status=none
+	@echo "  ✓ MFS 镜像: $(MFS_IMG)"
 
 # 文件系统阶段: 挂载 IDE 磁盘运行 (Legacy PIO 读扇区, 不依赖 DMA/MSI-X)
 .PHONY: run-ide
@@ -339,17 +354,32 @@ clean:
 # ============================================================
 # 代码检查
 # ============================================================
+# 三个 crate 目标各不相同 (kernel: x86_64-unknown-none, user: 自定义 json target,
+# boot: x86_64-unknown-uefi), 没有单一 target 能覆盖全工作区, 故逐个检查 ——
+# 直接用 `cargo check --workspace` 会退化到宿主 target, 在 no_std bin 上报
+# `#[panic_handler] required` 而失败。
 .PHONY: check
 check:
-	$(CARGO) check --workspace
+	$(CARGO) check --package morion-kernel --target $(KERNEL_TARGET)
+	$(CARGO) check --package morion-user \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-boot --target $(BOOT_TARGET)
 
 .PHONY: fmt
 fmt:
 	$(CARGO) fmt --all -- --check
 
+# clippy 是**门禁**: `-D warnings`, 三个 crate 任一有告警即失败。
 .PHONY: clippy
 clippy:
-	$(CARGO) clippy --workspace -- -D warnings
+	$(CARGO) clippy --package morion-kernel --target $(KERNEL_TARGET) -- -D warnings
+	$(CARGO) clippy --package morion-user \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem -- -D warnings
+	$(CARGO) clippy --package morion-boot --target $(BOOT_TARGET) -- -D warnings
 
 # ============================================================
 # Nix 构建集成

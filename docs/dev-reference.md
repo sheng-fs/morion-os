@@ -51,8 +51,32 @@ UEFI 固件
 | `PHYS_OFFSET` | `0xFFFF_8000_0000_0000` | 物理内存 offset 映射（P4[256]） |
 | `USER_SPACE_BASE` | `0x0000_0080_0000_0000` | 用户空间基址（P4[1]） |
 | `HEAP_START` | `0x4444_4444_0000` | 内核堆起始虚拟地址 |
-| `HEAP_SIZE` | `256 * 1024` | 内核堆 256 KiB |
+| `HEAP_SIZE` | `1 MiB` | 内核堆 1 MiB |
 | `MANAGED_MEMORY` | `4 GiB` | 管理的物理内存上限 |
+
+> **启动页表放在 `.bss`**（`BOOT_PML4` / `BOOT_PDPT` / `BOOT_PDS`，共 24 KiB，4 KiB 对齐），
+> 不再向帧分配器申请。历史上启动页表取自「镜像尾部相邻帧」，一旦镜像变大使该帧与内核栈顶或仍在
+> 使用的引导器页表重合，就会在 `paging::init` 处 triple fault（且随镜像大小变化时有时无）。
+
+> **ELF 入口必须是纯汇编桩**：`_start` 由 `global_asm!` 定义（`lea rsp, [rip + _stack_end]` + `cli` +
+> `jmp kernel_main`），而不是普通 Rust 函数。若把「设置 rsp」写进 `extern "C" fn _start`，LLVM 会在
+> 函数入口处先按**引导器**的 rsp 分配栈帧，随后该 asm 把 rsp 重置到 `_stack_end`，整个栈帧就被平移
+> 到 `[_stack_end, _stack_end + frame_size)` —— 恰好落在镜像之外、帧分配器最先交出的帧（内核堆第 0 页）
+> 上，随机破坏堆的链表元数据，表现为 `alloc` 失败或 `Bad free`（且随代码体积变化时有时无）。
+
+### 用户空间固定布局（内核与用户程序约定，见 [kernel/src/main.rs](../../kernel/src/main.rs) / [user/src/main.rs](../../user/src/main.rs)）
+
+| 区域 | 地址 | 说明 |
+| --- | --- | --- |
+| 程序镜像 | `USER_BASE` 起 | 扁平二进制，**随代码增长**（当前约 28 页 / 111 KiB） |
+| 文件服务缓冲页 | `USER_BASE + 0x10_0000` 起 | fat32 的 BPB/目录/FAT/文件缓冲（`..+0x10_4000`）、app 的 `RESULT_BUF`/`WRITE_BUF` 与 shell 的 `SHELL_RESULT_BUF`/`SHELL_WRITE_BUF`（`..+0x10_8000`）、mfs 的 4 个块缓冲（`..+0x10_C000`） |
+| 用户栈 | `USER_BASE + 0x40_0000` | 1 页，向下增长 |
+| 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 NVMe 配置、+0x2_0000 MMIO、+0x3_0000 DMA（5 页） |
+| 按需分页测试地址 | `USER_BASE + 0x1_0000_0000` | sender 触发的缺页演示 |
+
+> ⚠️ 程序镜像是**全部域共用**的同一镜像，新增代码会使其变大。所有固定映射地址必须留在
+> 镜像增长范围之上（当前 ≥ 1 MiB），否则会在 `load_user_program` / `sys_alloc_page` 触发
+> `map_user_page: PageAlreadyMapped` 内核 panic。
 
 ## 4. GDT 选择子（[kernel/src/arch/gdt.rs](../../kernel/src/arch/gdt.rs)）
 
@@ -92,6 +116,17 @@ UEFI 固件
 | 18 | `SYS_TERM_PUT` | `rdi=ch` | 在输入行光标处插入字符 `ch`（`ch=0x0A` 提交当前行），返回 1 |
 | 19 | `SYS_TERM_LEFT` | — | 输入行光标左移，返回 1 |
 | 20 | `SYS_TERM_RIGHT` | — | 输入行光标右移，返回 1 |
+| 21 | `SYS_MAP_MMIO` | `rdi=bar, rsi=vaddr` | 把物理 MMIO 页（`bar`，页对齐）映射到本域 `vaddr`（非缓存）；需 `Capability::Mmio(bar)`，返回 1/0 |
+| 22 | `SYS_PORT_IN8` | `rdi=port` | 从 I/O 端口读 1 字节（用户态设备驱动用） |
+| 23 | `SYS_PORT_IN16` | `rdi=port` | 从 I/O 端口读 2 字节 |
+| 24 | `SYS_PORT_OUT8` | `rdi=port, rsi=val` | 向 I/O 端口写 1 字节 |
+| 25 | `SYS_PORT_OUT16` | `rdi=port, rsi=val` | 向 I/O 端口写 2 字节 |
+| 26 | `SYS_VIRT_TO_PHYS` | `rdi=vaddr` | 本域用户虚拟地址反查物理地址（供 NVMe PRP），失败返回 0 |
+| 27 | `SYS_READLINE` | `rdi=buf, rsi=max` | 阻塞读取一行控制台输入到 `buf`（最多 `max` 字节，不含换行），返回长度，失败返回 `u64::MAX`；队列空时阻塞至键盘回车 |
+| 28 | `SYS_CLEAR` | — | 清屏并复位终端状态（历史 / 输入行 / 光标 / 回滚），返回 1 |
+| 29 | `SYS_CAP_ISSUE` | `rdi=obj` | 「能力即句柄」：为调用方域的不透明对象 `obj` 签发句柄，返回句柄索引（0 起），槽满返回 `u64::MAX` |
+| 30 | `SYS_CAP_LOOKUP` | `rdi=handle` | 校验句柄是否有效，有效返回其对象标识，被撤销 / 非法返回 `u64::MAX` |
+| 31 | `SYS_CAP_DROP` | `rdi=handle` | 撤销句柄（关闭打开对象时调用），返回 1/0 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -119,6 +154,14 @@ UEFI 固件
 - `width() -> u32` / `height() -> u32`
 - `term_put(c)` / `term_backspace()` / `term_left()` / `term_right()`（终端编辑：光标处插入 / 删光标前 / 左右移动光标）
 - `scroll_view_up()` / `scroll_view_down()`（控制台行历史回滚）
+- `unsafe input_read(out: *mut u8, max: usize) -> Option<usize>`（`SYS_READLINE` 用：从输入行队列取走一行，键盘回车时由 `term_put('\n')` 入队并唤醒等待者）
+- `term_put` 记录本轮**用户输入起点** `INPUT_BASE`（首个按键时锁定为当时行尾），回车只提交该起点之后的内容，
+  由此支持「行内提示符」：提示符可先 `print` 到输入行，`SYS_READLINE` 只回传用户键入部分；退格/左移不会越过该起点。
+- `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII，因内核字体仅含 0x20..=0x7E）
+- 背景：清屏/重绘不再填纯色，而是调用 `bg_fill_rect` / `bg_fill_all`，按 `bg::color_for_row` 的**竖直渐变**
+  逐行取色填充。颜色表 `bg.rs` 由 `resources/system/terminal/终端背景_1024x768.raw` 采样得到（64 级 ≈ 256 字节），
+  已压暗偏蓝以保证白色文字可读；分辨率无关，重绘开销与原先纯色填充同量级。
+- 帧缓冲格式：BGRA8888，颜色 `0x00RRGGBB`（[framebuffer.rs](../../kernel/src/video/framebuffer.rs)）；实际分辨率 1280x800（q35 + virtio + OVMF）。
 
 ### 物理帧分配（[kernel/src/memory/frame_allocator.rs](../../kernel/src/memory/frame_allocator.rs)）
 
@@ -128,6 +171,11 @@ UEFI 固件
 - `inc_ref(addr: u64)` / `dec_ref(addr: u64) -> bool`（共享帧引用计数；`dec_ref` 归零返回 `true`）
 - `total_frames() / free_frames() / total_memory_bytes() / free_memory_bytes()`
 - `FRAME_SIZE = 4096`
+- 初始化末尾调用 `reserve_active_page_tables()`：把当前 `CR3` 页表层级引用的物理帧标记为占用。
+  这些「引导器遗留页表」在 UEFI 内存图中可能为 CONVENTIONAL，若被当作空闲帧分配并清零，会摧毁
+  正在生效的地址翻译，导致启动到 `paging::init` 即 #PF → #DF → triple fault（且随镜像大小变化时有时无）。
+- 内核保留上界取 `_kernel_end` **向上对齐到 64 KiB**：链接符号与镜像实际占用末尾可能有少量出入，
+  留余量可确保内核栈顶所在的帧不会被当作空闲帧分配（栈顶就在镜像末尾附近，被复用为页表会立刻被栈写坏）。
 
 ### 分页（[kernel/src/memory/paging.rs](../../kernel/src/memory/paging.rs)）
 
@@ -153,8 +201,9 @@ UEFI 固件
 - `current_domain() -> u64`
 - `set_current_reply_target(target: u64)` / `current_reply_target() -> u64`（`reply` 回复目标追踪；`u64::MAX` 表示无）
 - `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口）
+- `INPUT_WAIT`（伪域 id `u64::MAX-1`：表示等待控制台输入行；`SYS_READLINE` 用 `block_current(INPUT_WAIT)`，`video::term_put` 回车时 `wake_one(INPUT_WAIT)`）
 
-任务表常量：`MAX_TASKS = 8`，内核栈 `STACK_SIZE = 4096 * 8`（32 KiB）。
+任务表常量：`MAX_TASKS = 16`，内核栈 `STACK_SIZE = 4096 * 8`（32 KiB）。
 
 ### IPC（[kernel/src/ipc.rs](../../kernel/src/ipc.rs)）
 
@@ -175,6 +224,7 @@ UEFI 固件
 - `revoke(domain: u64, cap: Capability) -> bool`
 - `grant` / `revoke` 保存并恢复中断使能状态，避免 boot 期（IF=0）被提前开中断。
 - `Capability::SendTo(u64)` / `Capability::MapInto(u64)` / `Capability::Irq(u8)`，每域 `CAP_SLOTS = 16`
+- **「能力即句柄」句柄表**：`handle_issue(domain, obj) -> u64` / `handle_lookup(domain, handle) -> Option<u64>` / `handle_drop(domain, handle) -> bool`，每域 `HANDLE_SLOTS = 32`。槽内存放**不透明**对象标识（微内核不解释其含义，libvfs 传 `(服务域 << 32) | 服务内 fd`），由 `SYS_CAP_ISSUE`/`SYS_CAP_LOOKUP`/`SYS_CAP_DROP` 暴露给用户态。
 
 ### 分页器（[kernel/src/pager.rs](../../kernel/src/pager.rs)）
 
@@ -194,6 +244,21 @@ UEFI 固件
 
 「中断即 IPC」模型：硬件 IRQ 处理器读设备数据（如键盘 scancode）→ `irq::dispatch` 投递到驱动域邮箱 → 驱动域循环 `SYS_RECV` 接收并处理，再 `send_eoi`。
 
+### 文件服务与挂载层（用户态）
+
+文件系统全部位于用户态，经 libvfs 统一接入（见 [user/src/vfs.rs](../../user/src/vfs.rs)）。
+
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv`（共 12 个域）。
+- **libvfs 路由**：每个路径操作先经 `mount_lookup(path)` 向 `mount_srv` 查询，回复打包为 `(服务域 << 32) | 挂载点前缀长度`；`route()` 去掉挂载前缀得到子路径再下发目标服务。
+- **对外 fd 编码**：`[63:48] 能力句柄 | [47:32] 服务域 | [31:0] 服务内 fd`。`open`/`creat` 成功后向内核申请句柄（`SYS_CAP_ISSUE`）并编进高位；`read`/`write`/`readdir` 先经 `cap_guard`（`SYS_CAP_LOOKUP` 校验句柄有效且对象标识与 fd 一致）再下发；`close` 撤销句柄（`SYS_CAP_DROP`）。句柄被撤销后该 fd 上的任何 I/O 都失败——这就是「能力即句柄」的执行点。
+- **mount_srv**：维护「挂载点前缀 → 服务域」表，组件边界敏感的最长前缀匹配（`/tmpfoo` 不匹配 `/tmp`）。表是**运行时可变的**（`MOUNT_MAX = 8` 槽）：`mount_main` 启动时写入引导默认项 `/ → fat32_srv(6)`、`/tmp → tmpfs_srv(10)`、`/mfs → mfs_srv(11)`，此后任何服务都可经 `MNTA`/`MNTD` 在运行时挂载/卸载。`MNTA` payload 为 `MountReq { domain u64, prefix [u8; 24] }`：前缀为空则 mount_srv 自动分配最小的空闲 `/mnt<N>`，回复挂载槽位号（1 起）；`MNTD` payload 为前缀，回复 1/`u64::MAX`，根 `/` 不可卸载。
+- **fat32_srv**：NVMe（回退 IDE PIO）块设备之上的 FAT32 服务，挂载于 `/`。
+- **tmpfs_srv**：纯内存文件系统，挂载于 `/tmp`；平铺节点表（绝对路径 → 节点）+ 32 KiB 字节区，名称限定 8.3 短名并转大写。与 fat32 共存，经挂载层拼成统一目录树。
+- **mfs_srv**：原创文件系统 MorionFS，挂载于 `/mfs`，后端为 NVMe 第二 namespace（独立 `build/mfs.img`）。4 KiB 块 + 8 字节块头（magic + CRC32）；超级块 A/B 双副本交替写；**只增不回收的 COW** 写时复制（叶子 → 逐级上溯父目录 → 根），因此**内建快照**（`{gen, root_block, alloc_next}`）天然可用；快照表（上限 8）随超级块持久化且为**环形**，满时淘汰最旧一条再写入（旧块仍由 COW 保留，仅丢弃快照记录，索引随之整体前移）；空白盘首次挂载自动格式化。详情见 [roadmap-fs.md](roadmap-fs.md) 阶段 C3。
+- **block_srv 多设备**：`BlockReq.op = (device << 8) | opcode`（payload 恰好 32 字节、无空位，故把设备号并进 `op`）。NVMe 取 `nsid = device + 1`：nsid1 = FAT32 盘 `nvme.img`、nsid2 = MFS 盘 `mfs.img`（QEMU 单控制器双 `nvme-ns`）；IDE PIO 仅支持 `device == 0`。
+- 每个客户端把结果/写缓冲页用 `SYS_SHARE_PAGE` 共享给**所有**它可能访问的文件服务域：app 的 `RESULT_BUF`/`WRITE_BUF`、shell 的 `SHELL_RESULT_BUF` 均共享给域 6 / 域 10 / 域 11。
+- **共享缓冲地址约定**：共享页必须位于程序镜像之外的固定虚拟地址（同地址共享，目标域自身的镜像会占住同地址）。已用区间：fat32 `+0x10_0000..0x10_4000`、app/shell 共享缓冲 `+0x10_4000..0x10_8000`、mfs 块缓冲 `+0x10_8000..0x10_C000`。
+
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
 - `gdt::init()` / `gdt::set_rsp0(stack_top: u64)`
@@ -212,6 +277,8 @@ UEFI 固件
 | `make iso` | 构建完整 ISO（`build/morion-os.iso`） |
 | `make run` | QEMU 运行（KVM） |
 | `make run-nokvm` | QEMU 运行（无 KVM） |
+| `make run-nvme` | **文件系统验证主用**：q35 + NVMe 单控制器双 namespace（nsid1 `nvme.img` FAT32 / nsid2 `mfs.img` MorionFS） |
+| `make run-ide` | IDE PIO 运行（回退验证路径） |
 | `make debug` | QEMU + GDB（`-s -S`） |
 | `make clean` / `check` / `clippy` | 清理 / 检查 / 静态检查 |
 
@@ -253,3 +320,14 @@ UEFI 固件
 | 14 | 按需分页（外部页管理器模型）：缺页捕获转发 + 匿名零帧映射 + 分页器域 | ✅ |
 | 15 | 同步 IPC（`call`/`reply`）：回复目标追踪 + echo 服务演示 + 匿名零帧清零 | ✅ |
 | 16 | 用户态中断/驱动框架（`Irq` 能力 + `irq::dispatch` + 键盘驱动迁到用户态） | ✅ |
+| 17 | 控制台阻塞读行（`SYS_READLINE` + 输入行队列 + shell 域 8 骨架） | ✅ |
+| 18 | Shell 基础命令（`help/echo/ls/cat/clear` + `sys_clear`；VFS 请求携带客户端缓冲地址） | ✅ |
+| 19 | Shell 路径与写命令（`cd/pwd/mkdir/rm/touch` + cwd 归一化 + 相对路径解析） | ✅ |
+| 20 | 行内提示符（输入起点追踪 + `flush()`；提示符含 cwd）+ 保留活动页表帧修复 | ✅ |
+| 21 | 启动 ASCII LOGO（`video::logo`，61x25，按几何编排；整块居中 + 单次重绘） | ✅ |
+| 22 | 渐变终端背景（`video::bg`，由 `.raw` 采样竖直色表）+ 启动页表改入 `.bss` | ✅ |
+| 23 | 挂载层（`mount_srv` 域 9：挂载点前缀 → 服务域；libvfs 按挂载表路由 + fd 编码服务域） | ✅ |
+| 24 | tmpfs 内存文件系统（`tmpfs_srv` 域 10）：挂载 `/tmp`，与 fat32 共存构成统一目录树 | ✅ |
+| 25 | MorionFS（`mfs_srv` 域 11）：块设备后端（NVMe nsid2）+ COW + CRC32 + 超级块 A/B + 内建快照 + 自动格式化，挂载 `/mfs` | ✅ |
+| 26 | 运行时挂载（`MNTA`/`MNTD` + 自动分配空闲 `/mnt<N>`）+ 能力即句柄（`SYS_CAP_ISSUE`/`LOOKUP`/`DROP`，libvfs `cap_guard`） | ✅ |
+| 27 | 帧缓冲渲染性能（32 位写 + 输入行局部重绘）与终端输出批量化 | ✅ |

@@ -26,6 +26,11 @@ const MAX_TASKS: usize = 16;
 /// 每任务内核栈大小 (32 KiB, 足以容纳中断帧 + 若干层函数调用)。
 const STACK_SIZE: usize = 4096 * 8;
 
+/// 伪域 id: 表示「等待控制台输入行」而非某个域的邮箱。
+/// 供 `SYS_READLINE` 阻塞 (block_current) 与 `video::term_put` 回车唤醒 (wake_one) 使用。
+/// 真实域 id 均为小整数, 故用 `u64::MAX - 1` 作哨兵不会冲突 (`u64::MAX` 已用作「无回复目标」)。
+pub const INPUT_WAIT: u64 = u64::MAX - 1;
+
 /// 任务状态。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -64,7 +69,7 @@ pub struct Task {
 
 /// 调度器: 固定大小任务表 + 当前任务索引 + 时钟 tick 计数。
 pub struct Scheduler {
-    tasks: [Option<Task>; MAX_TASKS],
+    tasks: Box<[Option<Task>; MAX_TASKS]>,
     current: usize,
     /// 自启动以来累计的时钟 tick 数 (100 Hz → 每 tick 10ms)。
     ticks: u64,
@@ -72,7 +77,7 @@ pub struct Scheduler {
 
 /// 毫秒 → tick 数 (100 Hz → 每 tick 10ms), 至少 1 tick。
 fn ms_to_ticks(ms: u64) -> u64 {
-    ((ms + 9) / 10).max(1)
+    ms.div_ceil(10).max(1)
 }
 
 /// 加载页表根 (CR3), 保留原 CR3 标志位。
@@ -86,7 +91,7 @@ fn load_cr3(pml4: u64) {
 impl Scheduler {
     fn new() -> Self {
         Self {
-            tasks: core::array::from_fn(|_| None),
+            tasks: Box::new(core::array::from_fn(|_| None)),
             current: 0,
             ticks: 0,
         }

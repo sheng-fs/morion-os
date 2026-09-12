@@ -188,10 +188,7 @@ impl FrameBuffer {
     pub fn bpp(&self) -> u8 { self.bytes_per_pixel }
 
     pub fn is_bgra(&self) -> bool {
-        match self.pixel_format {
-            PixelFormat::Bgr => true,
-            _ => false,
-        }
+        matches!(self.pixel_format, PixelFormat::Bgr)
     }
 
     #[inline]

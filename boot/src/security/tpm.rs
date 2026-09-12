@@ -69,3 +69,9 @@ impl TpmMeasurer {
         self.enabled
     }
 }
+
+impl Default for TpmMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}

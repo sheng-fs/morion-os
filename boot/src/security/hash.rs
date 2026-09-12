@@ -100,17 +100,16 @@ impl ImageHasher {
         let mut level: Vec<Hash256> = data.chunks(cs).map(Self::hash).collect();
 
         while level.len() > 1 {
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            let mut it = level.chunks_exact(2);
-            for pair in &mut it {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let (pairs, rem) = level.as_chunks::<2>();
+            for pair in pairs {
                 let mut buf = [0u8; 64];
                 buf[..32].copy_from_slice(&pair[0].bytes);
                 buf[32..].copy_from_slice(&pair[1].bytes);
                 next.push(Self::hash(&buf));
             }
-            let rem = it.remainder();
-            if !rem.is_empty() {
-                next.push(rem[0]);
+            if let Some(last) = rem.first() {
+                next.push(*last);
             }
             level = next;
         }
@@ -123,5 +122,11 @@ impl ImageHasher {
 
     pub fn verify(data: &[u8], expected: &Hash256) -> bool {
         Self::hash(data).matches(expected)
+    }
+}
+
+impl Default for ImageHasher {
+    fn default() -> Self {
+        Self::new()
     }
 }

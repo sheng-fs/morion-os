@@ -66,6 +66,12 @@ impl KexecBoot {
     }
 
     /// 执行 kexec 跳转 (永不返回)
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `entry_point` 指向已校验通过、按目标内核约定映射的可执行入口，
+    /// 且 `boot_params_ptr` 指向对目标内核可见、生命周期覆盖跳转的合法参数结构；
+    /// 跳转后将直接放弃 UEFI 运行时环境，本函数永不返回。
     pub unsafe fn jump_to_kernel(
         entry_point: u64,
         boot_params_ptr: u64,
@@ -87,5 +93,11 @@ impl KexecBoot {
         // 追加 loop{} 作为 rust-analyzer 可见的 -> ! 保证 (永远不会被实际执行)
         #[allow(unreachable_code)]
         loop { core::hint::spin_loop(); }
+    }
+}
+
+impl Default for KexecBoot {
+    fn default() -> Self {
+        Self::new()
     }
 }

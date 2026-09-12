@@ -15,16 +15,19 @@ use crate::memory::{frame_allocator, paging};
 const PAGE: u64 = 4096;
 
 /// 配置结构 / MMIO / DMA 在 `nvme_srv` 域内的约定虚拟地址。
-/// 位于用户程序镜像 + 用户栈之上 (USER_BASE + 0x1000), 从 0x10000 起预留。
-pub const NVME_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x1_0000;
-pub const NVME_MMIO_VADDR: u64 = paging::USER_SPACE_BASE + 0x2_0000;
-pub const NVME_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x3_0000;
+///
+/// 布置在 `USER_BASE + 8 MiB` 起的高地址数据区, 远离用户程序镜像 (自 `USER_BASE`
+/// 起且随代码增长) 与用户栈 (`USER_BASE + 4 MiB`), 避免镜像增长后踩到这些固定映射。
+/// 共享页 (`USER_BASE + 0x80_0000`) 亦属同一数据区, 由 sender/receiver 使用。
+pub const NVME_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x81_0000;
+pub const NVME_MMIO_VADDR: u64 = paging::USER_SPACE_BASE + 0x82_0000;
+pub const NVME_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x83_0000;
 
 /// DMA 区域页数: ASQ / ACQ / ISQ / ICQ / 数据缓冲, 共 5 页 (物理连续)。
 pub const NVME_DMA_PAGES: u64 = 5;
 
 /// 配置结构 magic (校验内核与用户态布局一致)。
-pub const NVME_CONFIG_MAGIC: u64 = 0x4E56_4D45_4F53_21; // "NVM EOS!"
+pub const NVME_CONFIG_MAGIC: u64 = 0x004E_564D_454F_5321; // "NVM EOS!"
 
 /// 内核写入、用户态读取的 NVMe 配置结构。
 /// `#[repr(C)]` 保证跨 crate 布局一致。

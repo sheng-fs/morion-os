@@ -35,6 +35,11 @@ pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
 pub const SYS_VIRT_TO_PHYS: u64 = 26;
+pub const SYS_READLINE: u64 = 27;
+pub const SYS_CLEAR: u64 = 28;
+pub const SYS_CAP_ISSUE: u64 = 29;
+pub const SYS_CAP_LOOKUP: u64 = 30;
+pub const SYS_CAP_DROP: u64 = 31;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -195,6 +200,33 @@ pub fn sys_virt_to_phys(vaddr: u64) -> u64 {
     unsafe { syscall(SYS_VIRT_TO_PHYS, vaddr, 0, 0) }
 }
 
+/// 阻塞读取一行控制台输入到 `buf` (最多 `buf.len()` 字节, 不含换行)。
+/// 返回实际读到的字节数, 失败返回 `u64::MAX`。无输入时阻塞, 直到键盘回车提交一行。
+pub fn sys_readline(buf: &mut [u8]) -> u64 {
+    unsafe { syscall(SYS_READLINE, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
+}
+
+/// 清屏并复位终端状态 (历史 / 输入行 / 光标)。返回 1。
+pub fn sys_clear() -> u64 {
+    unsafe { syscall(SYS_CLEAR, 0, 0, 0) }
+}
+
+/// 「能力即句柄」: 为不透明对象 `obj` 签发一个句柄, 返回句柄索引 (0 起);
+/// 句柄槽耗尽返回 `u64::MAX`。
+pub fn sys_cap_issue(obj: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_ISSUE, obj, 0, 0) }
+}
+
+/// 校验句柄是否有效, 有效则返回其对象标识; 已被撤销 / 非法返回 `u64::MAX`。
+pub fn sys_cap_lookup(handle: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_LOOKUP, handle, 0, 0) }
+}
+
+/// 撤销句柄 (关闭打开对象时调用), 成功返回 1。
+pub fn sys_cap_drop(handle: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_DROP, handle, 0, 0) }
+}
+
 pub fn sys_puts(s: &str) {
     unsafe {
         syscall(SYS_PUTS, s.as_ptr() as u64, s.len() as u64, 0);
@@ -206,7 +238,9 @@ pub fn sys_exit() -> ! {
     unsafe {
         syscall(SYS_EXIT, 0, 0, 0);
     }
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +263,9 @@ impl<T> StaticCell<T> {
     const fn new(value: T) -> Self {
         StaticCell(UnsafeCell::new(value))
     }
+    // 有意为之的内部可变性: 单核 + 各域地址空间独立, 不存在对同一 static 的
+    // 并发访问, 故从 &self 返回 &mut T 是安全的, 无需改为 unsafe fn。
+    #[allow(clippy::mut_from_ref)]
     fn borrow_mut(&self) -> &mut T {
         unsafe { &mut *self.0.get() }
     }
@@ -271,6 +308,12 @@ pub fn print(s: &str) {
 pub fn println(s: &str) {
     print_push(s);
     print_push("\n");
+    print_flush();
+}
+
+/// 立即提交当前行缓冲 (把尚未以换行结束的内容送出)。用于「行内提示符」——
+/// 提示符须在用户输入前显示出来, 不能等换行。
+pub fn flush() {
     print_flush();
 }
 

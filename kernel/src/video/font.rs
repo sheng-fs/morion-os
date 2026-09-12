@@ -106,7 +106,7 @@ pub const CHAR_HEIGHT: u32 = 16;
 
 /// 在 (x, y) 处绘制单个 ASCII 字符
 pub fn draw_char(fb: &mut Framebuffer, x: u32, y: u32, ch: u8, color: u32) {
-    if ch < 0x20 || ch > 0x7E {
+    if !(0x20..=0x7E).contains(&ch) {
         return;
     }
     let glyph = &FONT[(ch - 0x20) as usize];

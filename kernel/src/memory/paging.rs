@@ -56,18 +56,36 @@ pub fn init() {
     init_heap(pml4_phys);
 }
 
+/// 4 KiB 对齐的页表存储。放在内核镜像的 `.bss` 中, 由链接器保留 (帧分配器不会
+/// 复用镜像内的帧), 因此启动页表与堆/栈/引导器页表都不可能互相覆盖。
+///
+/// 历史上启动页表是从帧分配器「镜像尾部相邻帧」里取的, 一旦镜像大小变化使该帧
+/// 与内核栈顶或仍在使用的引导器页表重合, 就会在 `paging::init` 处 triple fault,
+/// 且时有时无。改为静态存储后该类问题不再可能发生。
+#[repr(C, align(4096))]
+struct BootPageTable([u64; 512]);
+
+static mut BOOT_PML4: BootPageTable = BootPageTable([0; 512]);
+static mut BOOT_PDPT: BootPageTable = BootPageTable([0; 512]);
+static mut BOOT_PDS: [BootPageTable; 4] = [
+    BootPageTable([0; 512]),
+    BootPageTable([0; 512]),
+    BootPageTable([0; 512]),
+    BootPageTable([0; 512]),
+];
+
 /// 手动构造初始页表, 返回 PML4 的物理地址。
 ///
 /// 此时 CPU 仍运行在 UEFI 的恒等映射下, 物理地址可直接作为虚拟地址访问。
 fn setup_page_tables() -> PhysAddr {
-    // 分配页表帧: 1 PML4 + 1 PDPT + 4 PD (每个 PD 用 2 MiB 大页覆盖 1 GiB)
-    let pml4_phys = frame_allocator::allocate_frame().expect("allocate PML4");
-    let pdpt_phys = frame_allocator::allocate_frame().expect("allocate PDPT");
+    // 启动页表位于 .bss (镜像内, 已被帧分配器保留), 不再向分配器申请。
+    let pml4_phys = core::ptr::addr_of!(BOOT_PML4) as u64;
+    let pdpt_phys = core::ptr::addr_of!(BOOT_PDPT) as u64;
     let pd_count = (MANAGED_MEMORY / (512 * 0x20_0000)) as usize; // 4 GiB → 4 个 PD
+    let pds_base = core::ptr::addr_of!(BOOT_PDS) as *const BootPageTable;
     let mut pd_phys = [0u64; 4];
     for (i, slot) in pd_phys.iter_mut().enumerate().take(pd_count) {
-        *slot = frame_allocator::allocate_frame().expect("allocate PD");
-        let _ = i;
+        *slot = pds_base.wrapping_add(i) as u64;
     }
 
     // 零填充页表帧

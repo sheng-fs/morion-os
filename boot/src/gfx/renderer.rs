@@ -196,11 +196,14 @@ impl<'fb> Renderer<'fb> {
                     }
                 }
 
-                if cnt > 0 {
+                // cnt 为 0 时不写像素, checked_div 同时规避除零
+                if let (Some(r), Some(g), Some(b)) =
+                    (r_sum.checked_div(cnt), g_sum.checked_div(cnt), b_sum.checked_div(cnt))
+                {
                     self.fb.put_pixel(px, py, Color {
-                        red:   (r_sum / cnt) as u8,
-                        green: (g_sum / cnt) as u8,
-                        blue:  (b_sum / cnt) as u8,
+                        red:   r as u8,
+                        green: g as u8,
+                        blue:  b as u8,
                         alpha: 255,
                     });
                 }

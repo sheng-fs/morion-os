@@ -4,8 +4,10 @@
 //!   - 顶部 `MARGIN` 起为「历史区」, 显示已提交的行, 可通过 ↑/↓ 回滚查看。
 //!   - 底部固定一行「输入行」, 用于当前正在编辑/打印的行, 带可见光标。
 
+pub mod bg;
 pub mod font;
 pub mod framebuffer;
+pub mod logo;
 
 use crate::bootinfo::BootInfo;
 use framebuffer::Framebuffer;
@@ -19,8 +21,6 @@ static mut CURSOR_Y: u32 = 0;
 const MARGIN: u32 = 16;
 /// 行高 (字符高 + 行间距)
 const LINE_HEIGHT: u32 = font::CHAR_HEIGHT + 4;
-/// 背景色 (与清屏颜色一致)
-const BACKGROUND: u32 = 0x08102A;
 /// 前景色 (字符 / 光标)
 const FG: u32 = 0xFFFFFF;
 
@@ -43,6 +43,11 @@ static mut CUR_LEN: usize = 0;
 /// 光标位置 (输入行内字符索引, 0..=CUR_LEN)
 static mut CUR_POS: usize = 0;
 
+/// 本轮用户输入的起点 (CUR_LINE 下标): 其前是 shell 提示符等已打印文本, 不计入输入。
+static mut INPUT_BASE: usize = 0;
+/// 本轮是否已有用户按键 (决定 INPUT_BASE 何时锁定, 以及回车提交哪一段)。
+static mut INPUT_ACTIVE: bool = false;
+
 /// 回滚偏移: 0 = 跟随底部(live), N > 0 = 向上回滚了 N 行
 static mut SCROLL_OFFSET: usize = 0;
 
@@ -51,6 +56,19 @@ static mut CUR_ROW: usize = 0;
 
 /// 光标在历史区行的列位置 (CUR_ROW > 0 时使用, 0..=该行长度)
 static mut CUR_COL: usize = 0;
+
+// ---- 输入行队列 (键盘 Enter 提交的行, 供 SYS_READLINE 取走) ----
+// 键盘域经 SYS_TERM_PUT 编辑 CUR_LINE, 回车时把整行压入此队列并唤醒等待者;
+// 用户态 SYS_READLINE 阻塞取走一行。队列满时丢弃最旧行 (交互输入不阻塞内核)。
+const INPUT_QUEUE_LINES: usize = 4;
+static mut INPUT_QUEUE: [[u8; LINE_BYTES]; INPUT_QUEUE_LINES] = [[0; LINE_BYTES]; INPUT_QUEUE_LINES];
+static mut INPUT_QUEUE_LEN: [usize; INPUT_QUEUE_LINES] = [0; INPUT_QUEUE_LINES];
+/// 最老行在队列中的下标。
+static mut INPUT_HEAD: usize = 0;
+/// 下一写入位置在队列中的下标。
+static mut INPUT_TAIL: usize = 0;
+/// 当前队列中的行数 (<= INPUT_QUEUE_LINES)。
+static mut INPUT_COUNT: usize = 0;
 
 // ---------------------------------------------------------------------------
 // COM1 串口输出 (headless 调试用)
@@ -109,7 +127,7 @@ pub fn init(info: &BootInfo) {
         CURSOR_X = MARGIN;
         CURSOR_Y = MARGIN;
     }
-    clear(BACKGROUND);
+    bg_fill_all();
 }
 
 /// 帧缓冲是否可用 (panic/异常处理在打印前检查)
@@ -125,9 +143,52 @@ pub fn height() -> u32 {
     unsafe { FB.height() }
 }
 
+/// 用背景渐变填充一块矩形 (替代纯色填充)。
+///
+/// 背景是竖直渐变, 逐行取色一次性填满整行, 开销与纯色 `fill_rect` 同量级。
+fn bg_fill_rect(x: u32, y: u32, w: u32, h: u32) {
+    unsafe {
+        let screen_h = FB.height();
+        for dy in 0..h {
+            let color = bg::color_for_row(y + dy, screen_h);
+            FB.fill_rect(x, y + dy, w, 1, color);
+        }
+    }
+}
+
+/// 用背景渐变铺满整屏。
+fn bg_fill_all() {
+    unsafe {
+        let (w, h) = (FB.width(), FB.height());
+        bg_fill_rect(0, 0, w, h);
+    }
+}
+
 /// 清屏
 pub fn clear(color: u32) {
     unsafe { FB.clear(color) }
+}
+
+/// 清屏并复位终端状态 (历史 / 输入行 / 光标 / 回滚), 供 `SYS_CLEAR` 使用。
+pub fn clear_screen() {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    unsafe {
+        HISTORY_COUNT = 0;
+        HISTORY_START = 0;
+        SCROLL_OFFSET = 0;
+        CUR_LINE = [0; LINE_BYTES];
+        CUR_LEN = 0;
+        CUR_POS = 0;
+        CUR_ROW = 0;
+        CUR_COL = 0;
+        INPUT_BASE = 0;
+        INPUT_ACTIVE = false;
+    }
+    bg_fill_all();
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
 }
 
 /// 将光标移动到指定位置 (字符坐标)
@@ -176,9 +237,7 @@ fn history_push(bytes: &[u8]) {
             HISTORY_START = (HISTORY_START + 1) % HISTORY_LINES;
         }
         let n = if bytes.len() > LINE_BYTES { LINE_BYTES } else { bytes.len() };
-        for i in 0..n {
-            HISTORY[idx][i] = bytes[i];
-        }
+        HISTORY[idx][..n].copy_from_slice(&bytes[..n]);
         HISTORY_LEN[idx] = n;
     }
 }
@@ -189,6 +248,47 @@ fn commit_line() {
         history_push(&CUR_LINE[..CUR_LEN]);
         CUR_LEN = 0;
         CUR_POS = 0;
+        // 提交后本轮输入结束: 下一次按键重新锁定输入起点。
+        INPUT_BASE = 0;
+        INPUT_ACTIVE = false;
+    }
+}
+
+/// 把一行 (键盘回车提交的输入) 压入输入行队列; 队列满时丢弃最旧行。
+fn input_queue_push(bytes: &[u8]) {
+    unsafe {
+        let idx = INPUT_TAIL;
+        let n = if bytes.len() > LINE_BYTES { LINE_BYTES } else { bytes.len() };
+        INPUT_QUEUE[idx][..n].copy_from_slice(&bytes[..n]);
+        INPUT_QUEUE_LEN[idx] = n;
+        INPUT_TAIL = (INPUT_TAIL + 1) % INPUT_QUEUE_LINES;
+        if INPUT_COUNT < INPUT_QUEUE_LINES {
+            INPUT_COUNT += 1;
+        } else {
+            INPUT_HEAD = (INPUT_HEAD + 1) % INPUT_QUEUE_LINES;
+        }
+    }
+}
+
+/// 从输入行队列取走一行, 拷入 `out` (最多 `max` 字节, 不含换行)。
+/// 返回该行长度; 队列为空返回 `None`。
+///
+/// # Safety
+/// `out` 必须指向本域内至少 `max` 字节的可写缓冲。
+pub unsafe fn input_read(out: *mut u8, max: usize) -> Option<usize> {
+    unsafe {
+        if INPUT_COUNT == 0 {
+            return None;
+        }
+        let idx = INPUT_HEAD;
+        let len = INPUT_QUEUE_LEN[idx];
+        let n = if len > max { max } else { len };
+        if n > 0 {
+            core::ptr::copy_nonoverlapping(INPUT_QUEUE[idx].as_ptr(), out, n);
+        }
+        INPUT_HEAD = (INPUT_HEAD + 1) % INPUT_QUEUE_LINES;
+        INPUT_COUNT -= 1;
+        Some(n)
     }
 }
 
@@ -196,7 +296,7 @@ fn commit_line() {
 fn max_scroll() -> usize {
     let total = unsafe { HISTORY_COUNT };
     let visible = hist_visible();
-    if total > visible { total - visible } else { 0 }
+    total.saturating_sub(visible)
 }
 
 /// 光标可上移到的最大行数 (不触发滚动); 0 = 底部输入行。
@@ -209,7 +309,7 @@ fn cur_row_max() -> usize {
     } else {
         0
     };
-    let drawn = if total > start { total - start } else { 0 };
+    let drawn = total.saturating_sub(start);
     drawn.min(visible)
 }
 
@@ -258,8 +358,8 @@ fn cur_hist_len() -> usize {
 /// 从历史 + 输入行重绘整个文本区, 并在光标位置画下划线。
 fn redraw() {
     unsafe {
-        FB.fill_rect(0, MARGIN, FB.width(), FB.height() - MARGIN, BACKGROUND);
-
+        // 用背景渐变擦除内容区 (而非纯色), 以便背景图在每次重绘后保持。
+        bg_fill_rect(0, MARGIN, FB.width(), FB.height() - MARGIN);
         let visible = hist_visible();
         let total = HISTORY_COUNT;
         let start = if total > visible { total - visible - SCROLL_OFFSET } else { 0 };
@@ -272,8 +372,7 @@ fn redraw() {
             let idx = (HISTORY_START + i) % HISTORY_LINES;
             let len = HISTORY_LEN[idx];
             let mut x = MARGIN;
-            for b in 0..len {
-                let ch = HISTORY[idx][b];
+            for &ch in HISTORY[idx][..len].iter() {
                 if ch == 0 {
                     break;
                 }
@@ -285,12 +384,28 @@ fn redraw() {
             }
             y += LINE_HEIGHT;
         }
+    }
+    draw_input_line();
+}
 
-        // 输入行 (固定底部)
-        let iy = input_y();
+/// 只重绘底部输入行 (清空该行 + 画字符与光标)。
+///
+/// 打字/退格/左右移动光标时历史区不变, 无需整屏重绘 —— 整屏 `redraw()` 会重填
+/// 整个文本区背景并重画所有历史行, 在未缓存的 MMIO 帧缓冲上代价很高 (逐键卡顿)。
+/// 仅在光标始终位于输入行 (`CUR_ROW == 0` 且未发生换行提交) 时使用。
+fn redraw_input_line() {
+    let iy = input_y();
+    bg_fill_rect(0, iy, unsafe { FB.width() }, LINE_HEIGHT);
+    draw_input_line();
+}
+
+/// 画输入行内容与光标下划线 (调用方负责先擦除该行区域)。
+fn draw_input_line() {
+    let iy = input_y();
+    unsafe {
         let mut x = MARGIN;
-        for b in 0..CUR_LEN {
-            font::draw_char(&mut FB, x, iy, CUR_LINE[b], FG);
+        for &ch in CUR_LINE[..CUR_LEN].iter() {
+            font::draw_char(&mut FB, x, iy, ch, FG);
             x += font::CHAR_WIDTH;
             if x + font::CHAR_WIDTH > FB.width() {
                 break;
@@ -339,8 +454,8 @@ pub fn scroll_view_down() {
     unsafe {
         if CUR_ROW > 0 {
             CUR_ROW -= 1;
-        } else if SCROLL_OFFSET > 0 {
-            SCROLL_OFFSET -= 1;
+        } else {
+            SCROLL_OFFSET = SCROLL_OFFSET.saturating_sub(1);
         }
         // 下移后把列位置收敛到新行长度内 (仅在历史区)
         if CUR_ROW > 0 {
@@ -360,6 +475,41 @@ pub fn scroll_view_down() {
 /// 输出互斥锁: 串行化各域的打印, 防止并发下字符交错 (多核防御)。
 static PRINT_LOCK: Mutex<()> = Mutex::new(());
 
+/// 把一个字符追加到当前输入行 (行满则先换行提交); 返回是否发生了提交。
+fn append_char(ch: u8) -> bool {
+    unsafe {
+        if CUR_LEN >= max_cols() {
+            commit_line();
+            if CUR_LEN < LINE_BYTES {
+                CUR_LINE[CUR_LEN] = ch;
+                CUR_LEN += 1;
+                CUR_POS = CUR_LEN;
+            }
+            return true;
+        }
+        if CUR_LEN < LINE_BYTES {
+            CUR_LINE[CUR_LEN] = ch;
+            CUR_LEN += 1;
+            CUR_POS = CUR_LEN;
+        }
+        false
+    }
+}
+
+/// 追加一段文本 (`\n` 提交当前行); 返回是否发生过换行提交。
+fn append_text(s: &str) -> bool {
+    let mut committed = false;
+    for ch in s.bytes() {
+        if ch == b'\n' {
+            commit_line();
+            committed = true;
+        } else if append_char(ch) {
+            committed = true;
+        }
+    }
+    committed
+}
+
 /// 打印字符串 (支持 '\n' 换行; 日志追加到输入行末尾)
 pub fn print(s: &str) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
@@ -369,22 +519,13 @@ pub fn print(s: &str) {
     // 镜像到 COM1 串口, 供 headless 调试捕获。
     serial_write(s);
 
-    for ch in s.bytes() {
-        match ch {
-            b'\n' => commit_line(),
-            _ => unsafe {
-                if CUR_LEN >= max_cols() {
-                    commit_line();
-                }
-                if CUR_LEN < LINE_BYTES {
-                    CUR_LINE[CUR_LEN] = ch;
-                    CUR_LEN += 1;
-                    CUR_POS = CUR_LEN;
-                }
-            },
-        }
+    let committed = append_text(s);
+    // 历史区变化或光标不在输入行时才需要整屏重绘, 否则只重画输入行。
+    if committed || unsafe { CUR_ROW } != 0 {
+        redraw();
+    } else {
+        redraw_input_line();
     }
-    redraw();
 
     // 先释放锁再开中断, 避免「开中断后被抢占、别的核/任务自旋等锁」造成的死锁。
     drop(guard);
@@ -399,6 +540,37 @@ pub fn println(s: &str) {
     print("\n");
 }
 
+/// 打印启动 LOGO: 整块水平居中, 一次性追加 + 单次重绘。
+///
+/// 注意必须按**整块**居中 (常量左缩进): 逐行各自居中的话, 每行长度不同会把图形
+/// 横向错切 (这是此前 LOGO「形状不对」的原因)。原先逐字符/逐行调用
+/// `print()` 还会触发上百次整屏重绘 (启动明显卡顿), 这里改为批量追加后只重绘一次。
+pub fn print_logo() {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let guard = PRINT_LOCK.lock();
+
+    let cols = max_cols();
+    let indent = if cols > logo::WIDTH { (cols - logo::WIDTH) / 2 } else { 0 };
+
+    for line in logo::LOGO {
+        for _ in 0..indent {
+            serial_putc(b' ');
+            append_char(b' ');
+        }
+        serial_write(line);
+        serial_write("\n");
+        append_text(line);
+        commit_line();
+    }
+    redraw();
+
+    drop(guard);
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 终端编辑 (键盘输入)
 // ---------------------------------------------------------------------------
@@ -410,18 +582,37 @@ pub fn term_put(c: u8) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
+    let mut entered = false;
+    // 历史区是否变化 (决定整屏重绘还是只重画输入行)。
+    let mut needs_full = false;
     unsafe {
         match c {
             b'\n' => {
+                // 回车提交: 只把「用户输入段」(INPUT_BASE 起) 拷入输入行队列,
+                // 不含此前打印的提示符, 再清空输入行。
+                let base = if INPUT_ACTIVE { INPUT_BASE.min(CUR_LEN) } else { CUR_LEN };
+                input_queue_push(&CUR_LINE[base..CUR_LEN]);
                 return_to_input();
                 commit_line();
+                entered = true;
+                needs_full = true;
             }
             _ => {
                 if CUR_ROW > 0 {
                     insert_hist_char(c);
+                    needs_full = true;
                 } else {
+                    // 本轮首个按键: 锁定输入起点 = 当前行尾 (提示符长度)。
+                    if !INPUT_ACTIVE {
+                        INPUT_BASE = CUR_LEN;
+                        INPUT_ACTIVE = true;
+                    }
                     if CUR_LEN >= max_cols() {
+                        // 输入行满: 换行续写, 新行完全属于用户输入。
                         commit_line();
+                        INPUT_BASE = 0;
+                        INPUT_ACTIVE = true;
+                        needs_full = true;
                     }
                     if CUR_LEN < LINE_BYTES {
                         for i in (CUR_POS..CUR_LEN).rev() {
@@ -435,7 +626,16 @@ pub fn term_put(c: u8) {
             }
         }
     }
-    redraw();
+    if needs_full {
+        redraw();
+    } else {
+        redraw_input_line();
+    }
+
+    // 有新输入行时唤醒阻塞在 SYS_READLINE 上的任务 (哨兵 wait_on = INPUT_WAIT)。
+    if entered {
+        crate::scheduler::wake_one(crate::scheduler::INPUT_WAIT);
+    }
 
     if was_enabled {
         x86_64::instructions::interrupts::enable();
@@ -472,18 +672,27 @@ pub fn term_backspace() {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
+    let mut needs_full = false;
     unsafe {
         if CUR_ROW > 0 {
             backspace_hist_char();
+            needs_full = true;
         } else if CUR_POS > 0 {
-            for i in CUR_POS..CUR_LEN {
-                CUR_LINE[i - 1] = CUR_LINE[i];
+            // 不删到输入起点之前 (即不破坏提示符)。
+            if !(INPUT_ACTIVE && CUR_POS <= INPUT_BASE) {
+                for i in CUR_POS..CUR_LEN {
+                    CUR_LINE[i - 1] = CUR_LINE[i];
+                }
+                CUR_LEN -= 1;
+                CUR_POS -= 1;
             }
-            CUR_LEN -= 1;
-            CUR_POS -= 1;
         }
     }
-    redraw();
+    if needs_full {
+        redraw();
+    } else {
+        redraw_input_line();
+    }
 
     if was_enabled {
         x86_64::instructions::interrupts::enable();
@@ -517,16 +726,23 @@ pub fn term_left() {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
+    let mut needs_full = false;
     unsafe {
         if CUR_ROW == 0 {
-            if CUR_POS > 0 {
+            // 不左移到输入起点之前 (即不进入提示符)。
+            if CUR_POS > 0 && !(INPUT_ACTIVE && CUR_POS <= INPUT_BASE) {
                 CUR_POS -= 1;
             }
-        } else if CUR_COL > 0 {
-            CUR_COL -= 1;
+        } else {
+            CUR_COL = CUR_COL.saturating_sub(1);
+            needs_full = true;
         }
     }
-    redraw();
+    if needs_full {
+        redraw();
+    } else {
+        redraw_input_line();
+    }
 
     if was_enabled {
         x86_64::instructions::interrupts::enable();
@@ -538,16 +754,24 @@ pub fn term_right() {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
+    let mut needs_full = false;
     unsafe {
         if CUR_ROW == 0 {
             if CUR_POS < CUR_LEN {
                 CUR_POS += 1;
             }
-        } else if CUR_COL < cur_hist_len() {
-            CUR_COL += 1;
+        } else {
+            if CUR_COL < cur_hist_len() {
+                CUR_COL += 1;
+            }
+            needs_full = true;
         }
     }
-    redraw();
+    if needs_full {
+        redraw();
+    } else {
+        redraw_input_line();
+    }
 
     if was_enabled {
         x86_64::instructions::interrupts::enable();

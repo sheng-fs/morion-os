@@ -4,6 +4,7 @@
 //!   - arch  : GDT / TSS / IDT (x86_64)
 //!   - video : GOP 线性帧缓冲 + 8x16 位图字体输出
 //!   - bootinfo: 引导器传递的 Boot Info 结构
+//!
 //! 阶段二: 物理内存管理
 //!   - memory: 位图物理帧分配器 (基于 UEFI 内存图)
 

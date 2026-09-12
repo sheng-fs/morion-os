@@ -117,10 +117,7 @@ impl BootEntry {
     /// 是否可被选择启动
     pub fn bootable(&self) -> bool {
         use EntryType::*;
-        match self.entry_type {
-            CurrentGeneration | PreviousGeneration | Latest | Rescue | OtherOS => true,
-            _ => false,
-        }
+        matches!(self.entry_type, CurrentGeneration | PreviousGeneration | Latest | Rescue | OtherOS)
     }
 }
 
@@ -154,7 +151,7 @@ impl GenerationManager {
         // 按世代降序插入
         let pos = self.entries[..self.count]
             .iter()
-            .position(|e| e.as_ref().map_or(true, |e| entry.generation > e.generation))
+            .position(|e| e.as_ref().is_none_or(|e| entry.generation > e.generation))
             .unwrap_or(self.count);
 
         for i in (pos..self.count).rev() {
@@ -279,5 +276,11 @@ impl GenerationManager {
                 })
             })
             .collect()
+    }
+}
+
+impl Default for GenerationManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

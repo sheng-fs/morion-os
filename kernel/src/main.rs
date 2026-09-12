@@ -16,6 +16,17 @@ extern "C" {
     static _stack_end: u8;
 }
 
+// 真正的 ELF 入口: 必须在任何 Rust 栈帧建立之前设定 rsp (栈顶) 并关中断。
+// 用纯汇编桩实现 (而非普通 Rust 函数), 否则 LLVM 会先按引导器 rsp 分配栈帧,
+// 之后重置 rsp 会把该帧平移到镜像之上、破坏帧分配器交出的内存 (详见 kernel_main)。
+core::arch::global_asm!(
+    ".global _start",
+    "_start:",
+    "lea rsp, [rip + _stack_end]",
+    "cli",
+    "jmp kernel_main",
+);
+
 // ---------------------------------------------------------------------------
 // 阶段十: 用户程序加载 (编译产物, 替代阶段九的手写机器码)
 // ---------------------------------------------------------------------------
@@ -23,10 +34,10 @@ extern "C" {
 const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
 /// 用户栈页虚拟地址。
 ///
-/// 不能紧邻程序镜像 (程序已超 1 页, 会与镜像后续页重叠); 也不得占用
-/// `USER_BASE + 0x9000` (用户态 sender/receiver 共享页演示) 与
-/// `USER_BASE + 0x10000` 起的 NVMe 配置/MMIO/DMA 区域。故预留 0x8000 起。
-const USER_STACK_ADDR: u64 = USER_BASE + 0x8000;
+/// 布置在程序镜像 (自 `USER_BASE` 起, 随代码增长) 之上、固定数据区之下。固定数据区
+/// (`USER_BASE + 8 MiB` 起: sender/receiver 共享页、NVMe 配置/MMIO/DMA) 与文件服务
+/// 缓冲页 (`USER_BASE + 1 MiB` 起) 均在其上, 互不重叠。故取 4 MiB 处留足余量。
+const USER_STACK_ADDR: u64 = USER_BASE + 0x40_0000;
 /// 用户栈顶虚拟地址 (栈向下增长)。
 const USER_STACK_TOP: u64 = USER_STACK_ADDR + 0x1000;
 /// 页大小。
@@ -39,7 +50,7 @@ const USER_PROGRAM: &[u8] = include_bytes!("../../build/user/user.bin");
 /// 并映射一页用户栈。
 fn load_user_program(domain_id: u64) {
     let bytes = USER_PROGRAM;
-    let pages = (bytes.len() as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages = (bytes.len() as u64).div_ceil(PAGE_SIZE);
 
     for i in 0..pages {
         let frame =
@@ -74,17 +85,15 @@ extern "C" fn task_idle() {
 }
 
 /// 内核入口 — 引导器通过 `jmp` 进入, Boot Info 指针在 rdi
+///
+/// 该符号由 `global_asm!` 定义 (见下方), 是真正的 ELF 入口: 它必须在任何
+/// Rust 栈帧建立之前设置 `rsp`。若把 `mov rsp, _stack_end` 放进普通 Rust
+/// 函数 (如 `extern "C" fn _start`), LLVM 会在入口处先按引导器的 rsp
+/// 「向下」分配栈帧, 随后该 asm 把 rsp 重置到 `_stack_end`, 导致整个栈帧
+/// 被平移到 `[_stack_end, _stack_end + frame_size)` —— 恰好落在镜像之后、
+/// 帧分配器最先交出去的内存上 (堆的第 0 页), 从而随机破坏堆的链表元数据。
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // 设置内核栈 + 关中断 (IDT 就绪前不允许中断)
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {0}",
-            "cli",
-            in(reg) &_stack_end as *const u8 as u64,
-        );
-    }
-
+pub extern "C" fn kernel_main() -> ! {
     // 1. 读取并校验 Boot Info
     let info = bootinfo::get();
 
@@ -212,15 +221,19 @@ pub extern "C" fn _start() -> ! {
     // ============================================================
     scheduler::init();
 
-    // 创建 8 个保护域:
+    // 创建 9 个保护域:
     //   0 = sender    (持有 SendTo(1)+MapInto(1) 能力, 触发按需分页 + call 演示)
     //   1 = receiver  (接收消息)
     //   2 = pager     (分页器, 服务所有域的缺页)
     //   3 = echo      (同步 IPC 服务: recv → reply 回显)
     //   4 = kbd       (用户态键盘驱动, 注册接收 IRQ1)
-    //   5 = block_srv (IDE PIO 块设备服务)
+    //   5 = block_srv (IDE PIO / NVMe 块设备服务)
     //   6 = fat32_srv (FAT32 文件服务)
     //   7 = app       (测试应用, 经 libvfs 读文件)
+    //   8 = shell     (命令行解释器, 经 libvfs 访问文件服务)
+    //   9 = mount_srv (挂载服务: 路径前缀 → 文件服务域, 支撑统一目录树)
+    //  10 = tmpfs_srv (内存文件系统, 挂载于 /tmp)
+    //  11 = mfs_srv   (MorionFS: 块设备后端的原创文件系统, 挂载于 /mfs)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
     let pager_domain = domain::create();
@@ -229,11 +242,15 @@ pub extern "C" fn _start() -> ! {
     let block_domain = domain::create();
     let fat32_domain = domain::create();
     let app_domain = domain::create();
+    let shell_domain = domain::create();
+    let mount_domain = domain::create();
+    let tmpfs_domain = domain::create();
+    let mfs_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(8);
-    cap::init(8);
-    pager::init(8, pager_domain);
+    ipc::init(12);
+    cap::init(12);
+    pager::init(12, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -250,6 +267,10 @@ pub extern "C" fn _start() -> ! {
         block_domain,
         fat32_domain,
         app_domain,
+        shell_domain,
+        mount_domain,
+        tmpfs_domain,
+        mfs_domain,
     ] {
         cap::grant(pager_domain, cap::Capability::MapInto(d));
     }
@@ -261,7 +282,26 @@ pub extern "C" fn _start() -> ! {
     // 授权: app 经 IPC 调 fat32_srv 读文件 (阶段 C), 并共享结果页 (MapInto)。
     cap::grant(app_domain, cap::Capability::SendTo(fat32_domain));
     cap::grant(app_domain, cap::Capability::MapInto(fat32_domain));
-    video::println("[OK] IPC + capability + pager initialized (8 domains)");
+    // 授权: shell 经 IPC 调 fat32_srv 执行文件操作, 并共享结果/写缓冲页 (MapInto)。
+    cap::grant(shell_domain, cap::Capability::SendTo(fat32_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(fat32_domain));
+    // 授权: app / shell 经 mount_srv 查询路径路由 (阶段 C1)。
+    cap::grant(app_domain, cap::Capability::SendTo(mount_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(mount_domain));
+    // 授权: app / shell 可访问 tmpfs_srv (挂载于 /tmp), 并共享缓冲页 (阶段 C2)。
+    cap::grant(app_domain, cap::Capability::SendTo(tmpfs_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(tmpfs_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(tmpfs_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(tmpfs_domain));
+    // 授权: mfs_srv 经 IPC 调 block_srv (SendTo) 访问 MFS 盘 (namespace 2) 并共享块缓冲。
+    cap::grant(mfs_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(mfs_domain, cap::Capability::MapInto(block_domain));
+    // 授权: app / shell 可访问 mfs_srv (挂载于 /mfs), 并共享缓冲页 (阶段 C3)。
+    cap::grant(app_domain, cap::Capability::SendTo(mfs_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(mfs_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(mfs_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(mfs_domain));
+    video::println("[OK] IPC + capability + pager initialized (12 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
     // 找到则映射 BAR0/队列/DMA 并授权 Mmio; 否则降级 (magic=0), block 回退 IDE PIO。
@@ -278,7 +318,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 加载用户程序到八个域 (同一镜像, 经 domain_id 参数区分角色)。
+    // 加载用户程序到十二个域 (同一镜像, 经 domain_id 参数区分角色)。
     load_user_program(sender_domain);
     load_user_program(receiver_domain);
     load_user_program(pager_domain);
@@ -287,9 +327,13 @@ pub extern "C" fn _start() -> ! {
     load_user_program(block_domain);
     load_user_program(fat32_domain);
     load_user_program(app_domain);
-    video::println("[OK] user program loaded into domains 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7");
+    load_user_program(shell_domain);
+    load_user_program(mount_domain);
+    load_user_program(tmpfs_domain);
+    load_user_program(mfs_domain);
+    video::println("[OK] user program loaded into domains 0..11");
 
-    // 域 0..7 各起一个用户任务。
+    // 域 0..11 各起一个用户任务。
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, pager_domain);
@@ -298,17 +342,32 @@ pub extern "C" fn _start() -> ! {
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, block_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, fat32_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, app_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, shell_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mount_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, tmpfs_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mfs_domain);
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + idle tasks spawned");
+    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + shell + mount + tmpfs + mfs + idle tasks spawned");
     video::println("");
-    video::println("Expected: sender shares memory with receiver, then");
-    video::println("touches an unmapped page to trigger demand paging.");
+    // 启动 LOGO (日志末尾, shell 提示符之前)。
+    video::print_logo();
     video::println("");
 
     // 交给调度器。首次切换在中断关闭下进行, 避免 enable 与首次调度之间
     // 的竞态 (否则定时器中断会在 run 完成前触发 schedule 抢走主执行流)。
     scheduler::run();
+}
+
+/// 供 panic 处理器使用的免分配格式化输出 (直接写视频/串口)。
+#[cfg(target_os = "none")]
+struct VidWriter;
+#[cfg(target_os = "none")]
+impl core::fmt::Write for VidWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        video::print(s);
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -319,12 +378,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         video::set_cursor(2, 2);
         video::println("KERNEL PANIC");
         // 打印 panic 位置与消息, 便于定位崩溃点 (黑匣子)。
+        // 注意: 这里不用 format! (依赖堆), 否则堆一旦异常会造成 panic 递归。
+        use core::fmt::Write;
+        let mut w = VidWriter;
         if let Some(loc) = info.location() {
-            let s = alloc::format!("  at {}:{}:{}", loc.file(), loc.line(), loc.column());
-            video::println(&s);
+            let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
         }
-        let s = alloc::format!("  {}", info.message());
-        video::println(&s);
+        let _ = writeln!(w, "  msg: {}", info.message());
     }
     morion_kernel::halt();
 }

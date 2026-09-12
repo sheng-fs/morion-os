@@ -8,7 +8,8 @@ use crate::gfx::framebuffer::Color;
 use alloc::string::String;
 
 /// 主题配置顶层结构 — 完全映射 theme.toml 的所有 section
-#[derive(Debug, Clone)]
+// 默认值完全对应 theme.toml 的内容
+#[derive(Debug, Clone, Default)]
 pub struct ThemeConfig {
     /// [theme] 元数据
     pub meta: ThemeMeta,
@@ -42,30 +43,6 @@ pub struct ThemeConfig {
     pub power_icons: PowerIconPaths,
     /// [timeout] 超时配置
     pub timeout: TimeoutConfig,
-}
-
-impl Default for ThemeConfig {
-    fn default() -> Self {
-        // 默认值完全对应 theme.toml 的内容
-        Self {
-            meta: ThemeMeta::default(),
-            render: RenderConfig::default(),
-            splash: SplashConfig::default(),
-            logo: LogoConfig::default(),
-            background: BackgroundConfig::default(),
-            menu: MenuConfig::default(),
-            scroll: ScrollConfig::default(),
-            cursor: CursorConfig::default(),
-            loading: LoadingConfig::default(),
-            progress: ProgressConfig::default(),
-            security: SecurityIconPaths::default(),
-            dialog: DialogConfig::default(),
-            system_icons: SystemIcons::default(),
-            ui_icons: UiIconPaths::default(),
-            power_icons: PowerIconPaths::default(),
-            timeout: TimeoutConfig::default(),
-        }
-    }
 }
 
 // ============================================================

@@ -114,7 +114,7 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::video::print_hex(stack_frame.instruction_pointer.as_u64());
         crate::video::println("");
         crate::video::print("error code: 0x");
-        crate::video::print_hex(error_code.bits() as u64);
+        crate::video::print_hex(error_code.bits());
         crate::video::println("");
         crate::video::print("rsp:        0x");
         crate::video::print_hex(stack_frame.stack_pointer.as_u64());

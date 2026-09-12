@@ -102,7 +102,13 @@ impl AnimationEngine {
     pub fn is_finished(&self, slot: usize) -> bool {
         self.animations[slot]
             .as_ref()
-            .map_or(true, |a| a.finished)
+            .is_none_or(|a| a.finished)
+    }
+}
+
+impl Default for AnimationEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

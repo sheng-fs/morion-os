@@ -86,6 +86,13 @@ make iso       # 完整镜像
 | 2 | pager | 用户态分页器（服务缺页） |
 | 3 | echo | 同步 IPC 服务（recv → reply 回显） |
 | 4 | kbd | 用户态键盘驱动（注册 IRQ1） |
+| 5 | block_srv | 块设备服务（NVMe / IDE PIO） |
+| 6 | fat32_srv | FAT32 文件服务 |
+| 7 | app | 测试应用（libvfs 读文件 + FS 自测） |
+| 8 | shell | 命令行解释器（`SYS_READLINE` 阻塞读行 + libvfs） |
+| 9 | mount_srv | 挂载服务（路径前缀 → 文件服务域；libvfs 据此路由） |
+| 10 | tmpfs_srv | 内存文件系统（挂载于 `/tmp`） |
+| 11 | mfs_srv | MorionFS 原创文件系统（挂载于 `/mfs`；块设备后端 + COW + 快照） |
 
 > 新增一个应用/域：需在 `kernel/src/main.rs` 里 `domain::create()` → `cap::grant(..)` 授权 →
 > `load_user_program(..)` → `scheduler::spawn_user(..)`，并在 `user/src/main.rs` 的 `_start` 里加对应分支。
@@ -143,12 +150,26 @@ ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态
 | 18 | `sys_term_put(ch)` | `rdi=ch` | 1 | 在输入行光标处插入字符（`ch=0x0A` 提交当前行） |
 | 19 | `sys_term_left()` | — | 1 | 光标左移 |
 | 20 | `sys_term_right()` | — | 1 | 光标右移 |
+| 28 | `sys_clear()` | — | 1 | 清屏并复位终端状态（历史 / 输入行 / 光标） |
 
-> 打印辅助函数（基于 `sys_puts`）：`print(s)`、`println(s)`、`print_u64(v)`、`print_hex(v)`。
+> 打印辅助函数（基于 `sys_puts`）：`print(s)`、`println(s)`、`print_u64(v)`、`print_hex(v)`、`flush()`。
+>
+> `print` 为**行缓冲**（换行或缓冲满才提交）；`flush()` 立即提交未以换行结束的内容，用于**行内提示符**。
 >
 > ⚠️ 当前**没有用户态 framebuffer 访问接口**（图形输出后续补充）。GUI 开发前需把 GOP 帧缓冲
 > 以 MMIO 方式映射进用户域；通用 MMIO 映射能力 `sys_map_mmio`（编号 21，`Capability::Mmio`）已就绪，
 > 见 [roadmap-fs.md](roadmap-fs.md)。
+
+### 3.6 控制台输入
+
+| 编号 | 封装 | 参数 | 返回 | 说明 |
+| --- | --- | --- | --- | --- |
+| 27 | `sys_readline(buf)` | `rdi=buf ptr, rsi=len` | 行长度 | 阻塞读取一行控制台输入到 `buf`（最多 `len` 字节，不含换行）；无输入时阻塞，直到键盘回车提交一行（由键盘域经 `SYS_TERM_PUT` 驱动）。失败返回 `u64::MAX` |
+
+> 提示符支持**行内显示**（与用户键入内容处于同一行，形如正常终端 `[morion@morion <cwd>]$ `）：
+> 内核记录本轮用户输入起点（第一个按键时锁定为当时行尾），`sys_readline` **只返回用户输入部分**，
+> 不含此前打印的提示符；退格/左移也不会越过输入起点（不会删掉提示符）。因此 shell 用
+> `print(...)` 打印提示符后调用 `flush()` 即可，无需 `println`。
 
 ---
 
@@ -261,15 +282,39 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 | pager (2) | 缺页处理，映射匿名零帧 | 接收缺页消息 → `sys_map_anon` → `sys_page_fault_reply` |
 | echo (3) | 同步 IPC 演示 | `recv` → `reply` |
 | kbd (4) | 键盘驱动 | 注册 IRQ1 → `recv` scancode → 解码 |
+| block_srv (5) | 块设备服务 | `recv` `BlockReq` → NVMe / IDE PIO 读写扇区 |
+| fat32_srv (6) | FAT32 文件服务，挂载于 `/` | `recv` VFS tag → 解析 FAT32 → 经 block_srv 访问磁盘 |
+| mount_srv (9) | 挂载管理（统一目录树） | `recv` `VFS_LOOKUP_TAG` → 最长前缀匹配 → `reply` `(域<<32)|前缀长度`；`MNTA` 运行时挂载（回复槽位号）/ `MNTD` 卸载 |
+| tmpfs_srv (10) | 内存文件系统，挂载于 `/tmp` | `recv` VFS tag → 平铺节点表 + 字节区读写 |
+| mfs_srv (11) | MorionFS 原创文件系统，挂载于 `/mfs` | `recv` VFS tag → 4 KiB 块 + CRC32 + COW 写时复制 → 经 block_srv 访问第二盘；另有快照 tag `MSNP/MSNL/MSNR` |
+| shell (8) | 命令行解释器 | `sys_readline` 取行 → 命令 `help / echo / pwd / ls / cat / cd / mkdir / touch / rm / clear`（含 cwd 相对路径）→ libvfs(先查 mount_srv 路由, 再 `sys_call` 目标服务) |
+
+> libvfs 对每个路径先向 mount_srv 查询，再由 fd 高 32 位的服务域字段路由后续
+> `read/write/readdir/close`。应用只看到单一根 `/`：`/tmp/**` 落到 tmpfs_srv、
+> `/mfs/**` 落到 mfs_srv，其余落到 fat32_srv。
+>
+> fd 的最高 16 位是**能力句柄**（`vfs::open`/`creat` 时由内核 `sys_cap_issue` 签发，
+> 每次 I/O 前 `sys_cap_lookup` 校验，`vfs::close` 时 `sys_cap_drop` 撤销）。因此
+> 关闭后的 fd、或伪造出其它域 fd 数值的 fd 都无法访问文件服务——「无能力即不可访问」。
+>
+> 路径需要临时改路由时可用 `vfs::mount(prefix, domain)` / `vfs::umount(prefix)`
+> 在运行时增删挂载点（前缀传空串则自动分配空闲 `/mnt<N>`）。
 
 ### 规划中的服务
 
 | 服务 | 职责 | 状态 |
 | --- | --- | --- |
-| `nvme_srv` | NVMe 块设备驱动，提供 read_lba/write_lba | 规划中，见 roadmap-fs.md |
-| `fat32_srv` | FAT32 文件服务 | 规划中 |
-| 挂载服务 | 统一目录树 | 规划中 |
-| GUI / Shell 服务 | 图形界面与命令行 | 远期 |
+| ext2/ext4 服务（只读） | 兼容既有 Linux 分区 | 规划中，见 roadmap-fs.md |
+| GUI 服务 | 图形界面 | 远期 |
+
+### 输出约定（避免打断 shell 提示符）
+
+域与 shell 共用同一控制台。为保持「正常终端」体验，**成功路径不要在运行期打印**
+（尤其是反复触发的事件，如缺页、IPC、键盘），只在**失败**时打印一行诊断信息：
+
+- 演示域（sender / receiver / pager / echo / kbd）与自检域（block_srv / fat32_srv / app）成功时静默；
+- 自测只保留失败信息（如 `app: FS2 … FAILED`），通过与否以「无 FAILED + 能进 shell」判定；
+- shell 自身的启动提示（`type 'help' for commands`）与提示符属于顺序输出，可保留。
 
 ---
 

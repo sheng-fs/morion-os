@@ -45,6 +45,11 @@ pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
 pub const SYS_VIRT_TO_PHYS: u64 = 26;
+pub const SYS_READLINE: u64 = 27;
+pub const SYS_CLEAR: u64 = 28;
+pub const SYS_CAP_ISSUE: u64 = 29;
+pub const SYS_CAP_LOOKUP: u64 = 30;
+pub const SYS_CAP_DROP: u64 = 31;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -342,6 +347,46 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             let domain = crate::scheduler::current_domain();
             if crate::memory::paging::is_user_address(a1) {
                 crate::memory::paging::resolve_user_page(domain, a1).unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        SYS_READLINE => {
+            // 阻塞读取一行控制台输入: 把内核输入行队列中的一行拷入用户缓冲 `a1`
+            // (最多 `a2` 字节, 不含换行), 返回行长度。队列为空则阻塞当前任务,
+            // 由键盘域经 SYS_TERM_PUT 回车提交时唤醒 (wait_on = INPUT_WAIT)。
+            if a1 == 0 || !crate::memory::paging::is_user_address(a1) {
+                return u64::MAX;
+            }
+            loop {
+                // 调用方已用 is_user_address 校验过 a1, 满足 input_read 的安全前提。
+                if let Some(n) = unsafe { crate::video::input_read(a1 as *mut u8, a2 as usize) } {
+                    return n as u64;
+                }
+                crate::scheduler::block_current(crate::scheduler::INPUT_WAIT);
+            }
+        }
+        SYS_CLEAR => {
+            // 清屏并复位终端状态 (历史 / 输入行 / 光标)。
+            crate::video::clear_screen();
+            1
+        }
+        SYS_CAP_ISSUE => {
+            // 「能力即句柄」: 为调用方域的不透明对象 `a1` 签发句柄, 返回句柄索引。
+            // 微内核不解释对象含义 (文件句柄由 libvfs 打包成 (服务域<<32)|服务内 fd)。
+            let domain = crate::scheduler::current_domain();
+            crate::cap::handle_issue(domain, a1)
+        }
+        SYS_CAP_LOOKUP => {
+            // 校验句柄是否仍然有效, 有效则返回其对象标识 (被撤销后一律失败)。
+            let domain = crate::scheduler::current_domain();
+            crate::cap::handle_lookup(domain, a1).unwrap_or(u64::MAX)
+        }
+        SYS_CAP_DROP => {
+            // 撤销句柄 (关闭打开对象时调用)。
+            let domain = crate::scheduler::current_domain();
+            if crate::cap::handle_drop(domain, a1) {
+                1
             } else {
                 0
             }

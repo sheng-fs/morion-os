@@ -137,7 +137,7 @@ impl BitmapFont {
         let w = self.metrics.glyph_width as usize;
         let h = self.metrics.glyph_height as usize;
         // 假设位图存储为每字节代表 8 个水平像素
-        let bytes_per_row = (w + 7) / 8;
+        let bytes_per_row = w.div_ceil(8);
 
         for row in 0..h {
             let row_data = if row * bytes_per_row < data.len() {
