@@ -13,7 +13,9 @@
 //! 句柄 (见 `cap_guard`), `close` 时撤销句柄。句柄被撤销后, 该 fd 上的任何操作
 //! 都会失败 —— 即使 fd 数值被伪造也无法访问服务 (无能力即不可访问)。
 
-use crate::syscall::{sys_call_payload, sys_cap_drop, sys_cap_issue, sys_cap_lookup};
+use crate::syscall::{
+    sys_call_payload, sys_cap_drop, sys_cap_issue, sys_cap_lookup, PAYLOAD_LEN,
+};
 
 /// fat32 文件服务域 id (与内核 `main.rs` 创建顺序一致), 挂载于 `/`。
 pub const FAT32_DOMAIN: u64 = 6;
@@ -23,6 +25,10 @@ pub const MOUNT_DOMAIN: u64 = 9;
 pub const TMPFS_DOMAIN: u64 = 10;
 /// MorionFS (MFS) 文件服务域 id, 挂载于 `/mfs`。
 pub const MFS_DOMAIN: u64 = 11;
+/// ext2 只读文件服务域 id, 挂载于 `/ext2`。
+pub const EXT2_DOMAIN: u64 = 12;
+/// exFAT 读写文件服务域 id, 挂载于 `/usb`。
+pub const EXFAT_DOMAIN: u64 = 13;
 
 /// 结果页虚拟地址: app 分配并共享给 fat32_srv, fat32_srv 在此写入文件内容或
 /// 目录列表。`read` / `readdir` 返回的字节数即该页内的有效数据长度。
@@ -54,6 +60,14 @@ pub const VFS_MKDIR_TAG: u64 = 0x4D4B_4449; // "MKDI"
 pub const VFS_UNLINK_TAG: u64 = 0x554E_4C4B; // "UNLK"
 pub const VFS_RMDIR_TAG: u64 = 0x524D_4449; // "RMDI"
 pub const VFS_STAT_TAG: u64 = 0x5354_4154; // "STAT"
+/// 截断/扩展到指定长度: payload = `TruncateReq { fd, size }`。
+pub const VFS_TRUNCATE_TAG: u64 = 0x5452_4E43; // "TRNC"
+/// 重命名/移动 (可跨目录): payload = `TwoPathReq`, 两条路径在共享页里。
+pub const VFS_RENAME_TAG: u64 = 0x5245_4E4D; // "RENM"
+/// 修改权限位: payload = `PathReq`, 路径在共享页里。
+pub const VFS_CHMOD_TAG: u64 = 0x4348_4D44; // "CHMD"
+/// 硬链接: payload = `TwoPathReq`, 两条路径在共享页里 (`src\0dst`)。
+pub const VFS_LINK_TAG: u64 = 0x4C49_4E4B; // "LINK"
 
 /// 挂载查询 tag: 请求 payload 为路径, 回复为 `(服务域 << 32) | 挂载点前缀长度`,
 /// 无匹配返回 `u64::MAX`。仅 mount_srv 处理。
@@ -95,9 +109,7 @@ pub fn mount(prefix: &str, domain: u64) -> u64 {
 
 /// 运行时卸载挂载点 `prefix`, 成功返回 1, 失败 `u64::MAX`。
 pub fn umount(prefix: &str) -> u64 {
-    let mut payload = [0u8; 32];
-    let n = prefix.len().min(31);
-    payload[..n].copy_from_slice(&prefix.as_bytes()[..n]);
+    let payload = path_payload(prefix);
     sys_call_payload(MOUNT_DOMAIN, VFS_UMOUNT_TAG, &payload)
 }
 
@@ -109,6 +121,26 @@ pub const MFS_SNAP_TAG: u64 = 0x4D53_4E50; // "MSNP"
 pub const MFS_SNAPLIST_TAG: u64 = 0x4D53_4E4C; // "MSNL"
 /// 回滚到快照: payload = 快照索引 (u32)。回复 1 / `u64::MAX`。
 pub const MFS_SNAPRESTORE_TAG: u64 = 0x4D53_4E52; // "MSNR"
+/// 空间回收 (mark & sweep): 回复本次回收的块数, 失败 `u64::MAX`。
+pub const MFS_GC_TAG: u64 = 0x4D53_4743; // "MSGC"
+/// 查询空间用量: 回复 `(总块数 << 32) | 空闲块数`。
+pub const MFS_STAT_TAG: u64 = 0x4D53_5354; // "MSST"
+
+/// 触发 MorionFS 空间回收 (回收不可达的 COW 旧块), 成功返回回收的块数。
+///
+/// 回收以可达性为唯一判据, 快照仍引用的历史版本不会被回收。
+pub fn mfs_gc() -> u64 {
+    sys_call_payload(MFS_DOMAIN, MFS_GC_TAG, &[])
+}
+
+/// 查询 MorionFS 空间用量, 返回 `(总块数 << 32) | 空闲块数`, 失败 `u64::MAX`。
+pub fn mfs_stat() -> u64 {
+    sys_call_payload(MFS_DOMAIN, MFS_STAT_TAG, &[])
+}
+
+/// 快照列表单条记录的字节数 (与 mfs_srv 的 `MFS_SNAP_REC` 一致)：
+/// gen(u64) + itab_root / ino_hint / alloc_hint / reserved (4 × u32)。
+pub const SNAP_REC_LEN: usize = 24;
 
 /// 创建 MorionFS 快照 (记录当前根与代际), 成功返回快照索引。
 pub fn mfs_snapshot() -> u64 {
@@ -131,9 +163,7 @@ pub fn mfs_snapshot_restore(idx: u32) -> u64 {
 ///
 /// 未挂载 / 查询失败返回 None。路径长度按 payload 上限截断 (挂载点都是短前缀)。
 fn mount_lookup(path: &str) -> Option<(u64, usize)> {
-    let mut payload = [0u8; 32];
-    let n = path.len().min(31);
-    payload[..n].copy_from_slice(&path.as_bytes()[..n]);
+    let payload = path_payload(path);
     let r = sys_call_payload(MOUNT_DOMAIN, VFS_LOOKUP_TAG, &payload);
     if r == u64::MAX {
         return None;
@@ -247,21 +277,132 @@ pub struct DirReq {
     pub buf: u64,
 }
 
+/// 截断请求 (序列化进 IPC payload, 8 字节)。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TruncateReq {
+    pub fd: u32,
+    /// 目标长度 (字节); 小于现有长度则截短, 大于则稀疏扩展。
+    pub size: u32,
+}
+
+/// 双路径请求 (rename / 将来的 link 共用), 序列化进 IPC payload (16 字节)。
+///
+/// 单条 IPC payload 只有 95 字节可用, 装不下两条绝对路径, 故路径放进调用方
+/// **共享页** (`buf`, 与 `DirReq.buf` 同模式): 布局为 `src\0dst`。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TwoPathReq {
+    /// 第一条路径的字节数 (不含 NUL)。
+    pub a_len: u32,
+    /// 第二条路径的字节数 (不含 NUL)。
+    pub b_len: u32,
+    /// 路径所在共享页虚拟地址 (须已共享给目标文件服务域)。
+    pub buf: u64,
+}
+
+/// 「路径放在共享页里」的请求 (序列化进 IPC payload, 16 字节), `STAT` / `CHMOD` 共用。
+///
+/// 单条 IPC payload 只有 95 字节可用, 且结果页地址也要随请求下发 (shell 与 app 的
+/// 结果页地址不同, 见 `RESULT_BUF` / `SHELL_RESULT_BUF`), 故路径改放调用方共享页
+/// (`buf`, NUL 结尾), payload 只带附加参数与缓冲地址。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PathReq {
+    /// 附加参数: `CHMOD` = 新权限位; `STAT` 未用 (填 0)。
+    pub aux: u32,
+    /// 对齐填充 (使 `buf` 8 字节对齐)。
+    pub _pad: u32,
+    /// 路径所在 (也是结果写入的) 共享页虚拟地址。
+    pub buf: u64,
+}
+
+/// 目录条目里长名 (VFAT LFN / ext2 / MFS 名字) 的最大字节数。
+///
+/// VFAT 的长名上限是 255 个 UTF-16 码元, 但内核字体只有 ASCII, 超出这个长度的名字
+/// 既显示不下也没必要: 超过则截断 (只截整字符边界)。
+///
+/// 客户端路径走 IPC payload (96 字节), 故端到端可达 ~90 字节; 这里取 128 保证服务端
+/// 能回传完整名字 (磁盘侧 MFS 支持到 255, 见 roadmap 阶段 D/M4)。
+pub const DIR_LONG_MAX: usize = 128;
+
+/// 结果页的大小 (与内核 `PAGE_SIZE` 一致), 用于给 readdir 定条目上限。
+pub const RESULT_PAGE_SIZE: usize = 4096;
+
+/// 一页结果缓冲最多能放的条目数。
+///
+/// readdir 必须按此上限截断: 结果页只有一页, 条目写多了会越界写到相邻映射之外
+/// (每个文件服务都共享同一个客户端页)。
+pub const RESULT_MAX_ENTRIES: usize = RESULT_PAGE_SIZE / core::mem::size_of::<DirEntry>();
+
 /// 结构化目录条目 — `readdir` 写入 `RESULT_BUF` 的固定大小记录。
 /// 返回字节数 = 条目数 × `size_of::<DirEntry>()`。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DirEntry {
     /// 原始 8.3 短名: 主名 8 字节 + 扩展名 3 字节, 空格填充 (无 '.' 分隔)。
+    /// 没有短名概念的文件系统 (ext2) 也填一个截断后的等价形式供回退显示。
     pub name: [u8; 11],
+    /// 长名字节数 (UTF-8); 0 = 该条目没有长名, 显示与匹配都用短名。
+    pub long_len: u8,
+    /// 对齐填充 (使 `long` 与 `size` 保持 4 字节对齐)。
+    pub _pad: [u8; 3],
+    /// 长名 (UTF-8, 最多 `DIR_LONG_MAX` 字节); `long_len == 0` 时内容无意义。
+    pub long: [u8; DIR_LONG_MAX],
     /// 文件大小 (目录为 0)。
     pub size: u32,
     /// 1 = 目录, 0 = 普通文件。
     pub is_dir: u32,
+    /// 权限位 (仅 MFS 提供; 其它服务填 0755/0644)。仅展示。
+    pub mode: u16,
+    /// 属主域 id (仅 MFS 提供; 其它服务填 0)。
+    pub owner: u16,
+    /// 硬链接数 (仅 MFS 提供; 其它服务填 1)。
+    pub nlink: u32,
+    /// 最后修改时间 (Unix 秒; 0 = 未知)。
+    pub mtime: u64,
+}
+
+impl DirEntry {
+    /// 只有 8.3 短名的条目 (内部只按短名寻址的文件服务: tmpfs / MFS)。
+    pub const fn short(name: [u8; 11], size: u32, is_dir: u32) -> Self {
+        Self {
+            name,
+            long_len: 0,
+            _pad: [0; 3],
+            long: [0; DIR_LONG_MAX],
+            size,
+            is_dir,
+            mode: if is_dir == 1 { 0o755 } else { 0o644 },
+            owner: 0,
+            nlink: 1,
+            mtime: 0,
+        }
+    }
+
+    /// 带长名的条目 (VFAT 长名 / ext2 名字)。
+    pub const fn with_long(name: [u8; 11], long: [u8; DIR_LONG_MAX], long_len: u8, size: u32, is_dir: u32) -> Self {
+        Self {
+            name,
+            long_len,
+            _pad: [0; 3],
+            long,
+            size,
+            is_dir,
+            mode: if is_dir == 1 { 0o755 } else { 0o644 },
+            owner: 0,
+            nlink: 1,
+            mtime: 0,
+        }
+    }
 }
 
 /// 路径元数据 — `stat` 写入 `RESULT_BUF` 的单条记录。
 /// 返回字节数 = `size_of::<Stat>()`。
+///
+/// `mode` / `owner` / `nlink` / 三个时间是 MFS 提供的节点元数据 (见 roadmap M5);
+/// 其它文件服务没有对应概念, 一律填默认值 (`mode` 按目录/文件给 0755/0644, 时间为 0)。
+/// 时间单位是 Unix 秒 (UTC), 0 表示"未知"。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Stat {
@@ -269,14 +410,51 @@ pub struct Stat {
     pub size: u32,
     /// 1 = 目录, 0 = 普通文件。
     pub is_dir: u32,
+    /// 权限位 (低 12 位: setuid/setgid/sticky + rwxrwxrwx)。仅存储/显示, **不强制**。
+    pub mode: u16,
+    /// 属主域 id (创建者)。仅展示。
+    pub owner: u16,
+    /// 硬链接数。
+    pub nlink: u32,
+    /// 最后修改时间 (内容变更)。
+    pub mtime: u64,
+    /// 状态变更时间 (元数据变更)。
+    pub ctime: u64,
+    /// 最后访问时间 (MFS 不随读更新, 与创建/写入同刻)。
+    pub atime: u64,
 }
 
-/// 把 `path` 编码进 32 字节 payload (其余字节为 0, 故路径恒以 NUL 结尾,
+impl Stat {
+    /// 元数据缺省值: 按类型给常规权限, 其余置 0 ("未知")。
+    pub const fn plain(size: u32, is_dir: u32) -> Self {
+        Self {
+            size,
+            is_dir,
+            mode: if is_dir == 1 { 0o755 } else { 0o644 },
+            owner: 0,
+            nlink: 1,
+            mtime: 0,
+            ctime: 0,
+            atime: 0,
+        }
+    }
+}
+
+/// 把 `path` 编码进 IPC payload (其余字节为 0, 故路径恒以 NUL 结尾,
 /// 服务端按 NUL 取长度)。返回实际写入的路径长度。
-fn encode_path(path: &str, payload: &mut [u8; 32]) -> usize {
-    let n = path.len().min(31);
+///
+/// payload 只有 `PAYLOAD_LEN` (96) 字节, 故路径上限为 `PAYLOAD_LEN - 1`。
+fn encode_path(path: &str, payload: &mut [u8; PAYLOAD_LEN]) -> usize {
+    let n = path.len().min(PAYLOAD_LEN - 1);
     payload[..n].copy_from_slice(&path.as_bytes()[..n]);
     n
+}
+
+/// 把路径编码成 VFS 请求 payload (未用字节为 0, 故恒以 NUL 结尾)。
+fn path_payload(path: &str) -> [u8; PAYLOAD_LEN] {
+    let mut payload = [0u8; PAYLOAD_LEN];
+    encode_path(path, &mut payload);
+    payload
 }
 
 /// 服务端返回局部 fd 后, 签发能力句柄并打包为对外 fd。
@@ -301,8 +479,7 @@ fn wrap_open(domain: u64, local: u64) -> u64 {
 pub fn open(path: &str) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
+            let payload = path_payload(sub);
             wrap_open(domain, sys_call_payload(domain, VFS_OPEN_TAG, &payload))
         }
         None => u64::MAX,
@@ -416,8 +593,7 @@ pub fn close(fd: u64) -> u64 {
 pub fn creat(path: &str) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
+            let payload = path_payload(sub);
             wrap_open(domain, sys_call_payload(domain, VFS_CREAT_TAG, &payload))
         }
         None => u64::MAX,
@@ -428,8 +604,7 @@ pub fn creat(path: &str) -> u64 {
 pub fn mkdir(path: &str) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
+            let payload = path_payload(sub);
             sys_call_payload(domain, VFS_MKDIR_TAG, &payload)
         }
         None => u64::MAX,
@@ -440,8 +615,7 @@ pub fn mkdir(path: &str) -> u64 {
 pub fn unlink(path: &str) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
+            let payload = path_payload(sub);
             sys_call_payload(domain, VFS_UNLINK_TAG, &payload)
         }
         None => u64::MAX,
@@ -452,8 +626,7 @@ pub fn unlink(path: &str) -> u64 {
 pub fn rmdir(path: &str) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
+            let payload = path_payload(sub);
             sys_call_payload(domain, VFS_RMDIR_TAG, &payload)
         }
         None => u64::MAX,
@@ -463,15 +636,162 @@ pub fn rmdir(path: &str) -> u64 {
 /// 查询 `path` 的元数据, 以 `Stat` 记录写入 `RESULT_BUF`。
 /// 返回字节数 (= `size_of::<Stat>()`), 失败返回 `u64::MAX`。
 ///
-/// 注: 当前 stat 不带缓冲地址 (沿用 `RESULT_BUF`), 故仅对以 `RESULT_BUF` 为
-/// 共享页的客户端 (app) 有效; shell 不使用 stat。
+/// 以 `RESULT_BUF` 为共享页的客户端 (app) 直接用它; 其它客户端 (shell) 用
+/// `stat_into` 指定自己的结果页。
 pub fn stat(path: &str) -> u64 {
+    stat_into(path, RESULT_BUF)
+}
+
+/// 同 `stat`, 但结果写入 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+pub fn stat_into(path: &str, buf: u64) -> u64 {
     match route(path) {
         Some((domain, sub)) => {
-            let mut payload = [0u8; 32];
-            encode_path(sub, &mut payload);
-            sys_call_payload(domain, VFS_STAT_TAG, &payload)
+            let req = PathReq { aux: 0, _pad: 0, buf };
+            write_cstr(sub, buf);
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    &req as *const PathReq as *const u8,
+                    core::mem::size_of::<PathReq>(),
+                )
+            };
+            sys_call_payload(domain, VFS_STAT_TAG, payload)
         }
         None => u64::MAX,
+    }
+}
+
+/// 修改权限位为 `mode` (低 12 位), 成功返回 1, 失败 `u64::MAX`。
+///
+/// 权限位当前只存储与显示, 不参与访问判定 (没有多用户概念)。
+pub fn chmod(path: &str, mode: u32) -> u64 {
+    chmod_into(path, mode, RESULT_BUF)
+}
+
+/// 同 `chmod`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
+    match route(path) {
+        Some((domain, sub)) => {
+            let req = PathReq { aux: mode, _pad: 0, buf };
+            write_cstr(sub, buf);
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    &req as *const PathReq as *const u8,
+                    core::mem::size_of::<PathReq>(),
+                )
+            };
+            sys_call_payload(domain, VFS_CHMOD_TAG, payload)
+        }
+        None => u64::MAX,
+    }
+}
+
+/// 把文件 `fd` 的长度截断/扩展到 `size` 字节, 成功返回 1, 失败 `u64::MAX`。
+///
+/// 截短会释放尾部数据块; 扩展为**稀疏**(未写过的区间读回 0)。目录不支持截断。
+pub fn truncate(fd: u64, size: u32) -> u64 {
+    if !cap_guard(fd) {
+        return u64::MAX;
+    }
+    let req = TruncateReq { fd: fd_local(fd), size };
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const TruncateReq as *const u8,
+            core::mem::size_of::<TruncateReq>(),
+        )
+    };
+    sys_call_payload(fd_domain(fd), VFS_TRUNCATE_TAG, payload)
+}
+
+/// 把 `src` 重命名/移动为 `dst` (可跨目录, 必须在同一文件服务内)。
+/// 成功返回 1, 失败 `u64::MAX`。
+pub fn rename(src: &str, dst: &str) -> u64 {
+    rename_into(src, dst, RESULT_BUF)
+}
+
+/// 同 `rename`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+///
+/// 两条路径经共享页传 (IPC payload 装不下), 布局 `src\0dst\0`。
+pub fn rename_into(src: &str, dst: &str, buf: u64) -> u64 {
+    let (sd, ssub) = match route(src) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    let (dd, dsub) = match route(dst) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    // 跨文件服务 (跨挂载点) 的 rename 需要搬迁数据, 当前不支持。
+    if sd != dd {
+        return u64::MAX;
+    }
+    let req = TwoPathReq {
+        a_len: ssub.len() as u32,
+        b_len: dsub.len() as u32,
+        buf,
+    };
+    // 先写页再取 payload: 两条路径都进共享页, 服务端从页里读。
+    write_two_paths(ssub, dsub, buf);
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const TwoPathReq as *const u8,
+            core::mem::size_of::<TwoPathReq>(),
+        )
+    };
+    sys_call_payload(sd, VFS_RENAME_TAG, payload)
+}
+
+/// 把 NUL 结尾的短字符串写进共享页 (供 `PathReq` / `TwoPathReq` 使用)。
+///
+/// 长度按 `PAYLOAD_LEN - 1` 截断 —— 与服务端从页里读路径的上限一致。
+fn write_cstr(s: &str, buf: u64) {
+    let n = s.len().min(PAYLOAD_LEN - 1);
+    unsafe {
+        let p = buf as *mut u8;
+        core::ptr::copy_nonoverlapping(s.as_bytes().as_ptr(), p, n);
+        *p.add(n) = 0;
+    }
+}
+
+/// 为 `src` 再建一个名字 `dst` (硬链接, 仅同一文件服务内)。成功返回 1。
+pub fn link(src: &str, dst: &str) -> u64 {
+    link_into(src, dst, RESULT_BUF)
+}
+
+/// 同 `link`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+pub fn link_into(src: &str, dst: &str, buf: u64) -> u64 {
+    let (sd, ssub) = match route(src) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    let (dd, dsub) = match route(dst) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    if sd != dd {
+        return u64::MAX; // 跨文件服务不支持
+    }
+    let req = TwoPathReq {
+        a_len: ssub.len() as u32,
+        b_len: dsub.len() as u32,
+        buf,
+    };
+    write_two_paths(ssub, dsub, buf);
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const TwoPathReq as *const u8,
+            core::mem::size_of::<TwoPathReq>(),
+        )
+    };
+    sys_call_payload(sd, VFS_LINK_TAG, payload)
+}
+
+/// 把两条路径按 `src\0dst\0` 写进共享页。
+fn write_two_paths(a: &str, b: &str, buf: u64) {
+    unsafe {
+        let p = buf as *mut u8;
+        core::ptr::copy_nonoverlapping(a.as_bytes().as_ptr(), p, a.len());
+        *p.add(a.len()) = 0;
+        core::ptr::copy_nonoverlapping(b.as_bytes().as_ptr(), p.add(a.len() + 1), b.len());
+        *p.add(a.len() + 1 + b.len()) = 0;
     }
 }

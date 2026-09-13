@@ -57,23 +57,60 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | --- | --- |
 | `make run` | 最简运行（`-machine pc`，无磁盘） |
 | `make run-nokvm` | 无硬件虚拟化环境（CI） |
-| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，双 namespace |
+| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，五 namespace |
 | `make run-ide` | IDE PIO 回退路径验证 |
 
 ### `make run-nvme` 的磁盘布局（重要）
 
-单控制器双 namespace，设备号即 `nsid - 1`：
+单控制器五 namespace，`dev`（BlockReq 高位）现在是**卷号**，由 block_srv 扫描各盘分区表后分配：
 
 | namespace | 后端镜像 | 文件系统 | 挂载点 |
 | --- | --- | --- | --- |
 | `nsid=1` | `build/nvme.img`（宿主机 `mkfs.fat -F 32`） | FAT32 | `/` |
 | `nsid=2` | `build/mfs.img`（纯空白 raw） | MorionFS | `/mfs` |
+| `nsid=3` | `build/ext2.img`（宿主机 `mke2fs -t ext2`） | ext2（只读） | `/ext2` |
+| `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | —（仅验证卷层解析） |
+| `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
+
+前三个镜像**没有分区表**，各成一个「整盘卷」，卷号恰为 0/1/2 —— 与引入卷层前一致
+（`nsid=5` 的 exFAT 整盘卷号为 5）。
+`build/parts.img` 是额外的一卷测试盘，用于验证 MBR 解析与类型探测（不影响上述挂载）。
 
 `build/mfs.img` 由 Makefile 用 `dd` 生成空白盘；超级块由 `mfs_srv` 首次挂载时写入
-（自动格式化）。**删掉 `build/mfs.img` 即回到全新盘**：
+（自动格式化）。**当前格式为 MFS6**（空闲位图 + 空间回收 + 文件间接块 + 变长目录项/长名 +
+节点元数据 + inode 号间接层/硬链接）：盘上是旧格式（`MFS1`…`MFS5` 或未知 magic）时，
+首次挂载会**自动重新格式化**，旧数据不再保留。**删掉 `build/mfs.img` 即回到全新盘**：
 
 ```bash
 rm -f build/mfs.img && make build/mfs.img    # 重新生成空白盘
+```
+
+`build/ext2.img` 由宿主 `mke2fs` 预格式化，并用 `debugfs` 预置测试文件
+（`HELLO.TXT`、`SUBDIR/NESTED.TXT`）；`ext2_srv` **只读、不自动格式化**，
+删掉后重新生成即可回到干净镜像：
+
+```bash
+rm -f build/ext2.img && make build/ext2.img  # 重新生成 ext2 镜像
+```
+
+`build/exfat.img` 由宿主 `mkfs.exfat -L MORIONUSB` 预格式化（16 MiB，默认 4 KiB 簇）；
+`exfat_srv`（域 13）**不自动格式化**，签名 / boot checksum 不符即拒绝挂载
+（打印 `exfat: mount FAILED vol=… stage=…`）。**读写均支持**（`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`；
+`rename`/`chmod`/`link` 不支持），app 的 FS-16 自测会在结束时把卷清空，故每轮回归后
+卷内容回到「只有系统项与卷标」。镜像里**不含预置文件**（当前宿主环境无免密 loop 挂载，无法预置）。
+删掉后重新生成即可回到干净镜像：
+
+```bash
+rm -f build/exfat.img && make build/exfat.img   # 重新生成 exFAT 镜像
+fsck.exfat -n build/exfat.img                   # 宿主校验镜像完好 (回归后应为 clean)
+```
+
+`build/parts.img` 是分区测试盘：宿主用 `sfdisk` 写 MBR 两个主分区（起点 2048 的 FAT32、
+起点 34816 的 ext2），分区内容先在独立小镜像上 `mkfs` 再 `dd` 进去。它用于验证
+block_srv 卷层的**分区解析 + 类型探测**，删掉后重新生成即可：
+
+```bash
+rm -f build/parts.img && make build/parts.img  # 重新生成分区测试盘
 ```
 
 ---
@@ -97,6 +134,12 @@ qemu-system-x86_64 -machine q35 -m 2G \
   -device nvme-ns,drive=nvme0n1,bus=nvme0,nsid=1 \
   -drive file=build/mfs.img,if=none,id=nvme0n2,format=raw \
   -device nvme-ns,drive=nvme0n2,bus=nvme0,nsid=2 \
+  -drive file=build/ext2.img,if=none,id=nvme0n3,format=raw \
+  -device nvme-ns,drive=nvme0n3,bus=nvme0,nsid=3 \
+  -drive file=build/parts.img,if=none,id=nvme0n4,format=raw \
+  -device nvme-ns,drive=nvme0n4,bus=nvme0,nsid=4 \
+  -drive file=build/exfat.img,if=none,id=nvme0n5,format=raw \
+  -device nvme-ns,drive=nvme0n5,bus=nvme0,nsid=5 \
   -vga virtio -no-reboot -display none \
   -serial file:build/s.log \
   -monitor unix:/tmp/morion-mon.sock,server,nowait
@@ -108,6 +151,14 @@ grep -n "shell: type 'help'" build/s.log # 出现即已进 shell
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
+app 的 FS 自测（FS-1..FS-16）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+故「无 FAILED」即代表挂载与读写自测全通
+（ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
+`mfs-dbg: vol=… total=… free=… gen=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
+（`free` 接近 `total`、`gen` 逐次启动单调增长）；`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
+一行给出 exFAT 挂载后的卷参数，用于与宿主 `mkfs.exfat` 的参数对齐核对。
+**exFAT 写路径**另用宿主 `fsck.exfat -n build/exfat.img` 交叉验证：回归后应为
+`clean. directories 1, files 0`（写盘的位图 / FAT / entry set 一致性由 exfatprogs 独立判定）。
 
 ### 键盘注入（monitor socket）
 

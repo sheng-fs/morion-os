@@ -221,7 +221,7 @@ pub extern "C" fn kernel_main() -> ! {
     // ============================================================
     scheduler::init();
 
-    // 创建 9 个保护域:
+    // 创建 13 个保护域:
     //   0 = sender    (持有 SendTo(1)+MapInto(1) 能力, 触发按需分页 + call 演示)
     //   1 = receiver  (接收消息)
     //   2 = pager     (分页器, 服务所有域的缺页)
@@ -234,6 +234,8 @@ pub extern "C" fn kernel_main() -> ! {
     //   9 = mount_srv (挂载服务: 路径前缀 → 文件服务域, 支撑统一目录树)
     //  10 = tmpfs_srv (内存文件系统, 挂载于 /tmp)
     //  11 = mfs_srv   (MorionFS: 块设备后端的原创文件系统, 挂载于 /mfs)
+    //  12 = ext2_srv  (ext2 只读兼容: 挂载既有 Linux 分区, 挂载于 /ext2)
+    //  13 = exfat_srv (exFAT 读写: 挂载既有 exFAT 卷/U 盘, 挂载于 /usb)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
     let pager_domain = domain::create();
@@ -246,11 +248,13 @@ pub extern "C" fn kernel_main() -> ! {
     let mount_domain = domain::create();
     let tmpfs_domain = domain::create();
     let mfs_domain = domain::create();
+    let ext2_domain = domain::create();
+    let exfat_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(12);
-    cap::init(12);
-    pager::init(12, pager_domain);
+    ipc::init(14);
+    cap::init(14);
+    pager::init(14, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -271,6 +275,8 @@ pub extern "C" fn kernel_main() -> ! {
         mount_domain,
         tmpfs_domain,
         mfs_domain,
+        ext2_domain,
+        exfat_domain,
     ] {
         cap::grant(pager_domain, cap::Capability::MapInto(d));
     }
@@ -301,7 +307,26 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(app_domain, cap::Capability::MapInto(mfs_domain));
     cap::grant(shell_domain, cap::Capability::SendTo(mfs_domain));
     cap::grant(shell_domain, cap::Capability::MapInto(mfs_domain));
-    video::println("[OK] IPC + capability + pager initialized (12 domains)");
+    // 授权: ext2_srv 经 IPC 调 block_srv (SendTo) 访问 ext2 盘 (namespace 3) 并共享块缓冲。
+    cap::grant(ext2_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(ext2_domain, cap::Capability::MapInto(block_domain));
+    // 授权: app / shell 可访问 ext2_srv (挂载于 /ext2), 并共享缓冲页。
+    cap::grant(app_domain, cap::Capability::SendTo(ext2_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(ext2_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(ext2_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(ext2_domain));
+    // 授权: exfat_srv 经 IPC 调 block_srv 访问 exFAT 卷 (namespace 5) 并共享块缓冲。
+    cap::grant(exfat_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(exfat_domain, cap::Capability::MapInto(block_domain));
+    // 授权: app / shell 可访问 exfat_srv (挂载于 /usb), 并共享缓冲页。
+    cap::grant(app_domain, cap::Capability::SendTo(exfat_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(exfat_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(exfat_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(exfat_domain));
+    // 授权: app 可直接查询 block_srv 的卷表 (自测卷层/分区解析); 只需读 + 共享结果页。
+    cap::grant(app_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(block_domain));
+    video::println("[OK] IPC + capability + pager initialized (14 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
     // 找到则映射 BAR0/队列/DMA 并授权 Mmio; 否则降级 (magic=0), block 回退 IDE PIO。
@@ -318,7 +343,7 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // 加载用户程序到十二个域 (同一镜像, 经 domain_id 参数区分角色)。
+    // 加载用户程序到十四个域 (同一镜像, 经 domain_id 参数区分角色)。
     load_user_program(sender_domain);
     load_user_program(receiver_domain);
     load_user_program(pager_domain);
@@ -331,9 +356,11 @@ pub extern "C" fn kernel_main() -> ! {
     load_user_program(mount_domain);
     load_user_program(tmpfs_domain);
     load_user_program(mfs_domain);
-    video::println("[OK] user program loaded into domains 0..11");
+    load_user_program(ext2_domain);
+    load_user_program(exfat_domain);
+    video::println("[OK] user program loaded into domains 0..13");
 
-    // 域 0..11 各起一个用户任务。
+    // 域 0..13 各起一个用户任务。
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, pager_domain);
@@ -346,9 +373,11 @@ pub extern "C" fn kernel_main() -> ! {
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mount_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, tmpfs_domain);
     scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mfs_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, ext2_domain);
+    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, exfat_domain);
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + shell + mount + tmpfs + mfs + idle tasks spawned");
+    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + shell + mount + tmpfs + mfs + ext2 + exfat + idle tasks spawned");
     video::println("");
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();

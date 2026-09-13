@@ -59,6 +59,14 @@ NVME_IMG      ?= $(OUT_DIR)/nvme.img
 # MorionFS (MFS) 磁盘镜像: 纯空白 raw, 由 mfs_srv 首次挂载时自动格式化 (namespace 2)
 MFS_IMG       ?= $(OUT_DIR)/mfs.img
 MFS_MIB       ?= 16
+# ext2 磁盘镜像: 由宿主 mke2fs 预格式化 + debugfs 预置测试文件 (namespace 3, 只读)
+EXT2_IMG      ?= $(OUT_DIR)/ext2.img
+EXT2_MIB      ?= 16
+# exFAT 磁盘镜像: 由宿主 mkfs.exfat 预格式化 (namespace 5, 读写)
+EXFAT_IMG     ?= $(OUT_DIR)/exfat.img
+EXFAT_MIB     ?= 16
+# 分区测试盘: MBR 两个主分区 (FAT32 + ext2), 用于验证 block_srv 卷层的分区解析 (namespace 4)
+PARTS_IMG     ?= $(OUT_DIR)/parts.img
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -229,12 +237,15 @@ run-nokvm: iso
 		-vga virtio \
 		-no-reboot
 
-# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + 单控制器双 namespace)
-#   nsid=1 -> $(NVME_IMG) (FAT32, 挂载 /)
-#   nsid=2 -> $(MFS_IMG)  (MorionFS, 挂载 /mfs, 首次挂载自动格式化)
+# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + 单控制器四 namespace)
+#   nsid=1 -> $(NVME_IMG)  (FAT32, 挂载 /)
+#   nsid=2 -> $(MFS_IMG)   (MorionFS, 挂载 /mfs, 首次挂载自动格式化)
+#   nsid=3 -> $(EXT2_IMG)  (ext2 只读, 挂载 /ext2, 宿主预格式化)
+#   nsid=4 -> $(PARTS_IMG) (MBR 分区测试盘: FAT32 + ext2, 验证卷层分区解析)
+#   nsid=5 -> $(EXFAT_IMG) (exFAT 读写, 挂载 /usb, 宿主 mkfs.exfat 预格式化)
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS)..."
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT)..."
 	$(QEMU) \
 		-machine q35 \
 		-m $(QEMU_MEM) \
@@ -245,6 +256,12 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG)
 		-device nvme-ns,drive=nvme0n1,bus=nvme0,nsid=1 \
 		-drive file=$(MFS_IMG),if=none,id=nvme0n2,format=raw \
 		-device nvme-ns,drive=nvme0n2,bus=nvme0,nsid=2 \
+		-drive file=$(EXT2_IMG),if=none,id=nvme0n3,format=raw \
+		-device nvme-ns,drive=nvme0n3,bus=nvme0,nsid=3 \
+		-drive file=$(PARTS_IMG),if=none,id=nvme0n4,format=raw \
+		-device nvme-ns,drive=nvme0n4,bus=nvme0,nsid=4 \
+		-drive file=$(EXFAT_IMG),if=none,id=nvme0n5,format=raw \
+		-device nvme-ns,drive=nvme0n5,bus=nvme0,nsid=5 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
@@ -255,6 +272,52 @@ $(MFS_IMG):
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(MFS_IMG) bs=1M count=$(MFS_MIB) status=none
 	@echo "  ✓ MFS 镜像: $(MFS_IMG)"
+
+# ext2 磁盘镜像: 宿主 mke2fs 预格式化 (只读兼容, 首挂载不自动格式化),
+# 并用 debugfs 预置测试文件与子目录, 保证启动后无需写盘即可验证。
+$(EXT2_IMG):
+	@echo "==> 创建 ext2 磁盘镜像 (mke2fs + debugfs 预置测试文件)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(EXT2_IMG) bs=1M count=$(EXT2_MIB) status=none
+	mke2fs -q -t ext2 -F -b 1024 $(EXT2_IMG)
+	@printf 'Hello from ext2!\nThis is a read-only test file.\n' > $(OUT_DIR)/ext2hello.txt
+	debugfs -w -R "write $(OUT_DIR)/ext2hello.txt HELLO.TXT" $(EXT2_IMG) >/dev/null 2>&1
+	debugfs -w -R "mkdir /SUBDIR" $(EXT2_IMG) >/dev/null 2>&1
+	@printf 'nested file in ext2 subdir!\n' > $(OUT_DIR)/ext2nested.txt
+	debugfs -w -R "write $(OUT_DIR)/ext2nested.txt SUBDIR/NESTED.TXT" $(EXT2_IMG) >/dev/null 2>&1
+	@echo "  ✓ ext2 镜像: $(EXT2_IMG)"
+
+# 分区测试盘: 32 MiB, MBR 两个主分区 —— 分区 1 FAT32 (16 MiB, 起点 2048),
+# 分区 2 ext2 (4 MiB, 起点 34816)。分区内容先在独立小镜像上格式化再 dd 进分区
+# (宿主 mkfs 只认整盘/偏移, 先格式化再拼接最直观), 用于验证卷层:
+#   - 能解析 MBR 分区表并登记分区为独立卷;
+#   - 能按卷首签名探测出 FAT32 / ext2 类型。
+# 注意: 这是**额外**的一卷测试盘, 不影响现有三张整盘镜像的卷号 (0/1/2)。
+$(PARTS_IMG):
+	@echo "==> 创建分区测试盘 (MBR: FAT32 + ext2)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(PARTS_IMG) bs=1M count=32 status=none
+	printf '2048,32768,0x0c\n34816,8192,0x83\n' | sfdisk --quiet --no-tell-kernel $(PARTS_IMG)
+	dd if=/dev/zero of=$(OUT_DIR)/part1.fat bs=512 count=32768 status=none
+	mkfs.fat -F 32 $(OUT_DIR)/part1.fat >/dev/null 2>&1
+	@printf 'partition 1 (FAT32) test file\n' > $(OUT_DIR)/part1.txt
+	mcopy -i $(OUT_DIR)/part1.fat $(OUT_DIR)/part1.txt ::/PART1.TXT
+	dd if=$(OUT_DIR)/part1.fat of=$(PARTS_IMG) bs=512 seek=2048 conv=notrunc status=none
+	dd if=/dev/zero of=$(OUT_DIR)/part2.ext2 bs=1M count=4 status=none
+	mke2fs -q -t ext2 -F -b 1024 $(OUT_DIR)/part2.ext2
+	@printf 'partition 2 (ext2) test file\n' > $(OUT_DIR)/part2.txt
+	debugfs -w -R "write $(OUT_DIR)/part2.txt PART2.TXT" $(OUT_DIR)/part2.ext2 >/dev/null 2>&1
+	dd if=$(OUT_DIR)/part2.ext2 of=$(PARTS_IMG) bs=512 seek=34816 conv=notrunc status=none
+	@echo "  ✓ 分区测试盘: $(PARTS_IMG)"
+
+# exFAT 磁盘镜像: 宿主 mkfs.exfat 预格式化 (exfatprogs), 首挂载即可读;
+# 服务**不**自动格式化 (与 ext2 同: 定位是读写既有的 exFAT 卷/U 盘)。
+$(EXFAT_IMG):
+	@echo "==> 创建 exFAT 磁盘镜像 (mkfs.exfat)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(EXFAT_IMG) bs=1M count=$(EXFAT_MIB) status=none
+	mkfs.exfat -L MORIONUSB $(EXFAT_IMG) >/dev/null
+	@echo "  ✓ exFAT 镜像: $(EXFAT_IMG)"
 
 # 文件系统阶段: 挂载 IDE 磁盘运行 (Legacy PIO 读扇区, 不依赖 DMA/MSI-X)
 .PHONY: run-ide
@@ -272,6 +335,8 @@ run-ide: iso $(DISK_IMG)
 		-D $(OUT_DIR)/qemu.log
 
 # 创建 NVMe 磁盘镜像并格式化为 FAT32, 写入与 IDE 镜像一致的测试文件
+# 另含一个 VFAT 长名文件 (Long File Name.txt, 短名派生为 LONGFI~1.TXT),
+# 供 VFAT 长名读取 / 按长名打开的自测与交互验证使用。
 $(NVME_IMG):
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32)..."
 	$(MKDIR) $(OUT_DIR)
@@ -282,6 +347,8 @@ $(NVME_IMG):
 	mmd -i $(NVME_IMG) ::/DIR1
 	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
+	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
+	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
 	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
 
 # 创建 IDE 磁盘镜像并格式化为 FAT32

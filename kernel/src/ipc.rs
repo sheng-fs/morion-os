@@ -15,7 +15,10 @@ use spin::Mutex;
 use crate::cap::Capability;
 
 /// 消息 payload 固定大小 (字节)。
-pub const PAYLOAD_LEN: usize = 32;
+///
+/// 96 字节: 需容纳 VFS 请求里的绝对路径 (MFS/ext2 的长名可达 ~90 字节);
+/// 结构化的请求 (如 32 字节 `BlockReq`/`ReadReq`) 仍只用其前若干字节。
+pub const PAYLOAD_LEN: usize = 96;
 /// 每域邮箱容量 (超出则发送失败)。
 const MAILBOX_CAP: usize = 16;
 

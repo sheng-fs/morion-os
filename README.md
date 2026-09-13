@@ -22,7 +22,7 @@
 
 墨渊操作系统是一个基于 **Rust** 语言从零构建的现代操作系统。项目当前处于**重新设计与重写阶段**，彻底梳理了前期实现中的架构冲突，重新确立了以 **微内核 + 外核混合架构** 为核心的技术路线。
 
-旧代码已归档（`legacy` 分支），主线重新开始。
+旧代码已归档（`legacy` 分支），主线重新开始。目前已从纯设计推进到**可运行的微内核原型**：可在 QEMU（UEFI）下启动进入用户态 Shell，并跑通「应用 → libvfs → 文件服务 → 块设备服务 → NVMe 磁盘」的完整文件读写链路。
 
 ### 核心理念
 
@@ -32,6 +32,31 @@
 - **Anykernel 双形态驱动**：同一套驱动源码可编译为用户态服务进程（共享场景）或直通库（高性能场景），共享超过 90% 的代码。
 
 > 详细架构设计见 [docs/architecture.md](./docs/architecture.md)。
+
+---
+
+## 当前进展
+
+系统已从设计文档落到**能在真机 / QEMU 上启动运行的微内核原型**。下表区分「已跑通」与「尚未开始」，
+避免把设计目标误读为既有能力。
+
+| 方向 | 状态 | 说明 |
+|------|------|------|
+| 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度、地址空间与按需分页、中断路由、能力系统 |
+| 系统调用接口 | ✅ 约 30 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
+| 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力 |
+| 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
+| 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接）、ext2 **只读**、exFAT（读 + 写） |
+| 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；`dev` 已升级为「卷号」，为读真实 U 盘分区铺路 |
+| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/chmod/truncate/stat/clear`（`ls -l` 长格式）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
+| 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
+| 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
+| 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
+
+> 快速上手：构建与运行命令见 [docs/commands.md](./docs/commands.md)；
+> 内核与接口速查见 [docs/dev-reference.md](./docs/dev-reference.md)；
+> 应用开发（含 AI 可调用能力）见 [docs/app-dev-guide.md](./docs/app-dev-guide.md)；
+> 文件系统路线见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)。
 
 ---
 
@@ -106,17 +131,18 @@
 
 所有传统内核功能以独立用户态进程运行：
 
-| 服务 | 职责 |
-|------|------|
-| 文件系统服务 | ext4、FAT32、tmpfs 等，通过 libvfs 统一接口 |
-| 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 |
-| 设备服务 | 驱动管理、中断分发 |
-| 安全/审计服务 | 认证、策略引擎、入侵检测 |
-| 飞地管理器 | 飞地生命周期、日志流、迁移与暂停 |
-| 包管理器 | Nix 风格声明式构建、原子切换、版本回滚 |
-| GUI 服务 | 亚克力半透明风格桌面环境，高度可自定义 |
-| Shell 服务 | 命令行解释器 |
-| 音频 / 输入法 / 容器 / 时间 / 电源 / 日志 / 配置服务 | 系统基础支撑 |
+| 服务 | 职责 | 状态 |
+|------|------|------|
+| 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2 只读、exFAT（读 + 写），通过 libvfs 统一接口 | ✅ 已实现（ext2 只读 / exFAT 读写） |
+| 设备服务 | 块设备（NVMe 驱动）、键盘驱动、中断分发 | ✅ 部分实现 |
+| Shell 服务 | 命令行解释器 + 统一目录树 / 运行时挂载 | ✅ 已实现 |
+| 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 | ⏳ 规划中 |
+| 安全/审计服务 | 认证、策略引擎、入侵检测 | ⏳ 规划中 |
+| 飞地管理器 | 飞地生命周期、日志流、迁移与暂停 | ⏳ 规划中 |
+| 包管理器 | Nix 风格声明式构建、原子切换、版本回滚 | ⏳ 规划中 |
+| GUI 服务 | 亚克力半透明风格桌面环境，高度可自定义 | ⏳ 规划中 |
+| 音频 / 输入法 / 容器 / 时间 / 电源 / 日志 / 配置服务 | 系统基础支撑 | ⏳ 规划中 |
+| AI 能力注册 / 网关服务 | 应用能力注册与发现、AI 调用鉴权与审计 | 📐 规范已定（见 [app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节） |
 
 ### 虚拟化
 
@@ -138,7 +164,9 @@
 
 ### 当前实际结构
 
-> 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`kernel_test` 三个 crate。
+> 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`user`、`kernel_test` **四个 crate**。
+> 其中 `user` 是一个**扁平二进制**，内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
+> 都在其中按**域 id** 分流实现，由内核在启动时加载。
 > UI 素材统一按用途归档：引导期资源在 `boot/loader/resources/`，系统全局资源在 `resources/system/`。
 
 ```
@@ -172,16 +200,26 @@
 │       └── main.rs
 ├── kernel/                   # 微内核 (morion-kernel, 最小可信基)
 │   └── src/
-│       ├── arch/             #   x86_64 架构 (gdt/idt/pic/pit/keyboard)
+│       ├── arch/             #   x86_64 架构 (gdt/idt/pic/pit/keyboard/pci)
 │       ├── memory/           #   内存管理 (paging/frame_allocator)
-│       ├── scheduler/        #   调度器 (context)
-│       ├── video/            #   早期视频输出 (framebuffer/font)
-│       ├── bootinfo.rs
+│       ├── scheduler/        #   调度器 (context 上下文切换)
+│       ├── video/            #   帧缓冲文本控制台 (framebuffer/font/logo/bg)
+│       ├── bootinfo.rs       #   引导信息 (内存图 + GOP 帧缓冲)
+│       ├── cap.rs            #   能力系统 (能力槽 + 能力句柄表)
 │       ├── domain.rs         #   保护域 (进程)
 │       ├── ipc.rs            #   进程间通信
+│       ├── irq.rs            #   中断路由 (中断即 IPC)
+│       ├── nvme.rs           #   NVMe 控制器初始化 (队列 / DMA)
+│       ├── pager.rs          #   用户态分页器接口
+│       ├── syscall.rs        #   系统调用入口与编号表
 │       ├── lib.rs
 │       └── main.rs
-├── kernel_test/              # 引导器联调用测试内核 (临时)
+├── user/                     # 用户态程序与系统服务 (morion-user, 扁平二进制)
+│   └── src/
+│       ├── syscall.rs        #   系统调用封装 + 打印辅助 (libuser)
+│       ├── vfs.rs            #   libvfs: fd / 挂载路由 / 能力句柄守卫
+│       └── main.rs           #   _start 按域 id 分流: 各服务与 shell 实现
+├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
 │   └── system/               # 全局系统资源
@@ -193,10 +231,15 @@
 │       ├── service/          #   服务图标 (.ico)
 │       └── terminal/         #   终端背景 (.raw)
 ├── docs/
-│   └── architecture.md       # 架构设计文档
-├── Cargo.toml                # Rust workspace (boot/kernel/kernel_test)
+│   ├── architecture.md       #   技术架构设计
+│   ├── app-dev-guide.md      #   应用开发指南 (含 AI 可调用能力规范)
+│   ├── dev-reference.md      #   内核与接口速查手册
+│   ├── commands.md           #   构建 / 运行 / 验证命令
+│   ├── shell-reference.md    #   Shell 使用参考
+│   └── roadmap-fs.md         #   文件系统路线图
+├── Cargo.toml                # Rust workspace (boot/kernel/user/kernel_test)
 ├── Cargo.lock
-├── Makefile                  # 构建系统 (make iso/run/debug)
+├── Makefile                  # 构建系统 (make iso/run/run-nvme/debug/check/clippy)
 ├── flake.nix                 # Nix 构建集成
 ├── rust-toolchain.toml       # Rust nightly 工具链
 ├── linker.ld                 # 内核链接脚本
@@ -239,11 +282,55 @@
 
 ## 开发路线
 
-- [ ] **阶段一**：微内核核心 — IPC、调度、地址空间、能力系统
-- [ ] **阶段二**：基础服务 — 文件系统、设备驱动、Shell
-- [ ] **阶段三**：性能飞地 — IOMMU 直通、LibDevice、飞地管理器
-- [ ] **阶段四**：网络与安全 — TCP/IP 协议栈、能力审计、策略引擎
-- [ ] **阶段五**：GUI 与生态 — 桌面环境、包管理、虚拟化
+> 详细文件系统路线见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)。勾选项表示**已在 QEMU 实机跑通**。
+
+### 阶段一 — 微内核核心（基本完成）
+
+- [x] 保护域（进程）创建与地址空间隔离
+- [x] 同步 / 异步 IPC（`send` / `recv` / `call` / `reply`；96 字节载荷 + 共享内存传大数据）
+- [x] 任务调度与上下文切换
+- [x] 地址空间映射 / 解除映射 + 用户态分页器（按需分页）
+- [x] 中断路由（「中断即 IPC」）+ MMIO / I/O 端口授权
+- [x] 能力系统（能力槽 + 能力句柄：签发 / 校验 / 撤销）
+- [ ] 能力随 IPC 传递（句柄转移）
+
+### 阶段二 — 基础服务（进行中）
+
+- [x] PCI 枚举 + NVMe 用户态驱动（块设备服务，含 IDE PIO 回退）
+- [x] MBR/GPT **分区解析 + 卷层**（block_srv 内，`dev` = 卷号；按卷首签名探测 FAT / exFAT / MFS / ext2）
+- [x] 文件系统：FAT32（含 VFAT 长名）/ tmpfs / 原创 MorionFS（COW 写时复制 + 快照）
+- [x] ext2 **只读**兼容（挂载既有 Linux 分区）
+- [x] exFAT 兼容（`exfat_srv` 域 13，挂载 `/usb`）：**只读** = 引导区 + boot checksum、FAT 链、目录 entry set、分配位图、upcase 表；**读写** = 位图分配/释放、FAT 链扩展、entry set 增删（含 NameHash/SetChecksum 生成），`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`rename`/`chmod`/`link` 除外）
+- [x] libvfs + 挂载层：多文件系统拼成单根 `/`，支持运行时挂载
+- [x] Shell（内置命令 + cwd 相对路径）与用户态键盘驱动
+- [x] **MorionFS v2 格式定稿 + 空间回收 / GC**（空闲位图 + mark & sweep，快照仍引用的旧块不回收；旧 `MFS1` 盘首挂自动重格式化）
+- [x] **MorionFS 大文件**（`MFS3`：1008 直接块 + 一/二级间接块，单文件上限 = 整卷容量，突破旧 ≈4 MiB）
+- [x] **MorionFS 目录与长名**（`MFS4`：ext2 风格变长目录项 + `MFXI` 扩展目录块，名字 ≤255 字节、大小写敏感；IPC payload 32 → 96 字节以承载长路径）
+- [x] **MorionFS 节点元数据**（`MFS5`：时间戳（CMOS RTC）/权限/owner/链接数，`rename`（跨目录）/`truncate`（稀疏）/`chmod`，shell 增 `mv`/`chmod`/`truncate`/`stat`/`ls -l`）
+- [x] **MorionFS inode 号间接层 + 硬链接**（`MFS6`：目录项改存 inode 号，inode 表（索引块 → 表块）让多个名字共享一个对象；`ln` 落地；顺带删掉沿祖先链的逐级回写，写代价与目录深度无关）
+- [ ] **MorionFS 软链接**（新节点类型 + 路径解析跟随 + 防环）
+- [ ] **更多文件系统兼容**（ext4 写、UDF 等）
+- [ ] 可执行文件加载（当前所有服务共用一份扁平二进制，按域 id 分流）
+- [ ] 帧缓冲对用户态开放 / GUI 服务
+- [ ] 网络协议栈
+
+### 阶段三 — 性能飞地（未开始）
+
+- [ ] IOMMU 直通、LibDevice 直通驱动库、飞地管理器
+
+### 阶段四 — 网络与安全（未开始）
+
+- [ ] TCP/IP 协议栈、能力审计、策略引擎
+
+### 阶段五 — GUI 与生态（未开始）
+
+- [ ] 桌面环境、包管理、虚拟化
+
+### 贯穿 — 面向系统 AI 的能力接口（规范已定，实现未开始）
+
+- [x] 设计规范：应用如何把功能标注 / 描述为 **AI 可调用能力**（见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节）
+- [ ] 能力注册与发现服务
+- [ ] AI 调用网关（能力校验 / 审计日志 / 超时与限额）
 
 ---
 
