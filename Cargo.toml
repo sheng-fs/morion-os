@@ -30,7 +30,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Morion OS Team"]
 license = "MIT"
-repository = "https://github.com/morion-os/morion-os"
+repository = "https://github.com/sheng-fs/morion-os"
 
 [workspace.dependencies]
 # --- UEFI 引导 ---
