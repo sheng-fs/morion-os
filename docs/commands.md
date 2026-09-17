@@ -37,6 +37,7 @@
 make run-nvme QEMU_MEM=4G                    # 内存 (默认 2G)
 make run-nvme MFS_MIB=64                     # MFS 盘大小 MiB (默认 16)
 make run-nvme EXFAT_MIB=2048 EXFAT_CLU=32K   # 大 exFAT 卷 (32 KiB 簇, 位图 > 4 KiB) 验证去上限
+make run-nvme NVME_CLU=64                    # fat32 大簇 (32 KiB 簇) 验证写路径
 make iso OUT_DIR=build2                      # 自定义输出目录
 ```
 
@@ -46,6 +47,7 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `QEMU_SMP` | `4` | 客户机 CPU 数 |
 | `QEMU_ACCEL` | `kvm` | 加速方式（`kvm` / `hvf` / `whpx`） |
 | `NVME_IMG` | `build/nvme.img` | FAT32 盘（挂 `/`） |
+| `NVME_CLU` | `8` | fat32 每簇扇区数（8 = 4 KiB 簇）；`64` = 32 KiB 簇。mkfs.fat 对 64 MiB 盘默认给 512 B 簇，太碎且写大文件极慢，故固定为 4 KiB |
 | `MFS_IMG` | `build/mfs.img` | MorionFS 盘（挂 `/mfs`，**空白 raw，首次挂载自动格式化**） |
 | `MFS_MIB` | `16` | MorionFS 盘大小 |
 | `EXT2_IMG` | `build/ext2.img` | ext2 盘（挂 `/ext2`，宿主 `mke2fs`） |
@@ -229,12 +231,14 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-17）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-18）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
 拼出 `/usb3` / `/usb4`，读回宿主预置的 `PART1.TXT` / `PART2.TXT`（校验前 10 字节 == `partition `），
 **全程只读**；失败会打印 `app: FS17 … FAILED`。
+**FS-18** 是 fat32 的**大文件写路径**用例：写 100000 字节跨簇、逐簇读回校验、UNLINK 释放簇链
+（4 KiB 簇跨 25 簇、32 KiB 簇跨 4 簇），补上之前只有小文件 mkdir/creat/write 的缺口。
 
 > ⏱️ **自测整套约需 3.5~4 分钟**（约 2 万个块请求，IPC 一跳 ≈ 一个时钟 tick，故有效吞吐 ~100 请求/s）。
 > 期间日志会长时间「只有 shell 提示符、没有新行」，**这不是卡死** —— 别用几十秒的超时去判定失败，
