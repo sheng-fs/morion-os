@@ -65,6 +65,7 @@ commands:
   stat <path>    show metadata (mode / owner / links / times)
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
+  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
 ```
 
 ---
@@ -193,11 +194,15 @@ commands:
 | `/ext2` | ext2_srv (12) | ext2 **只读**（NVMe `nsid=3`，宿主预格式化的既有分区） |
 | `/usb` | exfat_srv (13) | exFAT（**读 + 写**；NVMe `nsid=5`，宿主 `mkfs.exfat` 预格式化） |
 | `/` | fat32_srv (6) | FAT32（NVMe `nsid=1`） |
+| `/usb<卷号>` | fat32_srv (6) / ext2_srv (12) / exfat_srv (13) | **额外卷（M1b）**：各服务把自己那类的非默认卷自动挂到这里（`<卷号>` = block_srv 卷表里的 id，如 `/usb3` = FAT32 分区、`/usb4` = ext2 分区）。MFS 不参与。 |
 
 - 匹配是**组件边界敏感**的：`/tmpfoo` **不会**匹配到 `/tmp`，而会落到 `/`。
 - 跨服务操作需显式写路径：`cp` 之类命令尚未提供，`cat /mfs/X` 与 `ls /tmp` 各自路由。
 - `/ext2` 是只读挂载：`touch`/`mkdir`/`rm` 等写命令会失败（`ext2_srv` 对写请求一律拒绝）。
   `/usb`（exFAT）**可写**；但 `mv`（rename）与 `ln`（硬链接）在该服务上不支持，会失败。
+- `/usb<卷号>` 下各服务仍遵守自己的写能力：挂到 `ext2_srv` 的额外卷**只读**，挂到 `fat32_srv`/`exfat_srv` 的可写。
+  接入真实 U 盘时建议以 `readonly=on` 打开块设备（见 [commands.md](commands.md#接入真实-u-盘只读)），
+  此时写入会在块层失败 —— 这是预期的保护行为，不是 bug。
 
 ### 例（NVMe 五盘下）
 

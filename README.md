@@ -46,8 +46,8 @@
 | 系统调用接口 | ✅ 约 30 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力 |
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
-| 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接）、ext2 **只读**、exFAT（读 + 写） |
-| 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；`dev` 已升级为「卷号」，为读真实 U 盘分区铺路 |
+| 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
+| 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/chmod/truncate/stat/clear`（`ls -l` 长格式）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
@@ -298,12 +298,13 @@
 
 - [x] PCI 枚举 + NVMe 用户态驱动（块设备服务，含 IDE PIO 回退）
 - [x] MBR/GPT **分区解析 + 卷层**（block_srv 内，`dev` = 卷号；按卷首签名探测 FAT / exFAT / MFS / ext2）
+- [x] **多卷挂载**：请求 tag 高 32 位携带卷编码、一次打开绑定一个卷、切卷时重解析该卷几何；各文件服务把自己那类的**额外卷**自动上报挂载（`/usb<卷号>`，MFS 除外）；顺带把 fat32 簇缓冲从 2 页扩到 16 页（**64 KiB 簇**上限，真机 U 盘常见 32 KiB 簇可挂）、ext2 块组上限 16 → 4096
 - [x] 文件系统：FAT32（含 VFAT 长名）/ tmpfs / 原创 MorionFS（COW 写时复制 + 快照）
 - [x] ext2 **只读**兼容（挂载既有 Linux 分区）
-- [x] exFAT 兼容（`exfat_srv` 域 13，挂载 `/usb`）：**只读** = 引导区 + boot checksum、FAT 链、目录 entry set、分配位图、upcase 表；**读写** = 位图分配/释放、FAT 链扩展、entry set 增删（含 NameHash/SetChecksum 生成），`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`rename`/`chmod`/`link` 除外）
+- [x] exFAT 兼容（`exfat_srv` 域 13，挂载 `/usb`）：**只读** = 引导区 + boot checksum、FAT 链、目录 entry set、分配位图、upcase 表；**读写** = 位图分配/释放、FAT 链扩展、entry set 增删（含 NameHash/SetChecksum 生成），`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`rename`/`chmod`/`link` 除外）；**大容量卷** = 块层多页 DMA（单命令 ≤ 256 扇区 = 128 KiB，更大请求自动切段）+ exFAT 去掉 4 KiB 簇 / 4 KiB 位图 / 8 KiB upcase 三处硬上限（集群缓冲依簇大小动态分配、位图与 upcase 改按需扇区窗口）
 - [x] libvfs + 挂载层：多文件系统拼成单根 `/`，支持运行时挂载
 - [x] Shell（内置命令 + cwd 相对路径）与用户态键盘驱动
-- [x] **MorionFS v2 格式定稿 + 空间回收 / GC**（空闲位图 + mark & sweep，快照仍引用的旧块不回收；旧 `MFS1` 盘首挂自动重格式化）
+- [x] **MorionFS v2 格式定稿 + 空间回收 / GC**（空闲位图 + mark & sweep，快照仍引用的旧块不回收；旧 `MFS1` 盘首挂自动重格式化；自动格式化**仅限**空白盘与 MFS 盘，非 MFS 卷拒绝挂载以免误格式化真机 U 盘分区）
 - [x] **MorionFS 大文件**（`MFS3`：1008 直接块 + 一/二级间接块，单文件上限 = 整卷容量，突破旧 ≈4 MiB）
 - [x] **MorionFS 目录与长名**（`MFS4`：ext2 风格变长目录项 + `MFXI` 扩展目录块，名字 ≤255 字节、大小写敏感；IPC payload 32 → 96 字节以承载长路径）
 - [x] **MorionFS 节点元数据**（`MFS5`：时间戳（CMOS RTC）/权限/owner/链接数，`rename`（跨目录）/`truncate`（稀疏）/`chmod`，shell 增 `mv`/`chmod`/`truncate`/`stat`/`ls -l`）

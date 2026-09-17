@@ -36,6 +36,7 @@
 ```bash
 make run-nvme QEMU_MEM=4G                    # 内存 (默认 2G)
 make run-nvme MFS_MIB=64                     # MFS 盘大小 MiB (默认 16)
+make run-nvme EXFAT_MIB=2048 EXFAT_CLU=32K   # 大 exFAT 卷 (32 KiB 簇, 位图 > 4 KiB) 验证去上限
 make iso OUT_DIR=build2                      # 自定义输出目录
 ```
 
@@ -47,6 +48,11 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `NVME_IMG` | `build/nvme.img` | FAT32 盘（挂 `/`） |
 | `MFS_IMG` | `build/mfs.img` | MorionFS 盘（挂 `/mfs`，**空白 raw，首次挂载自动格式化**） |
 | `MFS_MIB` | `16` | MorionFS 盘大小 |
+| `EXT2_IMG` | `build/ext2.img` | ext2 盘（挂 `/ext2`，宿主 `mke2fs`） |
+| `PARTS_IMG` | `build/parts.img` | MBR 分区测试盘（卷层解析） |
+| `EXFAT_IMG` | `build/exfat.img` | exFAT 盘（挂 `/usb`，宿主 `mkfs.exfat`） |
+| `EXFAT_MIB` | `16` | exFAT 盘大小 MiB |
+| `EXFAT_CLU` | *(空)* | exFAT 簇大小（如 `4K`/`32K`/`128K`）；空 = 由 `mkfs.exfat` 按卷大小自选 |
 | `DISK_IMG` | `build/disk.img` | IDE 回退测试盘 |
 
 ---
@@ -69,12 +75,53 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `nsid=1` | `build/nvme.img`（宿主机 `mkfs.fat -F 32`） | FAT32 | `/` |
 | `nsid=2` | `build/mfs.img`（纯空白 raw） | MorionFS | `/mfs` |
 | `nsid=3` | `build/ext2.img`（宿主机 `mke2fs -t ext2`） | ext2（只读） | `/ext2` |
-| `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | —（仅验证卷层解析） |
+| `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | `/usb3`（FAT32 分区）、`/usb4`（ext2 分区） |
 | `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
 
 前三个镜像**没有分区表**，各成一个「整盘卷」，卷号恰为 0/1/2 —— 与引入卷层前一致
 （`nsid=5` 的 exFAT 整盘卷号为 5）。
-`build/parts.img` 是额外的一卷测试盘，用于验证 MBR 解析与类型探测（不影响上述挂载）。
+`build/parts.img` 是额外的一卷测试盘，用于验证 MBR 解析与类型探测。
+
+**额外卷自动挂载（M1b）**：每个文件服务认领**一个**默认卷（fat32 → 卷 0、mfs → 卷 1、
+ext2 → 卷 2、exfat → 卷 5），随后把自己那类的**其余卷**上报给 mount_srv，自动挂到
+`/usb<卷号>`（卷号 = 上表里 block_srv 分配的 id）。故 `parts.img` 的两个分区会分别挂到
+`/usb3`（FAT32）与 `/usb4`（ext2），启动日志里有对应诊断行：
+
+```
+mount-dbg: /usb3 domain=6 slot=7        # FAT 分区 → fat32_srv
+mount-dbg: /usb4 domain=12 slot=6       # ext2 分区 → ext2_srv
+```
+
+MFS **不参与**额外卷（持久卷 + 自动格式化语义，多卷会误伤），故 `/usb<卷号>` 下不会出现 MFS。
+
+### 接入真实 U 盘（只读）
+
+`-drive file=/dev/sdXN,...` 可把宿主机分区当作一个 namespace 交给 MorionOS，卷层会解析出
+该分区的文件系统类型并自动挂到 `/usb<卷号>`。**读别人的盘一律加 `readonly=on`** —— QEMU 层
+拒绝写入，物理盘不可改（重新插拔即恢复）：
+
+```bash
+# 需要先给当前用户对该块设备的读权限 (临时; 拔插后失效):
+#   sudo chgrp $(id -gn) /dev/sdb{,1,2} && sudo chmod 440 /dev/sdb{,1,2}
+qemu-system-x86_64 \
+  -machine q35 -m 2G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom build/morion-os.iso \
+  -device nvme,serial=MORION,id=nvme0 \
+  -drive file=build/nvme.img,if=none,id=n0,format=raw -device nvme-ns,drive=n0,bus=nvme0,nsid=1 \
+  -drive file=build/mfs.img, if=none,id=n1,format=raw -device nvme-ns,drive=n1,bus=nvme0,nsid=2 \
+  -drive file=/dev/sdb1,    if=none,id=u6,format=raw,readonly=on -device nvme-ns,drive=u6,bus=nvme0,nsid=6 \
+  -drive file=/dev/sdb2,    if=none,id=u7,format=raw,readonly=on -device nvme-ns,drive=u7,bus=nvme0,nsid=7 \
+  -serial file:/tmp/usb.log -display none
+```
+
+> ⚠️ `format=raw` 必须显式写。若该分区在宿主上**已挂载**，`readonly=on` 的 `O_RDONLY` 打开
+> 仍然安全（多读者无冲突），但**绝不要**去掉 `readonly`：宿主与来宾同时写同一分区会毁数据。
+> 另外 **NTFS 无法挂载**（没有 NTFS 驱动），这类盘会被卷层识别成一个「未知类型」卷，
+> 各服务都不会认领它 —— 既不会挂上，也不会写坏。
+
+**块请求语义（M6c）**：`BlockReq.count` 单位是 512 B 扇区。单条 NVMe 命令上限 **256 扇区
+（128 KiB，`NVME_MAX_SECTORS`）**；`count` 超过 256 时由 block_srv 按 256 扇区**切段**并连续提交，
+故调用方缓冲必须是**逐页映射的连续虚拟区间**（多页段首地址页对齐）。段内多页传输由 block_srv
+组织 PRP：1 页用 PRP1、2 页 PRP2 直指第 2 页、> 2 页则写 PRP 表页（逐页 `SYS_VIRT_TO_PHYS` 反查）。
 
 `build/mfs.img` 由 Makefile 用 `dd` 生成空白盘；超级块由 `mfs_srv` 首次挂载时写入
 （自动格式化）。**当前格式为 MFS6**（空闲位图 + 空间回收 + 文件间接块 + 变长目录项/长名 +
@@ -104,6 +151,19 @@ rm -f build/ext2.img && make build/ext2.img  # 重新生成 ext2 镜像
 rm -f build/exfat.img && make build/exfat.img   # 重新生成 exFAT 镜像
 fsck.exfat -n build/exfat.img                   # 宿主校验镜像完好 (回归后应为 clean)
 ```
+
+**大容量 / 大簇验证（M6c）**：默认 16 MiB 卷只有 4 KiB 簇、位图 448 B，覆盖不到大簇与大位图
+路径。要验证「块层多页 DMA + exFAT 去上限」，用 `EXFAT_MIB` / `EXFAT_CLU` 生成大卷
+（例如 2048 MiB + 32 KiB 簇 = 位图 8184 B > 4 KiB；FS-16 的 100000 字节写会跨多页 DMA）：
+
+```bash
+rm -f build/exfat.img && make build/exfat.img EXFAT_MIB=2048 EXFAT_CLU=32K
+# 启动前确认参数: 挂载日志应打印 exfat-dbg: … cluster=32768 … bitmap=8184 …
+fsck.exfat -n build/exfat.img                   # 回归后仍应为 clean
+```
+
+> ⚠️ Make 的镜像目标是 `$(EXFAT_IMG)` 展开后的路径，自定义路径时目标名也要跟着写
+> （如 `make /tmp/big.img EXFAT_IMG=/tmp/big.img EXFAT_MIB=2048 EXFAT_CLU=32K`）。
 
 `build/parts.img` 是分区测试盘：宿主用 `sfdisk` 写 MBR 两个主分区（起点 2048 的 FAT32、
 起点 34816 的 ext2），分区内容先在独立小镜像上 `mkfs` 再 `dd` 进去。它用于验证
@@ -151,9 +211,17 @@ grep -n "shell: type 'help'" build/s.log # 出现即已进 shell
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-16）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-17）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
+**FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
+拼出 `/usb3` / `/usb4`，读回宿主预置的 `PART1.TXT` / `PART2.TXT`（校验前 10 字节 == `partition `），
+**全程只读**；失败会打印 `app: FS17 … FAILED`。
+
+> ⏱️ **自测整套约需 3.5~4 分钟**（约 2 万个块请求，IPC 一跳 ≈ 一个时钟 tick，故有效吞吐 ~100 请求/s）。
+> 期间日志会长时间「只有 shell 提示符、没有新行」，**这不是卡死** —— 别用几十秒的超时去判定失败，
+> 请给足 ≥ 300 s（脚本内先 `grep 'SELFTEST DONE'` 再判）。`mfs-dbg`/`exfat-dbg` 行在挂载后立刻出现，
+> 之后到 `SELFTEST DONE` 之间的静默属正常。
 `mfs-dbg: vol=… total=… free=… gen=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
 （`free` 接近 `total`、`gen` 逐次启动单调增长）；`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
 一行给出 exFAT 挂载后的卷参数，用于与宿主 `mkfs.exfat` 的参数对齐核对。
