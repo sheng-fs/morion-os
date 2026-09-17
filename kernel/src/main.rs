@@ -336,6 +336,11 @@ pub extern "C" fn kernel_main() -> ! {
     // 授权: app 可直接查询 block_srv 的卷表 (自测卷层/分区解析); 只需读 + 共享结果页。
     cap::grant(app_domain, cap::Capability::SendTo(block_domain));
     cap::grant(app_domain, cap::Capability::MapInto(block_domain));
+    // 授权: 各文件服务把**自己那类的额外卷**上报给 mount_srv (M1b 多卷挂载:
+    // `/usb<卷号>`)。只需 SendTo —— 挂载请求是一条普通 IPC, 不经共享页。
+    cap::grant(fat32_domain, cap::Capability::SendTo(mount_domain));
+    cap::grant(ext2_domain, cap::Capability::SendTo(mount_domain));
+    cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     video::println("[OK] IPC + capability + pager initialized (14 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
