@@ -1446,10 +1446,34 @@ fn write_cluster(bpb: &Fat32Bpb, cluster: u32, buf: *mut u8) -> bool {
     block_write(sector, bpb.sectors_per_cluster as u16, buf)
 }
 
+/// fat32 的簇分配游标 (与 exFAT 的 `EXFAT_ALLOC_HINT` 同义)。
+///
+/// `find_free_cluster` 从它起向后扫描, 找到后推进到下一簇 —— 避免每次分配都从簇 2
+/// 重新扫整张 FAT。没有它, 写一个 100000 字节的文件 (512 B 簇 = 196 簇) 会让
+/// 分配变成 O(n²) 次 FAT 读, 实测整套自测被拖到 8 分钟以上还跑不完。
+static mut FAT_ALLOC_HINT: u32 = 2;
+
 /// 扫描 FAT 表找第一个空闲簇 (表项 == 0), 无空闲返回 None。
+/// 从 `FAT_ALLOC_HINT` 起向后扫描, 扫到表尾回绕到 2, 回到起点仍无空闲则返回 None。
 fn find_free_cluster(bpb: &Fat32Bpb, fat_buf: *mut u8) -> Option<u32> {
     let total = bpb.total_clusters();
-    (2..=(total + 1)).find(|&cluster| read_fat_entry(bpb, cluster, fat_buf) == 0)
+    let start = unsafe { FAT_ALLOC_HINT }.max(2);
+    let mut cluster = start;
+    loop {
+        if read_fat_entry(bpb, cluster, fat_buf) == 0 {
+            unsafe {
+                FAT_ALLOC_HINT = if cluster + 1 > total + 1 { 2 } else { cluster + 1 };
+            }
+            return Some(cluster);
+        }
+        cluster += 1;
+        if cluster > total + 1 {
+            cluster = 2;
+        }
+        if cluster == start {
+            return None; // 扫完一圈仍无空闲
+        }
+    }
 }
 
 /// 把目录项 (父目录簇 `dir_cluster`, 簇内字节偏移 `entry_offset`) 的
@@ -3047,6 +3071,8 @@ fn fat_load_bpb(vol: u64, bpb_buf: *mut u8, out: &mut Fat32Bpb) -> bool {
     *out = b;
     unsafe {
         FAT_BPB_VOL = vol;
+        // 换卷后分配游标归位 (各卷簇数不同, 沿用旧卷的 hint 可能越过新卷簇数)。
+        FAT_ALLOC_HINT = 2;
     }
     true
 }
@@ -5514,6 +5540,87 @@ fn app_main() {
                 println("app: FS17 PART2.TXT content FAILED");
                 return;
             }
+        }
+    }
+
+    // 21. FS-18 自测: fat32 大簇写路径 (跨簇写入 + 读回 + 删除释放)。
+    //     fat32 没有 truncate, 故重点覆盖 WRITE 触发簇链扩展、逐簇读回、UNLINK 释放
+    //     簇链这三条「目录项增删 / 簇分配 / FAT 链维护」的写路径。写入 100000 字节:
+    //     512 B 簇下跨 196 簇、32 KiB 簇下跨 4 簇 —— 无论哪种几何都会真实跨簇。
+    //     这一条是 fat32 写路径里**唯一**的大文件用例, 且能在 `NVME_CLU=64` 造出的
+    //     32 KiB 簇镜像上验证 M1b 大簇写路径。
+    {
+        // 幂等: 清掉上一轮被中断可能残留的对象。
+        vfs::unlink("/FS18.BIN");
+        let pat = |i: usize| (i % 251) as u8;
+        let total = 100_000usize;
+
+        let fd = vfs::creat("/FS18.BIN");
+        if fd == u64::MAX {
+            println("app: FS18 creat FAILED");
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        let mut written = 0usize;
+        while written < total {
+            let n = (total - written).min(buf.len());
+            let mut i = 0usize;
+            while i < n {
+                buf[i] = pat(written + i);
+                i += 1;
+            }
+            if vfs::write(fd, written as u32, &buf[..n]) != n as u64 {
+                println("app: FS18 write FAILED");
+                return;
+            }
+            written += n;
+        }
+        vfs::close(fd);
+
+        if vfs::stat("/FS18.BIN") == u64::MAX {
+            println("app: FS18 stat FAILED");
+            return;
+        }
+        {
+            let st = unsafe { core::ptr::read_unaligned(vfs::RESULT_BUF as *const vfs::Stat) };
+            if st.size as usize != total {
+                println("app: FS18 size mismatch FAILED");
+                return;
+            }
+        }
+
+        let rfd = vfs::open("/FS18.BIN");
+        if rfd == u64::MAX {
+            println("app: FS18 reopen FAILED");
+            return;
+        }
+        let mut off = 0usize;
+        while off < total {
+            let n = (total - off).min(4096);
+            if vfs::read(rfd, off as u32, n as u32) != n as u64 {
+                println("app: FS18 read back FAILED");
+                return;
+            }
+            let r = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, n) };
+            let mut i = 0usize;
+            while i < n {
+                if r[i] != pat(off + i) {
+                    println("app: FS18 content mismatch FAILED");
+                    return;
+                }
+                i += 1;
+            }
+            off += n;
+        }
+        vfs::close(rfd);
+
+        if vfs::unlink("/FS18.BIN") != 1 {
+            println("app: FS18 unlink FAILED");
+            return;
+        }
+        if vfs::stat("/FS18.BIN") != u64::MAX {
+            println("app: FS18 still present after unlink FAILED");
+            return;
         }
     }
     println("app: SELFTEST DONE");

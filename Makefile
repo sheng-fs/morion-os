@@ -56,6 +56,11 @@ OVMF_CODE     ?= /usr/share/edk2/x64/OVMF_CODE.fd
 OVMF_VARS     ?= /usr/share/edk2/x64/OVMF_VARS.fd
 # 文件系统阶段: NVMe 磁盘镜像 (宿主机 mkfs.fat 生成)
 NVME_IMG      ?= $(OUT_DIR)/nvme.img
+# 可选的每簇扇区数 (1/2/4/.../128); 默认 8 (= 4 KiB 簇)。
+# mkfs.fat 对 64 MiB 盘会给 512 B 簇 (每簇 1 扇区), 写大文件要跨数百簇、慢到
+# 不可用且不现实; 4 KiB 簇是 fat32 的常见默认。大簇写路径用 `make NVME_CLU=64`
+# (= 32 KiB 簇) 单独验证。
+NVME_CLU      ?= 8
 # MorionFS (MFS) 磁盘镜像: 纯空白 raw, 由 mfs_srv 首次挂载时自动格式化 (namespace 2)
 MFS_IMG       ?= $(OUT_DIR)/mfs.img
 MFS_MIB       ?= 16
@@ -341,10 +346,10 @@ run-ide: iso $(DISK_IMG)
 # 另含一个 VFAT 长名文件 (Long File Name.txt, 短名派生为 LONGFI~1.TXT),
 # 供 VFAT 长名读取 / 按长名打开的自测与交互验证使用。
 $(NVME_IMG):
-	@echo "==> 创建 NVMe 磁盘镜像 (FAT32)..."
+	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
-	mkfs.fat -F 32 $(NVME_IMG) >/dev/null 2>&1
+	mkfs.fat -F 32 $(if $(NVME_CLU),-s $(NVME_CLU),) $(NVME_IMG) >/dev/null 2>&1
 	@printf 'Hello from FAT32!\nThis is a test file.\n' > $(OUT_DIR)/hello.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/hello.txt ::/HELLO.TXT
 	mmd -i $(NVME_IMG) ::/DIR1
