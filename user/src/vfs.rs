@@ -78,9 +78,38 @@ pub const VFS_LOOKUP_TAG: u64 = 0x4D4E_5451; // "MNTQ"
 pub const VFS_MOUNT_TAG: u64 = 0x4D4E_5441; // "MNTA"
 /// 运行时卸载 tag: payload 为挂载点前缀 (NUL 结尾)。回复 1 / `u64::MAX`。
 pub const VFS_UMOUNT_TAG: u64 = 0x4D4E_5444; // "MNTD"
+/// 运行时挂载**额外卷** tag (M1b 多卷挂载): payload 为 `MountVolReq`。
+/// 由 mount_srv 自动挂到 `/usb<卷号>`。回复挂载槽位号 (1 起), 失败 `u64::MAX`。
+pub const VFS_MOUNT_VOL_TAG: u64 = 0x4D4E_5456; // "MNTV"
 
 /// 挂载点前缀最大长度 (与 mount_srv 的 `MOUNT_PREFIX_MAX` 一致)。
 pub const MOUNT_PREFIX_MAX: usize = 24;
+
+/// 运行时挂载额外卷的请求 (序列化进 IPC payload, 16 字节)。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MountVolReq {
+    /// 要额外挂载的文件服务域。
+    pub domain: u64,
+    /// 该服务要额外挂载的**卷号** (block_srv 卷表里的 id; 各服务自己认领的是默认卷)。
+    pub vol: u64,
+}
+
+/// 把服务的额外卷 `vol` 挂到 `/usb<卷号>` (M1b 多卷挂载)。
+///
+/// 挂载点直接取「卷号」编号, 使同一台机器上任何服务挂额外卷都不会撞名, 且挂载点
+/// 与 block_srv 卷表里的卷号一一对应 (`/usb3` = 卷 3), 便于排查。
+/// 成功返回挂载槽位号 (1 起), 失败 `u64::MAX`。
+pub fn mount_vol(domain: u64, vol: u64) -> u64 {
+    let req = MountVolReq { domain, vol };
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const MountVolReq as *const u8,
+            core::mem::size_of::<MountVolReq>(),
+        )
+    };
+    sys_call_payload(MOUNT_DOMAIN, VFS_MOUNT_VOL_TAG, payload)
+}
 
 /// 运行时挂载请求 (序列化进 IPC payload, 32 字节)。
 #[repr(C)]
@@ -159,42 +188,80 @@ pub fn mfs_snapshot_restore(idx: u32) -> u64 {
     sys_call_payload(MFS_DOMAIN, MFS_SNAPRESTORE_TAG, &payload)
 }
 
-/// 向挂载服务查询 `path` 应路由到的文件服务域, 返回 (服务域, 挂载点前缀长度)。
+/// 请求 tag 中「卷编码」的位偏移与掩码 (M1b 多卷挂载)。
+///
+/// VFS tag 正文是 4 字节 ASCII (低 32 位); 高 8 位另作**卷编码**: `0` = 让服务用它
+/// 自己认领的默认卷, 否则 = 卷号 + 1。这样「这次请求落在哪个卷」随请求一起到达
+/// 服务, 而无需给每个请求结构体都加字段 —— 服务端分发前先用 `tag_body` 剥掉高位。
+const TAG_VOL_SHIFT: u32 = 32;
+const TAG_VOL_MASK: u64 = 0xFF;
+
+/// 请求 tag 的正文 (剥掉高位卷编码), 供服务端 `match` 分发。
+pub fn tag_body(tag: u64) -> u64 {
+    tag & 0xFFFF_FFFF
+}
+
+/// 请求 tag 携带的卷编码 (`0` = 服务默认卷)。
+pub fn tag_vol(tag: u64) -> u32 {
+    ((tag >> TAG_VOL_SHIFT) & TAG_VOL_MASK) as u32
+}
+
+/// 卷号 → 卷编码 (0 保留给「默认卷」, 故整体 +1; 卷号 ≤ 254)。
+pub fn enc_of_vol(vol: u64) -> u32 {
+    (vol + 1) as u32
+}
+
+/// 卷编码 → 卷号; 编码 0 解释为服务默认卷 `default_vol`。
+pub fn vol_from_enc(enc: u32, default_vol: u64) -> u64 {
+    if enc == 0 {
+        default_vol
+    } else {
+        (enc - 1) as u64
+    }
+}
+
+/// 把卷编码写进请求 tag。
+fn with_vol(tag: u64, vol_enc: u32) -> u64 {
+    tag | (((vol_enc as u64) & TAG_VOL_MASK) << TAG_VOL_SHIFT)
+}
+
+/// 向挂载服务查询 `path` 应路由到的文件服务域, 返回 (服务域, 卷编码, 挂载点前缀长度)。
 ///
 /// 未挂载 / 查询失败返回 None。路径长度按 payload 上限截断 (挂载点都是短前缀)。
-fn mount_lookup(path: &str) -> Option<(u64, usize)> {
+fn mount_lookup(path: &str) -> Option<(u64, u32, usize)> {
     let payload = path_payload(path);
     let r = sys_call_payload(MOUNT_DOMAIN, VFS_LOOKUP_TAG, &payload);
     if r == u64::MAX {
         return None;
     }
-    let domain = r >> 32;
+    let domain = (r >> 32) & 0xFF;
+    let vol_enc = ((r >> 40) & 0xFF) as u32;
     let prefix_len = (r & 0xFFFF_FFFF) as usize;
     // 域 0/挂载前缀长度非法视为查询失败 (无文件服务挂在域 0)。
     if domain == 0 || prefix_len == 0 || prefix_len > path.len() {
         return None;
     }
-    Some((domain, prefix_len))
+    Some((domain, vol_enc, prefix_len))
 }
 
-/// 把绝对路径 `path` 解析为 (目标服务域, 相对挂载点根的路径)。
+/// 把绝对路径 `path` 解析为 (目标服务域, 卷编码, 相对挂载点根的路径)。
 ///
 /// 相对路径保留前导 '/' (服务端一律按以 '/' 开头的绝对路径处理子路径)。例如
 /// `/tmp/a` 在 `/tmp`→tmpfs 下得到 `("/a", tmpfs)`; `/h.txt` 在 `/`→fat32 下
 /// 得到 `("/h.txt", fat32)`。
-fn route(path: &str) -> Option<(u64, &str)> {
-    let (domain, prefix_len) = mount_lookup(path)?;
+fn route(path: &str) -> Option<(u64, u32, &str)> {
+    let (domain, vol_enc, prefix_len) = mount_lookup(path)?;
     if prefix_len > path.len() {
         return None;
     }
     // 根挂载 ("/", 前缀长度 1): 路径本身就是服务内绝对路径, 原样下发。
     if prefix_len == 1 {
-        return Some((domain, path));
+        return Some((domain, vol_enc, path));
     }
     // 其它挂载点: 去掉挂载前缀, 余下部分自带前导 '/' (如 `/tmp/D1` → `/D1`);
     // 恰好等于挂载点时余下为空, 即子树根 `/`。
     let rest = &path[prefix_len..];
-    Some((domain, if rest.is_empty() { "/" } else { rest }))
+    Some((domain, vol_enc, if rest.is_empty() { "/" } else { rest }))
 }
 
 /// 把「服务域 + 服务内局部 fd」打包为对外 fd, 并在高 16 位带上能力句柄索引。
@@ -478,9 +545,12 @@ fn wrap_open(domain: u64, local: u64) -> u64 {
 /// 打开文件或目录, 成功返回 fd (已编码目标服务域 + 能力句柄), 失败返回 `u64::MAX`。
 pub fn open(path: &str) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let payload = path_payload(sub);
-            wrap_open(domain, sys_call_payload(domain, VFS_OPEN_TAG, &payload))
+            wrap_open(
+                domain,
+                sys_call_payload(domain, with_vol(VFS_OPEN_TAG, vol_enc), &payload),
+            )
         }
         None => u64::MAX,
     }
@@ -592,9 +662,12 @@ pub fn close(fd: u64) -> u64 {
 /// 成功返回 fd (已编码目标服务域 + 能力句柄), 失败返回 `u64::MAX`。
 pub fn creat(path: &str) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let payload = path_payload(sub);
-            wrap_open(domain, sys_call_payload(domain, VFS_CREAT_TAG, &payload))
+            wrap_open(
+                domain,
+                sys_call_payload(domain, with_vol(VFS_CREAT_TAG, vol_enc), &payload),
+            )
         }
         None => u64::MAX,
     }
@@ -603,9 +676,9 @@ pub fn creat(path: &str) -> u64 {
 /// 创建目录 `path`, 成功返回 1, 失败返回 `u64::MAX`。
 pub fn mkdir(path: &str) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let payload = path_payload(sub);
-            sys_call_payload(domain, VFS_MKDIR_TAG, &payload)
+            sys_call_payload(domain, with_vol(VFS_MKDIR_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
     }
@@ -614,9 +687,9 @@ pub fn mkdir(path: &str) -> u64 {
 /// 删除文件 `path` (不删目录), 成功返回 1, 失败返回 `u64::MAX`。
 pub fn unlink(path: &str) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let payload = path_payload(sub);
-            sys_call_payload(domain, VFS_UNLINK_TAG, &payload)
+            sys_call_payload(domain, with_vol(VFS_UNLINK_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
     }
@@ -625,9 +698,9 @@ pub fn unlink(path: &str) -> u64 {
 /// 删除空目录 `path`, 成功返回 1, 失败返回 `u64::MAX`。
 pub fn rmdir(path: &str) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let payload = path_payload(sub);
-            sys_call_payload(domain, VFS_RMDIR_TAG, &payload)
+            sys_call_payload(domain, with_vol(VFS_RMDIR_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
     }
@@ -645,7 +718,7 @@ pub fn stat(path: &str) -> u64 {
 /// 同 `stat`, 但结果写入 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn stat_into(path: &str, buf: u64) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let req = PathReq { aux: 0, _pad: 0, buf };
             write_cstr(sub, buf);
             let payload = unsafe {
@@ -654,7 +727,7 @@ pub fn stat_into(path: &str, buf: u64) -> u64 {
                     core::mem::size_of::<PathReq>(),
                 )
             };
-            sys_call_payload(domain, VFS_STAT_TAG, payload)
+            sys_call_payload(domain, with_vol(VFS_STAT_TAG, vol_enc), payload)
         }
         None => u64::MAX,
     }
@@ -670,7 +743,7 @@ pub fn chmod(path: &str, mode: u32) -> u64 {
 /// 同 `chmod`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
     match route(path) {
-        Some((domain, sub)) => {
+        Some((domain, vol_enc, sub)) => {
             let req = PathReq { aux: mode, _pad: 0, buf };
             write_cstr(sub, buf);
             let payload = unsafe {
@@ -679,7 +752,7 @@ pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
                     core::mem::size_of::<PathReq>(),
                 )
             };
-            sys_call_payload(domain, VFS_CHMOD_TAG, payload)
+            sys_call_payload(domain, with_vol(VFS_CHMOD_TAG, vol_enc), payload)
         }
         None => u64::MAX,
     }
@@ -712,16 +785,16 @@ pub fn rename(src: &str, dst: &str) -> u64 {
 ///
 /// 两条路径经共享页传 (IPC payload 装不下), 布局 `src\0dst\0`。
 pub fn rename_into(src: &str, dst: &str, buf: u64) -> u64 {
-    let (sd, ssub) = match route(src) {
+    let (sd, senc, ssub) = match route(src) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let (dd, dsub) = match route(dst) {
+    let (dd, denc, dsub) = match route(dst) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    // 跨文件服务 (跨挂载点) 的 rename 需要搬迁数据, 当前不支持。
-    if sd != dd {
+    // 跨文件服务 (跨挂载点) 的 rename 需要搬迁数据, 当前不支持; 跨卷同理。
+    if sd != dd || senc != denc {
         return u64::MAX;
     }
     let req = TwoPathReq {
@@ -737,7 +810,7 @@ pub fn rename_into(src: &str, dst: &str, buf: u64) -> u64 {
             core::mem::size_of::<TwoPathReq>(),
         )
     };
-    sys_call_payload(sd, VFS_RENAME_TAG, payload)
+    sys_call_payload(sd, with_vol(VFS_RENAME_TAG, senc), payload)
 }
 
 /// 把 NUL 结尾的短字符串写进共享页 (供 `PathReq` / `TwoPathReq` 使用)。
@@ -759,16 +832,16 @@ pub fn link(src: &str, dst: &str) -> u64 {
 
 /// 同 `link`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn link_into(src: &str, dst: &str, buf: u64) -> u64 {
-    let (sd, ssub) = match route(src) {
+    let (sd, senc, ssub) = match route(src) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let (dd, dsub) = match route(dst) {
+    let (dd, denc, dsub) = match route(dst) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    if sd != dd {
-        return u64::MAX; // 跨文件服务不支持
+    if sd != dd || senc != denc {
+        return u64::MAX; // 跨文件服务 / 跨卷不支持
     }
     let req = TwoPathReq {
         a_len: ssub.len() as u32,
@@ -782,7 +855,7 @@ pub fn link_into(src: &str, dst: &str, buf: u64) -> u64 {
             core::mem::size_of::<TwoPathReq>(),
         )
     };
-    sys_call_payload(sd, VFS_LINK_TAG, payload)
+    sys_call_payload(sd, with_vol(VFS_LINK_TAG, senc), payload)
 }
 
 /// 把两条路径按 `src\0dst\0` 写进共享页。
