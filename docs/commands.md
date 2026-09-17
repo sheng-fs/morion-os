@@ -209,6 +209,24 @@ grep -cE "FAILED|PANIC" build/s.log     # 必须为 0
 grep -n "shell: type 'help'" build/s.log # 出现即已进 shell
 ```
 
+**回归脚本（推荐直接用，省去手写上面那段）**：
+
+```bash
+bash scripts/fs-regress.sh                   # 5 张模拟镜像跑全量自测 → /tmp/morion-fs-regress.log
+bash scripts/usb-ro.sh /dev/sda1 /dev/sda2   # 真盘只读端到端 (前后比对盘头 sha256)
+```
+
+两者都用**退出码**表示结果（`0` = 通过），并自带日志落盘与失败明细输出。
+`fs-regress.sh` 会轮询日志直到出现 `SELFTEST DONE` / `FAILED` / `PANIC` ——
+别用几十秒的超时去判失败（见下）。`usb-ro.sh` 把每个参数设备以 `readonly=on` 作
+namespace 6, 7, 8… 接入，跑之前需要先给当前用户**读**权限：
+
+```bash
+sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
+```
+
+> 授权是临时的，拔插设备即恢复；重插后**盘符会变**，先用 `lsblk` 确认设备名。
+
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
 app 的 FS 自测（FS-1..FS-17）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
