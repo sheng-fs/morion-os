@@ -2654,18 +2654,27 @@ fn vol_scan_namespace(
         );
         return;
     }
-    // 普通 MBR: 4 个 16 字节主分区项 (type@4, lba_start@8, sectors@12)。
+    // 普通 MBR: 4 个 16 字节主分区项 (boot@0, type@4, lba_start@8, sectors@12)。
     // 先把所有项摘出来再逐个探测: 探测文件系统类型会读盘并覆写 `scratch`
     // (即分区表所在缓冲), 边读表边探测会把后续分区项毁掉。
+    //
+    // ⚠️ 必须校验项的合法性, 不能只看「type != 0 且 count != 0」: 本函数也用于
+    // **本身就是分区**的卷 (真机 U 盘的分区用 `-drive file=/dev/sdXN` 接入)。此时
+    // 扇区 0 是该分区的 VBR 而不是 MBR, 而 0x55AA 之外 446..509 那段在真实 FAT32
+    // 引导代码里是**非零 ASCII**, 会被误读成 4 条主分区项, 于是真正的文件系统卷
+    // 永远登记不上、只登记出 4 个指向非法 LBA 的假卷 (读它们直接 `LBA Out of Range`)。
+    // 合法主分区项的启动标志只能是 0x00/0x80, 且 LBA 起点不可能为 0 (扇区 0 是 MBR 本身)。
     let mut parts: [(u32, u32); 4] = [(0, 0); 4];
     let mut npart = 0usize;
     let mut i = 0usize;
     while i < 4 {
         let e = unsafe { entries.add(i * 16) };
+        let bootflag = unsafe { *e.add(0) };
         let ptype = unsafe { *e.add(4) };
         let start = read_u32(unsafe { e.add(8) });
         let count = read_u32(unsafe { e.add(12) });
-        if boot_sig && ptype != 0 && count != 0 {
+        let plausible = (bootflag == 0x00 || bootflag == 0x80) && start != 0;
+        if boot_sig && ptype != 0 && count != 0 && plausible {
             parts[npart] = (start, count);
             npart += 1;
         }
