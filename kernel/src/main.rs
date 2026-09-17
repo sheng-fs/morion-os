@@ -32,14 +32,22 @@ core::arch::global_asm!(
 // ---------------------------------------------------------------------------
 /// 用户程序基址 (P4[1] 用户空间基址), 与 user/linker.ld 的链接地址一致。
 const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
-/// 用户栈页虚拟地址。
+/// 用户栈顶虚拟地址 (栈向下增长)。
 ///
 /// 布置在程序镜像 (自 `USER_BASE` 起, 随代码增长) 之上、固定数据区之下。固定数据区
 /// (`USER_BASE + 8 MiB` 起: sender/receiver 共享页、NVMe 配置/MMIO/DMA) 与文件服务
-/// 缓冲页 (`USER_BASE + 1 MiB` 起) 均在其上, 互不重叠。故取 4 MiB 处留足余量。
-const USER_STACK_ADDR: u64 = USER_BASE + 0x40_0000;
-/// 用户栈顶虚拟地址 (栈向下增长)。
-const USER_STACK_TOP: u64 = USER_STACK_ADDR + 0x1000;
+/// 缓冲页 (`USER_BASE + 1 MiB` 起, 最高到 `+0x16_2000`) 均在其上, 互不重叠。
+/// 故取 4 MiB 处留足余量。
+const USER_STACK_TOP: u64 = USER_BASE + 0x40_1000;
+/// 用户栈页数 (栈自 `USER_STACK_TOP` 向下增长)。
+///
+/// 单页 (4 KiB) 不够: VFS 请求/回复在栈上构造 `Message` (96 字节 payload) 并层层
+/// 调用, app 域在最早的几次 VFS 调用就会越过一页栈底; 过去靠按需分页把缺的页
+/// 静默补上, 但那是「碰巧能用」而非可靠 —— 栈布局随代码/时序变化, 一旦在补页的
+/// 间隙踩到未映射页就会表现成随机卡死。这里直接给足 8 页 (32 KiB)。
+const USER_STACK_PAGES: u64 = 8;
+/// 用户栈区域最低页虚拟地址 (由栈顶与页数推出, 不再写死单页)。
+const USER_STACK_ADDR: u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
 /// 页大小。
 const PAGE_SIZE: u64 = 4096;
 
@@ -69,10 +77,12 @@ fn load_user_program(domain_id: u64) {
         }
     }
 
-    // 用户栈页。
-    let stack_frame =
-        memory::frame_allocator::allocate_frame().expect("allocate user stack frame");
-    memory::paging::map_user_page(domain_id, USER_STACK_ADDR, stack_frame);
+    // 用户栈: 连续映射 USER_STACK_PAGES 页 (栈向下增长, 最高页紧邻栈顶)。
+    for i in 0..USER_STACK_PAGES {
+        let stack_frame =
+            memory::frame_allocator::allocate_frame().expect("allocate user stack frame");
+        memory::paging::map_user_page(domain_id, USER_STACK_ADDR + i * PAGE_SIZE, stack_frame);
+    }
 }
 
 /// 空闲任务: 当用户任务退出后兜底运行, 停机等待中断。
