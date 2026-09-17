@@ -467,6 +467,10 @@ fn submit_wait(
                 print_u64(sqe.cdw10 as u64);
                 print(" cdw11=");
                 print_u64(sqe.cdw11 as u64);
+                print(" nlb-1=");
+                print_u64(sqe.cdw12 as u64);
+                print(" nsid=");
+                print_u64(sqe.nsid as u64);
                 print(" prp1=");
                 print_u64(sqe.prp1);
                 println("");
