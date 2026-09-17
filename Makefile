@@ -65,6 +65,9 @@ EXT2_MIB      ?= 16
 # exFAT 磁盘镜像: 由宿主 mkfs.exfat 预格式化 (namespace 5, 读写)
 EXFAT_IMG     ?= $(OUT_DIR)/exfat.img
 EXFAT_MIB     ?= 16
+# 可选的簇大小 (如 4K/32K/128K); 留空 = 让 mkfs.exfat 按卷大小选默认值。
+# 用于验证大簇 (多页 DMA / 按需位图): make EXFAT_MIB=2048 EXFAT_CLU=32K ...
+EXFAT_CLU     ?=
 # 分区测试盘: MBR 两个主分区 (FAT32 + ext2), 用于验证 block_srv 卷层的分区解析 (namespace 4)
 PARTS_IMG     ?= $(OUT_DIR)/parts.img
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
@@ -313,10 +316,10 @@ $(PARTS_IMG):
 # exFAT 磁盘镜像: 宿主 mkfs.exfat 预格式化 (exfatprogs), 首挂载即可读;
 # 服务**不**自动格式化 (与 ext2 同: 定位是读写既有的 exFAT 卷/U 盘)。
 $(EXFAT_IMG):
-	@echo "==> 创建 exFAT 磁盘镜像 (mkfs.exfat)..."
+	@echo "==> 创建 exFAT 磁盘镜像 (mkfs.exfat, $(EXFAT_MIB)MiB$(if $(EXFAT_CLU), 簇 $(EXFAT_CLU),))..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(EXFAT_IMG) bs=1M count=$(EXFAT_MIB) status=none
-	mkfs.exfat -L MORIONUSB $(EXFAT_IMG) >/dev/null
+	mkfs.exfat -L MORIONUSB $(if $(EXFAT_CLU),-c $(EXFAT_CLU),) $(EXFAT_IMG) >/dev/null
 	@echo "  ✓ exFAT 镜像: $(EXFAT_IMG)"
 
 # 文件系统阶段: 挂载 IDE 磁盘运行 (Legacy PIO 读扇区, 不依赖 DMA/MSI-X)

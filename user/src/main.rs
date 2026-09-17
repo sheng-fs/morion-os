@@ -517,13 +517,27 @@ fn submit_wait(
 /// 「最多等约几秒」设定 —— 预算过紧时, 宿主机负载稍高 (如 MFS 大量 COW 写)
 /// 就会误判超时, 使一次正常的块读写失败。
 const NVME_POLL_LIMIT: u32 = 1_000_000;
+/// 逻辑扇区大小 (与块层约定一致)。
+const NVME_SECTOR_SIZE: usize = 512;
+/// 页大小 (NVMe 的 PRP 粒度)。
+const NVME_PAGE_SIZE: usize = 4096;
+/// 单条 NVMe 命令的扇区上限 (256 扇区 = 128 KiB, 与 `BlockReq.count` 约定一致)。
+/// 更大的请求由 block_srv 拆成多条命令。
+const NVME_MAX_SECTORS: u16 = 256;
+/// block_srv 私有的 PRP 表页虚拟地址 (> 2 页的传输共用一页表项空间)。
+/// 与 `VOL_SCRATCH_VADDR` 同理: 必须落在所有共享缓冲段之上 (见该常量处的地址分区表)。
+const PRP_LIST_VADDR: u64 = 0x0000_0080_0016_1000;
 
-/// 经 NVMe I/O 队列读 `count` 个扇区到 `buf` (页对齐的用户页)。
+/// 经 NVMe I/O 队列读/写 `count` 个扇区到 `buf` (页对齐的用户页)。
 ///
-/// `buf` 为 fat32 共享给本域的缓冲页虚拟地址, 页对齐且已映射; 先经
-/// `sys_virt_to_phys` 反查物理地址作为 NVMe DMA 的 PRP1。单次 READ 用单
-/// PRP1 页, 最多 8 扇区 (4096 字节, 不跨页); 超过则返回 false (当前 fat32
-/// 最多读一簇 8 扇区, 不会触及)。
+/// `buf` 为调用方共享给本域的缓冲页虚拟地址, 已映射; 先经 `sys_virt_to_phys`
+/// 反查物理地址作为 NVMe DMA 的 PRP1。
+///
+/// **多页传输**: 单次命令可覆盖多页 (最多 `NVME_MAX_SECTORS` 扇区 = 128 KiB), 按 NVMe
+/// 规范组织 PRP —— 1 页只用 PRP1; 2 页时 PRP2 直接指向第 2 页; 超过 2 页时 PRP2 指向
+/// 本域私有的 **PRP 表页**, 表项依次是第 2..N 页的物理地址 (末项可指向半页, 长度由
+/// NLB 决定)。因为要让每页单独反查物理地址, 调用方的缓冲必须是**逐页映射**的连续
+/// 虚拟区间 (页式共享天然满足); 多页时首地址必须页对齐。
 #[allow(clippy::too_many_arguments)]
 fn nvme_rw_sectors(
     opcode: u8,
@@ -539,18 +553,53 @@ fn nvme_rw_sectors(
     head: &mut u32,
     phase: &mut u32,
 ) -> bool {
-    if count == 0 || count > 8 {
+    if count == 0 || count > NVME_MAX_SECTORS {
         return false;
     }
+    let bytes = count as usize * NVME_SECTOR_SIZE;
+    let pages = bytes.div_ceil(NVME_PAGE_SIZE);
     let paddr = sys_virt_to_phys(buf as u64);
     if paddr == 0 {
         return false;
+    }
+    let mut prp2: u64 = 0;
+    if pages > 1 {
+        // 多页传输: PRP1 必须是页地址, 其余页由 PRP2 (或 PRP 表) 描述。
+        if !paddr.is_multiple_of(NVME_PAGE_SIZE as u64) {
+            return false;
+        }
+        if pages == 2 {
+            let p = sys_virt_to_phys(buf as u64 + NVME_PAGE_SIZE as u64);
+            if p == 0 {
+                return false;
+            }
+            prp2 = p;
+        } else {
+            let lp = sys_virt_to_phys(PRP_LIST_VADDR);
+            if lp == 0 {
+                return false;
+            }
+            let list = PRP_LIST_VADDR as *mut u64;
+            let mut i = 1usize;
+            while i < pages {
+                let p = sys_virt_to_phys(buf as u64 + (i * NVME_PAGE_SIZE) as u64);
+                if p == 0 || !p.is_multiple_of(NVME_PAGE_SIZE as u64) {
+                    return false;
+                }
+                unsafe {
+                    core::ptr::write_volatile(list.add(i - 1), p);
+                }
+                i += 1;
+            }
+            prp2 = lp;
+        }
     }
     let mut sqe = Sqe::zero();
     sqe.opcode = opcode;
     sqe.cid = 5;
     sqe.nsid = nsid;
     sqe.prp1 = paddr;
+    sqe.prp2 = prp2;
     sqe.cdw10 = lba;
     sqe.cdw11 = 0; // SLBA 高 32 位 = 0
     sqe.cdw12 = (count as u32) - 1; // NLB (0-based)
@@ -762,6 +811,11 @@ fn nvme_main() {
         println("nvme: alloc vol scratch FAILED");
         return;
     }
+    // 多页 DMA 的 PRP 表页 (> 2 页的传输用它描述第 2..N 页)。
+    if sys_alloc_page(PRP_LIST_VADDR) != 1 {
+        println("nvme: alloc prp list FAILED");
+        return;
+    }
     let scratch = VOL_SCRATCH_VADDR as *mut u8;
     vol_reset();
     let nsn = unsafe { NVME_NS_COUNT };
@@ -818,21 +872,39 @@ fn nvme_main() {
                 } else {
                     OP_WRITE
                 };
-                let lba = vol.start_lba.saturating_add(req.lba as u32);
-                let ok = nvme_rw_sectors(
-                    opcode,
-                    vol.nsid,
-                    &cfg,
-                    mmio,
-                    isq_doorbell,
-                    icq_doorbell,
-                    lba,
-                    req.count as u16,
-                    req.buf as *mut u8,
-                    &mut io_tail,
-                    &mut io_head,
-                    &mut io_phase,
-                );
+                let base_lba = vol.start_lba.saturating_add(req.lba as u32);
+                let total = req.count;
+                if total == 0 {
+                    sys_reply(0);
+                    continue;
+                }
+                // 超过单条命令上限 (256 扇区 = 128 KiB) 的请求按命令上限切分:
+                // 每段起始都落在页边界上 (256 * 512 = 128 KiB = 32 页), 故
+                // 除最后一段外每段的缓冲区都是页对齐的。
+                let mut done: u64 = 0;
+                let mut ok = true;
+                while done < total {
+                    let chunk = (total - done).min(NVME_MAX_SECTORS as u64) as u16;
+                    let seg_buf = (req.buf as *mut u8).wrapping_add((done * 512) as usize);
+                    if !nvme_rw_sectors(
+                        opcode,
+                        vol.nsid,
+                        &cfg,
+                        mmio,
+                        isq_doorbell,
+                        icq_doorbell,
+                        base_lba.saturating_add(done as u32),
+                        chunk,
+                        seg_buf,
+                        &mut io_tail,
+                        &mut io_head,
+                        &mut io_phase,
+                    ) {
+                        ok = false;
+                        break;
+                    }
+                    done += chunk as u64;
+                }
                 sys_reply(if ok { 1 } else { 0 });
             }
             BLOCK_OP_LIST_VOLUMES => {
@@ -1028,25 +1100,33 @@ const BLOCK_REQ_TAG: u64 = 0x424C_4F43; // "BLOC"
 struct BlockReq {
     op: u64,    // (volume << 8) | opcode
     lba: u64,   // 卷内起始扇区号 (块层会加上分区偏移)
-    count: u64, // 扇区数 (1..=256); opcode=2 时为卷描述符容量
+    count: u64, // 扇区数 (>0; 超过单条 NVMe 命令上限时由 block_srv 自动切分)
     buf: u64,   // 数据缓冲页虚拟地址; opcode=2 时为卷描述符输出页
 }
 
-/// fat32_srv 实际使用的卷号, 启动时由 `vol_claim` 认领 (见 `fat32_main`)。
+/// fat32_srv 的**默认卷**号, 启动时由 `vol_claim` 认领 (见 `fat32_main`)。
 /// 回退值 0 对应 `build/nvme.img` (namespace 1)。
 static mut FAT_VOL: u64 = 0;
+
+/// 本服务**当前请求**落在的卷号 (M1b 多卷挂载)。
+///
+/// 除默认卷 `FAT_VOL` 外, 本服务还会为额外挂载的 FAT 卷 (`/usb<卷号>`) 服务: 路径
+/// 类请求的 tag 高位带卷编码, fd 类请求由 fd 里绑定的卷决定 (见 `fd_lookup`)。
+/// 分派时把解出的卷写进这个「当前卷寄存器」, 于是所有既有的读写扇区调用无需改签名
+/// 就自动落在正确的卷上 —— 服务是**单任务串行**处理请求的, 不存在并发覆盖问题。
+static mut FAT_CUR_VOL: u64 = 0;
 
 /// 经 IPC 请求 block_srv 读 `count` 个扇区到 `buf`。成功返回 true。
 ///
 /// fat32_srv 通过它间接访问块设备, 而非直接触碰 IDE 端口; IDE PIO 逻辑
 /// 收拢在 block_srv 内, 符合微内核「驱动服务化」的解耦。
 fn block_read(lba: u32, count: u16, buf: *mut u8) -> bool {
-    block_read_dev(unsafe { FAT_VOL }, lba, count, buf)
+    block_read_dev(unsafe { FAT_CUR_VOL }, lba, count, buf)
 }
 
 /// 经 IPC 请求 block_srv 从 `buf` 写 `count` 个扇区到磁盘。成功返回 true。
 fn block_write(lba: u32, count: u16, buf: *mut u8) -> bool {
-    block_write_dev(unsafe { FAT_VOL }, lba, count, buf)
+    block_write_dev(unsafe { FAT_CUR_VOL }, lba, count, buf)
 }
 
 /// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。
@@ -2273,8 +2353,20 @@ fn dir_is_empty(
 
 /// 卷表上限。
 const VOL_MAX: usize = 16;
-/// 卷扫描临时缓冲页: block_srv 自有 (不共享给任何域), 位于所有已用共享区之上。
-const VOL_SCRATCH_VADDR: u64 = 0x0000_0080_0012_0000;
+/// 卷扫描临时缓冲页: block_srv 自有 (不共享给任何域)。
+///
+/// ⚠️ 用户态固定虚拟地址分区 (从 `USER_BASE + 1 MiB` 起, 见各服务顶部注释):
+///   0x10_0000..0x10_FFFF  fat32 / app·shell 共享页 / mfs / ext2 块缓冲
+///   0x11_0000..0x11_3FFF  mfs GC 遍历 / inode 表 / 索引块 / GC 表块
+///   0x11_4000..0x15_3FFF  exFAT 集群缓冲 (**按簇大小最多 64 页**, 故预留整段)
+///   0x15_4000           exFAT 位图窗口
+///   0x15_5000           exFAT upcase 窗口
+///   0x15_6000           exFAT 单页暂存
+///   0x16_0000           block_srv 卷扫描页 (本页)   ← 必须在 exFAT 预留段之上
+///   0x16_1000           block_srv PRP 表页
+/// 新增固定地址时务必对照本表 —— 一旦与别人的共享页重叠, 「同地址共享」会因为
+/// 目标域的该地址已被映射而直接触发内核 panic (`map_user_page: PageAlreadyMapped`)。
+const VOL_SCRATCH_VADDR: u64 = 0x0000_0080_0016_0000;
 
 /// 文件系统类型 (按卷首签名探测)。
 const VOL_KIND_UNKNOWN: u32 = 0;
@@ -2671,6 +2763,52 @@ fn vol_claim(scratch: *mut u8, max: u32, kind: u32, fallback: u64) -> u64 {
     }
 }
 
+/// 卷表里卷号 `vol` 的文件系统类型 (查不到则返回 `VOL_KIND_UNKNOWN`)。
+///
+/// `scratch` 必须是本域**已共享给 block_srv** 的缓冲页 (卷描述符经它回传)。
+fn vol_kind_of(scratch: *mut u8, vol: u64) -> u32 {
+    let n = block_list_volumes(scratch, 16);
+    if n == 0 || n == u64::MAX {
+        return VOL_KIND_UNKNOWN;
+    }
+    let esize = core::mem::size_of::<VolumeDesc>();
+    let mut i = 0u64;
+    while i < n {
+        let d = unsafe {
+            core::ptr::read_unaligned(scratch.add(i as usize * esize) as *const VolumeDesc)
+        };
+        if d.id as u64 == vol {
+            return d.kind;
+        }
+        i += 1;
+    }
+    VOL_KIND_UNKNOWN
+}
+
+/// 把本服务**默认卷之外**的同类卷挂到 `/usb<卷号>` (M1b 多卷挂载)。
+///
+/// `scratch` 必须是本域**已共享给 block_srv** 的缓冲页 (卷描述符经它回传), 且调用
+/// 时机须在服务自己的元数据解析**之后** —— 它会覆盖该页内容。
+/// 真实多盘/多分区机器上, 各文件服务借此把自己那一类的其余卷也提供给客户端, 而不是
+/// 只认领「第一个匹配卷」。
+fn mount_extra_volumes(scratch: *mut u8, kind: u32, primary: u64, domain: u64) {
+    let n = block_list_volumes(scratch, VOL_MAX as u32);
+    if n == 0 || n == u64::MAX {
+        return;
+    }
+    let esize = core::mem::size_of::<VolumeDesc>();
+    let mut i = 0u64;
+    while i < n {
+        let d = unsafe {
+            core::ptr::read_unaligned(scratch.add(i as usize * esize) as *const VolumeDesc)
+        };
+        if d.kind == kind && d.id as u64 != primary {
+            vfs::mount_vol(domain, d.id as u64);
+        }
+        i += 1;
+    }
+}
+
 /// 域 5 — 块设备服务: 优先 NVMe (若内核已配置), 否则 IDE PIO 回退。
 ///
 /// 接收 `BlockReq` (op/lba/count/buf), 读扇区写入调用方共享的缓冲页,
@@ -2770,6 +2908,8 @@ struct OpenNode {
     dir_cluster: u32,
     /// 目录项在父目录簇内的字节偏移 (文件写回用)。
     entry_offset: u32,
+    /// 打开时绑定的卷号 (M1b 多卷挂载: 同一服务可同时服务默认卷与额外卷)。
+    vol: u64,
 }
 
 static mut FD_TABLE: [Option<OpenNode>; MAX_FD] = [None; MAX_FD];
@@ -2781,6 +2921,7 @@ fn fd_alloc(
     file_size: u32,
     dir_cluster: u32,
     entry_offset: u32,
+    vol: u64,
 ) -> u64 {
     unsafe {
         let base = core::ptr::addr_of_mut!(FD_TABLE).cast::<Option<OpenNode>>();
@@ -2793,6 +2934,7 @@ fn fd_alloc(
                     file_size,
                     dir_cluster,
                     entry_offset,
+                    vol,
                 });
                 return i as u64;
             }
@@ -2801,12 +2943,22 @@ fn fd_alloc(
     u64::MAX
 }
 
-/// 查询 fd 对应的节点描述符。
+/// 查询 fd 对应的节点描述符, 并把「当前卷寄存器」切到该 fd 绑定的卷。
+///
+/// fd 类请求 (READ/WRITE/READDIR) 的 payload 里没有卷号 —— 卷在 `open` 时就固定
+/// 绑到了 fd 上, 这里顺带切换, 使后续读写自动落在同一卷 (与路径类请求的 tag 卷编码
+/// 等价, 见 `FAT_CUR_VOL`)。
 fn fd_lookup(fd: u32) -> Option<OpenNode> {
     if (fd as usize) >= MAX_FD {
         return None;
     }
-    unsafe { *core::ptr::addr_of!(FD_TABLE).cast::<Option<OpenNode>>().add(fd as usize) }
+    let node = unsafe { *core::ptr::addr_of!(FD_TABLE).cast::<Option<OpenNode>>().add(fd as usize) };
+    if let Some(n) = node {
+        unsafe {
+            FAT_CUR_VOL = n.vol;
+        }
+    }
+    node
 }
 
 /// 更新 fd 对应节点的首簇号与文件大小 (写操作后同步)。
@@ -2844,39 +2996,86 @@ fn fd_free(fd: u32) -> u64 {
     }
 }
 
+/// 各卷几何 (根簇 / FAT 起址 / 簇大小) 不同, 这里记住 BPB 当前属于哪个卷。
+/// 请求落在别的卷上时重新解析该卷的 BPB (见 `fat_load_bpb`)。
+static mut FAT_BPB_VOL: u64 = u64::MAX;
+
+/// fat32_srv 的**整簇缓冲**虚拟地址 (M1b: 大簇支持)。
+///
+/// 整簇读写 (目录簇扫描 / 文件数据暂存) 都在这里进行, 按 FAT32 的**最大簇**预留:
+/// BPB 的 `SecPerClus` 只有 1 字节且必须是 2 的幂, 故簇最大 128 扇区 = 64 KiB。
+/// 地址取 2 MiB 偏移处: 避开 1 MiB 处的小缓冲段 (`0x10_xxxx`) 与用户栈 (`0x3F_9000`),
+/// 也避开 exFAT 的集群缓冲段 (`0x11_4000..0x15_3FFF`) —— 两个服务都会把自己的缓冲
+/// **同地址共享给 block_srv**, 地址撞上会让 block_srv 侧触发内核
+/// `map_user_page: PageAlreadyMapped` panic。
+const FAT32_CLU_VADDR: u64 = 0x0000_0080_0020_0000;
+/// 整簇缓冲页数 (64 KiB 上限簇 = 16 页)。
+const FAT32_CLU_PAGES: u64 = 16;
+/// FAT32 允许的最大簇字节数 (`SecPerClus` ≤ 128 扇区 × 512 B)。
+const FAT32_MAX_CLUSTER_BYTES: u32 = 128 * 512;
+
+/// 载入卷 `vol` 的 BPB 到 `out`, 并把 `FAT_BPB_VOL` 标成 `vol`。
+///
+/// 调用者须已把 `FAT_CUR_VOL` 指向 `vol`。几何不合法 (非 512B 扇区 / 簇为 0 /
+/// 簇超过整簇缓冲) 时返回 false —— 请求按失败回复, 不拿错几何去读盘。
+fn fat_load_bpb(vol: u64, bpb_buf: *mut u8, out: &mut Fat32Bpb) -> bool {
+    if !block_read(0, 1, bpb_buf) {
+        return false;
+    }
+    // 引导扇区签名 (偏移 510 = 0x55, 511 = 0xAA)。
+    if read_u16(unsafe { bpb_buf.add(510) } as *const u8) != 0xAA55 {
+        return false;
+    }
+    let b = Fat32Bpb::parse(bpb_buf as *const u8);
+    let cb = b.cluster_bytes();
+    if b.bytes_per_sector != 512 || cb == 0 || cb > FAT32_MAX_CLUSTER_BYTES {
+        return false;
+    }
+    *out = b;
+    unsafe {
+        FAT_BPB_VOL = vol;
+    }
+    true
+}
+
 /// 域 6 — FAT32 文件服务 (fat32_srv): 经 IPC 请求 block_srv 读扇区,
 /// 解析 BPB / FAT / 目录 / 路径, 提供 open/read/readdir/close。
 fn fat32_main() {
-    // 缓冲页: BPB / 目录簇 / FAT 扇区 / 文件内容。
-    // 地址须避开程序镜像 (USER_BASE 起, 随代码增长)、用户栈 (USER_BASE + 4 MiB)
-    // 与 USER_DATA_BASE 区 (共享页 / NVMe 配置等, USER_BASE + 8 MiB), 故放到 1MB 偏移处。
+    // 小缓冲 (各 1 页): BPB / FAT 扇区 —— 放 1 MiB 处, 与 app·shell 的共享页同段。
     let bpb_buf = 0x0000_0080_0010_2000u64;
-    let dir_buf = 0x0000_0080_0010_3000u64;
     let fat_buf = 0x0000_0080_0010_1000u64;
-    let file_buf = 0x0000_0080_0010_0000u64;
+    // 整簇缓冲 (最多 16 页 = 64 KiB 簇): 目录簇扫描与文件数据暂存共用同一块。
+    let clu_buf = FAT32_CLU_VADDR;
+    let dir_buf = clu_buf;
+    let file_buf = clu_buf;
 
-    if sys_alloc_page(bpb_buf) != 1
-        || sys_alloc_page(dir_buf) != 1
-        || sys_alloc_page(fat_buf) != 1
-        || sys_alloc_page(file_buf) != 1
-    {
+    if sys_alloc_page(bpb_buf) != 1 || sys_alloc_page(fat_buf) != 1 {
         println("fat32: alloc buffer FAILED");
         return;
     }
 
     // 把缓冲页共享给 block_srv (同地址映射), 使其能直接写入读到的扇区数据。
     if sys_share_page(bpb_buf, BLOCK_DOMAIN) != 1
-        || sys_share_page(dir_buf, BLOCK_DOMAIN) != 1
         || sys_share_page(fat_buf, BLOCK_DOMAIN) != 1
-        || sys_share_page(file_buf, BLOCK_DOMAIN) != 1
     {
         println("fat32: share buffer FAILED");
         return;
     }
 
+    // 整簇缓冲逐页分配 + 同地址共享 (M1b: 大簇支持, 见 `FAT32_CLU_VADDR`)。
+    for i in 0..FAT32_CLU_PAGES {
+        let p = clu_buf + i * 4096;
+        if sys_alloc_page(p) != 1 || sys_share_page(p, BLOCK_DOMAIN) != 1 {
+            println("fat32: alloc/share cluster buffer FAILED");
+            return;
+        }
+    }
+
     // 认领卷: 第一个 FAT 签名的卷; 无分区表的整盘镜像即卷 0 (回退值)。
     unsafe {
         FAT_VOL = vol_claim(bpb_buf as *mut u8, 16, VOL_KIND_FAT, 0);
+        // 启动期 (读 BPB / FS-1 自测) 的读写都落在默认卷上。
+        FAT_CUR_VOL = FAT_VOL;
     }
 
     // 经 block_srv 读 LBA 0 并解析 BPB。
@@ -2884,12 +3083,25 @@ fn fat32_main() {
         println("fat32: read LBA 0 FAILED");
         return;
     }
-    let bpb = Fat32Bpb::parse(bpb_buf as *const u8);
-
     // 引导签名校验 (offset 510 = 0x55, 511 = 0xAA)。
     let sig = read_u16((bpb_buf + 510) as *const u8);
     if sig != 0xAA55 {
         println("fat32: not a boot sector");
+        return;
+    }
+    let mut bpb = Fat32Bpb::parse(bpb_buf as *const u8);
+    unsafe {
+        FAT_BPB_VOL = FAT_VOL;
+    }
+    // 几何校验: 整簇缓冲按 64 KiB 上限预留, 更大的簇 (以及非 512B 扇区) 直接拒绝,
+    // 绝不用「按小块缓冲算出的偏移」去读盘。
+    let cbytes = bpb.cluster_bytes();
+    if bpb.bytes_per_sector != 512 || cbytes == 0 || cbytes > FAT32_MAX_CLUSTER_BYTES {
+        print("fat32: unsupported geometry bps=");
+        print_u64(bpb.bytes_per_sector as u64);
+        print(" cluster=");
+        print_u64(cbytes as u64);
+        println("");
         return;
     }
 
@@ -2973,6 +3185,15 @@ fn fat32_main() {
         }
     }
 
+    // M1b: 把**额外**的 FAT 卷 (如分区盘上的第二个 FAT 分区、真 U 盘) 挂到 `/usb<卷号>`。
+    // 用 `fat_buf` 暂存卷描述符 —— 元数据已解析完毕, 该页此刻是空闲暂存。
+    mount_extra_volumes(
+        fat_buf as *mut u8,
+        VOL_KIND_FAT,
+        unsafe { FAT_VOL },
+        vfs::FAT32_DOMAIN,
+    );
+
     // 服务循环: 经 IPC 提供 open / read / readdir / close (见 vfs.rs 协议)。
     loop {
         let mut msg = Message {
@@ -2983,7 +3204,25 @@ fn fat32_main() {
         };
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
 
-        match msg.tag {
+        let tag = vfs::tag_body(msg.tag);
+        // tag 高位携带卷编码 (M1b): 路径类请求由它决定目标卷; fd 类请求由 fd 绑定的卷
+        // 决定 (fd 是这些请求 payload 的首字段), 先探一次 fd, 使两类请求都对。
+        let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { FAT_VOL });
+        if matches!(tag, vfs::VFS_READ_TAG | vfs::VFS_WRITE_TAG | vfs::VFS_READDIR_TAG) {
+            if let Some(n) = fd_lookup(read_u32(msg.payload.as_ptr())) {
+                vol = n.vol;
+            }
+        }
+        unsafe {
+            FAT_CUR_VOL = vol;
+        }
+        // 卷切换: 各 FAT 卷的根簇 / FAT 起址 / 簇大小都不同, 必须重新解析该卷的 BPB,
+        // 否则会拿上一个卷的几何去算扇区号, 读到完全错误的位置。
+        if unsafe { FAT_BPB_VOL } != vol && !fat_load_bpb(vol, bpb_buf as *mut u8, &mut bpb) {
+            sys_reply(u64::MAX);
+            continue;
+        }
+        match tag {
             vfs::VFS_OPEN_TAG => {
                 let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
@@ -2995,6 +3234,7 @@ fn fat32_main() {
                         info.file_size,
                         info.dir_cluster,
                         info.entry_offset,
+                        vol,
                     ),
                     None => u64::MAX,
                 };
@@ -3081,6 +3321,7 @@ fn fat32_main() {
                             info.file_size,
                             info.dir_cluster,
                             info.entry_offset,
+                            vol,
                         ),
                         Some(_) => u64::MAX, // 已存在目录
                         None => {
@@ -3099,7 +3340,7 @@ fn fat32_main() {
                                         dir_buf as *mut u8,
                                     ) =>
                                 {
-                                    fd_alloc(false, 0, 0, dc, off)
+                                    fd_alloc(false, 0, 0, dc, off, vol)
                                 }
                                 _ => u64::MAX,
                             }
@@ -4188,6 +4429,47 @@ fn app_main() {
     const FS12_FILES: u32 = 200;
     const FS12_LONG: &str =
         "/mfs/LONGFILE_WITH_A_REALLY_LONG_NAME_0123456789ABCDEFGHIJ.TXT";
+    // 幂等准备: 上一轮若在本段清理之前提前返回 (失败 / 被中断), 残留在盘上的目录与文件
+    // 会让本次 `mkdir` 因「目录已存在」而失败, 把上一次的失败传染到本次 —— 与 FS-5 的
+    // 处理相同 (MFS 是持久卷, 自测必须能反复重跑)。
+    {
+        let mut cb = [0u8; 64];
+        let nb = FS12_DIR.len() + 1;
+        cb[..FS12_DIR.len()].copy_from_slice(FS12_DIR.as_bytes());
+        cb[FS12_DIR.len()] = b'/';
+        let mut k = 0u32;
+        while k < FS12_FILES {
+            fs12_name(k, &mut cb[nb..nb + 16]);
+            let s = unsafe { core::str::from_utf8_unchecked(&cb[..nb + 16]) };
+            vfs::unlink(s);
+            k += 1;
+        }
+        vfs::unlink("/mfs/CHURN4.BIN");
+        vfs::unlink(FS12_LONG);
+        vfs::rmdir(FS12_DIR);
+        // 深目录 (18 级, 名字按 lvl % 26 循环) 自叶向上删。
+        let mut db = [0u8; 64];
+        db[..8].copy_from_slice(b"/mfs/D12");
+        let mut dl0 = 8usize;
+        let mut lvl0 = 0u32;
+        while lvl0 < 18 {
+            db[dl0] = b'/';
+            db[dl0 + 1] = b'a' + (lvl0 % 26) as u8;
+            dl0 += 2;
+            lvl0 += 1;
+        }
+        db[dl0] = b'/';
+        db[dl0 + 1] = b'H';
+        let hp0 = unsafe { core::str::from_utf8_unchecked(&db[..dl0 + 2]) };
+        vfs::unlink(hp0);
+        let mut d0 = dl0;
+        while d0 > 8 {
+            let s = unsafe { core::str::from_utf8_unchecked(&db[..d0]) };
+            vfs::rmdir(s);
+            d0 -= 2;
+        }
+        vfs::rmdir("/mfs/D12");
+    }
     if vfs::mkdir(FS12_DIR) != 1 {
         println("app: FS12 mkdir /mfs/DIR12 FAILED");
         return;
@@ -4891,7 +5173,7 @@ fn app_main() {
         println("app: FS15 readdir /usb FAILED");
         return;
     }
-    if rn15 as usize % core::mem::size_of::<vfs::DirEntry>() != 0 {
+    if !(rn15 as usize).is_multiple_of(core::mem::size_of::<vfs::DirEntry>()) {
         println("app: FS15 listing not whole entries FAILED");
         return;
     }
@@ -4913,7 +5195,8 @@ fn app_main() {
     // 19. FS-16 自测 (阶段 D/M6b): exFAT 读写。
     //     覆盖 creat/write/读回/stat/mkdir/readdir/rmdir(非空拒绝)/truncate(缩+扩)/unlink
     //     全链路, 并在末尾把卷清空 —— 下一次启动的 FS-15 因此仍看到空卷。
-    //     写入 6000 字节 (> 一簇) 以验证簇链扩展; 建 45 个文件以验证目录块扩容。
+    //     写入 100000 字节: 4 KiB 簇下跨 25 簇、32 KiB 簇下跨 4 簇, 都能验证簇链扩展;
+    //     建 45 个文件以验证目录块扩容 (4 KiB 簇下 135 条目 > 单簇 128 项)。
     {
         // 幂等: 先清掉上次可能残留的自测对象。
         vfs::unlink("/usb/D16/A.TXT");
@@ -4921,14 +5204,14 @@ fn app_main() {
         vfs::unlink("/usb/FS16.TXT");
         let pat = |i: usize| (i % 251) as u8;
 
-        // --- 写 6000 字节 ---
+        // --- 写 100000 字节 ---
         let fd = vfs::creat("/usb/FS16.TXT");
         if fd == u64::MAX {
             println("app: FS16 creat FAILED");
             return;
         }
         let mut buf = [0u8; 4096];
-        let total = 6000usize;
+        let total = 100_000usize;
         let mut written = 0usize;
         while written < total {
             let n = (total - written).min(buf.len());
@@ -4997,8 +5280,8 @@ fn app_main() {
                 i += 1;
             }
         }
-        // --- 扩展回 6000 (新区必须读到 0, exFAT 无稀疏) ---
-        if vfs::truncate(rfd, 6000) == u64::MAX {
+        // --- 扩展回 100000 (新区必须读到 0, exFAT 无稀疏) ---
+        if vfs::truncate(rfd, 100_000) == u64::MAX {
             println("app: FS16 truncate up FAILED");
             return;
         }
@@ -5122,6 +5405,102 @@ fn app_main() {
         if left != 0 {
             println("app: FS16 cleanup left entries FAILED");
             return;
+        }
+    }
+
+    // 20. FS-17 自测 (阶段 D/M1b): **额外卷**自动挂载。
+    //     分区测试盘 (nsid 4) 上的 FAT32 / ext2 分区都不是「第一个匹配卷」, 卷层按
+    //     M1b 把它们作为额外卷挂到 `/usb<卷号>`, 由同一个文件服务**按卷切换几何**来
+    //     服务。这里验证:
+    //       - 卷表里能查到这两个分区的卷号, 并据此拼出挂载点;
+    //       - FAT32 分区可打开目录, 且能读出宿主预置的 PART1.TXT;
+    //       - ext2 分区可读出 PART2.TXT;
+    //     全程只读: 不向额外卷写任何数据。
+    {
+        let nvol = block_list_volumes(vfs::RESULT_BUF as *mut u8, 16);
+        if nvol == u64::MAX {
+            println("app: FS17 list volumes FAILED");
+            return;
+        }
+        let mut fat_vol = u64::MAX;
+        let mut ext_vol = u64::MAX;
+        let mut i = 0u64;
+        while i < nvol {
+            let d = vol_desc(vfs::RESULT_BUF as *const u8, i as usize);
+            if d.nsid == 4 && d.start_lba == 2048 && d.kind == VOL_KIND_FAT {
+                fat_vol = d.id as u64;
+            }
+            if d.nsid == 4 && d.start_lba == 34816 && d.kind == VOL_KIND_EXT2 {
+                ext_vol = d.id as u64;
+            }
+            i += 1;
+        }
+        if fat_vol == u64::MAX || ext_vol == u64::MAX {
+            println("app: FS17 partition volumes missing FAILED");
+            return;
+        }
+
+        // 额外卷的挂载点 = `/usb<卷号>` (与 mount_srv 的命名规则一致)。
+        let mut base = [0u8; 8];
+        base[..4].copy_from_slice(b"/usb");
+        let mut path = [0u8; 32];
+        path[..4].copy_from_slice(b"/usb");
+
+        // --- FAT32 分区: 目录可打开, 且能读出宿主 mcopy 预置的 PART1.TXT ---
+        let dn = dec_to_str(fat_vol, &mut base[4..]);
+        let root = unsafe { core::str::from_utf8_unchecked(&base[..4 + dn]) };
+        let dfd = vfs::open(root);
+        if dfd == u64::MAX {
+            println("app: FS17 open extra FAT volume FAILED");
+            return;
+        }
+        vfs::close(dfd);
+        path[4..4 + dn].copy_from_slice(&base[4..4 + dn]);
+        path[4 + dn..4 + dn + 10].copy_from_slice(b"/PART1.TXT");
+        let fpath = unsafe { core::str::from_utf8_unchecked(&path[..4 + dn + 10]) };
+        let f = vfs::open(fpath);
+        if f == u64::MAX {
+            println("app: FS17 open PART1.TXT on extra FAT volume FAILED");
+            return;
+        }
+        let n = vfs::read(f, 0, 4096);
+        vfs::close(f);
+        if n == u64::MAX || n < 10 {
+            println("app: FS17 read PART1.TXT FAILED");
+            return;
+        }
+        {
+            let head = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 10) };
+            if head != &b"partition "[..] {
+                println("app: FS17 PART1.TXT content FAILED");
+                return;
+            }
+        }
+
+        // --- ext2 分区: 同样读一个宿主预置的文件 ---
+        let dn2 = dec_to_str(ext_vol, &mut base[4..]);
+        path = [0u8; 32];
+        path[..4].copy_from_slice(b"/usb");
+        path[4..4 + dn2].copy_from_slice(&base[4..4 + dn2]);
+        path[4 + dn2..4 + dn2 + 10].copy_from_slice(b"/PART2.TXT");
+        let epath = unsafe { core::str::from_utf8_unchecked(&path[..4 + dn2 + 10]) };
+        let e = vfs::open(epath);
+        if e == u64::MAX {
+            println("app: FS17 open PART2.TXT on extra ext2 volume FAILED");
+            return;
+        }
+        let en = vfs::read(e, 0, 4096);
+        vfs::close(e);
+        if en == u64::MAX || en < 10 {
+            println("app: FS17 read PART2.TXT FAILED");
+            return;
+        }
+        {
+            let head = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 10) };
+            if head != &b"partition "[..] {
+                println("app: FS17 PART2.TXT content FAILED");
+                return;
+            }
         }
     }
     println("app: SELFTEST DONE");
@@ -5319,6 +5698,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  stat <path>    show metadata (mode / owner / links / times)");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
+            println("  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)");
         }
         "echo" => println(arg),
         "pwd" => println(st.cwd_str()),
@@ -5957,12 +6337,14 @@ const MOUNT_MAX: usize = 8;
 /// 挂载点前缀最大长度 (含前导 '/', 不含结尾 NUL)。
 const MOUNT_PREFIX_MAX: usize = 24;
 
-/// 一条挂载记录: 挂载点前缀 → 文件服务域。
+/// 一条挂载记录: 挂载点前缀 → 文件服务域 (可选绑定一个卷)。
 #[derive(Clone, Copy)]
 struct MountEntry {
     used: bool,
     /// 前缀长度 (不含结尾 NUL)。
     plen: u8,
+    /// 卷编码: 0 = 该服务的默认卷; 否则 = block_srv 卷号 + 1 (M1b 多卷挂载)。
+    vol_enc: u32,
     domain: u64,
     prefix: [u8; MOUNT_PREFIX_MAX],
 }
@@ -5970,6 +6352,7 @@ struct MountEntry {
 const MOUNT_EMPTY: MountEntry = MountEntry {
     used: false,
     plen: 0,
+    vol_enc: 0,
     domain: 0,
     prefix: [0; MOUNT_PREFIX_MAX],
 };
@@ -6024,9 +6407,12 @@ fn mount_find(prefix: &str) -> Option<usize> {
 
 /// 写入一条挂载记录, 成功返回挂载槽位号 (1 起)。
 ///
+/// `vol_enc` 为 0 表示「该服务的默认卷」(服务自己认领的那一个); 非 0 表示把该
+/// 挂载点绑定到 `vol_enc - 1` 号卷 (M1b 多卷挂载), 该编码随每次请求下发。
+///
 /// 拒绝: 空前缀 / 非绝对路径 / 前缀过长 / 域号为 0 / 该前缀已被占用
 /// (重复挂载同一前缀需先 `MNTD`, 避免静默改写别人的命名空间)。
-fn mount_add(prefix: &str, domain: u64) -> u64 {
+fn mount_add(prefix: &str, domain: u64, vol_enc: u32) -> u64 {
     let b = prefix.as_bytes();
     if b.is_empty() || b[0] != b'/' || b.len() >= MOUNT_PREFIX_MAX || domain == 0 {
         return u64::MAX;
@@ -6039,6 +6425,7 @@ fn mount_add(prefix: &str, domain: u64) -> u64 {
         if !e.used {
             e.used = true;
             e.domain = domain;
+            e.vol_enc = vol_enc;
             e.plen = b.len() as u8;
             e.prefix = [0; MOUNT_PREFIX_MAX];
             e.prefix[..b.len()].copy_from_slice(b);
@@ -6048,7 +6435,7 @@ fn mount_add(prefix: &str, domain: u64) -> u64 {
     u64::MAX
 }
 
-/// 自动分配挂载点: 取最小的未被占用的 `/mnt<N>`。
+/// 自动分配挂载点: 取最小的未被占用的 `/mnt<N>`, 服务默认卷。
 /// 成功返回挂载槽位号 (1 起)。
 fn mount_auto(domain: u64) -> u64 {
     let mut buf = [0u8; MOUNT_PREFIX_MAX];
@@ -6057,10 +6444,61 @@ fn mount_auto(domain: u64) -> u64 {
         buf[4] = b'0' + n as u8;
         let name = unsafe { core::str::from_utf8_unchecked(&buf[..5]) };
         if mount_find(name).is_none() {
-            return mount_add(name, domain);
+            return mount_add(name, domain, 0);
         }
     }
     u64::MAX
+}
+
+/// 自动分配「额外卷」挂载点: `/usb<卷号>`, 并绑定该卷 (M1b 多卷挂载)。
+///
+/// 命名直接用卷号, 故同一台机器上多个服务挂各自的额外卷也不会撞名, 且挂载点与
+/// block_srv 卷表一一对应 (`/usb3` = 卷 3)。已经挂过同一卷时静默成功 (幂等)。
+fn mount_auto_vol(domain: u64, vol: u64) -> u64 {
+    let mut buf = [0u8; MOUNT_PREFIX_MAX];
+    buf[..4].copy_from_slice(b"/usb");
+    let digits = dec_to_str(vol, &mut buf[4..]);
+    let name = unsafe { core::str::from_utf8_unchecked(&buf[..4 + digits]) };
+    let r = if let Some(i) = mount_find(name) {
+        // 同一前缀已挂上: 只在「同域同卷」时算成功 (重复上报幂等)。
+        let e = mount_at(i);
+        if e.domain == domain && e.vol_enc == vfs::enc_of_vol(vol) {
+            (i + 1) as u64
+        } else {
+            u64::MAX
+        }
+    } else {
+        mount_add(name, domain, vfs::enc_of_vol(vol))
+    };
+    // 启动期诊断 (与 `mfs-dbg` / `exfat-dbg` 同类): 记下额外卷挂到了哪个前缀。
+    print("mount-dbg: ");
+    print(name);
+    print(" domain=");
+    print_u64(domain);
+    print(" slot=");
+    print_u64(r);
+    println("");
+    r
+}
+
+/// 把 `v` 的十进制写法写进 `dst`, 返回写入的字节数 (不使用堆)。
+fn dec_to_str(v: u64, dst: &mut [u8]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        tmp[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+        if x == 0 || n == tmp.len() {
+            break;
+        }
+    }
+    let n = n.min(dst.len());
+    for i in 0..n {
+        dst[i] = tmp[n - 1 - i];
+    }
+    n
 }
 
 /// 卸载挂载点 `prefix`, 成功返回 1。
@@ -6081,24 +6519,24 @@ fn mount_del(prefix: &str) -> u64 {
 /// 写入引导用的默认挂载: 三个编译期已知的核心文件服务。
 /// 其余服务一律走运行时 `MNTA`。
 fn mounts_init() {
-    mount_add("/", vfs::FAT32_DOMAIN);
-    mount_add("/tmp", vfs::TMPFS_DOMAIN);
-    mount_add("/mfs", vfs::MFS_DOMAIN);
-    mount_add("/ext2", vfs::EXT2_DOMAIN);
-    mount_add("/usb", vfs::EXFAT_DOMAIN);
+    mount_add("/", vfs::FAT32_DOMAIN, 0);
+    mount_add("/tmp", vfs::TMPFS_DOMAIN, 0);
+    mount_add("/mfs", vfs::MFS_DOMAIN, 0);
+    mount_add("/ext2", vfs::EXT2_DOMAIN, 0);
+    mount_add("/usb", vfs::EXFAT_DOMAIN, 0);
 }
 
-/// 在挂载表中查最长匹配前缀, 返回 (服务域, 前缀长度)。
-fn mount_resolve(path: &str) -> Option<(u64, usize)> {
-    let mut best: Option<(u64, usize)> = None;
+/// 在挂载表中查最长匹配前缀, 返回 (服务域, 卷编码, 前缀长度)。
+fn mount_resolve(path: &str) -> Option<(u64, u32, usize)> {
+    let mut best: Option<(u64, u32, usize)> = None;
     for i in 0..MOUNT_MAX {
         let e = mount_at(i);
         if !e.used {
             continue;
         }
         if let Some(len) = mount_prefix_match(path, mount_prefix_of(e)) {
-            if best.is_none_or(|(_, bl)| len > bl) {
-                best = Some((e.domain, len));
+            if best.is_none_or(|(_, _, bl)| len > bl) {
+                best = Some((e.domain, e.vol_enc, len));
             }
         }
     }
@@ -6120,8 +6558,12 @@ fn mount_main() {
             vfs::VFS_LOOKUP_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
+                // 回复布局: `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 前缀长度`
+                // (libvfs 按同布局解出, 见 `vfs::mount_lookup`)。
                 let r = match mount_resolve(path) {
-                    Some((domain, prefix_len)) => (domain << 32) | prefix_len as u64,
+                    Some((domain, vol_enc, prefix_len)) => {
+                        ((vol_enc as u64) << 40) | (domain << 32) | prefix_len as u64
+                    }
                     None => u64::MAX,
                 };
                 sys_reply(r);
@@ -6138,9 +6580,14 @@ fn mount_main() {
                     mount_auto(req.domain)
                 } else {
                     let prefix = unsafe { core::str::from_utf8_unchecked(&req.prefix[..plen]) };
-                    mount_add(prefix, req.domain)
+                    mount_add(prefix, req.domain, 0)
                 };
                 sys_reply(r);
+            }
+            vfs::VFS_MOUNT_VOL_TAG => {
+                // payload = MountVolReq { domain, vol }: 把某服务的额外卷挂到 `/usb<卷号>`。
+                let req = unsafe { &*(msg.payload.as_ptr() as *const vfs::MountVolReq) };
+                sys_reply(mount_auto_vol(req.domain, req.vol));
             }
             vfs::VFS_UMOUNT_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
@@ -6481,7 +6928,8 @@ fn tmpfs_main() {
     let mut canon = [0u8; TMP_PATH_MAX];
     loop {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
-        match msg.tag {
+        // 卷编码 (tag 高位) 对本服务无意义 (tmpfs 没有卷概念), 分发前剥掉。
+        match vfs::tag_body(msg.tag) {
             vfs::VFS_OPEN_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
@@ -9416,6 +9864,18 @@ fn mfs_main() {
     unsafe {
         MFS_VOL = vol_claim(mfs_a(), 16, VOL_KIND_MFS, MFS_VOL_FALLBACK);
     }
+    // 安全护栏: 只允许挂载「已是 MFS」或「整盘无文件系统 (UNKNOWN, 需格式化)」的卷。
+    // 卷号回退一旦算错 (例如接了真 U 盘、换了镜像布局), 自动格式化会把别人的分区
+    // 直接写掉 —— 这里宁可让服务不挂载 (上层会看到 FAILED), 也绝不动非 MFS 卷。
+    let kind = vol_kind_of(mfs_a(), unsafe { MFS_VOL });
+    if kind != VOL_KIND_UNKNOWN && kind != VOL_KIND_MFS {
+        print("mfs: refuse to format non-MFS volume vol=");
+        print_u64(unsafe { MFS_VOL });
+        print(" kind=");
+        print_u64(kind as u64);
+        println("");
+        return;
+    }
     if !mfs_mount_or_format() {
         println("mfs: mount/format FAILED");
         return;
@@ -9441,7 +9901,9 @@ fn mfs_main() {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
         // 请求间隙无在建 COW, 是唯一安全的回收时机: 空闲块偏少就先整理一次。
         mfs_maybe_gc();
-        match msg.tag {
+        // 卷编码 (tag 高位) 对本服务无意义 (MFS 只服务自己认领的那一个卷), 分发前剥掉。
+        let tag = vfs::tag_body(msg.tag);
+        match tag {
             vfs::VFS_OPEN_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
@@ -9512,7 +9974,7 @@ fn mfs_main() {
                 sys_reply(mfs_fd_free(fd));
             }
             vfs::VFS_CREAT_TAG | vfs::VFS_MKDIR_TAG => {
-                let is_dir = msg.tag == vfs::VFS_MKDIR_TAG;
+                let is_dir = tag == vfs::VFS_MKDIR_TAG;
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 // 创建者域 id 作为 owner 记进元数据 (fire-and-forget 显示用)。
@@ -9520,7 +9982,7 @@ fn mfs_main() {
                 sys_reply(fd);
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
-                let want_dir = msg.tag == vfs::VFS_RMDIR_TAG;
+                let want_dir = tag == vfs::VFS_RMDIR_TAG;
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(mfs_remove(path, want_dir));
@@ -9937,8 +10399,12 @@ const EXT2_DIRECT_BLOCKS: u32 = 12;
 const EXT2_IND_BLOCK: usize = 12;
 const EXT2_DIND_BLOCK: usize = 13;
 
-/// 块组上限 (缓存每组 inode 表起始块; 16 MiB 镜像只需 2 组)。
-const EXT2_MAX_GROUPS: usize = 16;
+/// 块组数上限 —— 决定 inode 表起始块缓存的大小 (`EXT2_MAX_GROUPS` × 4 字节)。
+///
+/// 取 4096: 1 KiB 块 + 默认 8192 块/组 = 每组 8 MiB, 故可覆盖到约 32 GiB 的卷;
+/// 真实 U 盘 / 大分区 (M1b) 的块组数远超早期测试镜像 (16 MiB 只需 2 组), 上限过小
+/// 会让挂载直接失败。
+const EXT2_MAX_GROUPS: usize = 4096;
 /// 打开文件上限。
 const EXT2_MAX_FD: usize = 16;
 
@@ -9987,13 +10453,23 @@ struct Ext2Fd {
     used: bool,
     is_dir: bool,
     ino: u32,
+    /// 打开时绑定的卷号 (M1b 多卷挂载)。
+    vol: u64,
 }
 const EXT2_FD_EMPTY: Ext2Fd = Ext2Fd {
     used: false,
     is_dir: false,
     ino: 0,
+    vol: 0,
 };
 static mut EXT2_FDS: [Ext2Fd; EXT2_MAX_FD] = [EXT2_FD_EMPTY; EXT2_MAX_FD];
+
+/// 本服务**当前请求**落在的卷号 (M1b 多卷挂载; 见 fat32_srv 的 `FAT_CUR_VOL` 注释)。
+static mut EXT2_CUR_VOL: u64 = 0;
+
+/// 已解析的几何 (超级块 / 块组描述符) 属于哪个卷。各卷的块大小 / inode 表位置不同,
+/// 请求落到别的卷上必须重新解析 (见 `ext2_mount`)。
+static mut EXT2_GEO_VOL: u64 = u64::MAX;
 
 /// 读一个 ext2 块 (块号 → LBA = 块号 × 每块扇区数)。
 fn ext2_read_block(block_no: u32, dst: *mut u8) -> bool {
@@ -10001,7 +10477,7 @@ fn ext2_read_block(block_no: u32, dst: *mut u8) -> bool {
     if sectors == 0 {
         return false;
     }
-    block_read_dev(unsafe { EXT2_VOL }, block_no * sectors as u32, sectors, dst)
+    block_read_dev(unsafe { EXT2_CUR_VOL }, block_no * sectors as u32, sectors, dst)
 }
 
 /// 由 inode 号读 inode: inode 表块读入 `buf`, 需要的字段拷进返回值。
@@ -10364,14 +10840,48 @@ fn exfat_encode_time(unix: u64) -> (u32, u8) {
     (ts, ((sec % 2) * 100) as u8)
 }
 
-/// upcase 表查询: 表只覆盖前 N 个码元 (本卷 2918 个), 超出者映射为自身。
+/// upcase 表 / 位图的「按需窗口」缓存状态。
+///
+/// 这两个表在大容量卷上可以很大 (位图可达 MB 级), 因此不整体载入, 而是
+/// 每次把用到的那个 512B 扇区读进一页窗口; `SEC` 记录窗口当前装的是哪个扇区
+/// (命中时无需再走 FAT 链换算 LBA)。
+static mut EXFAT_UPC_WIN_SEC: usize = usize::MAX;
+static mut EXFAT_UPC_WIN_LBA: u32 = 0;
+static mut EXFAT_BMP_WIN_SEC: usize = usize::MAX;
+static mut EXFAT_BMP_WIN_LBA: u32 = 0;
+static mut EXFAT_BMP_DIRTY: bool = false;
+
+/// 表 (`first` 起始的 FAT 链) 第 `sec` 个 512B 扇区的 LBA。
+fn exfat_chain_sec_lba(first: u32, sec: usize) -> Option<u32> {
+    let spc = unsafe { EXFAT_SECTORS_PER_CLUSTER } as usize;
+    if spc == 0 {
+        return None;
+    }
+    let cl = exfat_chain_nth(first, (sec / spc) as u32)?;
+    Some(exfat_cluster_lba(cl) + (sec % spc) as u32)
+}
+
+/// upcase 表查询: 表只覆盖前 N 个码元, 超出者映射为自身。
 fn exfat_upcase_unit(u: u16) -> u16 {
-    let bytes = unsafe { EXFAT_UPCASE_BYTES } as usize;
     let off = u as usize * 2;
-    if off + 2 > bytes {
+    if (off + 2) as u32 > unsafe { EXFAT_UPCASE_BYTES } {
         return u;
     }
-    read_u16(exfat_at(exfat_d(), off))
+    let sec = off / EXFAT_SECTOR_SIZE as usize;
+    if unsafe { EXFAT_UPC_WIN_SEC } != sec {
+        let lba = match exfat_chain_sec_lba(unsafe { EXFAT_UPCASE_CLUSTER }, sec) {
+            Some(l) => l,
+            None => return u,
+        };
+        if !exfat_read_sectors(lba, 1, exfat_upc()) {
+            return u;
+        }
+        unsafe {
+            EXFAT_UPC_WIN_SEC = sec;
+            EXFAT_UPC_WIN_LBA = lba;
+        }
+    }
+    read_u16(exfat_at(exfat_upc(), off % EXFAT_SECTOR_SIZE as usize))
 }
 
 /// exFAT NameHash: 每个码元先对散列循环右移 1 位再累加其 upcase 值, 末尾再右移一次。
@@ -10502,7 +11012,7 @@ fn exfat_dir_locate(dir_first: u32, want: &[u8]) -> Option<ExfatLoc> {
         return None;
     }
     let per = cb / EXFAT_DIR_ENTRY;
-    let buf = exfat_a();
+    let buf = exfat_clu();
     let mut cl = dir_first;
     let mut guard = 0u32;
     while cl >= 2 && guard <= unsafe { EXFAT_CLUSTER_COUNT } + 1 {
@@ -10552,7 +11062,7 @@ fn exfat_dir_find_slot(dir_first: u32, need: usize) -> Option<ExfatLoc> {
         return None;
     }
     let per = cb / EXFAT_DIR_ENTRY;
-    let buf = exfat_a();
+    let buf = exfat_clu();
     let mut cl = dir_first;
     let mut guard = 0u32;
     while cl >= 2 && guard <= unsafe { EXFAT_CLUSTER_COUNT } + 1 {
@@ -10624,7 +11134,7 @@ fn exfat_dir_grow(dir_first: u32) -> Option<u32> {
         }
     }
     // 2) 填掉尾部空位 (幂等: 已填过的簇不会再出现 0x00 尾部)。
-    let buf = exfat_a();
+    let buf = exfat_clu();
     if !exfat_read_cluster(cur, buf) {
         return None;
     }
@@ -10651,7 +11161,7 @@ fn exfat_dir_grow(dir_first: u32) -> Option<u32> {
     }
     // 3) 追加并链接一个清零的新簇。
     let cl = exfat_alloc_cluster()?;
-    let z = exfat_a();
+    let z = exfat_clu();
     zero_bytes(z, cb);
     if !exfat_write_cluster(cl, z) {
         return None;
@@ -10668,7 +11178,7 @@ fn exfat_dir_put_set(loc: ExfatLoc, set: *const u8, total: usize) -> bool {
     if cb == 0 || (loc.index + total) * EXFAT_DIR_ENTRY > cb {
         return false;
     }
-    let buf = exfat_a();
+    let buf = exfat_clu();
     if !exfat_read_cluster(loc.cluster, buf) {
         return false;
     }
@@ -10689,7 +11199,7 @@ fn exfat_dir_del_set(loc: ExfatLoc) -> bool {
     if cb == 0 || (loc.index + total) * EXFAT_DIR_ENTRY > cb {
         return false;
     }
-    let buf = exfat_a();
+    let buf = exfat_clu();
     if !exfat_read_cluster(loc.cluster, buf) {
         return false;
     }
@@ -10763,13 +11273,13 @@ fn exfat_split_parent(path: &str) -> Option<(&str, &[u8])> {
 }
 
 /// 创建文件 / 目录 (已存在且类型匹配则直接打开), 返回 fd。
-fn exfat_create(path: &str, is_dir: bool) -> u64 {
+fn exfat_create(path: &str, is_dir: bool, vol: u64) -> u64 {
     if path.is_empty() || path == "/" {
         return u64::MAX;
     }
     if let Some(e) = exfat_resolve(path) {
         return if e.is_dir == is_dir {
-            exfat_fd_alloc(path, is_dir)
+            exfat_fd_alloc(path, is_dir, vol)
         } else {
             u64::MAX
         };
@@ -10789,7 +11299,7 @@ fn exfat_create(path: &str, is_dir: bool) -> u64 {
             Some(cl) => cl,
             None => return u64::MAX,
         };
-        let z = exfat_a();
+        let z = exfat_clu();
         zero_bytes(z, unsafe { EXFAT_CLUSTER_BYTES } as usize);
         if !exfat_write_cluster(first, z) {
             return u64::MAX;
@@ -10816,7 +11326,7 @@ fn exfat_create(path: &str, is_dir: bool) -> u64 {
     if !exfat_dir_put_set(loc, set.as_ptr(), total) {
         return u64::MAX;
     }
-    exfat_fd_alloc(path, is_dir)
+    exfat_fd_alloc(path, is_dir, vol)
 }
 
 /// 删除文件 (`want_dir = false`) 或空目录 (`want_dir = true`)。
@@ -10881,7 +11391,7 @@ fn exfat_write_file(
     let mut idx = have.min(n);
     while idx < n {
         let cl = exfat_chain_nth(first, idx)?;
-        let z = exfat_a();
+        let z = exfat_clu();
         zero_bytes(z, cb as usize);
         if !exfat_write_cluster(cl, z) {
             return None;
@@ -10889,7 +11399,7 @@ fn exfat_write_file(
         idx += 1;
     }
     let mut done = 0u32;
-    let scratch = exfat_b();
+    let scratch = exfat_clu();
     while done < count {
         let pos = offset as u64 + done as u64;
         let cl = exfat_chain_nth(first, (pos / cb as u64) as u32)?;
@@ -10951,7 +11461,7 @@ fn exfat_truncate(e: &ExfatEntry, parent_first: u32, name: &[u8], size: u32) -> 
     let mut idx = have.min(n);
     while idx < n {
         let cl = exfat_chain_nth(first, idx)?;
-        let z = exfat_a();
+        let z = exfat_clu();
         zero_bytes(z, cb as usize);
         if !exfat_write_cluster(cl, z) {
             return None;
@@ -11004,7 +11514,7 @@ fn exfat_fd_parent(fd: &ExfatFd, out: &mut [u8; vfs::DIR_LONG_MAX]) -> Option<(u
 // fd 表
 // ---------------------------------------------------------------------------
 
-fn ext2_fd_alloc(ino: u32, is_dir: bool) -> u64 {
+fn ext2_fd_alloc(ino: u32, is_dir: bool, vol: u64) -> u64 {
     for i in 0..EXT2_MAX_FD {
         unsafe {
             let s = &mut *core::ptr::addr_of_mut!(EXT2_FDS).cast::<Ext2Fd>().add(i);
@@ -11012,12 +11522,14 @@ fn ext2_fd_alloc(ino: u32, is_dir: bool) -> u64 {
                 s.used = true;
                 s.is_dir = is_dir;
                 s.ino = ino;
+                s.vol = vol;
                 return i as u64;
             }
         }
     }
     u64::MAX
 }
+/// 查 fd 并把「当前卷寄存器」切到该 fd 绑定的卷 (与路径类请求的 tag 卷编码等价)。
 fn ext2_fd_get(fd: u32) -> Option<Ext2Fd> {
     if fd as usize >= EXT2_MAX_FD {
         return None;
@@ -11025,6 +11537,7 @@ fn ext2_fd_get(fd: u32) -> Option<Ext2Fd> {
     unsafe {
         let s = &*core::ptr::addr_of!(EXT2_FDS).cast::<Ext2Fd>().add(fd as usize);
         if s.used {
+            EXT2_CUR_VOL = s.vol;
             Some(*s)
         } else {
             None
@@ -11054,7 +11567,7 @@ fn ext2_fd_free(fd: u32) -> u64 {
 fn ext2_mount() -> bool {
     // 超级块固定在字节偏移 1024 (LBA 2), 前 1024 字节已含所需全部字段。
     let sb = ext2_a();
-    if !block_read_dev(unsafe { EXT2_VOL }, 2, 2, sb) {
+    if !block_read_dev(unsafe { EXT2_CUR_VOL }, 2, 2, sb) {
         return false;
     }
     if read_u16(unsafe { sb.add(0x38) }) != EXT2_MAGIC {
@@ -11117,7 +11630,14 @@ fn ext2_mount() -> bool {
         blk += 1;
     }
     // 根 inode 必须存在且是目录, 否则视为无效卷。
-    matches!(ext2_read_inode(EXT2_ROOT_INO), Some(i) if i.mode & EXT2_S_IFMT == EXT2_S_IFDIR)
+    let ok = matches!(ext2_read_inode(EXT2_ROOT_INO), Some(i) if i.mode & EXT2_S_IFMT == EXT2_S_IFDIR);
+    if ok {
+        // 记录「当前几何属于哪个卷」(M1b: 卷切换时据此判断要不要重新解析)。
+        unsafe {
+            EXT2_GEO_VOL = EXT2_CUR_VOL;
+        }
+    }
+    ok
 }
 
 // ---------------------------------------------------------------------------
@@ -11145,11 +11665,15 @@ fn ext2_main() {
     // 认领卷: 第一个 ext2 签名的卷; 无分区表的整盘镜像即卷 2 (回退值)。
     unsafe {
         EXT2_VOL = vol_claim(ext2_a(), 16, VOL_KIND_EXT2, EXT2_VOL_FALLBACK);
+        EXT2_CUR_VOL = EXT2_VOL;
     }
     if !ext2_mount() {
         println("ext2: mount FAILED (not a valid ext2 volume)");
         return;
     }
+
+    // M1b: 把**额外**的 ext2 卷挂到 `/usb<卷号>` (元数据已解析完, `ext2_a` 可作暂存)。
+    mount_extra_volumes(ext2_a(), VOL_KIND_EXT2, unsafe { EXT2_VOL }, vfs::EXT2_DOMAIN);
 
     let mut msg = Message {
         from: 0,
@@ -11159,12 +11683,29 @@ fn ext2_main() {
     };
     loop {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
-        match msg.tag {
+        // 同 fat32_srv: tag 高位带卷编码 (M1b); fd 类请求的卷由 fd 绑定决定。
+        let tag = vfs::tag_body(msg.tag);
+        let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { EXT2_VOL });
+        if matches!(tag, vfs::VFS_READ_TAG | vfs::VFS_READDIR_TAG) {
+            if let Some(fd) = ext2_fd_get(read_u32(msg.payload.as_ptr())) {
+                vol = fd.vol;
+            }
+        }
+        unsafe {
+            EXT2_CUR_VOL = vol;
+        }
+        // 卷切换: 各 ext2 卷的块大小 / inode 表位置不同, 必须重新解析该卷的超级块与
+        // 块组描述符表 (只读, 不改盘), 否则会用上个卷的几何去换算块号。
+        if unsafe { EXT2_GEO_VOL } != vol && !ext2_mount() {
+            sys_reply(u64::MAX);
+            continue;
+        }
+        match tag {
             vfs::VFS_OPEN_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match ext2_resolve(path) {
-                    Some((ino, is_dir)) => ext2_fd_alloc(ino, is_dir),
+                    Some((ino, is_dir)) => ext2_fd_alloc(ino, is_dir, vol),
                     None => u64::MAX,
                 };
                 sys_reply(fd);
@@ -11249,31 +11790,35 @@ const EXFAT_VOL_FALLBACK: u64 = 5;
 /// exFAT 服务实际使用的卷号, 启动时由 `vol_claim` 认领。
 static mut EXFAT_VOL: u64 = EXFAT_VOL_FALLBACK;
 
-/// exFAT 缓冲页虚拟地址 (紧跟 MFS 的 `+0x11_0000..0x11_4000` 之后)。
+/// exFAT **集群缓冲**虚拟地址 (紧跟 MFS 的 `+0x11_0000..0x11_4000` 之后)。
 ///
 /// 与其它块缓冲页同理: 必须位于程序镜像之外, 且以「同地址」共享给 block_srv
-/// 供其 DMA 写入, 否则 NVMe 会回「非法字段」。
-const EXFAT_BUF_A_VADDR: u64 = 0x0000_0080_0011_4000;
-const EXFAT_BUF_B_VADDR: u64 = 0x0000_0080_0011_5000;
-const EXFAT_BUF_C_VADDR: u64 = 0x0000_0080_0011_6000;
-/// upcase 表缓存 (默认表 5836 字节, 跨两页, 故 D/E 必须**连续**)。
-const EXFAT_BUF_D_VADDR: u64 = 0x0000_0080_0011_7000;
-const EXFAT_BUF_E_VADDR: u64 = 0x0000_0080_0011_8000;
+/// 供其 DMA 读写, 否则 NVMe 会回「非法字段」。
+/// 尺寸按实际簇大小**动态分配** (`spc` 页), 上限 `EXFAT_MAX_CLUSTER_PAGES`
+/// (256 KiB 簇); 因此后续固定窗口从该上限之上开始排布, 避免重叠。
+const EXFAT_CLU_VADDR: u64 = 0x0000_0080_0011_4000;
+/// 集群缓冲页数上限 (对应 `spc_shift <= 9`, 即 256 KiB 簇)。
+const EXFAT_MAX_CLUSTER_PAGES: usize = 64;
+/// 分配位图窗口 (一页 = 一个 512B 扇区 + 余量, 按需读入、按扇区回写)。
+///
+/// 位图不再整体载入内存 —— 大容量卷的位图可达数十 KB 甚至 MB。
+const EXFAT_BMP_VADDR: u64 = 0x0000_0080_0015_4000;
+/// upcase 表窗口 (一页, 按需读入; 只在生成 NameHash 时用到)。
+const EXFAT_UPC_VADDR: u64 = 0x0000_0080_0015_5000;
+/// 通用单页暂存: FAT 表项读改写、引导扇区、卷表扫描。
+const EXFAT_PG_VADDR: u64 = 0x0000_0080_0015_6000;
 
-fn exfat_a() -> *mut u8 {
-    EXFAT_BUF_A_VADDR as *mut u8
+fn exfat_clu() -> *mut u8 {
+    EXFAT_CLU_VADDR as *mut u8
 }
-fn exfat_b() -> *mut u8 {
-    EXFAT_BUF_B_VADDR as *mut u8
+fn exfat_bmp() -> *mut u8 {
+    EXFAT_BMP_VADDR as *mut u8
 }
-fn exfat_c() -> *mut u8 {
-    EXFAT_BUF_C_VADDR as *mut u8
+fn exfat_upc() -> *mut u8 {
+    EXFAT_UPC_VADDR as *mut u8
 }
-fn exfat_d() -> *mut u8 {
-    EXFAT_BUF_D_VADDR as *mut u8
-}
-fn exfat_e() -> *mut u8 {
-    EXFAT_BUF_E_VADDR as *mut u8
+fn exfat_pg() -> *mut u8 {
+    EXFAT_PG_VADDR as *mut u8
 }
 fn exfat_at(buf: *const u8, off: usize) -> *const u8 {
     unsafe { buf.add(off) }
@@ -11302,12 +11847,12 @@ const EXFAT_FAT_EOC_MIN: u32 = 0xFFFF_FFF8;
 const EXFAT_DIR_ENTRY: usize = 32;
 /// 打开文件上限。
 const EXFAT_MAX_FD: usize = 16;
-/// 分配位图缓存容量 (字节); 1 = 已占用, 位 `cluster - 2`。
-const EXFAT_BITMAP_CAP: usize = 4096;
-/// upcase 表缓存容量 (字节; 跨 D/E 两页)。
-const EXFAT_UPCASE_CAP: usize = 8192;
 /// 仅支持 512 字节扇区 (`BytesPerSectorShift == 9`)。
 const EXFAT_SECTOR_SIZE: u32 = 512;
+/// 簇大小上限对应的 `SectorsPerClusterShift` (256 KiB 簇, 受集群缓冲页数约束)。
+const EXFAT_MAX_SPC_SHIFT: u8 = 9;
+/// 页大小 (逐页分配 / 共享的粒度)。
+const EXFAT_PAGE_SIZE: usize = 4096;
 
 // 挂载后固定的卷参数 (内存镜像)。
 static mut EXFAT_SECTORS_PER_CLUSTER: u32 = 0;
@@ -11355,14 +11900,26 @@ struct ExfatFd {
     is_dir: bool,
     path_len: u8,
     path: [u8; TMP_PATH_MAX],
+    /// 打开时绑定的卷号 (M1b 多卷挂载)。
+    vol: u64,
 }
 const EXFAT_FD_EMPTY: ExfatFd = ExfatFd {
     used: false,
     is_dir: false,
     path_len: 0,
     path: [0; TMP_PATH_MAX],
+    vol: 0,
 };
 static mut EXFAT_FDS: [ExfatFd; EXFAT_MAX_FD] = [EXFAT_FD_EMPTY; EXFAT_MAX_FD];
+
+/// 本服务**当前请求**落在的卷号 (M1b 多卷挂载; 见 fat32_srv 的 `FAT_CUR_VOL` 注释)。
+static mut EXFAT_CUR_VOL: u64 = 0;
+
+/// 已解析的几何 (引导区 / FAT / 集群堆 / 位图 / upcase) 属于哪个卷。各卷的簇大小与
+/// 各部分偏移都不同, 请求落到别的卷上必须重新挂载解析 (见 `exfat_mount`)。
+static mut EXFAT_GEO_VOL: u64 = u64::MAX;
+/// 集群缓冲**已分配并共享**的页数 (卷切换只需补分配差额, 见 `exfat_bufs_init`)。
+static mut EXFAT_BUFS_PAGES: usize = 0;
 
 // ---------------------------------------------------------------------------
 // 块 I/O / FAT / 集群
@@ -11370,7 +11927,7 @@ static mut EXFAT_FDS: [ExfatFd; EXFAT_MAX_FD] = [EXFAT_FD_EMPTY; EXFAT_MAX_FD];
 
 /// 经 block_srv 读 `count` 个 512B 扇区到 `dst`。
 fn exfat_read_sectors(lba: u32, count: u16, dst: *mut u8) -> bool {
-    block_read_dev(unsafe { EXFAT_VOL }, lba, count, dst)
+    block_read_dev(unsafe { EXFAT_CUR_VOL }, lba, count, dst)
 }
 
 /// 集群 `cl` 的首个 512B 扇区号 (集群 2 是堆内第一簇)。
@@ -11378,7 +11935,7 @@ fn exfat_cluster_lba(cl: u32) -> u32 {
     unsafe { EXFAT_HEAP_OFFSET + (cl - 2) * EXFAT_SECTORS_PER_CLUSTER }
 }
 
-/// 读一个完整集群到 `dst`。
+/// 读一个完整集群到 `dst` (`dst` 必须至少有 `spc` 页)。
 fn exfat_read_cluster(cl: u32, dst: *mut u8) -> bool {
     if cl < 2 {
         return false;
@@ -11395,7 +11952,7 @@ fn exfat_fat_get(cl: u32) -> Option<u32> {
     let byte = unsafe { EXFAT_FAT_OFFSET } as u64 * EXFAT_SECTOR_SIZE as u64 + cl as u64 * 4;
     let lba = (byte / EXFAT_SECTOR_SIZE as u64) as u32;
     let off = (byte % EXFAT_SECTOR_SIZE as u64) as usize;
-    let buf = exfat_b();
+    let buf = exfat_pg();
     if !exfat_read_sectors(lba, 1, buf) {
         return None;
     }
@@ -11406,50 +11963,71 @@ fn exfat_is_eoc(v: u32) -> bool {
     v >= EXFAT_FAT_EOC_MIN
 }
 
-/// 分配位图里集群 `cl` 是否已占用。
+/// 分配位图里集群 `cl` 是否已占用 (按需读入所在扇区)。
 fn exfat_bitmap_get(cl: u32) -> bool {
-    if cl < 2 {
-        return false;
+    match exfat_bitmap_byte(cl) {
+        Some(p) => unsafe { *p & (1u8 << ((cl - 2) & 7)) != 0 },
+        None => false,
     }
-    let idx = (cl - 2) as usize;
-    if idx / 8 >= unsafe { EXFAT_BITMAP_BYTES } as usize {
-        return false;
-    }
-    let buf = exfat_c();
-    unsafe { *exfat_at(buf, idx / 8) & (1u8 << (idx & 7)) != 0 }
 }
 
-/// 把一个 FAT 链上的文件内容 (前 `len` 字节) 载入 `dst`; 用于位图 / upcase 表。
-fn exfat_load_chain(first: u32, len: u32, dst: *mut u8) -> bool {
-    let cb = unsafe { EXFAT_CLUSTER_BYTES } as usize;
-    if cb == 0 || len == 0 {
+/// 定位位图中集群 `cl` 对应的那个字节所在扇区, 返回窗口内的字节指针。
+///
+/// 窗口是**写回缓存**: 一旦装载了新扇区, 之前的脏扇区会先落盘。
+fn exfat_bitmap_byte(cl: u32) -> Option<*mut u8> {
+    if cl < 2 {
+        return None;
+    }
+    let byte = (cl - 2) as usize / 8;
+    if byte >= unsafe { EXFAT_BITMAP_BYTES } as usize {
+        return None;
+    }
+    let sec = byte / EXFAT_SECTOR_SIZE as usize;
+    let off = byte % EXFAT_SECTOR_SIZE as usize;
+    if unsafe { EXFAT_BMP_WIN_SEC } != sec {
+        if !exfat_bitmap_flush() {
+            return None;
+        }
+        let lba = exfat_chain_sec_lba(unsafe { EXFAT_BITMAP_CLUSTER }, sec)?;
+        if !exfat_read_sectors(lba, 1, exfat_bmp()) {
+            return None;
+        }
+        unsafe {
+            EXFAT_BMP_WIN_SEC = sec;
+            EXFAT_BMP_WIN_LBA = lba;
+        }
+    }
+    Some(exfat_atm(exfat_bmp(), off))
+}
+
+/// 只改内存位图 (1 = 占用), 标脏由 `exfat_bitmap_flush` 落盘。
+fn exfat_bitmap_put(cl: u32, used: bool) -> bool {
+    let mask = 1u8 << ((cl - 2) & 7);
+    let p = match exfat_bitmap_byte(cl) {
+        Some(p) => p,
+        None => return false,
+    };
+    unsafe {
+        if used {
+            *p |= mask;
+        } else {
+            *p &= !mask;
+        }
+        EXFAT_BMP_DIRTY = true;
+    }
+    true
+}
+
+/// 把位图窗口里的脏扇区写回 (无脏数据时是空操作)。
+fn exfat_bitmap_flush() -> bool {
+    if !unsafe { EXFAT_BMP_DIRTY } {
+        return true;
+    }
+    let lba = unsafe { EXFAT_BMP_WIN_LBA };
+    if !exfat_write_sectors(lba, 1, exfat_bmp()) {
         return false;
     }
-    let scratch = exfat_b();
-    let mut done = 0usize;
-    let mut cl = first;
-    let mut guard = 0u32;
-    while done < len as usize {
-        if cl < 2 || guard > unsafe { EXFAT_CLUSTER_COUNT } + 1 {
-            return false;
-        }
-        if !exfat_read_cluster(cl, scratch) {
-            return false;
-        }
-        let chunk = (len as usize - done).min(cb);
-        unsafe {
-            core::ptr::copy_nonoverlapping(scratch, dst.add(done), chunk);
-        }
-        done += chunk;
-        guard += 1;
-        if done >= len as usize {
-            break;
-        }
-        cl = match exfat_fat_get(cl) {
-            Some(v) if v != EXFAT_FAT_FREE && !exfat_is_eoc(v) => v,
-            _ => return false,
-        };
-    }
+    unsafe { EXFAT_BMP_DIRTY = false };
     true
 }
 
@@ -11485,37 +12063,32 @@ fn exfat_cluster_at(e: &ExfatEntry, idx: u32) -> Option<u32> {
 /// boot checksum: 主引导区前 11 个扇区的滚动 32 位校验, 跳过 `VolumeFlags`
 /// (106/107) 与 `PercentInUse` (112); 结果重复填入第 11 扇区。
 fn exfat_verify_boot_checksum() -> bool {
-    // 前 11 个 512B 扇区 = 5632 字节, 落在 D+E 连续两页 (8192)。
-    // 块层单次 READ 仅支持「一页 / ≤8 扇区」, 故按页分两段读: 先用页对齐的 B
-    // 做 NVMe 目标, 再拷进 D/E 的正确偏移 (NVMe 的 PRP1 只接受页对齐地址)。
-    let dst = exfat_d();
-    let tmp = exfat_b();
-    if !exfat_read_sectors(0, 8, tmp) {
-        return false;
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(tmp, dst, 8 * 512);
-    }
-    if !exfat_read_sectors(8, 3, tmp) {
-        return false;
-    }
-    unsafe {
-        core::ptr::copy_nonoverlapping(tmp, dst.add(8 * 512), 3 * 512);
-    }
+    // 前 11 个 512B 扇区 = 5632 字节; 逐扇区读进单页暂存后滚动累加,
+    // 不依赖「一次读多页」, 也不需要额外的连续两页缓冲。
+    let buf = exfat_pg();
     let mut sum: u32 = 0;
-    let mut i = 0usize;
-    while i < 11 * 512 {
-        if i != 106 && i != 107 && i != 112 {
-            let byte = unsafe { *exfat_at(dst, i) } as u32;
-            let rot: u32 = if sum & 1 != 0 { 0x8000_0000 } else { 0 };
-            sum = rot.wrapping_add(sum >> 1).wrapping_add(byte);
+    let mut sec: usize = 0;
+    while sec < 11 {
+        if !exfat_read_sectors(sec as u32, 1, buf) {
+            return false;
         }
-        i += 1;
+        let base = sec * EXFAT_SECTOR_SIZE as usize;
+        let mut i = 0usize;
+        while i < EXFAT_SECTOR_SIZE as usize {
+            let off = base + i;
+            if off != 106 && off != 107 && off != 112 {
+                let byte = unsafe { *exfat_at(buf, i) } as u32;
+                let rot: u32 = if sum & 1 != 0 { 0x8000_0000 } else { 0 };
+                sum = rot.wrapping_add(sum >> 1).wrapping_add(byte);
+            }
+            i += 1;
+        }
+        sec += 1;
     }
-    if !exfat_read_sectors(11, 1, tmp) {
+    if !exfat_read_sectors(11, 1, buf) {
         return false;
     }
-    read_u32(tmp) == sum
+    read_u32(buf) == sum
 }
 
 /// entry set 的 16 位校验和: 覆盖整组 (count 字节), 跳过 SetChecksum 字段本身
@@ -11675,7 +12248,7 @@ fn exfat_dir_scan<F: FnMut(&ExfatEntry) -> bool>(dir_first: u32, mut cb: F) -> b
         return false;
     }
     let per = cb_size / EXFAT_DIR_ENTRY;
-    let buf = exfat_a();
+    let buf = exfat_clu();
     let mut cl = dir_first;
     let mut guard = 0u32;
     while cl >= 2 && guard <= unsafe { EXFAT_CLUSTER_COUNT } + 1 {
@@ -11814,7 +12387,7 @@ fn exfat_read_file(e: &ExfatEntry, offset: u32, count: u32, dst: *mut u8) -> Opt
     if cb == 0 {
         return None;
     }
-    let buf = exfat_b();
+    let buf = exfat_clu();
     let mut done = 0u32;
     while done < n {
         let pos = offset + done;
@@ -11888,21 +12461,21 @@ const EXFAT_NAME_UNITS_PER_ENTRY: usize = 15;
 /// 分配游标: 从上次分配处继续找空闲簇, 避免每次都从第 2 簇线性扫描。
 static mut EXFAT_ALLOC_HINT: u32 = 2;
 
-/// 经 block_srv 写 `count` 个 512B 扇区 (源需页对齐且不跨页)。
+/// 经 block_srv 写 `count` 个 512B 扇区 (源需页对齐; 超过块层单命令上限时自动切分)。
 fn exfat_write_sectors(lba: u32, count: u16, src: *mut u8) -> bool {
-    if count == 0 || count > 8 {
+    if count == 0 {
         return false;
     }
-    block_write_dev(unsafe { EXFAT_VOL }, lba, count, src)
+    block_write_dev(unsafe { EXFAT_CUR_VOL }, lba, count, src)
 }
 
-/// 写一个完整集群 (`src` 必须是页对齐的整页缓冲)。
+/// 写一个完整集群 (`src` 必须至少有 `spc` 页)。
 fn exfat_write_cluster(cl: u32, src: *mut u8) -> bool {
     if cl < 2 {
         return false;
     }
     let spc = unsafe { EXFAT_SECTORS_PER_CLUSTER };
-    if spc == 0 || spc > 8 {
+    if spc == 0 || spc > u16::MAX as u32 {
         return false;
     }
     exfat_write_sectors(exfat_cluster_lba(cl), spc as u16, src)
@@ -11920,7 +12493,7 @@ fn exfat_fat_set(cl: u32, val: u32) -> bool {
             + cl as u64 * 4;
         let lba = (byte / EXFAT_SECTOR_SIZE as u64) as u32;
         let off = (byte % EXFAT_SECTOR_SIZE as u64) as usize;
-        let buf = exfat_b();
+        let buf = exfat_pg();
         if !exfat_read_sectors(lba, 1, buf) {
             return false;
         }
@@ -11933,60 +12506,6 @@ fn exfat_fat_set(cl: u32, val: u32) -> bool {
             return true;
         }
     }
-}
-
-/// 只改内存位图 (1 = 占用)。
-fn exfat_bitmap_put(cl: u32, used: bool) -> bool {
-    if cl < 2 {
-        return false;
-    }
-    let idx = (cl - 2) as usize;
-    if idx / 8 >= unsafe { EXFAT_BITMAP_BYTES } as usize {
-        return false;
-    }
-    let mask = 1u8 << (idx & 7);
-    let p = exfat_atm(exfat_c(), idx / 8);
-    unsafe {
-        if used {
-            *p |= mask;
-        } else {
-            *p &= !mask;
-        }
-    }
-    true
-}
-
-/// 把内存位图回写到磁盘上的位图链 (按覆盖到的扇区粒度, 源保持页对齐)。
-fn exfat_bitmap_flush() -> bool {
-    let len = unsafe { EXFAT_BITMAP_BYTES } as usize;
-    let cb = unsafe { EXFAT_CLUSTER_BYTES } as usize;
-    if len == 0 || cb == 0 {
-        return false;
-    }
-    let src = exfat_c();
-    let mut cl = unsafe { EXFAT_BITMAP_CLUSTER };
-    let mut done = 0usize;
-    let mut guard = 0u32;
-    while done < len {
-        if cl < 2 || guard > unsafe { EXFAT_CLUSTER_COUNT } + 1 {
-            return false;
-        }
-        let chunk = (len - done).min(cb);
-        let sectors = chunk.div_ceil(EXFAT_SECTOR_SIZE as usize) as u16;
-        if !exfat_write_sectors(exfat_cluster_lba(cl), sectors, unsafe { src.add(done) }) {
-            return false;
-        }
-        done += cb;
-        guard += 1;
-        if done >= len {
-            break;
-        }
-        cl = match exfat_fat_get(cl) {
-            Some(v) if v != EXFAT_FAT_FREE && !exfat_is_eoc(v) => v,
-            _ => return false,
-        };
-    }
-    true
 }
 
 /// 分配一个空闲集群: 置位图 + FAT 置链尾 + 落盘 (位图与 FAT 保持一致)。
@@ -12155,7 +12674,7 @@ fn exfat_entry_clusters(e: &ExfatEntry) -> u32 {
 // fd 表
 // ---------------------------------------------------------------------------
 
-fn exfat_fd_alloc(path: &str, is_dir: bool) -> u64 {
+fn exfat_fd_alloc(path: &str, is_dir: bool, vol: u64) -> u64 {
     if path.len() > TMP_PATH_MAX {
         return u64::MAX;
     }
@@ -12168,12 +12687,14 @@ fn exfat_fd_alloc(path: &str, is_dir: bool) -> u64 {
                 s.path_len = path.len() as u8;
                 s.path = [0; TMP_PATH_MAX];
                 s.path[..path.len()].copy_from_slice(path.as_bytes());
+                s.vol = vol;
                 return i as u64;
             }
         }
     }
     u64::MAX
 }
+/// 查 fd 并把「当前卷寄存器」切到该 fd 绑定的卷 (与路径类请求的 tag 卷编码等价)。
 fn exfat_fd_get(fd: u32) -> Option<ExfatFd> {
     if fd as usize >= EXFAT_MAX_FD {
         return None;
@@ -12181,6 +12702,7 @@ fn exfat_fd_get(fd: u32) -> Option<ExfatFd> {
     unsafe {
         let s = &*core::ptr::addr_of!(EXFAT_FDS).cast::<ExfatFd>().add(fd as usize);
         if s.used {
+            EXFAT_CUR_VOL = s.vol;
             Some(*s)
         } else {
             None
@@ -12213,7 +12735,7 @@ fn exfat_scan_system_entries() -> bool {
         return false;
     }
     let per = cb / EXFAT_DIR_ENTRY;
-    let buf = exfat_a();
+    let buf = exfat_clu();
     let mut cl = unsafe { EXFAT_ROOT_CLUSTER };
     let mut guard = 0u32;
     let mut bitmap_found = false;
@@ -12234,7 +12756,11 @@ fn exfat_scan_system_entries() -> bool {
                 let len = read_u64(exfat_at(e, 24));
                 match t {
                     EXFAT_TYPE_BITMAP => {
-                        if first < 2 || len == 0 || len as usize > EXFAT_BITMAP_CAP {
+                        // 位图按需读取 (只缓存一个扇区), 故只校验存在性与覆盖面。
+                        if first < 2
+                            || len == 0
+                            || len * 8 < unsafe { EXFAT_CLUSTER_COUNT } as u64
+                        {
                             return false;
                         }
                         unsafe {
@@ -12244,7 +12770,7 @@ fn exfat_scan_system_entries() -> bool {
                         bitmap_found = true;
                     }
                     EXFAT_TYPE_UPCASE => {
-                        if first < 2 || len == 0 || len as usize > EXFAT_UPCASE_CAP {
+                        if first < 2 || len == 0 {
                             return false;
                         }
                         unsafe {
@@ -12276,7 +12802,7 @@ fn exfat_scan_system_entries() -> bool {
 ///
 /// 返回 0 表示成功; 非 0 是失败阶段编号 (供诊断打印定位)。
 fn exfat_mount() -> u32 {
-    let a = exfat_a();
+    let a = exfat_pg();
     if !exfat_read_sectors(0, 1, a) {
         return 1;
     }
@@ -12293,9 +12819,8 @@ fn exfat_mount() -> u32 {
         return 4;
     }
     let spc_shift = unsafe { *exfat_at(a, 109) };
-    if spc_shift > 3 {
-        // 块层单次 READ 上限是一页 (4096 字节), 故簇最大取 8 扇区 (4 KiB)。
-        // 更大簇的卷需要多页拼接读取, 属 M6 边界外。
+    if spc_shift == 0 || spc_shift > EXFAT_MAX_SPC_SHIFT {
+        // 簇上限 = 集群缓冲页数 (256 KiB); 更大簇的卷当前不支持。
         return 5;
     }
     let num_fats = unsafe { *exfat_at(a, 110) } as u32;
@@ -12319,6 +12844,14 @@ fn exfat_mount() -> u32 {
         EXFAT_CLUSTER_COUNT = clu_count;
         EXFAT_ROOT_CLUSTER = root;
         EXFAT_NUM_FATS = num_fats;
+        // 分配游标是**每卷**状态: 换卷时必须复位, 否则会指到新卷的簇范围之外。
+        EXFAT_ALLOC_HINT = 2;
+    }
+    // 簇大小已知, 现在按需分配集群缓冲 (簇字节数 / 页大小 页, 至少一页)。
+    let clu_bytes = (1u32 << spc_shift) * EXFAT_SECTOR_SIZE;
+    let pages = (clu_bytes as usize).div_ceil(EXFAT_PAGE_SIZE).max(1);
+    if !exfat_bufs_init(pages) {
+        return 13;
     }
     if !exfat_verify_boot_checksum() {
         return 8;
@@ -12326,51 +12859,55 @@ fn exfat_mount() -> u32 {
     if !exfat_scan_system_entries() {
         return 9;
     }
-    let (bmp_cl, bmp_len, up_cl, up_len) = unsafe {
-        (
-            EXFAT_BITMAP_CLUSTER,
-            EXFAT_BITMAP_BYTES,
-            EXFAT_UPCASE_CLUSTER,
-            EXFAT_UPCASE_BYTES,
-        )
-    };
-    if !exfat_load_chain(bmp_cl, bmp_len, exfat_c()) {
-        return 10;
-    }
-    if !exfat_load_chain(up_cl, up_len, exfat_d()) {
-        return 11;
-    }
-    // 根目录所在簇必须被位图标为占用 —— 同时对位图解析做一次端到端校验。
+    // 根目录所在簇必须被位图标为占用 —— 同时对「按需位图」做一次端到端校验。
     if !exfat_bitmap_get(root) {
         return 12;
+    }
+    // 记录「当前几何属于哪个卷」(M1b: 卷切换时据此判断要不要重新解析)。
+    unsafe {
+        EXFAT_GEO_VOL = EXFAT_CUR_VOL;
     }
     0
 }
 
-/// 域 13 — exFAT 服务主循环 (M6a: 只读)。
-fn exfat_main() {
-    if sys_alloc_page(exfat_a() as u64) != 1
-        || sys_alloc_page(exfat_b() as u64) != 1
-        || sys_alloc_page(exfat_c() as u64) != 1
-        || sys_alloc_page(exfat_d() as u64) != 1
-        || sys_alloc_page(exfat_e() as u64) != 1
-    {
-        println("exfat: alloc block buffers FAILED");
-        return;
+/// 按簇大小分配并共享 exFAT 的集群缓冲 (逐页 alloc + 同地址 share)。
+///
+/// 已经分配过的页**不能**再 alloc/share 一次 —— 同地址重复共享会让 block_srv 侧触发
+/// 内核 `map_user_page: PageAlreadyMapped` panic。故卷切换 (M1b) 需要更大簇时, 只补
+/// 分配「多出来的那几页」。
+fn exfat_bufs_init(spc_pages: usize) -> bool {
+    if spc_pages == 0 || spc_pages > EXFAT_MAX_CLUSTER_PAGES {
+        return false;
     }
-    // 同地址共享给 block_srv: 否则 NVMe 直接回「非法字段」而写入静默失败。
-    if sys_share_page(exfat_a() as u64, BLOCK_DOMAIN) != 1
-        || sys_share_page(exfat_b() as u64, BLOCK_DOMAIN) != 1
-        || sys_share_page(exfat_c() as u64, BLOCK_DOMAIN) != 1
-        || sys_share_page(exfat_d() as u64, BLOCK_DOMAIN) != 1
-        || sys_share_page(exfat_e() as u64, BLOCK_DOMAIN) != 1
-    {
-        println("exfat: share block buffers FAILED");
-        return;
+    let mut i = unsafe { EXFAT_BUFS_PAGES };
+    while i < spc_pages {
+        let va = EXFAT_CLU_VADDR + (i * EXFAT_PAGE_SIZE) as u64;
+        if sys_alloc_page(va) != 1 || sys_share_page(va, BLOCK_DOMAIN) != 1 {
+            return false;
+        }
+        i += 1;
+    }
+    unsafe {
+        EXFAT_BUFS_PAGES = spc_pages.max(EXFAT_BUFS_PAGES);
+    }
+    true
+}
+
+/// 域 13 — exFAT 服务主循环 (M6a 只读 + M6b 读写)。
+fn exfat_main() {
+    // 固定缓冲: 单页暂存 + 位图窗口 + upcase 窗口。集群缓冲按实际簇大小
+    // 在 `exfat_mount` 里动态分配 (逐页 alloc + 同地址 share 给 block_srv;
+    // 漏了共享 NVMe 会直接回「非法字段」而写入静默失败)。
+    for b in [exfat_pg(), exfat_bmp(), exfat_upc()] {
+        if sys_alloc_page(b as u64) != 1 || sys_share_page(b as u64, BLOCK_DOMAIN) != 1 {
+            println("exfat: alloc/share block buffers FAILED");
+            return;
+        }
     }
     // 认领卷: 第一个 exFAT 签名的卷; 无分区表的整盘镜像即卷 5 (回退值)。
     unsafe {
-        EXFAT_VOL = vol_claim(exfat_a(), 16, VOL_KIND_EXFAT, EXFAT_VOL_FALLBACK);
+        EXFAT_VOL = vol_claim(exfat_pg(), 16, VOL_KIND_EXFAT, EXFAT_VOL_FALLBACK);
+        EXFAT_CUR_VOL = EXFAT_VOL;
     }
     let stage = exfat_mount();
     if stage != 0 {
@@ -12395,6 +12932,9 @@ fn exfat_main() {
     print_u64(unsafe { EXFAT_UPCASE_BYTES } as u64);
     println("");
 
+    // M1b: 把**额外**的 exFAT 卷挂到 `/usb<卷号>` (元数据已解析完, `exfat_pg` 可作暂存)。
+    mount_extra_volumes(exfat_pg(), VOL_KIND_EXFAT, unsafe { EXFAT_VOL }, vfs::EXFAT_DOMAIN);
+
     let mut msg = Message {
         from: 0,
         to: 0,
@@ -12403,12 +12943,32 @@ fn exfat_main() {
     };
     loop {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
-        match msg.tag {
+        // 同 fat32_srv: tag 高位带卷编码 (M1b); fd 类请求的卷由 fd 绑定决定。
+        let tag = vfs::tag_body(msg.tag);
+        let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { EXFAT_VOL });
+        if matches!(
+            tag,
+            vfs::VFS_READ_TAG | vfs::VFS_WRITE_TAG | vfs::VFS_READDIR_TAG | vfs::VFS_TRUNCATE_TAG
+        ) {
+            if let Some(fd) = exfat_fd_get(read_u32(msg.payload.as_ptr())) {
+                vol = fd.vol;
+            }
+        }
+        unsafe {
+            EXFAT_CUR_VOL = vol;
+        }
+        // 卷切换: 各 exFAT 卷的簇大小 / 区域偏移都不同, 必须按该卷重新解析 (会顺带把
+        // 几何、集群缓冲、位图 / upcase 视图都切过去)。
+        if unsafe { EXFAT_GEO_VOL } != vol && exfat_mount() != 0 {
+            sys_reply(u64::MAX);
+            continue;
+        }
+        match tag {
             vfs::VFS_OPEN_TAG => {
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match exfat_resolve(path) {
-                    Some(e) => exfat_fd_alloc(path, e.is_dir),
+                    Some(e) => exfat_fd_alloc(path, e.is_dir, vol),
                     None => u64::MAX,
                 };
                 sys_reply(fd);
@@ -12485,13 +13045,13 @@ fn exfat_main() {
                 sys_reply(exfat_fd_free(fd));
             }
             vfs::VFS_CREAT_TAG | vfs::VFS_MKDIR_TAG => {
-                let is_dir = msg.tag == vfs::VFS_MKDIR_TAG;
+                let is_dir = tag == vfs::VFS_MKDIR_TAG;
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
-                sys_reply(exfat_create(path, is_dir));
+                sys_reply(exfat_create(path, is_dir, vol));
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
-                let want_dir = msg.tag == vfs::VFS_RMDIR_TAG;
+                let want_dir = tag == vfs::VFS_RMDIR_TAG;
                 let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(exfat_remove(path, want_dir));
