@@ -73,6 +73,14 @@ pub const VFS_LINK_TAG: u64 = 0x4C49_4E4B; // "LINK"
 /// 与硬链接的区别: `a` 是**目标字符串**, 原样存进链接节点, 不要求存在、不经挂载层
 /// 路由 (只有 `b` 即链接自身的路径需要路由)。
 pub const VFS_SYMLINK_TAG: u64 = 0x5359_4D4C; // "SYML"
+/// 读软链接自身的目标串 (不跟随): payload = `PathReq`, 路径在共享页里,
+/// 目标串写回同一页, 回复目标字节数。非软链接返回 `u64::MAX`。
+pub const VFS_READLINK_TAG: u64 = 0x5244_4C4B; // "RDLK"
+/// 取**链接自身**的元数据 (不跟随): payload = `PathReq`, 结果写回共享页 (`vfs::Stat`)。
+///
+/// 与 `STAT` 的区别只在「末段是否跟随软链接」: `STAT` 跟随 (悬空链接会失败, 与 Unix
+/// `stat` 一致), `LSTAT` 不跟随 (能看到链接自己的类型与目标长度, 悬空链接也 stat 得到)。
+pub const VFS_LSTAT_TAG: u64 = 0x4C53_5441; // "LSTA"
 
 /// `Stat.mode` / `DirEntry.mode` 高 4 位的节点类型, 与 ext2 `i_mode` 的 `S_IFMT` 同构。
 ///
@@ -747,6 +755,81 @@ pub fn stat_into(path: &str, buf: u64) -> u64 {
     }
 }
 
+/// 读软链接 `path` **自身**的目标串 (不跟随), 成功返回字节数, 失败 `u64::MAX`。
+pub fn readlink(path: &str) -> u64 {
+    readlink_into(path, RESULT_BUF)
+}
+
+/// 同 `readlink`, 但目标串写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+///
+/// 服务端存的目标是**它自己命名空间**里的路径 (创建时由 `symlink_into` 剥掉了挂载
+/// 前缀), 这里把前缀**加回去** —— 于是 `readlink` 输出的正是当初 `ln -s` 写的那个路径
+/// (`ln -s /mfs/a L` 之后 `readlink L` 仍是 `/mfs/a`)。加回前缀是安全的: 创建时已保证
+/// 绝对目标必然落在同一挂载点内 (`symlink_into` 对跨挂载点的绝对目标直接拒绝),
+/// 所以剥/加前缀是互逆的。相对目标原样返回。
+pub fn readlink_into(path: &str, buf: u64) -> u64 {
+    let (domain, vol_enc, sub) = match route(path) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    let prefix_len = match mount_lookup(path) {
+        Some((_, _, n)) => n,
+        None => 0,
+    };
+    let req = PathReq { aux: 0, _pad: 0, buf };
+    write_cstr(sub, buf);
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const PathReq as *const u8,
+            core::mem::size_of::<PathReq>(),
+        )
+    };
+    let n = sys_call_payload(domain, with_vol(VFS_READLINK_TAG, vol_enc), payload);
+    if n == u64::MAX || n == 0 || n as usize > PAYLOAD_LEN - 1 {
+        return u64::MAX;
+    }
+    let n = n as usize;
+    // 目标串已在 `buf` 里; 需要加回挂载前缀时就地右移 (长度不变或变长, 不能原地覆盖)。
+    let raw = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
+    if prefix_len == 0 || raw[0] != b'/' || prefix_len + n > PAYLOAD_LEN - 1 {
+        return n as u64;
+    }
+    let mut out = [0u8; PAYLOAD_LEN];
+    out[..prefix_len].copy_from_slice(&path.as_bytes()[..prefix_len]);
+    out[prefix_len..prefix_len + n].copy_from_slice(raw);
+    unsafe {
+        core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, prefix_len + n);
+        *(buf as *mut u8).add(prefix_len + n) = 0;
+    }
+    (prefix_len + n) as u64
+}
+
+/// 取**链接自身**的元数据 (不跟随软链接), 成功返回 `size_of::<Stat>()`, 失败 `u64::MAX`。
+///
+/// 与 `stat` 的区别只在末段是否跟随: `stat` 跟随 (悬空链接失败), `lstat` 不跟随 ——
+/// 悬空链接也能看到它的类型与目标长度。
+pub fn lstat(path: &str) -> u64 {
+    lstat_into(path, RESULT_BUF)
+}
+
+/// 同 `lstat`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+pub fn lstat_into(path: &str, buf: u64) -> u64 {
+    match route(path) {
+        Some((domain, vol_enc, sub)) => {
+            let req = PathReq { aux: 0, _pad: 0, buf };
+            write_cstr(sub, buf);
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    &req as *const PathReq as *const u8,
+                    core::mem::size_of::<PathReq>(),
+                )
+            };
+            sys_call_payload(domain, with_vol(VFS_LSTAT_TAG, vol_enc), payload)
+        }
+        None => u64::MAX,
+    }
+}
+
 /// 修改权限位为 `mode` (低 12 位), 成功返回 1, 失败 `u64::MAX`。
 ///
 /// 权限位当前只存储与显示, 不参与访问判定 (没有多用户概念)。
@@ -885,8 +968,9 @@ pub fn symlink(target: &str, linkpath: &str) -> u64 {
 /// 但绝对目标要先**换命名空间**: 文件服务只看得见自己那棵子树 (挂载点就是它的根),
 /// 不认识 `/mfs` 这一层挂载前缀 —— 直接存 `/mfs/a` 会变成服务内部的 `ROOT/mfs/a`,
 /// 解析必然失败。若目标落在**同一个**挂载点内, 这里剥掉前缀 (`/mfs/a` -> `/a`);
-/// 落在别的文件系统上则原样存下 (服务端解析不到, 成为悬空链接 —— 跨文件系统的软
-/// 链接本就不支持, 见 docs/roadmap-fs.md M5c)。相对目标不受影响, 原样存。
+/// 落在别的文件系统 (或未挂载路径) 上则**拒绝创建**: 服务端解析不到, 存下去只会是一个
+/// 悬空链接 —— 与其静默留个死链, 不如当场报错 (跨文件系统的软链接不支持, 见
+/// docs/roadmap-fs.md M5c)。相对目标不受影响, 原样存。
 pub fn symlink_into(target: &str, linkpath: &str, buf: u64) -> u64 {
     let (ld, lenc, lsub) = match route(linkpath) {
         Some(x) => x,
@@ -897,11 +981,13 @@ pub fn symlink_into(target: &str, linkpath: &str, buf: u64) -> u64 {
     }
     let mut tgt = target;
     if target.as_bytes()[0] == b'/' {
-        if let Some((td, tenc, tplen)) = mount_lookup(target) {
-            if td == ld && tenc == lenc {
+        match mount_lookup(target) {
+            Some((td, tenc, tplen)) if td == ld && tenc == lenc => {
                 let rest = &target[tplen..];
                 tgt = if rest.is_empty() { "/" } else { rest };
             }
+            // 别的挂载点 / 没有挂载点: 服务端无法解析, 不做悬空链接。
+            _ => return u64::MAX,
         }
     }
     // 两条路径要一起塞进共享页, 服务端按 `a_len + 1 + b_len` 校验, 这里先挡一次

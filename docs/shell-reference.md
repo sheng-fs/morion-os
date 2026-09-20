@@ -40,7 +40,9 @@ shell: type 'help' for commands
 | `ln -s` | `ln -s <target> <link-name>` | 建**软链接**（M5c；仅 MFS；目标原样存，可悬空） |
 | `chmod` | `chmod <octal-mode> <path>` | 设置权限位（仅 MFS 提供；只存储与显示，**不强制**） |
 | `truncate` | `truncate <file> <size>` | 把文件截断/扩展到 `<size>` 字节（扩展为稀疏） |
-| `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间 |
+| `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间（**跟随**软链接） |
+| `lstat` | `lstat <path>` | 同 `stat`，但作用于**链接自身**（不跟随；悬空链接也能看） |
+| `readlink` | `readlink <link>` | 打印软链接的目标字符串 |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
@@ -65,6 +67,8 @@ commands:
   chmod <mode> <path>  set permission bits (octal, display-only)
   truncate <file> <size>  resize a file (sparse on grow)
   stat <path>    show metadata (mode / owner / links / times)
+  lstat <path>   like stat but on the link itself (no follow)
+  readlink <link>  print a symbolic link's target (no follow)
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
@@ -141,15 +145,15 @@ commands:
 - 建**软链接**（M5c，仅 MFS 支持）：存的是**目标路径字符串**，解析时才解释。
 - `<target>` **不做路径解析**，原样存进链接节点：
   - 以 `/` 开头 = 绝对路径。落在**同一挂载点内**时前缀会被剥掉
-    （`ln -s /mfs/a /mfs/b` 存下的是 `/a`）；指到别的文件系统则成为**悬空链接**
-    （跨文件系统的软链接不支持）。
+    （`ln -s /mfs/a /mfs/b` 存下的是 `/a`）；指到**别的文件系统**（或没有挂载点的路径）
+    时**直接拒绝创建** —— 跨文件系统的软链接不支持，存成悬空链接只会让人分不清。
   - 否则 = 相对**链接所在目录**（不是相对当前目录）。
 - 目标**不必存在**（可以之后才创建，此时链接悬空：`ls -l` 能看到它，`cat`/`open` 会失败）。
 - 跟随语义：`cat` / `stat` / `open` 会**跟随**到目标；`rm` / `mv` / `rmdir` 作用于**链接自身**
   —— `rm link` 只摘掉链接，目标文件不受影响；`rmdir <指向目录的链接>` 会失败（它不是目录条目）。
   链接互相指、或指向自己时会**解析失败**（限深 16 层），不会挂死。
 - `ls -l` 里显示为 `lrwxrwxrwx`，`size=` 是**目标字符串长度**（不是目标文件大小）。
-  ⚠️ 目前没有 `readlink`，界面看不到目标串本身。
+  要看它指向哪里用 `readlink`，要看链接自身的元数据用 `lstat`。
 - 成功打印 `ln -s: <link-name> -> <target>`；用法错误：`ln: usage: ln -s <target> <link-name>`。
 - 失败：`ln -s: failed (name exists, target empty/too long, or no MFS): <link-name>`。
 
@@ -175,6 +179,22 @@ commands:
 - 时间格式 `YYYY-MM-DD HH:MM`（UTC，来自 CMOS RTC）；未知时间打印 `(unknown)`。
 - 失败：`stat: cannot stat <path>`。
 - 非 MFS 的服务返回默认值（权限 0755/0644、属主 0、链接数 1、时间未知）。
+- **跟随软链接**：`stat link` 打印的是目标文件的信息。
+
+### `lstat <path>`
+
+- 与 `stat` 同一套输出，区别是**不跟随**末段软链接 —— 打印链接自身：`Type: symbolic link`、
+  `Size` = 目标字符串长度。
+- 悬空链接 `stat` 会失败（`stat: cannot stat <path>`），`lstat` 仍能正常看到它是链接。
+- 失败：`lstat: cannot stat <path>`（与 `stat` 只差前缀）。
+
+### `readlink <link>`
+
+- 只打印软链接的目标字符串（**不跟随**）—— 与 Unix `readlink` 一致，只有目标一行，
+  不加 `link -> ` 前缀。返回的是建链时存下的那段路径，客户端已把挂载前缀加回
+  （服务端存 `/a`，这里显示 `/mfs/a`）。
+- 路径不是软链接（或为悬空链接之外的一般失败）：`readlink: not a symbolic link: <link>`。
+- 缺参数：`readlink: missing operand`；路径过长：`readlink: path too long`。
 
 ### `clear`
 

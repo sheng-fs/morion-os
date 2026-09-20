@@ -48,7 +48,7 @@
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
-| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
+| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
@@ -309,7 +309,7 @@
 - [x] **MorionFS 目录与长名**（`MFS4`：ext2 风格变长目录项 + `MFXI` 扩展目录块，名字 ≤255 字节、大小写敏感；IPC payload 32 → 96 字节以承载长路径）
 - [x] **MorionFS 节点元数据**（`MFS5`：时间戳（CMOS RTC）/权限/owner/链接数，`rename`（跨目录）/`truncate`（稀疏）/`chmod`，shell 增 `mv`/`chmod`/`truncate`/`stat`/`ls -l`）
 - [x] **MorionFS inode 号间接层 + 硬链接**（`MFS6`：目录项改存 inode 号，inode 表（索引块 → 表块）让多个名字共享一个对象；`ln` 落地；顺带删掉沿祖先链的逐级回写，写代价与目录深度无关）
-- [x] **MorionFS 软链接**（`MFSL` 节点类型：目标内联在节点里；路径解析跟随（绝对/相对/中间分量）+ 限深防环 16 层；`stat`/`cat` 跟随而 `rm`/`mv` 作用于链接自身；`ls -l` 显示 `l`；shell 增 `ln -s`）
+- [x] **MorionFS 软链接**（`MFSL` 节点类型：目标内联在节点里；路径解析跟随（绝对/相对/中间分量）+ 限深防环 16 层；`stat`/`cat` 跟随而 `rm`/`mv` 作用于链接自身；`ls -l` 显示 `l`；shell 增 `ln -s`；配套 `readlink`（读回目标）与 `lstat`（看链接自身）；跨文件系统目标创建即拒绝）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 可执行文件加载（当前所有服务共用一份扁平二进制，按域 id 分流）
 - [ ] 帧缓冲对用户态开放 / GUI 服务

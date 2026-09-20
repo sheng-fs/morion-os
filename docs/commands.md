@@ -220,7 +220,7 @@ bash scripts/probe-shell.sh "ls -l /mfs" "ln -s /mfs/A.TXT /mfs/L1" "cat /mfs/L1
 ```
 
 `probe-shell.sh` 是**调文件系统时的快速通道**：注入几条 shell 命令并打印串口日志，
-约 1 分钟出结果 —— 不必等整套 3.5~4 分钟的自测跑到出问题的那条用例（自测仍在后台跑，
+约 1 分钟出结果 —— 不必等整套 4 分钟的自测跑到出问题的那条用例（自测仍在后台跑，
 不干扰这几条命令）。⚠️ 它经 QEMU monitor 注入按键，**必须慢敲**：shell 输入信箱只有
 16 条，快了会丢字甚至把同一条命令提交两次（现象是路径少字符、或 `ln` 报"名字已存在"
 但其实刚建成功）。
@@ -239,7 +239,7 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-19）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-20）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -251,14 +251,29 @@ app 的 FS 自测（FS-1..FS-19）成功时几乎静默（末尾打印一行 `ap
 的相对目标、路径**中间**分量是目录链接；`stat` 跟随到目标类型、`readdir` 里才是链接；
 `rm` 摘链接后目标内容不变、`rmdir <指向目录的链接>` 必须失败、`mv` 移动链接自身且类型不丢；
 悬空链接「可建但 open 失败且名字被占」；互相指向与自指链接解析失败（不挂死）。
+**FS-20（M5c 配套）** 补上 `readlink` / `lstat`：`readlink` 对绝对 / 相对 / 带 `..` 三种目标
+**逐字节**往返（绝对目标要能还原出挂载前缀）；`lstat` 看链接自身（类型 LINK、size = 目标串长度）
+而 `stat` 跟随到目标；悬空链接 `stat` 失败但 `readlink`/`lstat` 正常；非链接上 `readlink` 必须失败；
+**跨挂载点的绝对目标创建必须失败**（`/usb/...`、`/tmp/...`、不存在的挂载点）。
 这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 
-> ⏱️ **自测整套约需 3.5~4 分钟**（约 2 万个块请求，IPC 一跳 ≈ 一个时钟 tick，故有效吞吐 ~100 请求/s）。
+> ⏱️ **自测整套约需 4~4.5 分钟**（约 2 万个块请求，IPC 一跳 ≈ 一个时钟 tick，故有效吞吐 ~100 请求/s）。
 > 期间日志会长时间「只有 shell 提示符、没有新行」，**这不是卡死** —— 别用几十秒的超时去判定失败，
 > 请给足 ≥ 300 s（脚本内先 `grep 'SELFTEST DONE'` 再判）。`mfs-dbg`/`exfat-dbg` 行在挂载后立刻出现，
 > 之后到 `SELFTEST DONE` 之间的静默属正常。
-`mfs-dbg: vol=… total=… free=… gen=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
-（`free` 接近 `total`、`gen` 逐次启动单调增长）；`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
+>
+> **为什么耗时会长**：几乎全部集中在 **FS-12**（MFS 目录与长名：200 项 + 深目录 + 中途 3 遍
+> 显式**全卷 GC**），空白卷上单它就 ~170 s，占整套约 2/3；其余用例都在 40 s 以内。
+>
+> ⚠️ **持久卷会让同一二进制越跑越慢**：FS-5 / FS-10 每轮各留下一个快照（环形槽位上限 8），
+> 约 4 轮后饱和；快照永久钉住当时的可达块，而 `mfs_gc` 的可达根 = 当前 inode 表 **+ 每个快照**、
+> 且对每个根完整重走一遍。实测同一二进制：空白卷自测 **258 s**，快照饱和后 **524 s**
+> （FS-12 由 171 s 涨到 274 s）。所以 `scripts/fs-regress.sh` **默认把 `build/mfs.img` 重置成空白**
+> （mfs_srv 首次挂载自动格式化），需要保留上一轮的卷时用 `MFS_KEEP=1`。
+> 手动跑（`make run-nvme`）不受影响，卷照旧持久。
+`mfs-dbg: vol=… total=… free=… gen=… snap=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
+（`free` 接近 `total`、`gen` 逐次启动单调增长；`snap` = 快照数，饱和时为 8，是上面那个「越跑越慢」的
+直接指标）；`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
 一行给出 exFAT 挂载后的卷参数，用于与宿主 `mkfs.exfat` 的参数对齐核对。
 **exFAT 写路径**另用宿主 `fsck.exfat -n build/exfat.img` 交叉验证：回归后应为
 `clean. directories 1, files 0`（写盘的位图 / FAT / entry set 一致性由 exfatprogs 独立判定）。

@@ -3651,6 +3651,24 @@ fn fs19_entry(dir: &str, name: &str) -> Option<vfs::DirEntry> {
     found
 }
 
+/// FS-20 辅助: `readlink` 并逐字节比对目标串。
+fn fs20_readlink_is(path: &str, want: &str) -> bool {
+    let n = vfs::readlink(path);
+    if n == u64::MAX || n as usize != want.len() {
+        return false;
+    }
+    let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, n as usize) };
+    got == want.as_bytes()
+}
+
+/// FS-20 辅助: 取 `path` **自身** (不跟随软链接) 的元数据。
+fn fs20_lstat(path: &str) -> Option<vfs::Stat> {
+    if vfs::lstat(path) != core::mem::size_of::<vfs::Stat>() as u64 {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned(vfs::RESULT_BUF as *const vfs::Stat) })
+}
+
 /// 域 7 — 测试应用: 经 libvfs 走通 read/write/readdir + FS-2/FS-3 全链路自测。
 /// 成功路径完全静默 (只保留失败信息), 避免刷屏打断 shell 提示符。
 fn app_main() {
@@ -5928,6 +5946,144 @@ fn app_main() {
         vfs::rmdir(F19_D);
         vfs::unlink(F19_T);
     }
+
+    // 23. FS-20 自测 (阶段 D/M5c 配套): `readlink` + `lstat`。
+    //     补上 M5c 落地时留下的两个缺口: 界面看不到链接指向哪里 (只有 readlink 能看),
+    //     以及悬空链接根本无法 stat (`stat` 一律跟随)。
+    {
+        const F20_T: &str = "/mfs/S20T.TXT";
+        const F20_L1: &str = "/mfs/S20L1";
+        const F20_L2: &str = "/mfs/S20L2";
+        const F20_L3: &str = "/mfs/S20L3";
+        const F20_L5: &str = "/mfs/S20L5";
+        // 幂等准备。
+        for p in [F20_L1, F20_L2, F20_L3, F20_L5, "/mfs/S20L4"] {
+            vfs::unlink(p);
+        }
+        vfs::unlink(F20_T);
+
+        let fd = vfs::creat(F20_T);
+        if fd == u64::MAX || !fs11_write_pages(fd, 0, 1, 0x70) {
+            println("app: FS20 create target FAILED");
+            return;
+        }
+        vfs::close(fd);
+
+        // (a) readlink 与 `ln -s` 的输入**逐字节往返**: 绝对目标原样回来
+        //     (服务端存的是剥掉挂载前缀的 `/S20T.TXT`, 客户端把前缀加回去)。
+        if vfs::symlink("/mfs/S20T.TXT", F20_L1) != 1 {
+            println("app: FS20 symlink abs FAILED");
+            return;
+        }
+        if !fs20_readlink_is(F20_L1, "/mfs/S20T.TXT") {
+            println("app: FS20 readlink abs FAILED");
+            return;
+        }
+        // (b) 相对目标**不加**前缀 (它相对链接所在目录, 与服务命名空间无关)。
+        if vfs::symlink("S20T.TXT", F20_L2) != 1 {
+            println("app: FS20 symlink rel FAILED");
+            return;
+        }
+        if !fs20_readlink_is(F20_L2, "S20T.TXT") {
+            println("app: FS20 readlink rel FAILED");
+            return;
+        }
+        // (c) 带 `..` 的相对目标同样原样返回。
+        if vfs::symlink("../S20T.TXT", F20_L5) != 1 {
+            println("app: FS20 symlink dotdot FAILED");
+            return;
+        }
+        if !fs20_readlink_is(F20_L5, "../S20T.TXT") {
+            println("app: FS20 readlink dotdot FAILED");
+            return;
+        }
+
+        // (d) lstat 看**链接自身**: 类型位 = LINK, size = 目标串长度 (存的是 `/S20T.TXT`
+        //     —— 9 字节, 挂载前缀已剥掉); 同一路径的 stat 则跟随到目标 (普通文件 / 4096)。
+        match fs20_lstat(F20_L1) {
+            Some(st)
+                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK
+                    && st.is_dir == 0
+                    && st.size == 9 => {}
+            _ => {
+                println("app: FS20 lstat link FAILED");
+                return;
+            }
+        }
+        match fs13_stat(F20_L1) {
+            Some(st)
+                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE
+                    && st.size == 4096 => {}
+            _ => {
+                println("app: FS20 stat-through-link FAILED");
+                return;
+            }
+        }
+
+        // (e) 悬空链接: `stat` 必然失败 (跟随不到), 而 `lstat` / `readlink` 都正常 ——
+        //     这正是 `lstat` 存在的意义。
+        if vfs::symlink("/mfs/S20NOPE.TXT", F20_L3) != 1 {
+            println("app: FS20 symlink dangling FAILED");
+            return;
+        }
+        if vfs::stat(F20_L3) != u64::MAX {
+            println("app: FS20 stat dangling should FAIL");
+            return;
+        }
+        if !fs20_readlink_is(F20_L3, "/mfs/S20NOPE.TXT") {
+            println("app: FS20 readlink dangling FAILED");
+            return;
+        }
+        match fs20_lstat(F20_L3) {
+            // "/S20NOPE.TXT" = 12 字节。
+            Some(st)
+                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK
+                    && st.size == 12 => {}
+            _ => {
+                println("app: FS20 lstat dangling FAILED");
+                return;
+            }
+        }
+
+        // (f) 非软链接上 readlink 必须失败 (普通文件 / 目录都不行)。
+        if vfs::readlink(F20_T) != u64::MAX || vfs::readlink("/mfs") != u64::MAX {
+            println("app: FS20 readlink non-link should FAIL");
+            return;
+        }
+        // (g) lstat 对普通文件 / 目录与 stat 等价。
+        match fs20_lstat(F20_T) {
+            Some(st) if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE && st.size == 4096 => {}
+            _ => {
+                println("app: FS20 lstat file FAILED");
+                return;
+            }
+        }
+        match fs20_lstat("/mfs") {
+            Some(st) if st.is_dir == 1 && st.size == 0 => {}
+            _ => {
+                println("app: FS20 lstat dir FAILED");
+                return;
+            }
+        }
+
+        // (h) 跨文件系统的绝对目标**拒绝创建**: 服务端解析不到别的挂载点, 与其留个
+        //     静默悬空链接, 不如当场失败 (这正是 readlink 能安全加回前缀的前提 --
+        //     绝对目标必然是同一个挂载点内的)。
+        if vfs::symlink("/usb/ANY.TXT", "/mfs/S20L4") != u64::MAX
+            || vfs::symlink("/tmp/ANY.TXT", "/mfs/S20L4") != u64::MAX
+            || vfs::symlink("/nosuchmount/A.TXT", "/mfs/S20L4") != u64::MAX
+        {
+            println("app: FS20 cross-fs symlink should FAIL");
+            return;
+        }
+
+        // 清理。
+        vfs::unlink(F20_L1);
+        vfs::unlink(F20_L2);
+        vfs::unlink(F20_L3);
+        vfs::unlink(F20_L5);
+        vfs::unlink(F20_T);
+    }
     println("app: SELFTEST DONE");
 }
 
@@ -6122,6 +6278,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  chmod <mode> <path>  set permission bits (octal, display-only)");
             println("  truncate <file> <size>  resize a file (sparse on grow)");
             println("  stat <path>    show metadata (mode / owner / links / times)");
+            println("  lstat <path>   like stat but on the link itself (no follow)");
+            println("  readlink <link>  print a symbolic link's target (no follow)");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
             println("  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)");
@@ -6138,7 +6296,9 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "ln" => shell_ln(st, arg),
         "chmod" => shell_chmod(st, arg),
         "truncate" => shell_truncate(st, arg),
-        "stat" => shell_stat(st, arg),
+        "stat" => shell_stat(st, arg, false),
+        "lstat" => shell_stat(st, arg, true),
+        "readlink" => shell_readlink(st, arg),
         "clear" => {
             sys_clear();
         }
@@ -6398,8 +6558,12 @@ fn shell_truncate(st: &ShellState, arg: &str) {
     }
 }
 
-/// `stat <path>` — 打印单条路径的完整元数据。
-fn shell_stat(st: &ShellState, arg: &str) {
+/// `stat <path>` / `lstat <path>` — 打印单条路径的完整元数据。
+///
+/// `no_follow = false` (`stat`) 跟随末段软链接 (悬空链接会失败, 与 Unix `stat` 一致);
+/// `no_follow = true` (`lstat`) 作用于链接自身 —— 类型显示为 `symbolic link`、
+/// `Size` 是**目标串长度**, 悬空链接也照样看得到。
+fn shell_stat(st: &ShellState, arg: &str, no_follow: bool) {
     if arg.is_empty() {
         println("stat: missing operand");
         return;
@@ -6411,8 +6575,14 @@ fn shell_stat(st: &ShellState, arg: &str) {
             return;
         }
     };
-    if vfs::stat_into(path, vfs::SHELL_RESULT_BUF) != core::mem::size_of::<vfs::Stat>() as u64 {
-        print("stat: cannot stat ");
+    let want = core::mem::size_of::<vfs::Stat>() as u64;
+    let got = if no_follow {
+        vfs::lstat_into(path, vfs::SHELL_RESULT_BUF)
+    } else {
+        vfs::stat_into(path, vfs::SHELL_RESULT_BUF)
+    };
+    if got != want {
+        print(if no_follow { "lstat: cannot stat " } else { "stat: cannot stat " });
         println(path);
         return;
     }
@@ -6433,6 +6603,36 @@ fn shell_stat(st: &ShellState, arg: &str) {
     print_time(st.mtime);
     print("  Change: ");
     print_time(st.ctime);
+}
+
+/// `readlink <link>` — 打印软链接**自身**的目标串 (不跟随)。
+///
+/// 输出的正是当初 `ln -s` 写的那个路径: 服务端存的是服务命名空间里的形式, 客户端
+/// `vfs::readlink_into` 会把挂载前缀加回去 (`/a` -> `/mfs/a`)。
+fn shell_readlink(st: &ShellState, arg: &str) {
+    if arg.is_empty() {
+        println("readlink: missing operand");
+        return;
+    }
+    let path = match resolve_in_cwd(st.cwd_str(), arg) {
+        Some(p) => p,
+        None => {
+            println("readlink: path too long");
+            return;
+        }
+    };
+    let n = vfs::readlink_into(path, vfs::SHELL_RESULT_BUF);
+    if n == u64::MAX || n == 0 {
+        print("readlink: not a symbolic link: ");
+        println(path);
+        return;
+    }
+    let raw = unsafe {
+        core::slice::from_raw_parts(vfs::SHELL_RESULT_BUF as *const u8, n as usize)
+    };
+    let target = unsafe { core::str::from_utf8_unchecked(raw) };
+    print_sanitized(target);
+    println("");
 }
 
 /// 按 8 / 10 进制解析无符号整数 (不带前缀, 空串/非法字符返回 None)。
@@ -10556,6 +10756,8 @@ fn mfs_main() {
     print_u64(unsafe { MFS_FREE_BLOCKS } as u64);
     print(" gen=");
     print_u64(unsafe { MFS_GEN });
+    print(" snap=");
+    print_u64(unsafe { MFS_SNAP_COUNT } as u64);
     println("");
 
     let mut msg = Message {
@@ -10708,6 +10910,27 @@ fn mfs_main() {
                 };
                 sys_reply(n);
             }
+            // 软链接配套 (M5c): 读**链接自身**的目标串 (不跟随)。
+            vfs::VFS_READLINK_TAG => {
+                let (buf, path) = parse_path_req(msg.payload.as_ptr());
+                let n = match mfs_normalize(path, &mut canon) {
+                    Some(nn) => mfs_readlink(&canon[..nn], buf),
+                    None => u64::MAX,
+                };
+                sys_reply(n);
+            }
+            // 取**链接自身**的元数据 (不跟随末段): 与 STAT 只差「末段是否跟随」。
+            vfs::VFS_LSTAT_TAG => {
+                let (buf, path) = parse_path_req(msg.payload.as_ptr());
+                let n = match mfs_normalize(path, &mut canon) {
+                    Some(nn) => match mfs_resolve_no_follow(&canon[..nn]) {
+                        Some(ino) => mfs_stat_into(mfs_ino_block(ino).unwrap_or_default(), buf),
+                        None => u64::MAX,
+                    },
+                    None => u64::MAX,
+                };
+                sys_reply(n);
+            }
             vfs::MFS_SNAP_TAG => {
                 // 快照表是**环形**: 满 (MFS_MAX_SNAP) 时先淘汰最旧一条, 为新快照腾位,
                 // 而不是直接失败 —— 表跨启动持久化在超级块里, 否则第 9 次起就再也建不出
@@ -10815,6 +11038,38 @@ fn mfs_node_type(block: u32) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// 读软链接 `path` **自身**的目标串到共享页 `buf`, 返回字节数 (不含 NUL)。
+///
+/// **不跟随**: 只对「末段是软链接」的路径有效, 普通文件 / 目录一律失败 (与 `readlink(2)`
+/// 一致 —— 它不会跟着链接往下走)。目标串是**服务命名空间**里的路径, 形如 `/a`;
+/// 把它还原成用户命名空间 (`/mfs/a`) 是客户端的事 (见 `vfs::readlink_into`)。
+fn mfs_readlink(canon: &[u8], buf: u64) -> u64 {
+    let ino = match mfs_resolve_no_follow(canon) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    // 类型用**条目**判断 (与 rm/mv 同口径): 刚解析完, `MFS_LEAF` 指向它的那条条目。
+    let loc = unsafe { MFS_LEAF };
+    if loc.dir_ino == 0 || !mfs_dir_load_loc(&loc) {
+        return u64::MAX;
+    }
+    if mfs_ent_type(mfs_c(), loc.off) != MFS_TYPE_LINK {
+        return u64::MAX;
+    }
+    let mut tmp = [0u8; MFS_LINK_MAX];
+    let n = match mfs_link_target(ino, &mut tmp) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    // 单条 IPC 能回的路径上限; 创建时已受限, 这里兜底。
+    let n = n.min(PAYLOAD_LEN - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n);
+        *(buf as *mut u8).add(n) = 0;
+    }
+    n as u64
 }
 
 /// 把节点 `block` 的大小与元数据写成 `vfs::Stat` 到共享页 `buf`, 返回写入字节数。
