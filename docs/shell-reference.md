@@ -37,6 +37,7 @@ shell: type 'help' for commands
 | `rm` | `rm <path>` | 删除文件；失败则按**空目录**删除 |
 | `mv` | `mv <src> <dst>` | 重命名 / 移动（同一次请求内跨目录；**不支持跨文件系统**） |
 | `ln` | `ln <file> <new-name>` | 给已有文件再加一个名字（**硬链接**；同文件系统、仅限文件） |
+| `ln -s` | `ln -s <target> <link-name>` | 建**软链接**（M5c；仅 MFS；目标原样存，可悬空） |
 | `chmod` | `chmod <octal-mode> <path>` | 设置权限位（仅 MFS 提供；只存储与显示，**不强制**） |
 | `truncate` | `truncate <file> <size>` | 把文件截断/扩展到 `<size>` 字节（扩展为稀疏） |
 | `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间 |
@@ -60,6 +61,7 @@ commands:
   rm <path>      remove file / empty directory
   mv <src> <dst> rename / move (same filesystem)
   ln <src> <dst> hard link an existing file (same filesystem)
+  ln -s <target> <name>  symbolic link (target kept verbatim; MFS only)
   chmod <mode> <path>  set permission bits (octal, display-only)
   truncate <file> <size>  resize a file (sparse on grow)
   stat <path>    show metadata (mode / owner / links / times)
@@ -133,6 +135,23 @@ commands:
 - 仅限**同一文件系统**（跨挂载点不支持）；目录不能硬链接（避免成环）；`<dst>` 必须不存在。
 - 成功打印 `ln: <dst> -> <src>`；用法错误：`ln: usage: ln <existing-file> <new-name>`。
 - 失败：`ln: failed (needs an existing file, new name, same fs): <src>`。
+
+### `ln -s <target> <link-name>`
+
+- 建**软链接**（M5c，仅 MFS 支持）：存的是**目标路径字符串**，解析时才解释。
+- `<target>` **不做路径解析**，原样存进链接节点：
+  - 以 `/` 开头 = 绝对路径。落在**同一挂载点内**时前缀会被剥掉
+    （`ln -s /mfs/a /mfs/b` 存下的是 `/a`）；指到别的文件系统则成为**悬空链接**
+    （跨文件系统的软链接不支持）。
+  - 否则 = 相对**链接所在目录**（不是相对当前目录）。
+- 目标**不必存在**（可以之后才创建，此时链接悬空：`ls -l` 能看到它，`cat`/`open` 会失败）。
+- 跟随语义：`cat` / `stat` / `open` 会**跟随**到目标；`rm` / `mv` / `rmdir` 作用于**链接自身**
+  —— `rm link` 只摘掉链接，目标文件不受影响；`rmdir <指向目录的链接>` 会失败（它不是目录条目）。
+  链接互相指、或指向自己时会**解析失败**（限深 16 层），不会挂死。
+- `ls -l` 里显示为 `lrwxrwxrwx`，`size=` 是**目标字符串长度**（不是目标文件大小）。
+  ⚠️ 目前没有 `readlink`，界面看不到目标串本身。
+- 成功打印 `ln -s: <link-name> -> <target>`；用法错误：`ln: usage: ln -s <target> <link-name>`。
+- 失败：`ln -s: failed (name exists, target empty/too long, or no MFS): <link-name>`。
 
 ### `chmod <octal-mode> <path>`
 
