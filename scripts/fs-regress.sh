@@ -1,11 +1,12 @@
 #!/bin/bash
 # 模拟镜像全量 FS 回归: 5 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT) 上跑
-# app 的 FS-1..FS-17 自测, 由日志判定通过与否。
+# app 的 FS-1..FS-20 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
-# ⏱️ 整套约 3.5~4 分钟: 约 2 万个块请求, IPC 一跳 ≈ 一个时钟 tick, 故有效吞吐
+# ⏱️ 整套约 4~4.5 分钟: 约 2 万个块请求, IPC 一跳 ≈ 一个时钟 tick, 故有效吞吐
 # 约 100 请求/s。期间日志会长时间「只有 shell 提示符、没有新行」, 这不是卡死。
+# 耗时集中在 FS-12 (MFS 目录与长名: 200 项 + 每次 3 遍显式全卷 GC), 单它就 ~170 s。
 #
 # 退出码: 0 = 自测跑完且无 FAILED/PANIC; 1 = 有失败或没等到结论。
 set -u
@@ -14,6 +15,22 @@ cd "$(dirname "$0")/.."
 OUT_DIR=${OUT_DIR:-build}
 log=${1:-/tmp/morion-fs-regress.log}
 rm -f "$log"
+
+# MFS 是**持久卷**, 而 FS-5 / FS-10 每轮各留下一个快照 (环形槽位上限 8), 约 4 轮就饱和。
+# 快照会永久钉住它当时的可达块, 而 `mfs_gc` 的可达根 = 当前 inode 表 **+ 每个快照**,
+# 且对每个根完整重走一遍 —— 于是同一个二进制**越跑越慢** (实测: 空白卷自测 258 s,
+# 快照环饱和后 524 s; FS-12 由 171 s 涨到 274 s)。故默认把卷重置成空白
+# (mfs_srv 首次挂载会自动格式化), 让每轮耗时可比。想留着上一轮的卷用 MFS_KEEP=1。
+if [ "${MFS_KEEP:-0}" = "1" ]; then
+  echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
+else
+  dd if=/dev/zero of="$OUT_DIR/mfs.img" bs=1M count="${MFS_MIB:-16}" status=none
+  echo "== 重置 MFS 卷: $OUT_DIR/mfs.img -> 空白 (首次挂载自动格式化)"
+fi
+
+# 记录耗时: 整套自测是一长串 IPC 往返 (每次请求 ≈ 一个时钟 tick), 加自测用例就会变慢,
+# 写进输出便于对比「是变慢了还是卡住了」。
+t0=$(date +%s)
 
 QEMU=${QEMU:-qemu-system-x86_64}
 BIOS=${BIOS:-/usr/share/edk2/x64/OVMF.4m.fd}
@@ -43,6 +60,7 @@ wait "$pid" 2>/dev/null
 done_n=$(grep -c 'SELFTEST DONE' "$log" 2>/dev/null || true)
 fail_n=$(grep -cE 'FAILED|PANIC' "$log" 2>/dev/null || true)
 echo "== 日志: $log"
+echo "== 耗时: $(($(date +%s) - t0)) 秒 (出现结论即停, 最长等 10 分钟)"
 echo "== SELFTEST DONE 次数: $done_n"
 echo "== FAILED/PANIC 次数: $fail_n"
 echo "== 额外卷挂载 (mount-dbg) =="
