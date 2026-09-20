@@ -216,9 +216,17 @@ grep -n "shell: type 'help'" build/s.log # 出现即已进 shell
 ```bash
 bash scripts/fs-regress.sh                   # 5 张模拟镜像跑全量自测 → /tmp/morion-fs-regress.log
 bash scripts/usb-ro.sh /dev/sda1 /dev/sda2   # 真盘只读端到端 (前后比对盘头 sha256)
+bash scripts/probe-shell.sh "ls -l /mfs" "ln -s /mfs/A.TXT /mfs/L1" "cat /mfs/L1"
 ```
 
-两者都用**退出码**表示结果（`0` = 通过），并自带日志落盘与失败明细输出。
+`probe-shell.sh` 是**调文件系统时的快速通道**：注入几条 shell 命令并打印串口日志，
+约 1 分钟出结果 —— 不必等整套 3.5~4 分钟的自测跑到出问题的那条用例（自测仍在后台跑，
+不干扰这几条命令）。⚠️ 它经 QEMU monitor 注入按键，**必须慢敲**：shell 输入信箱只有
+16 条，快了会丢字甚至把同一条命令提交两次（现象是路径少字符、或 `ln` 报"名字已存在"
+但其实刚建成功）。
+
+前两者都用**退出码**表示结果（`0` = 通过），并自带日志落盘与失败明细输出
+（`probe-shell.sh` 是诊断工具，恒返回 0）。
 `fs-regress.sh` 会轮询日志直到出现 `SELFTEST DONE` / `FAILED` / `PANIC` ——
 别用几十秒的超时去判失败（见下）。`usb-ro.sh` 把每个参数设备以 `readonly=on` 作
 namespace 6, 7, 8… 接入，跑之前需要先给当前用户**读**权限：
@@ -231,7 +239,7 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-18）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-19）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -239,6 +247,11 @@ app 的 FS 自测（FS-1..FS-18）成功时几乎静默（末尾打印一行 `ap
 **全程只读**；失败会打印 `app: FS17 … FAILED`。
 **FS-18** 是 fat32 的**大文件写路径**用例：写 100000 字节跨簇、逐簇读回校验、UNLINK 释放簇链
 （4 KiB 簇跨 25 簇、32 KiB 簇跨 4 簇），补上之前只有小文件 mkdir/creat/write 的缺口。
+**FS-19（M5c）** 是**软链接**用例（全在 `/mfs` 下，只有 MFS 支持）：绝对 / 同目录相对 / 带 `..`
+的相对目标、路径**中间**分量是目录链接；`stat` 跟随到目标类型、`readdir` 里才是链接；
+`rm` 摘链接后目标内容不变、`rmdir <指向目录的链接>` 必须失败、`mv` 移动链接自身且类型不丢；
+悬空链接「可建但 open 失败且名字被占」；互相指向与自指链接解析失败（不挂死）。
+这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 
 > ⏱️ **自测整套约需 3.5~4 分钟**（约 2 万个块请求，IPC 一跳 ≈ 一个时钟 tick，故有效吞吐 ~100 请求/s）。
 > 期间日志会长时间「只有 shell 提示符、没有新行」，**这不是卡死** —— 别用几十秒的超时去判定失败，
