@@ -68,6 +68,20 @@ pub const VFS_RENAME_TAG: u64 = 0x5245_4E4D; // "RENM"
 pub const VFS_CHMOD_TAG: u64 = 0x4348_4D44; // "CHMD"
 /// 硬链接: payload = `TwoPathReq`, 两条路径在共享页里 (`src\0dst`)。
 pub const VFS_LINK_TAG: u64 = 0x4C49_4E4B; // "LINK"
+/// 软链接 (M5c): payload = `TwoPathReq`, 共享页里是 `目标\0链接自身`。
+///
+/// 与硬链接的区别: `a` 是**目标字符串**, 原样存进链接节点, 不要求存在、不经挂载层
+/// 路由 (只有 `b` 即链接自身的路径需要路由)。
+pub const VFS_SYMLINK_TAG: u64 = 0x5359_4D4C; // "SYML"
+
+/// `Stat.mode` / `DirEntry.mode` 高 4 位的节点类型, 与 ext2 `i_mode` 的 `S_IFMT` 同构。
+///
+/// MFS 会填这几位 (故 `ls -l` 能显示 `l`); 其它文件服务的 `mode` 只有权限位、这几位
+/// 全 0, 显示时按 `is_dir` 回退。
+pub const MODE_FTYPE_MASK: u16 = 0xF000;
+pub const MODE_FTYPE_FILE: u16 = 0x8000;
+pub const MODE_FTYPE_DIR: u16 = 0x4000;
+pub const MODE_FTYPE_LINK: u16 = 0xA000;
 
 /// 挂载查询 tag: 请求 payload 为路径, 回复为 `(服务域 << 32) | 挂载点前缀长度`,
 /// 无匹配返回 `u64::MAX`。仅 mount_srv 处理。
@@ -856,6 +870,58 @@ pub fn link_into(src: &str, dst: &str, buf: u64) -> u64 {
         )
     };
     sys_call_payload(sd, with_vol(VFS_LINK_TAG, senc), payload)
+}
+
+/// 为 `linkpath` 建一个指向 `target` 的软链接 (M5c, 仅同一文件服务内)。成功返回 1。
+pub fn symlink(target: &str, linkpath: &str) -> u64 {
+    symlink_into(target, linkpath, RESULT_BUF)
+}
+
+/// 同 `symlink`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+///
+/// 只有 `linkpath` 走挂载层路由: `target` 是**存进链接节点的字符串**, 由服务端在解析
+/// 时才解释 (绝对 / 相对), 因此不在这里查它的所属文件系统。
+///
+/// 但绝对目标要先**换命名空间**: 文件服务只看得见自己那棵子树 (挂载点就是它的根),
+/// 不认识 `/mfs` 这一层挂载前缀 —— 直接存 `/mfs/a` 会变成服务内部的 `ROOT/mfs/a`,
+/// 解析必然失败。若目标落在**同一个**挂载点内, 这里剥掉前缀 (`/mfs/a` -> `/a`);
+/// 落在别的文件系统上则原样存下 (服务端解析不到, 成为悬空链接 —— 跨文件系统的软
+/// 链接本就不支持, 见 docs/roadmap-fs.md M5c)。相对目标不受影响, 原样存。
+pub fn symlink_into(target: &str, linkpath: &str, buf: u64) -> u64 {
+    let (ld, lenc, lsub) = match route(linkpath) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    if target.is_empty() {
+        return u64::MAX;
+    }
+    let mut tgt = target;
+    if target.as_bytes()[0] == b'/' {
+        if let Some((td, tenc, tplen)) = mount_lookup(target) {
+            if td == ld && tenc == lenc {
+                let rest = &target[tplen..];
+                tgt = if rest.is_empty() { "/" } else { rest };
+            }
+        }
+    }
+    // 两条路径要一起塞进共享页, 服务端按 `a_len + 1 + b_len` 校验, 这里先挡一次
+    // (超长直接失败, 不写出一份会被服务端拒绝的请求)。
+    if tgt.len() + 1 + lsub.len() > PAYLOAD_LEN - 1 {
+        return u64::MAX;
+    }
+    let req = TwoPathReq {
+        a_len: tgt.len() as u32,
+        b_len: lsub.len() as u32,
+        buf,
+    };
+    write_two_paths(tgt, lsub, buf);
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const TwoPathReq as *const u8,
+            core::mem::size_of::<TwoPathReq>(),
+        )
+    };
+    sys_call_payload(ld, with_vol(VFS_SYMLINK_TAG, lenc), payload)
 }
 
 /// 把两条路径按 `src\0dst\0` 写进共享页。

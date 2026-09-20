@@ -1232,7 +1232,8 @@ fn parse_path_req(payload: *const u8) -> (u64, &'static str) {
 /// 从 `TwoPathReq` 取出调用方共享页里的两条路径 (`src\0dst`), 交给 `f`。
 ///
 /// 长度必须自洽且落在单条 IPC 可达范围内, 否则视为坏请求 (不信任客户端给的长度)。
-fn with_two_paths(payload: *const u8, f: fn(&str, &str) -> u64) -> u64 {
+/// `f` 是泛型而非 `fn` 指针: 软链接还要带一个 owner 参数, 用闭包捕获比再多传一层更直接。
+fn with_two_paths<F: FnOnce(&str, &str) -> u64>(payload: *const u8, f: F) -> u64 {
     let req: vfs::TwoPathReq =
         unsafe { core::ptr::read_unaligned(payload as *const vfs::TwoPathReq) };
     let total = req.a_len as usize + 1 + req.b_len as usize;
@@ -3607,6 +3608,14 @@ fn fs13_stat(path: &str) -> Option<vfs::Stat> {
     Some(unsafe { core::ptr::read_unaligned(vfs::RESULT_BUF as *const vfs::Stat) })
 }
 
+/// FS-13 辅助: 从 `mode` 取**权限位** (低 12 位)。
+///
+/// M5c 起 `mode` 的高 4 位是节点类型 (见 `vfs::MODE_FTYPE_*`), 自测比较权限时统一用它
+/// 剥掉类型位, 否则「0o644」这类断言会被类型位顶掉。
+fn fs13_perm(mode: u16) -> u16 {
+    mode & !vfs::MODE_FTYPE_MASK
+}
+
 /// FS-13 辅助: 读 `fd` 的 [off, off+count) 并确认整段为 0 (稀疏区验证用)。
 fn fs13_all_zero(fd: u64, off: u32, count: u32) -> bool {
     if vfs::read(fd, off, count) != count as u64 {
@@ -3614,6 +3623,32 @@ fn fs13_all_zero(fd: u64, off: u32, count: u32) -> bool {
     }
     let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, count as usize) };
     got.iter().all(|&b| b == 0)
+}
+
+/// FS-19 辅助: 在目录 `dir` 的 readdir 结果里按**长名**取条目, 用于检查类型位与 size。
+fn fs19_entry(dir: &str, name: &str) -> Option<vfs::DirEntry> {
+    let fd = vfs::open(dir);
+    if fd == u64::MAX {
+        return None;
+    }
+    let n = vfs::readdir(fd);
+    vfs::close(fd);
+    if n == u64::MAX {
+        return None;
+    }
+    let entry_size = core::mem::size_of::<vfs::DirEntry>();
+    let count = n as usize / entry_size;
+    let list =
+        unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, count) };
+    let q = name.as_bytes();
+    let mut found = None;
+    for de in list {
+        let llen = de.long_len as usize;
+        if llen == q.len() && &de.long[..llen] == q {
+            found = Some(*de);
+        }
+    }
+    found
 }
 
 /// 域 7 — 测试应用: 经 libvfs 走通 read/write/readdir + FS-2/FS-3 全链路自测。
@@ -4795,6 +4830,18 @@ fn app_main() {
     /// 2020-01-01T00:00:00Z —— RTC 只要正常就应大于它。
     const FS13_EPOCH_FLOOR: u64 = 1_577_836_800;
 
+    // 幂等准备: `/mfs` 是持久卷, 上一轮若在自测中途被打断 (或被 kill), 这些对象会留在
+    // 卷上, 让下面的 `mkdir` 因「已存在」失败并传染后续所有步骤。先清成干净状态。
+    // 顺序: 先摘文件, 再自底向上删目录 (目录非空删不掉)。
+    vfs::unlink("/mfs/M5/SUB2/B.TXT");
+    vfs::unlink("/mfs/M5/SUB/B.TXT");
+    vfs::unlink("/mfs/M5/C.TXT");
+    vfs::unlink("/mfs/M5/A.TXT");
+    vfs::rmdir("/mfs/M5/SUB2/INNER");
+    vfs::rmdir("/mfs/M5/SUB2");
+    vfs::rmdir("/mfs/M5/SUB");
+    vfs::rmdir("/mfs/M5");
+
     if vfs::mkdir(FS13_DIR) != 1 || vfs::mkdir(FS13_SUB) != 1 {
         println("app: FS13 mkdir FAILED");
         return;
@@ -4822,7 +4869,7 @@ fn app_main() {
         println("app: FS13 owner FAILED");
         return;
     }
-    if st13.mode != 0o644 || st13.nlink != 1 || st13.is_dir != 0 {
+    if fs13_perm(st13.mode) != 0o644 || st13.nlink != 1 || st13.is_dir != 0 {
         println("app: FS13 default meta FAILED");
         return;
     }
@@ -4840,7 +4887,7 @@ fn app_main() {
         println("app: FS13 chmod FAILED");
         return;
     }
-    if fs13_stat(FS13_FILE).map(|s| s.mode) != Some(0o600) {
+    if fs13_stat(FS13_FILE).map(|s| fs13_perm(s.mode)) != Some(0o600) {
         println("app: FS13 chmod readback FAILED");
         return;
     }
@@ -4855,7 +4902,7 @@ fn app_main() {
             return;
         }
     };
-    if st13b.mode != 0o600 || st13b.ctime < FS13_EPOCH_FLOOR {
+    if fs13_perm(st13b.mode) != 0o600 || st13b.ctime < FS13_EPOCH_FLOOR {
         println("app: FS13 meta lost after GC FAILED");
         return;
     }
@@ -4931,7 +4978,7 @@ fn app_main() {
         return;
     }
     vfs::close(moved);
-    if fs13_stat(FS13_MOVED).map(|s| (s.mode, s.size)) != Some((0o600, 4096)) {
+    if fs13_stat(FS13_MOVED).map(|s| (fs13_perm(s.mode), s.size)) != Some((0o600, 4096)) {
         println("app: FS13 renamed meta FAILED");
         return;
     }
@@ -4999,7 +5046,9 @@ fn app_main() {
     if dent13 != 2
         || !dlist13
             .iter()
-            .all(|de| de.mode != 0 && de.mtime >= FS13_EPOCH_FLOOR && de.owner == APP_DOMAIN as u16)
+            .all(|de| fs13_perm(de.mode) != 0
+                && de.mtime >= FS13_EPOCH_FLOOR
+                && de.owner == APP_DOMAIN as u16)
     {
         println("app: FS13 readdir meta FAILED");
         return;
@@ -5023,7 +5072,7 @@ fn app_main() {
     }
     let ok_after = fs11_verify_pages(after, 0, 1, 0x60);
     vfs::close(after);
-    if !ok_after || fs13_stat(FS13_DST).map(|s| s.mode) != Some(0o600) {
+    if !ok_after || fs13_stat(FS13_DST).map(|s| fs13_perm(s.mode)) != Some(0o600) {
         println("app: FS13 content after GC FAILED");
         return;
     }
@@ -5078,7 +5127,7 @@ fn app_main() {
             return;
         }
     };
-    if sa.nlink != 2 || sb.nlink != 2 || sa.size != 4096 || sa.mode != 0o644 {
+    if sa.nlink != 2 || sb.nlink != 2 || sa.size != 4096 || fs13_perm(sa.mode) != 0o644 {
         println("app: FS14 nlink FAILED");
         return;
     }
@@ -5623,6 +5672,262 @@ fn app_main() {
             return;
         }
     }
+
+    // 22. FS-19 自测 (阶段 D/M5c): 软链接 —— 新节点类型 MFSL + 解析跟随 + 限深防环。
+    //     全在 `/mfs` 下做 (软链接只有 MFS 支持)。三类断言:
+    //       a) 跟随: 读链接等于读目标 (绝对目标 / 同目录相对目标 / 带 `..` 的相对目标 /
+    //          路径**中间**分量是目录链接); `stat` 链接跟随到目标类型 (不是 "symbolic
+    //          link"); readdir 里它才是链接 (mode 高位 = LINK, size = 目标串长度)。
+    //       b) 不跟随: `rm`/`mv`/`rmdir` 作用于链接自身 —— 摘掉链接后目标内容必须还在,
+    //          且 `rmdir <指向目录的链接>` 必须失败 (它不是目录条目)。
+    //       c) 防环: 互相指向 / 自指的链接在解析时报错, 不挂死、不无限展开。
+    {
+        const F19_T: &str = "/mfs/S19T.TXT";
+        const F19_D: &str = "/mfs/D19";
+        const F19_F: &str = "/mfs/D19/F.TXT";
+        // 幂等: /mfs 是持久卷, 清掉上一轮被中断可能残留的对象 (软链接用 unlink 摘)。
+        // 顺序: 先摘链接再删目录, 否则目录非空删不掉。
+        for p in [
+            "/mfs/S19L1",
+            "/mfs/S19L2",
+            "/mfs/S19L2R",
+            "/mfs/D19/S19L3",
+            "/mfs/S19LD",
+            "/mfs/S19L5",
+            "/mfs/C19A",
+            "/mfs/C19B",
+            "/mfs/C19C",
+        ] {
+            vfs::unlink(p);
+        }
+        vfs::unlink(F19_F);
+        vfs::rmdir(F19_D);
+        vfs::unlink(F19_T);
+
+        // 目标文件 (1 页, 内容标记 0x50)。
+        let fd = vfs::creat(F19_T);
+        if fd == u64::MAX || !fs11_write_pages(fd, 0, 1, 0x50) {
+            println("app: FS19 create target FAILED");
+            return;
+        }
+        vfs::close(fd);
+
+        // (a1) 绝对目标: 读链接 == 读目标。
+        if vfs::symlink("/mfs/S19T.TXT", "/mfs/S19L1") != 1 {
+            println("app: FS19 symlink abs FAILED");
+            return;
+        }
+        let lfd = vfs::open("/mfs/S19L1");
+        if lfd == u64::MAX {
+            println("app: FS19 open through abs link FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(lfd, 0, 1, 0x50);
+        vfs::close(lfd);
+        if !ok {
+            println("app: FS19 read through abs link FAILED");
+            return;
+        }
+
+        // (a2) stat 跟随: 报的是**目标**的类型与大小, 不是链接。
+        match fs13_stat("/mfs/S19L1") {
+            Some(st)
+                if st.size == 4096
+                    && st.is_dir == 0
+                    && st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE => {}
+            _ => {
+                println("app: FS19 stat through link FAILED");
+                return;
+            }
+        }
+
+        // (a3) readdir 看到的是**链接本身**: 类型位 = LINK, size = 目标串长度。
+        //      存下的是服务命名空间里的目标: 客户端已把挂载前缀 `/mfs` 剥掉,
+        //      "/mfs/S19T.TXT" -> "/S19T.TXT" (9 字节)。
+        match fs19_entry("/mfs", "S19L1") {
+            Some(de)
+                if de.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK
+                    && de.is_dir == 0
+                    && de.size == 9 => {}
+            _ => {
+                println("app: FS19 readdir link entry FAILED");
+                return;
+            }
+        }
+
+        // (a4) 同目录相对目标 ("S19T.TXT" 相对链接所在目录 /mfs)。
+        if vfs::symlink("S19T.TXT", "/mfs/S19L2") != 1 {
+            println("app: FS19 symlink rel FAILED");
+            return;
+        }
+        let lfd = vfs::open("/mfs/S19L2");
+        if lfd == u64::MAX {
+            println("app: FS19 open through rel link FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(lfd, 0, 1, 0x50);
+        vfs::close(lfd);
+        if !ok {
+            println("app: FS19 read through rel link FAILED");
+            return;
+        }
+
+        // (a5) 带 `..` 的相对目标: 链接在 /mfs/D19 里, 目标 "../D19/F.TXT"。
+        //      相对基准是**链接所在目录** (/mfs/D19), 展开后为 /mfs/D19/../D19/F.TXT,
+        //      必须重新规范化成 /mfs/D19/F.TXT 才找得到。
+        if vfs::mkdir(F19_D) != 1 {
+            println("app: FS19 mkdir D19 FAILED");
+            return;
+        }
+        let fd = vfs::creat(F19_F);
+        if fd == u64::MAX || !fs11_write_pages(fd, 0, 1, 0x60) {
+            println("app: FS19 create D19/F FAILED");
+            return;
+        }
+        vfs::close(fd);
+        if vfs::symlink("../D19/F.TXT", "/mfs/D19/S19L3") != 1 {
+            println("app: FS19 symlink dotdot FAILED");
+            return;
+        }
+        let lfd = vfs::open("/mfs/D19/S19L3");
+        if lfd == u64::MAX {
+            println("app: FS19 open through dotdot link FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(lfd, 0, 1, 0x60);
+        vfs::close(lfd);
+        if !ok {
+            println("app: FS19 dotdot link target FAILED");
+            return;
+        }
+
+        // (a6) **中间分量**是目录链接: /mfs/S19LD -> /mfs/D19, 打开 /mfs/S19LD/F.TXT。
+        if vfs::symlink("/mfs/D19", "/mfs/S19LD") != 1 {
+            println("app: FS19 symlink dir FAILED");
+            return;
+        }
+        let lfd = vfs::open("/mfs/S19LD/F.TXT");
+        if lfd == u64::MAX {
+            println("app: FS19 open via dir link FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(lfd, 0, 1, 0x60);
+        vfs::close(lfd);
+        if !ok {
+            println("app: FS19 dir-link traversal FAILED");
+            return;
+        }
+
+        // (b1) rmdir 一个**指向目录的链接**必须失败 (它不是目录条目, 不能跟随)。
+        if vfs::rmdir("/mfs/S19LD") != u64::MAX {
+            println("app: FS19 rmdir dir-link should FAIL");
+            return;
+        }
+        // (b2) rm 摘掉链接; 目标目录与其中的文件都不受影响。
+        if vfs::unlink("/mfs/S19LD") != 1 {
+            println("app: FS19 unlink dir-link FAILED");
+            return;
+        }
+        if vfs::stat("/mfs/D19/F.TXT") == u64::MAX {
+            println("app: FS19 target removed by link unlink FAILED");
+            return;
+        }
+
+        // (b3) 摘掉链接后, 目标文件内容必须原封不动。
+        if vfs::unlink("/mfs/S19L1") != 1 {
+            println("app: FS19 unlink link FAILED");
+            return;
+        }
+        let tfd = vfs::open(F19_T);
+        if tfd == u64::MAX {
+            println("app: FS19 target gone after unlink FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(tfd, 0, 1, 0x50);
+        vfs::close(tfd);
+        if !ok {
+            println("app: FS19 unlink touched target FAILED");
+            return;
+        }
+        // 链接已不存在: 经它打开必须失败。
+        if vfs::open("/mfs/S19L1") != u64::MAX {
+            println("app: FS19 link still resolvable FAILED");
+            return;
+        }
+
+        // (b4) mv 移动的是链接自身 (不跟随): 改名后仍是链接, 且仍能读到目标。
+        if vfs::rename("/mfs/S19L2", "/mfs/S19L2R") != 1 {
+            println("app: FS19 rename link FAILED");
+            return;
+        }
+        match fs19_entry("/mfs", "S19L2R") {
+            Some(de) if de.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK => {}
+            _ => {
+                println("app: FS19 link type lost after rename FAILED");
+                return;
+            }
+        }
+        let lfd = vfs::open("/mfs/S19L2R");
+        if lfd == u64::MAX {
+            println("app: FS19 open renamed link FAILED");
+            return;
+        }
+        let ok = fs11_verify_pages(lfd, 0, 1, 0x50);
+        vfs::close(lfd);
+        if !ok {
+            println("app: FS19 renamed link target FAILED");
+            return;
+        }
+
+        // (c1) 悬空链接: 建得出来, 但解析 (open) 失败; 条目本身仍在 (不能再建同名)。
+        if vfs::symlink("/mfs/S19NOPE.TXT", "/mfs/S19L5") != 1 {
+            println("app: FS19 symlink dangling FAILED");
+            return;
+        }
+        if vfs::open("/mfs/S19L5") != u64::MAX {
+            println("app: FS19 dangling link should FAIL to open");
+            return;
+        }
+        if vfs::mkdir("/mfs/S19L5") != u64::MAX {
+            println("app: FS19 dangling link name should be taken");
+            return;
+        }
+        if vfs::unlink("/mfs/S19L5") != 1 {
+            println("app: FS19 unlink dangling link FAILED");
+            return;
+        }
+
+        // (c2) 互相指向 C19A <-> C19B: 解析必须失败 (限深), 且不能挂死。
+        if vfs::symlink("/mfs/C19B", "/mfs/C19A") != 1
+            || vfs::symlink("/mfs/C19A", "/mfs/C19B") != 1
+        {
+            println("app: FS19 symlink cycle setup FAILED");
+            return;
+        }
+        if vfs::open("/mfs/C19A") != u64::MAX || vfs::open("/mfs/C19B") != u64::MAX {
+            println("app: FS19 link cycle should FAIL to resolve");
+            return;
+        }
+        // (c3) 自指链接。
+        if vfs::symlink("/mfs/C19C", "/mfs/C19C") != 1 {
+            println("app: FS19 symlink self FAILED");
+            return;
+        }
+        if vfs::open("/mfs/C19C") != u64::MAX {
+            println("app: FS19 self link should FAIL to resolve");
+            return;
+        }
+
+        // 清理 (幂等准备里同样的清单)。
+        vfs::unlink("/mfs/S19L2R");
+        vfs::unlink("/mfs/D19/S19L3");
+        vfs::unlink("/mfs/C19A");
+        vfs::unlink("/mfs/C19B");
+        vfs::unlink("/mfs/C19C");
+        vfs::unlink(F19_F);
+        vfs::rmdir(F19_D);
+        vfs::unlink(F19_T);
+    }
     println("app: SELFTEST DONE");
 }
 
@@ -5813,6 +6118,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  rm <path>      remove file / empty directory");
             println("  mv <src> <dst> rename / move (same filesystem)");
             println("  ln <src> <dst> hard link an existing file (same filesystem)");
+            println("  ln -s <target> <name>  symbolic link (target kept verbatim; MFS only)");
             println("  chmod <mode> <path>  set permission bits (octal, display-only)");
             println("  truncate <file> <size>  resize a file (sparse on grow)");
             println("  stat <path>    show metadata (mode / owner / links / times)");
@@ -5891,11 +6197,7 @@ fn shell_ls(st: &ShellState, arg: &str) {
             print_entry_name(de);
             println("");
         } else {
-            if de.is_dir != 0 {
-                print("[DIR]  ");
-            } else {
-                print("[FILE] ");
-            }
+            print(entry_kind_label(de));
             print_entry_name(de);
             if de.is_dir == 0 {
                 print("  size=");
@@ -5986,32 +6288,59 @@ fn shell_mv(st: &ShellState, arg: &str) {
     }
 }
 
-/// `ln <src> <dst>` — 为已存在的文件再建一个名字 (硬链接, 仅同一文件系统)。
+/// `ln [-s] <target> <name>` — 硬链接 (`ln`) 或软链接 (`ln -s`, 阶段 D/M5c)。
 ///
-/// 两个名字共享同一个 inode: 从任一个名字改写内容, 另一个名字都会看到。
+/// 硬链接: 两个名字共享同一个 inode, 从任一个名字改写内容, 另一个名字都会看到。
+/// 软链接: 存的是**目标路径字符串**, `target` 原样落盘 —— 相对路径相对链接所在目录,
+/// 允许悬空 (目标可以之后才创建)。`rm` 一个软链接只摘掉链接, 不动目标。
 fn shell_ln(st: &ShellState, arg: &str) {
-    let (src_s, dst_s) = match arg.find(' ') {
-        Some(i) => (&arg[..i], arg[i + 1..].trim()),
+    let (sym, rest) = match arg.strip_prefix("-s") {
+        Some(r) => (true, r.trim()),
+        None => (false, arg),
+    };
+    let (src_s, dst_s) = match rest.find(' ') {
+        Some(i) => (&rest[..i], rest[i + 1..].trim()),
         None => {
-            println("ln: usage: ln <existing-file> <new-name>");
+            println(if sym {
+                "ln: usage: ln -s <target> <link-name>"
+            } else {
+                "ln: usage: ln <existing-file> <new-name>"
+            });
             return;
         }
     };
     if dst_s.is_empty() {
-        println("ln: usage: ln <existing-file> <new-name>");
+        println(if sym {
+            "ln: usage: ln -s <target> <link-name>"
+        } else {
+            "ln: usage: ln <existing-file> <new-name>"
+        });
+        return;
+    }
+    let dst = match resolve_in_cwd(st.cwd_str(), dst_s) {
+        Some(p) => p,
+        None => {
+            println("ln: target path too long");
+            return;
+        }
+    };
+    if sym {
+        // 目标**不做路径解析**: 它只是一段要存进链接节点的字符串。
+        if vfs::symlink_into(src_s, dst, vfs::SHELL_RESULT_BUF) == 1 {
+            print("ln -s: ");
+            print(dst);
+            print(" -> ");
+            println(src_s);
+        } else {
+            print("ln -s: failed (name exists, target empty/too long, or no MFS): ");
+            println(dst);
+        }
         return;
     }
     let src = match resolve_in_cwd(st.cwd_str(), src_s) {
         Some(p) => p,
         None => {
             println("ln: source path too long");
-            return;
-        }
-    };
-    let dst = match resolve_in_cwd(st.cwd_str(), dst_s) {
-        Some(p) => p,
-        None => {
-            println("ln: target path too long");
             return;
         }
     };
@@ -6091,7 +6420,7 @@ fn shell_stat(st: &ShellState, arg: &str) {
     print("  File: ");
     println(path);
     print("  Type: ");
-    println(if st.is_dir != 0 { "directory" } else { "regular file" });
+    println(entry_type_name(st.mode, st.is_dir != 0));
     print("  Mode: ");
     print_mode(st.mode, st.is_dir != 0);
     print("  Owner: domain ");
@@ -6132,11 +6461,25 @@ fn parse_radix(s: &str, radix: u32) -> Option<u32> {
     Some(v)
 }
 
-/// 打印 `-rwxr-xr-x` 形式的权限串 (目录首位为 'd')。
+/// 打印 `ls -l` / `stat` 用的类型+权限字符串 (10 字符)。
+///
+/// 首字符优先取 `mode` 高 4 位的类型位 (MFS 会填, 能区分出软链接 `l`); 没有类型位
+/// 的文件服务 (fat32 / ext2 / exFAT / tmpfs) 回退到 `is_dir`。
 fn print_mode(mode: u16, is_dir: bool) {
     const RWX: [u8; 9] = *b"rwxrwxrwx";
     let mut out = [b'-'; 10];
-    out[0] = if is_dir { b'd' } else { b'-' };
+    out[0] = match mode & vfs::MODE_FTYPE_MASK {
+        vfs::MODE_FTYPE_DIR => b'd',
+        vfs::MODE_FTYPE_LINK => b'l',
+        vfs::MODE_FTYPE_FILE => b'-',
+        _ => {
+            if is_dir {
+                b'd'
+            } else {
+                b'-'
+            }
+        }
+    };
     for (i, slot) in out.iter_mut().enumerate().skip(1) {
         let bit = 9 - i; // i=1 -> bit8 (owner r) ... i=9 -> bit0 (other x)
         if mode & (1 << bit) != 0 {
@@ -6144,6 +6487,37 @@ fn print_mode(mode: u16, is_dir: bool) {
         }
     }
     print(unsafe { core::str::from_utf8_unchecked(&out) });
+}
+
+/// 条目的类型短标签 (供 `ls` 非长格式显示)。
+fn entry_kind_label(de: &vfs::DirEntry) -> &'static str {
+    match de.mode & vfs::MODE_FTYPE_MASK {
+        vfs::MODE_FTYPE_DIR => "[DIR]  ",
+        vfs::MODE_FTYPE_LINK => "[LINK] ",
+        _ => {
+            if de.is_dir != 0 {
+                "[DIR]  "
+            } else {
+                "[FILE] "
+            }
+        }
+    }
+}
+
+/// `stat` 的 Type 行文本。
+fn entry_type_name(mode: u16, is_dir: bool) -> &'static str {
+    match mode & vfs::MODE_FTYPE_MASK {
+        vfs::MODE_FTYPE_DIR => "directory",
+        vfs::MODE_FTYPE_LINK => "symbolic link",
+        vfs::MODE_FTYPE_FILE => "regular file",
+        _ => {
+            if is_dir {
+                "directory"
+            } else {
+                "regular file"
+            }
+        }
+    }
 }
 
 /// 打印无符号整数, 不足 `width` 位左侧补 '0'。
@@ -7363,6 +7737,8 @@ const MFS_MAGIC_DIR: u32 = 0x4D46_4449; // "MFDI"
 /// 目录扩展索引块 (槽位全是扩展目录块指针)。
 const MFS_MAGIC_DIDX: u32 = 0x4D46_5849; // "MFXI"
 const MFS_MAGIC_FILE: u32 = 0x4D46_464C; // "MFFL"
+/// 软链接节点 (M5c): 目标路径内联存在节点 payload 里, 不占数据块。
+const MFS_MAGIC_LINK: u32 = 0x4D46_534C; // "MFSL"
 const MFS_MAGIC_DATA: u32 = 0x4D46_4441; // "MFDA"
 /// 一级间接块 (槽位全是数据块指针)。
 const MFS_MAGIC_IND: u32 = 0x4D46_494E; // "MFIN"
@@ -7390,8 +7766,21 @@ const MFS_META_ATIME: usize = 24;
 const MFS_MODE_DIR: u16 = 0o755;
 /// 新建文件的默认权限 (rw-r--r--)。
 const MFS_MODE_FILE: u16 = 0o644;
+/// 新建软链接的默认权限 (rwxrwxrwx; 与 Unix 一致, 链接自身的权限位无意义)。
+const MFS_MODE_LINK: u16 = 0o777;
 /// 权限位掩码 (只保留低 12 位: setuid/setgid/sticky + rwxrwxrwx)。
 const MFS_MODE_MASK: u16 = 0o7777;
+
+// `mode` 的高 4 位是**节点类型** (与 ext2 `i_mode` 的 S_IFMT 同构), 低 12 位是权限。
+//
+// 为什么要它: 目录/文件之外多了软链接, 而 `vfs::Stat` / `vfs::DirEntry` 只有
+// `is_dir` 一个类型信号 —— 光看它区分不出「普通文件」与「软链接」。把类型编码进
+// 已经存在的 `mode` 字段即可让 `ls -l` / `stat` 显示 `l`, 不必改协议结构体。
+// 非 MFS 的文件服务不填类型位 (mode 只有权限), 客户端按 `is_dir` 回退显示。
+const MFS_FTYPE_MASK: u16 = 0xF000;
+const MFS_FTYPE_FILE: u16 = 0x8000;
+const MFS_FTYPE_DIR: u16 = 0x4000;
+const MFS_FTYPE_LINK: u16 = 0xA000;
 
 // 目录块 payload 布局: +0 ext(扩展索引块号, 0 = 无) / +4 pad / +8 元数据(40) / +48 起条目区。
 //
@@ -7428,6 +7817,21 @@ const MFS_FILE_IND2_OFF: usize = MFS_FILE_IND1_OFF + 4;
 const MFS_FILE_RESERVED_OFF: usize = MFS_FILE_IND2_OFF + 4;
 /// inode 保留区字节数。
 const MFS_FILE_RESERVED: usize = MFS_BLOCK - MFS_FILE_RESERVED_OFF;
+
+// 软链接块 payload 布局 (M5c) —— **沿用文件布局**, 这样所有元数据读写函数用
+// `is_dir = false` 就能直接作用于软链接, 不必给它们再加一种节点类型分支:
+//
+//   +0 size(u32)  ← 复用文件的大小字段, 这里存**目标路径字节数** (`lstat` 的 size)
+//   +4 nblocks    ← 未用 (恒 0)
+//   +8 起         ← 目标路径字节 (UTF-8, 无结尾 NUL), 见 `MFS_LINK_TARGET_OFF`
+//   ...
+//   +MFS_FILE_RESERVED_OFF 起 40 字节元数据 (与文件同偏移)
+//
+// 目标内联在节点里 (fast symlink), 不占数据块 —— 软链接不参与硬链接, nlink 恒为 1。
+/// 软链接目标路径在节点 payload 里的起始偏移 (复用文件的直接块指针区)。
+const MFS_LINK_TARGET_OFF: usize = MFS_HDR + 8;
+/// 软链接目标路径长度上限 (实际还受单条 IPC 路径长度约束, 见 `MFS_PATH_MAX`)。
+const MFS_LINK_MAX: usize = MFS_FILE_RESERVED_OFF - MFS_LINK_TARGET_OFF;
 /// 布局自检: 直接指针区 + 两个间接指针 + 保留区正好铺满一个 4 KiB 块。
 const _: () = assert!(MFS_FILE_RESERVED >= 40);
 /// 每个间接块的指针槽数 (整个 payload 都是指针)。
@@ -7440,11 +7844,23 @@ const MFS_DATA_CAP: usize = MFS_PAYLOAD;
 // 深度上限按「单条 IPC 路径最长 95 字节、最短分量 1 字符 + '/'」估算 (≈47 级), 取 48;
 // M4 起目录可任意嵌套 (无额外结构限制), 限制只来自路径编码长度。
 const MFS_MAX_DEPTH: usize = 48;
+/// 解析路径的工作缓冲大小 (与单条 IPC 路径上限一致)。
+///
+/// 跟随软链接时会把「目标 + 剩余分量」重新组装成一条路径再解析, 组装结果也受这个
+/// 上限约束 —— 超长则解析失败 (返回 None), 而不是截断成一条错路径。
+const MFS_PATH_MAX: usize = TMP_PATH_MAX;
+/// 一条路径上最多跟随多少个软链接 (防环 + 限制展开长度)。
+///
+/// 环 (a→b→a) 会在这里被截住并返回"解析失败", 而不是无限展开; 正常的软链接链远
+/// 短于这个值。
+const MFS_SYMLINK_MAX_DEPTH: u32 = 16;
 const MFS_MAX_FD: usize = 16;
 
 // 节点类型 (目录项 type 字段)。
 const MFS_TYPE_FILE: u32 = 1;
 const MFS_TYPE_DIR: u32 = 2;
+/// 软链接 (M5c)。目录项只按这个类型区分, 具体目标在节点 payload 里。
+const MFS_TYPE_LINK: u32 = 3;
 
 // MFS6: 目录项存 **inode 号** 而不是块号, inode 号到块号的映射由一棵独立的 COW 树
 // 提供 (索引块 -> 表块 -> 槽位)。这样多个目录项可以指向同一个 inode (硬链接), 而
@@ -8094,6 +8510,10 @@ fn mfs_gc_drain(total: usize) -> bool {
                     return false;
                 }
             }
+        } else if mfs_ok(gb, MFS_MAGIC_LINK) {
+            // 软链接节点 (M5c): 目标内联在 payload 里, 不引用任何其它块 —— 到这一层
+            // 就算展开完了。少了这一支会掉进下面的 else 被判成「盘上结构不可信」,
+            // 于是**只要卷上存在软链接, 整次回收都会被放弃**。
         } else {
             // 可达块却既不是目录也不是文件节点: 说明盘上结构不可信, 放弃本次回收
             // (宁可漏回收, 也不能把仍被引用的块分配出去)。
@@ -8464,7 +8884,7 @@ fn mfs_format() -> bool {
     let buf = mfs_a();
     zero_bytes(buf, MFS_BLOCK);
     mfs_dir_init_empty(buf);
-    mfs_init_meta(buf, true, 0, MFS_MODE_DIR);
+    mfs_init_meta(buf, true, MFS_FTYPE_DIR, 0, MFS_MODE_DIR);
     let root = match mfs_commit(buf, MFS_MAGIC_DIR) {
         Some(b) => b,
         None => return false,
@@ -8505,8 +8925,12 @@ fn mfs_meta_off(is_dir: bool) -> usize {
 fn mfs_get_mode(buf: *const u8, is_dir: bool) -> u16 {
     read_u16(mfs_at(buf, mfs_meta_off(is_dir) + MFS_META_MODE))
 }
+/// 设置权限位 (低 12 位), **保留**高 4 位的节点类型 —— 类型随节点固定, `chmod` 不该
+/// 把文件改成目录 (或被软链接的形式掩盖)。
 fn mfs_set_mode(buf: *mut u8, is_dir: bool, v: u16) {
-    write_u16(mfs_atm(buf, mfs_meta_off(is_dir) + MFS_META_MODE), v & MFS_MODE_MASK);
+    let off = mfs_meta_off(is_dir) + MFS_META_MODE;
+    let ty = read_u16(mfs_at(buf, off)) & MFS_FTYPE_MASK;
+    write_u16(mfs_atm(buf, off), ty | (v & MFS_MODE_MASK));
 }
 fn mfs_get_owner(buf: *const u8, is_dir: bool) -> u16 {
     read_u16(mfs_at(buf, mfs_meta_off(is_dir) + MFS_META_OWNER))
@@ -8540,9 +8964,16 @@ fn mfs_set_atime(buf: *mut u8, is_dir: bool, v: u64) {
 }
 
 /// 初始化一个新建节点的元数据 (nlink = 1, 三个时间同刻)。
-fn mfs_init_meta(buf: *mut u8, is_dir: bool, owner: u16, mode: u16) {
+///
+/// `ftype` 是 `mode` 高 4 位的节点类型 (文件 / 目录 / 软链接); 节点刚清零过, 类型位
+/// 必须在这里写入 —— `mfs_set_mode` 是"保留类型"的, 零值下它只能写权限。
+fn mfs_init_meta(buf: *mut u8, is_dir: bool, ftype: u16, owner: u16, mode: u16) {
     let now = mfs_now();
-    mfs_set_mode(buf, is_dir, mode);
+    let off = mfs_meta_off(is_dir) + MFS_META_MODE;
+    write_u16(
+        mfs_atm(buf, off),
+        (ftype & MFS_FTYPE_MASK) | (mode & MFS_MODE_MASK),
+    );
     mfs_set_owner(buf, is_dir, owner);
     mfs_set_nlink(buf, is_dir, 1);
     mfs_set_mtime(buf, is_dir, now);
@@ -9397,45 +9828,148 @@ fn mfs_normalize(path: &str, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// 解析规范化绝对路径, 返回叶子节点的 **inode 号**。
+/// 读软链接节点 `ino` 的目标路径到 `out`, 返回目标字节数 (不含 NUL)。
+///
+/// 目标**原样**存储在节点里 (以 '/' 开头 = 绝对路径, 否则相对链接所在目录); 这里也
+/// 原样取出 —— 规范化与「绝对/相对」的判断都留给解析方。
+fn mfs_link_target(ino: u32, out: &mut [u8]) -> Option<usize> {
+    let blk = mfs_ino_block(ino)?;
+    if blk == 0 {
+        return None;
+    }
+    let a = mfs_a();
+    if !mfs_read_blk(blk, a) || !mfs_ok(a, MFS_MAGIC_LINK) {
+        return None;
+    }
+    let tlen = mfs_file_size(a) as usize;
+    if tlen == 0 || tlen > MFS_LINK_MAX || tlen > out.len() {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(mfs_at(a, MFS_LINK_TARGET_OFF), out.as_mut_ptr(), tlen);
+    }
+    Some(tlen)
+}
+
+/// 解析规范化绝对路径, 返回叶子节点的 **inode 号**, 沿途**跟随软链接**。
 ///
 /// 顺带把叶子条目位置记进 `MFS_LEAF` —— 需要改/删这个条目的调用方 (rename / unlink)
 /// 直接用它。MFS6 起解析不再需要沿途记录整条链: 目录项存 ino, 改对象不影响祖先。
 fn mfs_resolve(canon: &[u8]) -> Option<u32> {
+    mfs_resolve_ex(canon, true)
+}
+
+/// 同 `mfs_resolve`, 但**不跟随最后一段**上的软链接。
+///
+/// `unlink` / `rmdir` / `rename` 作用在条目本身 (删除、移动的是链接而不是它的目标),
+/// 用这个版本; 路径中间分量上的软链接仍然跟随 —— `/a/link/b` 必须走进 link 指到的
+/// 那个目录才能找到 b。
+fn mfs_resolve_no_follow(canon: &[u8]) -> Option<u32> {
+    mfs_resolve_ex(canon, false)
+}
+
+/// 解析主体。`follow_leaf` = 最后一段是软链接时是否跟随。
+///
+/// 跟随的实现是「就地展开 + 整条重走」: 把路径里那个链接分量替换成它的目标 (绝对目标
+/// 直接用, 相对目标接到链接所在目录之后), 保留其后的剩余分量, 重新规范化后从头再走
+/// 一遍。不接着展开点往下走, 是因为目标里的 `..` 可能吃掉展开点**之前**的目录, 分量
+/// 位置会整体变化; 从头重走只是多几次目录查找, 换来逻辑简单可靠。展开次数由
+/// `MFS_SYMLINK_MAX_DEPTH` 兜底, 因此链接成环只会解析失败, 不会无限展开。
+fn mfs_resolve_ex(canon: &[u8], follow_leaf: bool) -> Option<u32> {
     unsafe {
         MFS_LEAF = MFS_LOC_EMPTY;
     }
-    if canon == b"/" {
-        return Some(MFS_ROOT_INO);
+    if canon.len() > MFS_PATH_MAX {
+        return None;
     }
-    let mut cur = MFS_ROOT_INO;
-    let mut i = 1usize;
-    while i < canon.len() {
-        let start = i;
-        while i < canon.len() && canon[i] != b'/' {
-            i += 1;
-        }
-        let comp = &canon[start..i];
-        if i < canon.len() {
-            i += 1;
-        }
-        let loc = mfs_dir_lookup(cur, comp)?;
-        let child_ino = {
-            let c = mfs_c();
-            if !mfs_read_blk(loc.blk, c) || !mfs_ok(c, MFS_MAGIC_DIR) {
+    // 工作缓冲: 链接展开会就地重写整条路径。
+    let mut buf = [0u8; MFS_PATH_MAX];
+    let mut len = canon.len();
+    buf[..len].copy_from_slice(canon);
+    if len == 1 {
+        return Some(MFS_ROOT_INO); // 根
+    }
+    let mut links = 0u32;
+    loop {
+        let mut i = 1usize;
+        let mut cur = MFS_ROOT_INO;
+        // 本轮走到的软链接分量 (需展开): (分量起点, 分量终点, 链接 ino)。
+        let mut expand: Option<(usize, usize, u32)> = None;
+        while i < len {
+            let start = i;
+            while i < len && buf[i] != b'/' {
+                i += 1;
+            }
+            let comp_end = i;
+            let comp_len = comp_end - start;
+            if comp_len == 0 || comp_len > MFS_NAME_MAX {
                 return None;
             }
-            mfs_ent_ino(c, loc.off)
-        };
-        if child_ino == 0 {
-            return None;
+            let loc = mfs_dir_lookup(cur, &buf[start..comp_end])?;
+            // 条目可能落在扩展块里, 上一步的 C 缓冲已被覆盖 —— 重新读条目所在块。
+            let (child_ino, is_link) = {
+                let c = mfs_c();
+                if !mfs_read_blk(loc.blk, c) || !mfs_ok(c, MFS_MAGIC_DIR) {
+                    return None;
+                }
+                (
+                    mfs_ent_ino(c, loc.off),
+                    mfs_ent_type(c, loc.off) == MFS_TYPE_LINK,
+                )
+            };
+            if child_ino == 0 {
+                return None;
+            }
+            let is_leaf = comp_end >= len;
+            if is_link && (!is_leaf || follow_leaf) {
+                expand = Some((start, comp_end, child_ino));
+                break;
+            }
+            unsafe {
+                MFS_LEAF = loc;
+            }
+            cur = child_ino;
+            if is_leaf {
+                return Some(cur);
+            }
+            i = comp_end + 1; // 跳过 '/'
         }
-        unsafe {
-            MFS_LEAF = loc;
+        // 本轮没碰到软链接却走到了这里 —— 说明分量没走完 (规范化后的路径不该出现)。
+        let (start, comp_end, link_ino) = expand?;
+        links += 1;
+        if links > MFS_SYMLINK_MAX_DEPTH {
+            return None; // 链接成环 / 链过长
         }
-        cur = child_ino;
+        // 组装新路径: [父目录前缀] + 目标 + [剩余分量] (绝对目标不带父前缀)。
+        let mut target = [0u8; MFS_LINK_MAX];
+        let tlen = mfs_link_target(link_ino, &mut target)?;
+        let parent = if target[0] == b'/' { 0 } else { start };
+        let rest = &buf[comp_end..len]; // 以 '/' 开头, 或为空
+        let mut merged = [0u8; MFS_PATH_MAX];
+        let mut n = 0usize;
+        if parent > 0 {
+            merged[..parent].copy_from_slice(&buf[..parent]);
+            n = parent;
+        }
+        if n + tlen + rest.len() > MFS_PATH_MAX {
+            return None; // 展开后超长: 直接失败, 不截断成一条错路径
+        }
+        merged[n..n + tlen].copy_from_slice(&target[..tlen]);
+        n += tlen;
+        merged[n..n + rest.len()].copy_from_slice(rest);
+        n += rest.len();
+        // 目标里可能带 '.' / '..' / 重复 '/', 重新规范化后再整条重走。
+        let mut canon2 = [0u8; MFS_PATH_MAX];
+        let cn = mfs_normalize(
+            unsafe { core::str::from_utf8_unchecked(&merged[..n]) },
+            &mut canon2,
+        )?;
+        len = cn;
+        buf[..len].copy_from_slice(&canon2[..len]);
+        if len == 1 {
+            return Some(MFS_ROOT_INO);
+        }
     }
-    Some(cur)
 }
 
 /// 读取文件 `ino` 的 [offset, offset+count) 区间到 `dst`, 返回读取字节数。
@@ -9715,8 +10249,8 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
     if sn == dn && sc[..sn] == dc[..dn] {
         return 1;
     }
-    // 源必须存在。
-    let s_ino = match mfs_resolve(&sc[..sn]) {
+    // 源必须存在。**不跟随末段软链接**: `mv link dst` 移动的是链接本身。
+    let s_ino = match mfs_resolve_no_follow(&sc[..sn]) {
         Some(x) => x,
         None => return u64::MAX,
     };
@@ -9724,7 +10258,12 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
         Some(b) if b != 0 => b,
         _ => return u64::MAX,
     };
-    let s_is_dir = mfs_is_dir(sblock);
+    // 类型取自节点魔数: 条目类型要与它一致, 否则改名会把软链接变成普通文件。
+    let s_typ = match mfs_node_type(sblock) {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let s_is_dir = s_typ == MFS_TYPE_DIR;
     // 目录不能移进自己的子孙 (否则目录树成环, 解析会绕圈)。
     if s_is_dir && dn > sn && dc[..sn] == sc[..sn] && dc[sn] == b'/' {
         return u64::MAX;
@@ -9740,16 +10279,21 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
         return u64::MAX;
     }
     // 目标若已存在: 校验类型与空目录约束, 并在插入前删掉旧条目。
-    if let Some(d_ino) = mfs_resolve(&dc[..dn]) {
+    // 同样**不跟随**: 目标是一个悬空软链接时它「已存在」, 必须按已存在处理, 否则
+    // 会往目录里插出两条同名的条目。
+    if let Some(d_ino) = mfs_resolve_no_follow(&dc[..dn]) {
         let dblk = match mfs_ino_block(d_ino) {
             Some(b) if b != 0 => b,
             _ => return u64::MAX,
         };
-        let d_is_dir = mfs_is_dir(dblk);
-        if d_is_dir != s_is_dir {
-            return u64::MAX; // 类型不匹配 (文件 <-> 目录)
+        let d_typ = match mfs_node_type(dblk) {
+            Some(t) => t,
+            None => return u64::MAX,
+        };
+        if d_typ != s_typ {
+            return u64::MAX; // 类型不匹配 (文件 / 目录 / 软链接之间)
         }
-        if d_is_dir && mfs_dir_is_empty(d_ino) != Some(true) {
+        if d_typ == MFS_TYPE_DIR && mfs_dir_is_empty(d_ino) != Some(true) {
             return u64::MAX; // 目标目录非空
         }
         // 刚解析完目标, `MFS_LEAF` 就是指向它的那条条目。
@@ -9766,12 +10310,11 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let typ = if s_is_dir { MFS_TYPE_DIR } else { MFS_TYPE_FILE };
-    if !mfs_dir_insert(dparent_ino, dcomp, s_ino, typ) {
+    if !mfs_dir_insert(dparent_ino, dcomp, s_ino, s_typ) {
         return u64::MAX;
     }
     // 2) 再删掉旧名字 (解析一次以取得条目位置, 上一步的改动不影响 ino)。
-    if mfs_resolve(&sc[..sn]).is_none() {
+    if mfs_resolve_no_follow(&sc[..sn]).is_none() {
         return u64::MAX;
     }
     let sloc = unsafe { MFS_LEAF };
@@ -9844,7 +10387,8 @@ fn mfs_dir_emit(buf: *const u8, out: *mut vfs::DirEntry, count: &mut usize) {
             let s = mfs_s();
             let child = mfs_ino_block(mfs_ent_ino(buf, off)).unwrap_or_default();
             if child != 0 && mfs_read_blk(child, s) {
-                if !is_dir && mfs_ok(s, MFS_MAGIC_FILE) {
+                // 软链接也带出 size (= 目标路径长度, 同 `lstat`); 类型靠 `mode` 高位区分。
+                if !is_dir && (mfs_ok(s, MFS_MAGIC_FILE) || mfs_ok(s, MFS_MAGIC_LINK)) {
                     de.size = mfs_file_size(s);
                 }
                 de.mode = mfs_get_mode(s, is_dir);
@@ -10135,6 +10679,14 @@ fn mfs_main() {
             vfs::VFS_LINK_TAG => {
                 sys_reply(with_two_paths(msg.payload.as_ptr(), mfs_link));
             }
+            // 软链接 (M5c): 两条路径 = (目标, 链接自身)。目标的**原样**存储, 故只有
+            // 链接自身的路径经挂载层路由 (见 `vfs::symlink_into`)。
+            vfs::VFS_SYMLINK_TAG => {
+                let owner = msg.from as u16;
+                sys_reply(with_two_paths(msg.payload.as_ptr(), |t, l| {
+                    mfs_symlink(t, l, owner)
+                }));
+            }
             vfs::VFS_CHMOD_TAG => {
                 let req: vfs::PathReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::PathReq)
@@ -10248,16 +10800,37 @@ fn mfs_is_dir(block: u32) -> bool {
     mfs_read_blk(block, a) && mfs_ok(a, MFS_MAGIC_DIR)
 }
 
+/// 读节点块, 按魔数返回它的类型 (`MFS_TYPE_*`); 魔数不认识时返回 None。
+fn mfs_node_type(block: u32) -> Option<u32> {
+    let a = mfs_a();
+    if !mfs_read_blk(block, a) {
+        return None;
+    }
+    if mfs_ok(a, MFS_MAGIC_DIR) {
+        Some(MFS_TYPE_DIR)
+    } else if mfs_ok(a, MFS_MAGIC_FILE) {
+        Some(MFS_TYPE_FILE)
+    } else if mfs_ok(a, MFS_MAGIC_LINK) {
+        Some(MFS_TYPE_LINK)
+    } else {
+        None
+    }
+}
+
 /// 把节点 `block` 的大小与元数据写成 `vfs::Stat` 到共享页 `buf`, 返回写入字节数。
 fn mfs_stat_into(block: u32, buf: u64) -> u64 {
     let a = mfs_a();
     if !mfs_read_blk(block, a) {
         return u64::MAX;
     }
+    // 类型信息不必单列一个字段: 它已在 `mode` 的高 4 位里 (见 `MFS_FTYPE_*`)。
     let (size, is_dir) = if mfs_ok(a, MFS_MAGIC_FILE) {
         (mfs_file_size(a), false)
     } else if mfs_ok(a, MFS_MAGIC_DIR) {
         (0, true)
+    } else if mfs_ok(a, MFS_MAGIC_LINK) {
+        // 软链接的 size 是目标路径字节数 (与 Unix `lstat` 一致)。
+        (mfs_file_size(a), false)
     } else {
         return u64::MAX;
     };
@@ -10322,13 +10895,14 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     let c = mfs_c();
     zero_bytes(c, MFS_BLOCK);
     let mode = if is_dir { MFS_MODE_DIR } else { MFS_MODE_FILE };
+    let ftype = if is_dir { MFS_FTYPE_DIR } else { MFS_FTYPE_FILE };
     if is_dir {
         mfs_dir_init_empty(c);
     } else {
         mfs_file_set_size(c, 0);
         mfs_file_set_nblocks(c, 0);
     }
-    mfs_init_meta(c, is_dir, owner, mode);
+    mfs_init_meta(c, is_dir, ftype, owner, mode);
     let magic = if is_dir { MFS_MAGIC_DIR } else { MFS_MAGIC_FILE };
     // 先落对象块, 再为它登记一个 ino (登记时把表槽直接指向该块)。顺序反过来会先占
     // 一个空槽却还不知道块号, 需要写两次表。
@@ -10349,6 +10923,74 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     } else {
         mfs_fd_alloc(&canon[..n], false)
     }
+}
+
+/// 在 `linkpath` 建一个指向 `target` 的软链接 (M5c)。成功返回 1。
+///
+/// `target` **原样存储**: 不规范化、不做长度以外的校验, 也**不要求它存在** (允许悬空
+/// 链接 —— 目标可以是之后才创建的文件)。绝对/相对在**解析时**判断: 以 '/' 开头 =
+/// 从服务这棵树的根开始, 否则相对链接**所在目录**。
+///
+/// 注意绝对目标是**服务自己命名空间**里的路径, 不含挂载前缀 —— 客户端侧的
+/// `vfs::symlink_into` 已经把同挂载点内的前缀剥掉了 (`/mfs/a` -> `/a`); 服务端
+/// 只看得见自己这棵子树, 无从知道挂载点叫什么。
+///
+/// 软链接节点沿用文件布局 (目标内联在 payload 里, 不占数据块), 故元数据用
+/// `is_dir = false` 读写; 它不参与硬链接, `nlink` 恒为 1。
+fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
+    let tb = target.as_bytes();
+    if tb.is_empty() || tb.len() > MFS_LINK_MAX {
+        return u64::MAX;
+    }
+    let mut canon = [0u8; MFS_PATH_MAX];
+    let n = match mfs_normalize(linkpath, &mut canon) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    if n == 1 {
+        return u64::MAX; // 不能把根变成软链接
+    }
+    // 已存在同名的任何条目都拒绝 (不覆盖) —— 含既有软链接 (含悬空的)。
+    if mfs_resolve_no_follow(&canon[..n]).is_some() {
+        return u64::MAX;
+    }
+    let mut split = n;
+    while split > 1 && canon[split - 1] != b'/' {
+        split -= 1;
+    }
+    let parent_end = if split > 1 { split - 1 } else { 1 };
+    let comp = &canon[split..n];
+    if comp.is_empty() {
+        return u64::MAX;
+    }
+    let parent_ino = match mfs_resolve(&canon[..parent_end]) {
+        Some(x) => x,
+        None => return u64::MAX,
+    };
+    if mfs_dir_lookup(parent_ino, comp).is_some() {
+        return u64::MAX;
+    }
+    // 目标内联进节点 (复用文件布局的 size 字段存目标长度)。
+    let c = mfs_c();
+    zero_bytes(c, MFS_BLOCK);
+    mfs_file_set_size(c, tb.len() as u32);
+    mfs_file_set_nblocks(c, 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(tb.as_ptr(), mfs_atm(c, MFS_LINK_TARGET_OFF), tb.len());
+    }
+    mfs_init_meta(c, false, MFS_FTYPE_LINK, owner, MFS_MODE_LINK);
+    let obj = match mfs_commit(c, MFS_MAGIC_LINK) {
+        Some(b) => b,
+        None => return u64::MAX,
+    };
+    let child_ino = match mfs_ino_alloc_for(obj) {
+        Some(i) => i,
+        None => return u64::MAX,
+    };
+    if !mfs_dir_insert(parent_ino, comp, child_ino, MFS_TYPE_LINK) {
+        return u64::MAX;
+    }
+    1
 }
 
 /// 为已存在的文件 `src` 在 `dst` 再加一个名字 (硬链接)。成功返回 1。
@@ -10433,11 +11075,13 @@ fn mfs_remove(path: &str, want_dir: bool) -> u64 {
     if n == 1 {
         return u64::MAX; // 不允许删除根
     }
-    let ino = match mfs_resolve(&canon[..n]) {
+    let ino = match mfs_resolve_no_follow(&canon[..n]) {
         Some(x) => x,
         None => return u64::MAX,
     };
     // 刚解析完, `MFS_LEAF` 就是指向它的那条条目 (可能在扩展块里)。
+    // 用**不跟随**的解析: `rm`/`rmdir` 删的是条目本身 —— `rm link` 摘掉的是软链接,
+    // 绝不能跟着目标去删目标文件。
     let loc = unsafe { MFS_LEAF };
     if loc.dir_ino == 0 {
         return u64::MAX;
@@ -10445,7 +11089,8 @@ fn mfs_remove(path: &str, want_dir: bool) -> u64 {
     if !mfs_dir_load_loc(&loc) {
         return u64::MAX;
     }
-    let is_dir = mfs_ent_type(mfs_c(), loc.off) == MFS_TYPE_DIR;
+    let typ = mfs_ent_type(mfs_c(), loc.off);
+    let is_dir = typ == MFS_TYPE_DIR;
     if want_dir != is_dir {
         return u64::MAX;
     }
@@ -10460,10 +11105,15 @@ fn mfs_remove(path: &str, want_dir: bool) -> u64 {
         }
         return 1;
     }
-    // 文件: 先摘掉这个条目, 再递减链接数; 还有别的名字就只更新计数, 否则释放 ino。
+    // 非目录 (普通文件 / 软链接): 先摘掉这个条目。
     if !mfs_dir_delete(&loc) {
         return u64::MAX;
     }
+    if typ == MFS_TYPE_LINK {
+        // 软链接不参与硬链接 (nlink 恒 1), 且它不占数据块 -> 直接释放 ino。
+        return if mfs_free_ino(ino) { 1 } else { u64::MAX };
+    }
+    // 普通文件: 递减链接数; 还有别的名字就只更新计数, 否则释放 ino。
     let blk = match mfs_ino_block(ino) {
         Some(b) if b != 0 => b,
         _ => return u64::MAX,
