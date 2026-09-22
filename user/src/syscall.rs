@@ -40,6 +40,8 @@ pub const SYS_CLEAR: u64 = 28;
 pub const SYS_CAP_ISSUE: u64 = 29;
 pub const SYS_CAP_LOOKUP: u64 = 30;
 pub const SYS_CAP_DROP: u64 = 31;
+pub const SYS_HANDLE_SEND: u64 = 32;
+pub const SYS_CAP_SEND: u64 = 33;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -226,6 +228,29 @@ pub fn sys_cap_lookup(handle: u64) -> u64 {
 /// 撤销句柄 (关闭打开对象时调用), 成功返回 1。
 pub fn sys_cap_drop(handle: u64) -> u64 {
     unsafe { syscall(SYS_CAP_DROP, handle, 0, 0) }
+}
+
+/// 「能力随 IPC 传递」: 把自己句柄 `handle` 指向的对象**移入**目标域 `to`,
+/// 返回 `to` 域里的新句柄索引; 失败 / 目标域句柄槽满返回 `u64::MAX`。
+///
+/// 移动语义: 成功后本域的 `handle` 立即失效 (交出 fd 后自己不再持有)。
+/// 前置能力 `SendTo(to)`。
+pub fn sys_handle_send(to: u64, handle: u64) -> u64 {
+    unsafe { syscall(SYS_HANDLE_SEND, to, handle, 0) }
+}
+
+/// 能力类型编码 (与内核 `cap::CAP_KIND_*` 一致)。
+pub const CAP_KIND_SEND_TO: u64 = 0;
+pub const CAP_KIND_MAP_INTO: u64 = 1;
+pub const CAP_KIND_IRQ: u64 = 2;
+pub const CAP_KIND_MMIO: u64 = 3;
+
+/// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 `to`, 成功返回 1。
+///
+/// 前置能力 `SendTo(to)`; 且必须**确实持有**要委派的能力 (无放大: 没有的能力给不出去)。
+/// `kind` 取 `CAP_KIND_*`, `arg` 是该能力的参数 (目标域 id / IRQ 号 / 页对齐 MMIO 基址)。
+pub fn sys_cap_send(to: u64, kind: u64, arg: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_SEND, to, kind, arg) }
 }
 
 pub fn sys_puts(s: &str) {

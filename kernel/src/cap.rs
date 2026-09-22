@@ -24,6 +24,29 @@ pub enum Capability {
 /// 每域能力槽数量。
 const CAP_SLOTS: usize = 16;
 
+/// `SYS_CAP_SEND` 的 `kind` 编码 —— 能力是枚举, 而 syscall 参数只有整数,
+/// 故用 `(kind, arg)` 两段表示 (与用户态 `syscall::CAP_KIND_*` 一致)。
+pub const CAP_KIND_SEND_TO: u64 = 0;
+pub const CAP_KIND_MAP_INTO: u64 = 1;
+pub const CAP_KIND_IRQ: u64 = 2;
+pub const CAP_KIND_MMIO: u64 = 3;
+
+/// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
+/// `arg` 越界返回 `None`。
+///
+/// 这里对 `arg` 的校验与各能力的使用点保持一致: `Irq` 是 u8 (见 `SYS_REGISTER_IRQ`),
+/// `Mmio` 以**页对齐**物理基址标识 (见 `SYS_MAP_MMIO` 的 `bar & !0xFFF`) ——
+/// 否则可以造出一个永远匹配不上的能力, 白占对方一个槽位。
+pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
+    match kind {
+        CAP_KIND_SEND_TO => Some(Capability::SendTo(arg)),
+        CAP_KIND_MAP_INTO => Some(Capability::MapInto(arg)),
+        CAP_KIND_IRQ if arg <= u8::MAX as u64 => Some(Capability::Irq(arg as u8)),
+        CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
+        _ => None,
+    }
+}
+
 /// 全局能力表: 每个域一个能力槽数组。
 static CAP_TABLE: Mutex<Vec<[Option<Capability>; CAP_SLOTS]>> = Mutex::new(Vec::new());
 
@@ -121,6 +144,55 @@ pub fn has(domain: u64, cap: Capability) -> bool {
     table[domain as usize].contains(&Some(cap))
 }
 
+/// 把 `from` 域句柄槽 `handle` 里的对象标识**移入** `to` 域的空槽,
+/// 返回 `to` 域里的新句柄索引。
+///
+/// 移动语义 (而非复制): 成功后 `from` 域的该槽立即失效 —— 「能力是唯一凭证」,
+/// 同一份能力在同一时刻只属于一个域。这也是 fd 传递需要的语义 (交出 fd 后自己不再持有)。
+///
+/// 失败 (源槽越界 / 已空, 或目标域句柄槽满) 返回 `u64::MAX`, 且**不改变任何状态**:
+/// 先取出对象再找空槽, 目标槽满时把对象放回原槽 (回滚), 避免「两边都没有」。
+pub fn handle_move(from: u64, to: u64, handle: u64) -> u64 {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut table = HANDLE_TABLE.lock();
+
+    let obj = table
+        .get_mut(from as usize)
+        .and_then(|slots| slots.get_mut(handle as usize))
+        .and_then(|slot| slot.take());
+
+    let mut out = u64::MAX;
+    match obj {
+        None => {}
+        Some(o) => {
+            if let Some(slots) = table.get_mut(to as usize) {
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        *slot = Some(o);
+                        out = i as u64;
+                        break;
+                    }
+                }
+            }
+            if out == u64::MAX {
+                // 目标槽满: 回滚, 对象仍留在原域。
+                if let Some(slots) = table.get_mut(from as usize) {
+                    if let Some(slot) = slots.get_mut(handle as usize) {
+                        *slot = Some(o);
+                    }
+                }
+            }
+        }
+    }
+
+    drop(table);
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    out
+}
+
 /// 向某域授予能力 (占用一个空槽)。
 pub fn grant(domain: u64, cap: Capability) -> bool {
     // 保存/恢复中断状态: boot 期 (IF=0) 调用时不能提前开启中断,
@@ -155,6 +227,46 @@ pub fn revoke(domain: u64, cap: Capability) -> bool {
             break;
         }
     }
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    ok
+}
+
+/// 把 `cap` 从 `from` 域**委派**给 `to` 域 (「能力随 IPC 传递」)。
+///
+/// 核心约束是**不允许放大**: `from` 必须自己持有 `cap`, 否则一律失败 ——
+/// 没有的能力给不出去, 这是能力安全模型的根。检查与写入在**同一把锁**内完成,
+/// 避免「检查后被抢先」。
+///
+/// `to` 已经持有该能力时直接返回成功且不占新槽 (幂等), 免得重复委派把 16 个槽位耗光。
+pub fn delegate(from: u64, to: u64, cap: Capability) -> bool {
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let mut table = CAP_TABLE.lock();
+
+    let mut ok = false;
+    let held = table
+        .get(from as usize)
+        .map(|slots| slots.contains(&Some(cap)))
+        .unwrap_or(false);
+    if held {
+        if let Some(slots) = table.get_mut(to as usize) {
+            if slots.contains(&Some(cap)) {
+                ok = true;
+            } else {
+                for slot in slots.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(cap);
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    drop(table);
     if was_enabled {
         x86_64::instructions::interrupts::enable();
     }

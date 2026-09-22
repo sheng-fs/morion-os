@@ -50,6 +50,10 @@ pub const SYS_CLEAR: u64 = 28;
 pub const SYS_CAP_ISSUE: u64 = 29;
 pub const SYS_CAP_LOOKUP: u64 = 30;
 pub const SYS_CAP_DROP: u64 = 31;
+/// 「能力随 IPC 传递」: 把自己句柄槽里的对象**移入**目标域 (fd 传递)。
+pub const SYS_HANDLE_SEND: u64 = 32;
+/// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 (不允许放大)。
+pub const SYS_CAP_SEND: u64 = 33;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -389,6 +393,29 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 1
             } else {
                 0
+            }
+        }
+        SYS_HANDLE_SEND => {
+            // 「能力随 IPC 传递」: 把自己句柄 `a2` 里的不透明对象移入 `a1` 域, 返回
+            // 目标域里的新句柄。前置能力 `SendTo(a1)` —— 否则任何域都能往别的域塞
+            // 句柄 (把自己的对象灌进对方 32 个槽位, 是纯粹的 DoS)。
+            let me = crate::scheduler::current_domain();
+            if !crate::cap::has(me, crate::cap::Capability::SendTo(a1)) {
+                return u64::MAX;
+            }
+            crate::cap::handle_move(me, a1, a2)
+        }
+        SYS_CAP_SEND => {
+            // 「能力随 IPC 传递」: 把自己**确实持有**的能力委派给 `a1` 域。
+            // 两层校验都不可省: 外层 `SendTo(a1)` 管「能不能把东西给对方」,
+            // 内层 `cap::delegate` 管「这东西是不是我的」(无放大)。
+            let me = crate::scheduler::current_domain();
+            if !crate::cap::has(me, crate::cap::Capability::SendTo(a1)) {
+                return 0;
+            }
+            match crate::cap::decode(a2, a3) {
+                Some(cap) => crate::cap::delegate(me, a1, cap) as u64,
+                None => 0,
             }
         }
         SYS_PUTS => {

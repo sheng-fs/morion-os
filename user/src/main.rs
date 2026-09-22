@@ -13,10 +13,12 @@ mod vfs;
 
 use syscall::{
     print, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
-    sys_call_payload, sys_clear, sys_map_anon, sys_page_fault_reply, sys_port_in16, sys_port_in8,
+    sys_call_payload, sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send,
+    sys_map_anon, sys_page_fault_reply, sys_port_in16, sys_port_in8,
     sys_port_out8, sys_port_out16, sys_readline, sys_recv, sys_recv_msg, sys_register_irq,
     sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page, sys_term_left,
-    sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, PAYLOAD_LEN,
+    sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, CAP_KIND_IRQ, CAP_KIND_MAP_INTO,
+    CAP_KIND_SEND_TO, PAYLOAD_LEN,
 };
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
@@ -59,7 +61,13 @@ pub extern "C" fn _start(domain_id: u64) -> ! {
     syscall::sys_exit();
 }
 
-/// 域 0 — 发送者: 持有 SendTo(1) + MapInto(1) 能力, 无 SendTo(2) 能力。
+/// 「能力随 IPC 传递」自测: 句柄指向的**不透明**对象标识 —— 内核不解释它的含义,
+/// 只负责在移交时原样搬运 (真实的文件 fd 也是这么打包的: `(服务域 << 32) | fd`)。
+const CAP_TOKEN: u64 = 0x5A5A_1234_5678_9ABC;
+/// `sender` 通知 `receiver`「新句柄已就绪」的 tag 基数: 低 8 位放句柄索引。
+const CAP_HANDLE_TAG: u64 = 0xCA00;
+
+/// 域 0 — 发送者: 持有 SendTo(1) + MapInto(1) + SendTo(3) 能力, **不持有** SendTo(2)。
 /// 成功路径保持静默 (避免刷屏), 仅失败时打印。
 fn sender_main() {
     // 共享内存演示: 申请一页 → 写入 → 共享给域 1 → IPC 通知。
@@ -88,14 +96,75 @@ fn sender_main() {
     let fault_addr = 0x81_0000_0000u64;
     let _ = unsafe { core::ptr::read_volatile(fault_addr as *const u64) };
 
+    // ---- 能力随 IPC 传递 (M-C1) ----
+    // 负例一: 委派自己**没有**的能力必须被拒 —— sender 持有 SendTo(1)/SendTo(3),
+    // 但从不持有 SendTo(2)。没有的能力给不出去 (无放大), 这是能力模型的根。
+    if sys_cap_send(1, CAP_KIND_SEND_TO, 2) != 0 {
+        println("sender: delegate unheld SendTo(2) NOT denied FAILED");
+    }
+    // 负例二: 连「往不可达域塞能力」都不允许 —— 没有 SendTo(2), 目标域校验先失败。
+    if sys_cap_send(2, CAP_KIND_SEND_TO, 3) != 0 {
+        println("sender: cap_send to unreachable domain FAILED");
+    }
+    // 负例三: 参数非法的能力 (Irq 的 arg 超出 u8) 必须被解码层拒绝。
+    if sys_cap_send(1, CAP_KIND_IRQ, 0x1234) != 0 {
+        println("sender: bad cap arg NOT rejected FAILED");
+    }
+
+    // 句柄移交: 为一个不透明对象签发句柄, 再把它**移入** receiver 域。
+    let h = sys_cap_issue(CAP_TOKEN);
+    if h == u64::MAX {
+        println("sender: cap_issue FAILED");
+        return;
+    }
+    let moved = sys_handle_send(1, h);
+    if moved == u64::MAX {
+        println("sender: handle_send FAILED");
+        return;
+    }
+    // 移动语义: 移走之后**本域的句柄必须立即失效** (能力同一时刻只属于一个域)。
+    if sys_cap_lookup(h) != u64::MAX {
+        println("sender: handle still valid after move FAILED");
+    }
+
+    // 能力委派: 把 SendTo(3) 复制给 receiver —— 它因此获得与 echo 通信的能力,
+    // 而启动期没有任何静态授权让它能这么做 (receiver 的能力槽是空的)。
+    if sys_cap_send(1, CAP_KIND_SEND_TO, 3) != 1 {
+        println("sender: delegate SendTo(3) FAILED");
+    }
+    // 同一项能力重复委派必须幂等 (不再占新槽): 连做两次都应成功。
+    if sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1
+        || sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1
+    {
+        println("sender: duplicate delegation NOT idempotent FAILED");
+    }
+
+    // 通知 receiver 去核验 (句柄索引编进 tag 低 8 位)。
+    // 必须检查返回值: 这条通知若没送出去, receiver 会**永久阻塞在第二次 recv**
+    // 而不报任何错 —— 是本次自测里唯一的静默挂死路径。
+    if sys_send(1, CAP_HANDLE_TAG | moved) != 1 {
+        println("sender: capability transfer notification FAILED");
+    }
+
     // 同步 IPC call/reply 演示: 调用 echo 服务 (域 3)。
     let _ = sys_call(3, 0xABCD);
 }
 
-/// 域 1 — 接收者: 经 IPC 收到通知后, 直接从共享页读取数据, 再解除映射。
+/// 域 1 — 接收者: 经 IPC 收到通知后, 直接从共享页读取数据, 再解除映射;
+/// 最后核验 sender 交过来的句柄与能力。
 fn receiver_main() {
+    // 反面对照 (关键): receiver 启动时**持有零个能力**, 此刻调用 echo 必须失败。
+    // 后面同样的调用在拿到委派来的 SendTo(3) 之后必须成功 —— 一负一正,
+    // 才能证明「能力确实是靠这次传递获得的」而不是本来就有的。
+    if sys_call(3, 0x1234) != u64::MAX {
+        println("receiver: call echo WITHOUT capability unexpectedly OK FAILED");
+    }
+
     // 等 sender 通知共享页就绪。
-    let _ = sys_recv();
+    let tag = sys_recv();
+    if tag != 777 {
+        println("receiver: unexpected first tag FAILED");
+    }
 
     // 直接读共享页 (零拷贝, 数据未经 IPC 传递)。
     let page = SHARED_PAGE;
@@ -105,6 +174,31 @@ fn receiver_main() {
     if sys_unmap(page) != 1 {
         println("receiver: unmap FAILED");
     }
+
+    // ---- 能力随 IPC 传递 (M-C1): 核验收到的句柄与能力 ----
+    let tag = sys_recv();
+    if tag & !0xFF != CAP_HANDLE_TAG {
+        println("receiver: capability transfer notification FAILED");
+        return;
+    }
+    let h = tag & 0xFF;
+    // 收到的句柄必须能查出 sender 当初放进去的那个不透明对象。
+    if sys_cap_lookup(h) != CAP_TOKEN {
+        println("receiver: transferred handle lookup FAILED");
+    }
+    // 用委派来的 SendTo(3) 直接调 echo —— 这正是本函数开头做不到的那件事。
+    if sys_call(3, 0xCAFE) != 0xCAFF {
+        println("receiver: call echo via delegated capability FAILED");
+    }
+    // 负例: receiver 依然没有 SendTo(2), 不能往 pager 塞能力。
+    if sys_cap_send(2, CAP_KIND_SEND_TO, 3) != 0 {
+        println("receiver: cap_send to unreachable domain FAILED");
+    }
+
+    // 成功标记: 本段其余步骤都「静默通过」, 但「静默」无法区分「跑过并通过」与
+    // 「根本没跑到」(例如阻塞在上面的 recv)。故这一行**必须打印** —— 它是本原语
+    // 被真正执行过的唯一正面证据。上面 8 条负例/正例中任意一条失败都会另打 FAILED。
+    println("receiver: capability passing OK (handle moved + SendTo(3) delegated)");
 }
 
 /// IPC 消息 (与内核 `ipc::Message` 布局一致: 24 字节头 + `PAYLOAD_LEN`)。
