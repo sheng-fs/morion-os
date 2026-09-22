@@ -722,6 +722,71 @@ const NVME_MAX_NS: usize = 8;
 static mut NVME_NSIDS: [u32; NVME_MAX_NS] = [0; NVME_MAX_NS];
 static mut NVME_NS_COUNT: usize = 0;
 
+/// 每个 namespace 的容量 (扇区数), 由 Identify Namespace (CNS=0) 的 NSZE 取得;
+/// 0 = 未知 (该盘不支持查询 / 查询失败)。与 `NVME_NSIDS` 下标一一对应。
+///
+/// 为什么需要它: 卷层对「无分区表的整盘」记 `sectors = 0`(容量未知), 而 MFS 首次
+/// 格式化要按**卷的真实几何**决定文件系统大小 —— 少了 NSZE 就只能退回写死的默认值,
+/// 在一整块新盘上会格式出一个小得离谱的文件系统。
+static mut NVME_NS_SECTORS: [u32; NVME_MAX_NS] = [0; NVME_MAX_NS];
+
+/// 取 namespace `nsid` 的容量 (扇区数)。
+///
+/// Identify Namespace (CNS=0) 的返回数据里偏移 0 是 NSZE (u64), 在 512 B 逻辑块下
+/// 即扇区数。走 **Admin 队列**: 该命令只在初始化阶段按盘各发一次, 不该占用 I/O 队列。
+/// 返回值超出 u32 的容量 (≥ 2 TiB) 截断 —— 卷层的 `sectors` 本就是 u32。
+#[allow(clippy::too_many_arguments)] // 与 vol_scan_namespace 等一样, 需透传队列上下文
+fn nvme_ns_sectors(
+    nsid: u32,
+    cfg: &NvmeConfig,
+    mmio: u64,
+    asq_doorbell: u64,
+    acq_doorbell: u64,
+    tail: &mut u32,
+    head: &mut u32,
+    phase: &mut u32,
+) -> u32 {
+    let mut sqe = Sqe::zero();
+    sqe.opcode = OP_IDENTIFY;
+    sqe.cid = 0x100 + nsid as u16; // 与初始化阶段已用的 cid 1..4 错开
+    sqe.nsid = nsid;
+    sqe.prp1 = cfg.data_paddr;
+    sqe.cdw10 = 0x00; // CNS=0 = Identify Namespace
+    if !submit_wait(
+        cfg.asq_vaddr,
+        cfg.acq_vaddr,
+        asq_doorbell,
+        acq_doorbell,
+        cfg.admin_qdepth as u32,
+        mmio,
+        sqe,
+        tail,
+        head,
+        phase,
+    ) {
+        return 0;
+    }
+    let nsze = rd64(cfg.data_vaddr);
+    if nsze > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        nsze as u32
+    }
+}
+
+/// 查已缓存的 namespace 容量 (扇区数); 0 = 未知。
+fn nvme_ns_sectors_of(nsid: u32) -> u32 {
+    let n = unsafe { NVME_NS_COUNT };
+    let mut i = 0usize;
+    while i < n {
+        if unsafe { NVME_NSIDS[i] } == nsid {
+            return unsafe { NVME_NS_SECTORS[i] };
+        }
+        i += 1;
+    }
+    0
+}
+
 /// 域 5 — NVMe 驱动服务: 复位控制器 → Admin 队列 → Identify → I/O 队列 → 块服务。
 fn nvme_main() {
     let cfg = unsafe { core::ptr::read_volatile(NVME_CFG_VADDR as *const NvmeConfig) };
@@ -817,36 +882,39 @@ fn nvme_main() {
         }
     }
 
-    // 7. Identify Namespace (CNS=0, NSID=1) → 扇区总数。
-    sqe = Sqe::zero();
-    sqe.opcode = OP_IDENTIFY;
-    sqe.cid = 2;
-    sqe.nsid = 1;
-    sqe.prp1 = cfg.data_paddr;
-    sqe.cdw10 = 0x00;
-    if !submit_wait(
-        cfg.asq_vaddr,
-        cfg.acq_vaddr,
-        asq_doorbell,
-        acq_doorbell,
-        cfg.admin_qdepth as u32,
-        mmio,
-        sqe,
-        &mut admin_tail,
-        &mut admin_head,
-        &mut admin_phase,
-    ) {
-        println("nvme: Identify Namespace FAILED");
-        return;
-    }
-
-    // 7b. 若 NN 不可用 (为 0), 回退按当前 QEMU 配置假定 namespace 为 1..=3。
+    // 7. 若 NN 不可用 (为 0), 回退按当前 QEMU 配置假定 namespace 为 1..=3。
+    //    必须在取 NSZE 之前: 下一步要按 namespace 列表逐个查询容量。
     if unsafe { NVME_NS_COUNT } == 0 {
         unsafe {
             NVME_NSIDS[0] = 1;
             NVME_NSIDS[1] = 2;
             NVME_NSIDS[2] = 3;
             NVME_NS_COUNT = 3;
+        }
+    }
+
+    // 7b. 逐个 namespace 取容量 (Identify Namespace CNS=0 → NSZE)。
+    //     卷层用它给「无分区表的整盘」填 sectors —— 此前那一栏恒为 0 (容量未知),
+    //     于是文件系统只能按写死的默认值格式化, 一整块盘会被格成迷你分区。
+    {
+        let n = unsafe { NVME_NS_COUNT };
+        let mut i = 0usize;
+        while i < n {
+            let nsid = unsafe { NVME_NSIDS[i] };
+            let sec = nvme_ns_sectors(
+                nsid,
+                &cfg,
+                mmio,
+                asq_doorbell,
+                acq_doorbell,
+                &mut admin_tail,
+                &mut admin_head,
+                &mut admin_phase,
+            );
+            unsafe {
+                NVME_NS_SECTORS[i] = sec;
+            }
+            i += 1;
         }
     }
 
@@ -2505,7 +2573,9 @@ const BLOCK_OP_WRITE: u8 = 1;
 const BLOCK_OP_LIST_VOLUMES: u8 = 2;
 
 /// 一个卷: 落在某 namespace 上的 [start_lba, start_lba+sectors) 区间。
-/// `sectors == 0` 表示「整盘其余部分」(无分区表时, 总扇区数未知)。
+/// `sectors == 0` 表示**容量未知** (Identify Namespace 没取到, 例如 IDE PIO 回退路径),
+/// 此时「卷从 start_lba 起一直到盘尾」, 但没人知道盘尾在哪 —— 需要容量的上层 (MFS
+/// 首次格式化) 必须按默认值兜底, 不能把 0 当成「零长度卷」。
 #[derive(Clone, Copy)]
 struct Volume {
     nsid: u32,
@@ -2804,7 +2874,9 @@ fn vol_scan_namespace(
         i += 1;
     }
     if npart == 0 {
-        // 无分区表 → 整盘一个卷 (sectors=0 表示「整盘」)。
+        // 无分区表 → 整盘一个卷。容量取 Identify Namespace 的 NSZE(在 `vol_probe_kind`
+        // 覆盖 scratch 之前查好); 取不到则仍记 0 = 容量未知, 由上层按默认值兜底。
+        let sectors = nvme_ns_sectors_of(nsid);
         let kind = vol_probe_kind(
             nsid,
             0,
@@ -2817,7 +2889,7 @@ fn vol_scan_namespace(
             head,
             phase,
         );
-        vol_push(nsid, 0, 0, kind);
+        vol_push(nsid, 0, sectors, kind);
         return;
     }
     let mut k = 0usize;
@@ -2895,13 +2967,13 @@ fn vol_claim(scratch: *mut u8, max: u32, kind: u32, fallback: u64) -> u64 {
     }
 }
 
-/// 卷表里卷号 `vol` 的文件系统类型 (查不到则返回 `VOL_KIND_UNKNOWN`)。
+/// 卷表里卷号 `vol` 的描述符; 查不到返回 `None`。
 ///
 /// `scratch` 必须是本域**已共享给 block_srv** 的缓冲页 (卷描述符经它回传)。
-fn vol_kind_of(scratch: *mut u8, vol: u64) -> u32 {
-    let n = block_list_volumes(scratch, 16);
+fn vol_find_desc(scratch: *mut u8, vol: u64) -> Option<VolumeDesc> {
+    let n = block_list_volumes(scratch, VOL_MAX as u32);
     if n == 0 || n == u64::MAX {
-        return VOL_KIND_UNKNOWN;
+        return None;
     }
     let esize = core::mem::size_of::<VolumeDesc>();
     let mut i = 0u64;
@@ -2910,11 +2982,21 @@ fn vol_kind_of(scratch: *mut u8, vol: u64) -> u32 {
             core::ptr::read_unaligned(scratch.add(i as usize * esize) as *const VolumeDesc)
         };
         if d.id as u64 == vol {
-            return d.kind;
+            return Some(d);
         }
         i += 1;
     }
-    VOL_KIND_UNKNOWN
+    None
+}
+
+/// 卷表里卷号 `vol` 的文件系统类型 (查不到则返回 `VOL_KIND_UNKNOWN`)。
+fn vol_kind_of(scratch: *mut u8, vol: u64) -> u32 {
+    vol_find_desc(scratch, vol).map_or(VOL_KIND_UNKNOWN, |d| d.kind)
+}
+
+/// 卷表里卷号 `vol` 的容量 (扇区数); 0 = 未知。
+fn vol_sectors(scratch: *mut u8, vol: u64) -> u32 {
+    vol_find_desc(scratch, vol).map_or(0, |d| d.sectors)
 }
 
 /// 把本服务**默认卷之外**的同类卷挂到 `/usb<卷号>` (M1b 多卷挂载)。
@@ -6178,6 +6260,53 @@ fn app_main() {
         vfs::unlink(F20_L5);
         vfs::unlink(F20_T);
     }
+    // 24. FS-21 自测 (阶段 D/M7): 文件系统**铺满卷** —— 格式化尺寸按卷几何定。
+    //     盯的是一个极易回退的默认值: 早先 `mfs_format` 无论卷多大都写死 4096 块
+    //     (16 MiB), 于是整块新盘也只会格式出 16 MiB。断言只有一条关系式:
+    //       MFS 总块数 × 8 扇区/块 == 它所在卷的 sectors
+    //     它同时证明两件事: (a) Identify Namespace 的 NSZE 真填进了卷表 —— 整盘卷
+    //     此前 `sectors` 恒为 0(容量未知); (b) 格式化确实按卷几何取尺寸。
+    //     ⚠️ 等号只在卷容量未超「内联位图上限」(MFS_MAX_BLOCKS ≈ 119 MiB) 时成立;
+    //     测试卷超过它时这里会失败 —— 那正是该去把位图挪出超级块的信号。
+    {
+        let usage = vfs::mfs_stat();
+        if usage == u64::MAX {
+            println("app: FS21 mfs_stat FAILED");
+            return;
+        }
+        let total = usage >> 32;
+        let free = usage & 0xFFFF_FFFF;
+        if total == 0 || free > total {
+            println("app: FS21 usage sanity FAILED");
+            return;
+        }
+        // 卷表里定位 MFS 那张盘 (整盘卷: mfs.img 是 nsid=2, start_lba=0)。
+        let n = block_list_volumes(vfs::RESULT_BUF as *mut u8, 16);
+        if n == 0 || n == u64::MAX {
+            println("app: FS21 list volumes FAILED");
+            return;
+        }
+        let mut i = 0u64;
+        let mut found = false;
+        while i < n {
+            let d = vol_desc(vfs::RESULT_BUF as *const u8, i as usize);
+            if d.nsid == 2 && d.start_lba == 0 {
+                found = true;
+                if d.sectors == 0 {
+                    println("app: FS21 whole-disk volume still reports no capacity FAILED");
+                    return;
+                }
+                if total * 8 != d.sectors as u64 {
+                    println("app: FS21 fs does not fill its volume FAILED");
+                    return;
+                }
+            }
+            i += 1;
+        }
+        if !found {
+            println("app: FS21 mfs disk missing from volume table FAILED");
+        }
+    }
     println("app: SELFTEST DONE");
 }
 
@@ -8007,9 +8136,15 @@ const MFS_PAYLOAD: usize = MFS_BLOCK - MFS_HDR;
 const MFS_VOL_FALLBACK: u64 = 1;
 /// MFS 服务实际使用的卷号, 启动时由 `vol_claim` 认领 (见 `mfs_main`)。
 static mut MFS_VOL: u64 = MFS_VOL_FALLBACK;
-/// 默认总块数 (16 MiB / 4 KiB), 须与 Makefile 的 `MFS_MIB=16` 对应。
+/// 认领到的卷的容量 (扇区数, 启动时从卷表取); 0 = 未知。
+/// 首次格式化按它决定文件系统大小 —— 不再假设「盘就是 16 MiB」。
+static mut MFS_VOL_SECTORS: u32 = 0;
+/// 卷容量未知时的兜底总块数 (16 MiB / 4 KiB), 与 Makefile 的默认 `MFS_MIB=16` 对应。
 /// 仅用于首次格式化; 之后以超级块记录的值为准。
 const MFS_DEFAULT_TOTAL_BLOCKS: u32 = 4096;
+/// 首次格式化的**下限** (256 KiB): 卷再小也得放得下两份超级块 + 根目录 + inode 表。
+/// 低于这个数直接格式化会得到一个连元数据都装不下的文件系统。
+const MFS_MIN_TOTAL_BLOCKS: u32 = 64;
 /// 超级块副本数 (块 0 / 块 1)。
 const MFS_SB_COPIES: u32 = 2;
 /// 超级块内快照表容量。
@@ -9090,6 +9225,13 @@ fn mfs_mount_or_format() -> bool {
         if total == 0 || itab == 0 || total > MFS_MAX_BLOCKS {
             continue;
         }
+        // 盘上记的总块数不能超过该卷的实际容量: 换过镜像 / 卷号认领错 / 卷被缩小过时,
+        // 超出的块一律读不到 —— 与其让后续读写大面积失败, 不如在这里判该副本不可用
+        // (两份都不可用就会走格式化, 那才是正确处置)。容量未知 (0) 时跳过这项检查。
+        let vsectors = unsafe { MFS_VOL_SECTORS } as u64;
+        if vsectors != 0 && total as u64 * MFS_SECTORS_PER_BLOCK as u64 > vsectors {
+            continue;
+        }
         // 索引块是 inode 表的根, 先验证它再采纳这份副本 (坏了就试另一份)。
         let x = mfs_itabx_buf();
         if !mfs_read_blk(itab, x) || !mfs_ok(x, MFS_MAGIC_ITABX) {
@@ -9152,11 +9294,25 @@ fn mfs_mount_or_format() -> bool {
     true
 }
 
+/// 首次格式化该用多少块: 按**卷的真实容量**算 (每块 4 KiB = 8 扇区), 夹在
+/// [`MFS_MIN_TOTAL_BLOCKS`, `MFS_MAX_BLOCKS`] 之间; 容量未知时退回默认值。
+///
+/// 上界是硬约束: 空闲位图内联在超级块 payload 里, 只能覆盖 `MFS_MAX_BLOCKS` 块,
+/// 超出的块没有位来记录占用 —— 想要更大的卷必须先把位图挪出超级块。
+fn mfs_format_total_blocks() -> u32 {
+    let sectors = unsafe { MFS_VOL_SECTORS } as u64;
+    if sectors == 0 {
+        return MFS_DEFAULT_TOTAL_BLOCKS;
+    }
+    let blocks = sectors / MFS_SECTORS_PER_BLOCK as u64;
+    blocks.clamp(MFS_MIN_TOTAL_BLOCKS as u64, MFS_MAX_BLOCKS as u64) as u32
+}
+
 /// 首次格式化 (含旧格式升级): 清空位图 -> 保留超级块副本 -> 建空根目录 (ino 1) ->
 /// 建 inode 表 -> 写超级块。
 fn mfs_format() -> bool {
     unsafe {
-        MFS_TOTAL_BLOCKS = MFS_DEFAULT_TOTAL_BLOCKS;
+        MFS_TOTAL_BLOCKS = mfs_format_total_blocks();
         MFS_ALLOC_NEXT = MFS_SB_COPIES;
         MFS_GEN = 0;
         MFS_SNAP_COUNT = 0;
@@ -10825,6 +10981,9 @@ fn mfs_main() {
     // 认领卷: 先按 MFS magic 找; 空白盘没有 magic, 回退到约定卷号 1。
     unsafe {
         MFS_VOL = vol_claim(mfs_a(), 16, VOL_KIND_MFS, MFS_VOL_FALLBACK);
+        // 卷容量 (扇区数): 首次格式化按它决定文件系统大小; 也用于校验盘上记录的总
+        // 块数没超出卷的实际容量。0 = 未知 (IDE 回退等), 上层按默认值兜底。
+        MFS_VOL_SECTORS = vol_sectors(mfs_a(), MFS_VOL);
     }
     // 安全护栏: 只允许挂载「已是 MFS」或「整盘无文件系统 (UNKNOWN, 需格式化)」的卷。
     // 卷号回退一旦算错 (例如接了真 U 盘、换了镜像布局), 自动格式化会把别人的分区
@@ -10852,6 +11011,9 @@ fn mfs_main() {
     print_u64(unsafe { MFS_GEN });
     print(" snap=");
     print_u64(unsafe { MFS_SNAP_COUNT } as u64);
+    // 卷容量 (扇区数): `total * 8` 应等于它 —— 不等说明文件系统没铺满卷 (或卷被换过)。
+    print(" volsec=");
+    print_u64(unsafe { MFS_VOL_SECTORS } as u64);
     println("");
 
     let mut msg = Message {
