@@ -140,6 +140,34 @@ ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态
 | --- | --- | --- | --- | --- | --- |
 | 14 | `sys_register_irq(irq)` | `rdi=irq` | 1/0 | `Irq(irq)` | 注册本域接收 `irq`（用户态设备驱动） |
 | 21 | `sys_map_mmio(bar, vaddr)` | `rdi=bar, rsi=vaddr` | 1/0 | `Mmio(bar)` | 把物理 MMIO 页（`bar`，页对齐）映射到本域 `vaddr`（非缓存） |
+| 29 | `sys_cap_issue(obj)` | `rdi=obj` | 句柄索引 | — | 「能力即句柄」：为不透明对象 `obj` 签发句柄，槽满返回 `u64::MAX` |
+| 30 | `sys_cap_lookup(handle)` | `rdi=handle` | 对象标识 | — | 校验句柄是否仍有效，被撤销 / 非法返回 `u64::MAX` |
+| 31 | `sys_cap_drop(handle)` | `rdi=handle` | 1/0 | — | 撤销句柄（关闭打开对象时调用） |
+| 32 | `sys_handle_send(to, handle)` | `rdi=to, rsi=handle` | 新句柄索引 | `SendTo(to)` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 指向的对象**移入** `to` 域，返回 `to` 域里的新句柄；失败返回 `u64::MAX` |
+| 33 | `sys_cap_send(to, kind, arg)` | `rdi=to, rsi=kind, rdx=arg` | 1/0 | `SendTo(to)` + 被委派的那项能力 | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力复制给 `to` 域；`kind` 取 `CAP_KIND_*` |
+
+**能力随 IPC 传递的两条路径**（[kernel/src/cap.rs](../kernel/src/cap.rs)）：
+
+```rust
+// 句柄移交（fd 传递）：移动语义 —— 交出后自己不再持有。
+let h = sys_cap_issue((mfs_domain << 32) | fd);
+let peer_h = sys_handle_send(peer_domain, h);   // h 在本地立即失效
+sys_send_payload(peer_domain, TAG, &peer_h.to_le_bytes());
+
+// 能力委派：复制语义 —— 自己仍持有；且必须有（无放大）。
+sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直接访问 mfs_srv
+```
+
+- **句柄移交是「移动」**：成功后本域的句柄立即失效（能力同一时刻只属于一个域）。失败（源槽空 / 目标域 32 个句柄槽满）不改变任何状态。
+- **能力委派是「复制」**：`from` 必须自己持有 `cap`，**没有的能力给不出去**（无放大）；对方已持有该项时幂等成功、不占新槽。
+- 两者都要求 `SendTo(to)`：不能往自己联系不上的域塞句柄或能力。
+- 委派出的 `SendTo(域)` 让接收方**获得启动期静态授权之外的新通路** —— 这是「最小权限随需授予」的实现基础（AI 调用网关要按任务临时授权，用的就是它）。
+
+> **当前未覆盖**（后续切片）：
+> - **不是原子的**：能力转移是同一 IPC 会话里的独立 syscall（先传、再发消息），并非随消息头原子送达；极端情况下存在「能力已给出但消息未送达」的窗口。
+> - **没有级联撤销**：能力委派出去就收不回来（`revoke` 只作用于本域），也没有「域退出时回收它发出的所有能力」。
+> - **没有 `dup`**：不能复制本域的句柄（只能签发新的），句柄移交是移动语义，因此「传出后自己还想继续用」需要重新 `sys_cap_issue`。
+> - **槽位满时无回收策略**：`CAP_SLOTS = 16` / `HANDLE_SLOTS = 32` 用尽即失败。
 
 ### 3.5 终端 / 视频（文本）
 
@@ -272,6 +300,7 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 
 - 每域 `CAP_SLOTS = 16` 个能力槽。
 - 新域默认**无任何能力**，由授权方在启动时 `cap::grant` 显式授予（见 [kernel/src/main.rs](../kernel/src/main.rs)）。
+- 启动授权之外，能力还可以**在运行时经 IPC 传递**：`sys_cap_send`（委派，复制且无放大）与 `sys_handle_send`（句柄移交，移动）。详见 3.4 节。
 - 应用侧通过 syscall 的返回 1/0 感知「是否被授权」；无能力时操作被内核拒绝。
 
 ---
@@ -570,7 +599,7 @@ payload = { capability_id: u32, request_len: u32, response_cap: u64, _pad }   //
 
 | 组件 | 状态 | 说明 |
 | --- | --- | --- |
-| 能力系统（能力槽 + 能力句柄） | ✅ 已就绪 | `SYS_CAP_ISSUE/LOOKUP/DROP`（29/30/31）；见第 6 节 |
+| 能力系统（能力槽 + 能力句柄） | ✅ 已就绪 | `SYS_CAP_ISSUE/LOOKUP/DROP`（29/30/31）；**能力随 IPC 传递** `SYS_HANDLE_SEND`/`SYS_CAP_SEND`（32/33，句柄移交为移动、能力委派为复制且无放大）；见第 6 节 |
 | IPC 与共享内存 | ✅ 已就绪 | `sys_call` / `sys_reply` / `sys_alloc_page` / `sys_share_page`；见第 4、5 节 |
 | 文件系统统一接口 libvfs | ✅ 已就绪 | `open/read/readdir/stat/close` + 挂载路由；可作为首批 AI 能力的底座 |
 | 用户态 JSON 序列化 / 解析 | ⏳ 缺失 | 当前 `#![no_std]` 且无 `alloc`；需先补一个最小的 `no_std` JSON 解析器与分配器 |

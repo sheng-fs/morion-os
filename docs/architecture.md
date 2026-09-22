@@ -96,7 +96,7 @@
 
 内核仅暴露 10\~20 个系统调用，构成唯一的硬件-软件边界。典型调用包括：
 
-1. `send`/`receive`/`call`：同步/异步 IPC，支持能力传递
+1. `send`/`receive`/`call`：同步/异步 IPC，支持能力传递 —— 消息收发由这三个原语完成；能力的转移由配套原语 `handle_send`（移交句柄，**移动**语义）与 `cap_send`（委派能力，**复制**且不允许放大）完成。**已实现**，见 [dev-reference.md](dev-reference.md)
 2. `map`/`unmap`：修改地址空间映射
 3. `create_domain`/`destroy_domain`：创建/销毁保护域（进程）
 4. `schedule`：主动让出 CPU

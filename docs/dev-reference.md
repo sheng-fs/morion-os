@@ -130,6 +130,8 @@ UEFI 固件
 | 29 | `SYS_CAP_ISSUE` | `rdi=obj` | 「能力即句柄」：为调用方域的不透明对象 `obj` 签发句柄，返回句柄索引（0 起），槽满返回 `u64::MAX` |
 | 30 | `SYS_CAP_LOOKUP` | `rdi=handle` | 校验句柄是否有效，有效返回其对象标识，被撤销 / 非法返回 `u64::MAX` |
 | 31 | `SYS_CAP_DROP` | `rdi=handle` | 撤销句柄（关闭打开对象时调用），返回 1/0 |
+| 32 | `SYS_HANDLE_SEND` | `rdi=to, rsi=handle` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 槽里的不透明对象**移入** `to` 域，返回 `to` 域里的新句柄索引；**移动语义**（成功后本域该句柄立即失效）。需 `Capability::SendTo(to)`；源槽空 / 目标槽满返回 `u64::MAX` 且不改变任何状态 |
+| 33 | `SYS_CAP_SEND` | `rdi=to, rsi=kind, rdx=arg` | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力**复制**给 `to` 域，返回 1/0。需 `Capability::SendTo(to)`，且**不允许放大**（自己没持有的能力给不出去）；`to` 已持有该项时幂等成功、不占新槽。`kind` 取 `cap::CAP_KIND_*`：`0=SendTo / 1=MapInto / 2=Irq / 3=Mmio`，`arg` 为该能力的参数（目标域 id / IRQ 号 / 页对齐 MMIO 基址） |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -228,6 +230,11 @@ UEFI 固件
 - `grant` / `revoke` 保存并恢复中断使能状态，避免 boot 期（IF=0）被提前开中断。
 - `Capability::SendTo(u64)` / `Capability::MapInto(u64)` / `Capability::Irq(u8)`，每域 `CAP_SLOTS = 16`
 - **「能力即句柄」句柄表**：`handle_issue(domain, obj) -> u64` / `handle_lookup(domain, handle) -> Option<u64>` / `handle_drop(domain, handle) -> bool`，每域 `HANDLE_SLOTS = 32`。槽内存放**不透明**对象标识（微内核不解释其含义，libvfs 传 `(服务域 << 32) | 服务内 fd`），由 `SYS_CAP_ISSUE`/`SYS_CAP_LOOKUP`/`SYS_CAP_DROP` 暴露给用户态。
+- **能力随 IPC 传递**（`SYS_HANDLE_SEND`/`SYS_CAP_SEND`）两条路径，语义刻意不同：
+  - `handle_move(from, to, handle) -> u64`：**移动**。先取出源槽对象、再在目标域找空槽；目标槽满则**回滚**（对象放回原槽），故失败时不会出现「两边都没有」。移走后源域该句柄立即失效 —— 「能力是唯一凭证」，同一份能力同一时刻只属于一个域。这是 fd 传递要的语义（交出 fd 后自己不再持有）。
+  - `delegate(from, to, cap) -> bool`：**复制**。`from` 必须自己持有 `cap`（**不允许放大** —— 没有的能力给不出去，这是能力模型的根）；检查与写入在同一把锁内完成，避免「检查后被抢先」。`to` 已持有该能力时幂等返回成功且不占新槽（否则重复委派会把 16 个槽位耗光）。
+  - 两者都要求调用方持有 `SendTo(to)`：`delegate` 上是双层校验（外层管「能不能给对方」，内层管「东西是不是我的」）；`handle_move` 上是防 DoS（否则任何域都能把对象灌进别的域的 32 个句柄槽）。
+  - `decode(kind, arg) -> Option<Capability>`：把 syscall 的两个整数还原成 `Capability`，并对 `arg` 做与该能力使用点一致的校验（`Irq` 是 u8、`Mmio` 必须页对齐），否则可以造出永远匹配不上的能力，白占对方槽位。
 
 ### 分页器（[kernel/src/pager.rs](../../kernel/src/pager.rs)）
 
