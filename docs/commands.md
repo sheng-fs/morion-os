@@ -35,7 +35,7 @@
 
 ```bash
 make run-nvme QEMU_MEM=4G                    # 内存 (默认 2G)
-make run-nvme MFS_MIB=64                     # MFS 盘大小 MiB (默认 16)
+make run-nvme MFS_MIB=128                    # MFS 盘大小 MiB (默认 64)
 make run-nvme EXFAT_MIB=2048 EXFAT_CLU=32K   # 大 exFAT 卷 (32 KiB 簇, 位图 > 4 KiB) 验证去上限
 make run-nvme NVME_CLU=64                    # fat32 大簇 (32 KiB 簇) 验证写路径
 make iso OUT_DIR=build2                      # 自定义输出目录
@@ -49,7 +49,7 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `NVME_IMG` | `build/nvme.img` | FAT32 盘（挂 `/`） |
 | `NVME_CLU` | `8` | fat32 每簇扇区数（8 = 4 KiB 簇）；`64` = 32 KiB 簇。mkfs.fat 对 64 MiB 盘默认给 512 B 簇，太碎且写大文件极慢，故固定为 4 KiB |
 | `MFS_IMG` | `build/mfs.img` | MorionFS 盘（挂 `/mfs`，**空白 raw，首次挂载自动格式化**） |
-| `MFS_MIB` | `16` | MorionFS 盘大小 |
+| `MFS_MIB` | `64` | MorionFS 盘大小。**M7 起格式化按卷真实容量定尺寸**，故这个值直接决定文件系统有多大；取值不要超过 ≈119 MiB（内联位图上限） |
 | `EXT2_IMG` | `build/ext2.img` | ext2 盘（挂 `/ext2`，宿主 `mke2fs`） |
 | `PARTS_IMG` | `build/parts.img` | MBR 分区测试盘（卷层解析） |
 | `EXFAT_IMG` | `build/exfat.img` | exFAT 盘（挂 `/usb`，宿主 `mkfs.exfat`） |
@@ -75,7 +75,7 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | namespace | 后端镜像 | 文件系统 | 挂载点 |
 | --- | --- | --- | --- |
 | `nsid=1` | `build/nvme.img`（宿主机 `mkfs.fat -F 32`） | FAT32 | `/` |
-| `nsid=2` | `build/mfs.img`（纯空白 raw） | MorionFS | `/mfs` |
+| `nsid=2` | `build/mfs.img`（纯空白 raw，默认 64 MiB） | MorionFS | `/mfs` |
 | `nsid=3` | `build/ext2.img`（宿主机 `mke2fs -t ext2`） | ext2（只读） | `/ext2` |
 | `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | `/usb3`（FAT32 分区）、`/usb4`（ext2 分区） |
 | `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
@@ -126,7 +126,9 @@ qemu-system-x86_64 \
 组织 PRP：1 页用 PRP1、2 页 PRP2 直指第 2 页、> 2 页则写 PRP 表页（逐页 `SYS_VIRT_TO_PHYS` 反查）。
 
 `build/mfs.img` 由 Makefile 用 `dd` 生成空白盘；超级块由 `mfs_srv` 首次挂载时写入
-（自动格式化）。**当前格式为 MFS6**（空闲位图 + 空间回收 + 文件间接块 + 变长目录项/长名 +
+（自动格式化），**尺寸按该卷的真实容量取**（M7 起；此前无论卷多大都写死 16 MiB）——
+所以 `MFS_MIB` 变了，格式化出来的文件系统也跟着变。
+**当前格式为 MFS6**（空闲位图 + 空间回收 + 文件间接块 + 变长目录项/长名 +
 节点元数据 + inode 号间接层/硬链接）：盘上是旧格式（`MFS1`…`MFS5` 或未知 magic）时，
 首次挂载会**自动重新格式化**，旧数据不再保留。**删掉 `build/mfs.img` 即回到全新盘**：
 
@@ -239,7 +241,7 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-20）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-21）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -255,6 +257,11 @@ app 的 FS 自测（FS-1..FS-20）成功时几乎静默（末尾打印一行 `ap
 **逐字节**往返（绝对目标要能还原出挂载前缀）；`lstat` 看链接自身（类型 LINK、size = 目标串长度）
 而 `stat` 跟随到目标；悬空链接 `stat` 失败但 `readlink`/`lstat` 正常；非链接上 `readlink` 必须失败；
 **跨挂载点的绝对目标创建必须失败**（`/usb/...`、`/tmp/...`、不存在的挂载点）。
+**FS-21（M7）** 盯的是「文件系统铺满卷」：断言 `MFS 总块数 × 8 == 它所在卷的 sectors`。
+一条关系式同时锁两件事 —— Identify Namespace 的 `NSZE` 真填进了卷表（整盘卷此前恒为 0），
+以及格式化确实按卷几何取尺寸。把 `mfs_format` 改回写死 4096 块，在 64 MiB 测试卷上立刻失败。
+⚠️ 等号只在卷容量未超内联位图上限（≈119 MiB）时成立；测试卷一旦超过它，这条**刻意失败**，
+提醒该去做「位图挪出超级块」。
 这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 另有一条**启动期**（不属于 FS 自测）的能力自测：域 0/1/3 走通「能力随 IPC 传递」后会打印
 `receiver: capability passing OK (handle moved + SendTo(3) delegated)`。它是**正面证据** ——
@@ -275,9 +282,10 @@ app 的 FS 自测（FS-1..FS-20）成功时几乎静默（末尾打印一行 `ap
 > （FS-12 由 171 s 涨到 274 s）。所以 `scripts/fs-regress.sh` **默认把 `build/mfs.img` 重置成空白**
 > （mfs_srv 首次挂载自动格式化），需要保留上一轮的卷时用 `MFS_KEEP=1`。
 > 手动跑（`make run-nvme`）不受影响，卷照旧持久。
-`mfs-dbg: vol=… total=… free=… gen=… snap=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
+`mfs-dbg: vol=… total=… free=… gen=… snap=… volsec=…` 一行给出 MFS 挂载后的空间状态，可用来确认空间回收是否生效
 （`free` 接近 `total`、`gen` 逐次启动单调增长；`snap` = 快照数，饱和时为 8，是上面那个「越跑越慢」的
-直接指标）；`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
+直接指标；`volsec` = 认领到的卷容量扇区数，**`total × 8` 应等于它**，不等说明文件系统没铺满卷）；
+`exfat-dbg: vol=… cluster=… clusters=… root=… bitmap=… upcase=…`
 一行给出 exFAT 挂载后的卷参数，用于与宿主 `mkfs.exfat` 的参数对齐核对。
 **exFAT 写路径**另用宿主 `fsck.exfat -n build/exfat.img` 交叉验证：回归后应为
 `clean. directories 1, files 0`（写盘的位图 / FAT / entry set 一致性由 exfatprogs 独立判定）。

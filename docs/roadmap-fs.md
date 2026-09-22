@@ -97,8 +97,8 @@ qemu-system-x86_64 \
 
 ### 阶段 C3 — 原创 MorionFS (MFS) 与 ext2 只读兼容
 
-- [x] **MFS（原创文件系统）** ✅ 已完成：块设备后端（NVMe 第二 namespace → 独立 `build/mfs.img`，16 MiB，
-      空白盘首次挂载自动格式化）。
+- [x] **MFS（原创文件系统）** ✅ 已完成：块设备后端（NVMe 第二 namespace → 独立 `build/mfs.img`，
+      默认 64 MiB，空白盘首次挂载自动格式化 —— **M7 起按该卷真实容量定尺寸**，不再写死）。
 - [x] **块设备后端（推荐）** ✅ 已完成：新增 `mfs_srv`（域 11），挂载到 `/mfs`，与 fat32(`/`)、tmpfs(`/tmp`) 共存。
 - [x] 块格式：4 KiB 块 + 8 字节块头（`magic u32` + `CRC32 u32`，payload 4088）；块 0/1 为**超级块 A/B 双副本**
       （A/B 交替写 + generation 取新），块 2 起为**分配区**（MFS2 起由空闲位图管理，
@@ -166,6 +166,7 @@ shell 交互 `ls /mfs` / `cat /mfs/PERSIST.TXT` / `ls /ext2` / `cat /ext2/HELLO.
 | M6a ✅ | exFAT 只读兼容 | 新文件服务域 `exfat_srv`（域 13）：引导区 + boot checksum、FAT 链、entry set 解析、分配位图、upcase 表；认领既有 exFAT 卷挂到 `/usb` | M1 |
 | M6b ✅ | exFAT 读写 | 位图分配/释放、FAT 链扩展、entry set 增删 + set checksum / NameHash 生成；`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE` | M6a |
 | M6c ✅ | 大容量卷（块层多页 DMA + exFAT 去上限） | 块层 PRP 表（单命令 ≤ 128 KiB，更大的请求自动切分）；exFAT 去掉 4 KiB 簇 / 4 KiB 位图 / 8 KiB upcase 三处硬上限（集群缓冲按簇大小分配、位图与 upcase 改为按需扇区窗口）；另加 MFS「非 MFS 卷拒绝格式化」护栏 | M6b |
+| M7 ✅ | MFS 按卷几何格式化（容量前置） | block_srv 补 `Identify Namespace`(CNS=0) 的 **NSZE**，整盘卷的 `sectors` 不再恒为 0；`mfs_format` 按该卷真实容量定总块数（此前写死 4096 块 = 16 MiB），挂载时校验盘上总块数不超过卷容量；卷表查询辅助收敛为 `vol_find_desc` | M2 |
 
 #### M1 已完成 ✅
 
@@ -842,6 +843,54 @@ exFAT 去上限：
   「按类型认领第一个匹配卷」，要让真盘出现在 shell 里还需 **M1b**（额外卷挂到 `/usb<N>`）。
 - fat32_srv 仍按「整簇读进单页缓冲」工作，**大簇 FAT32 分区（如 32 KiB 簇的 53.6 GiB U 盘）
   尚不能读**；块层已就绪，等 fat32 侧改造。
+
+#### M7 已完成 ✅
+
+**动机**：要让 MorionFS 从「挂在 `/mfs` 的第二棵树」变成**主力文件系统**，先得让它能
+真正用满一块盘。此前有两个把 MFS 限制成玩具的硬伤：
+
+- **格式化尺寸写死**：`mfs_format` 里 `MFS_TOTAL_BLOCKS = MFS_DEFAULT_TOTAL_BLOCKS`
+  （4096 块 = 16 MiB）—— **不看卷有多大**。整块 2 TiB 新盘接上，也会被格成 16 MiB。
+- **整盘卷容量未知**：卷层对「无分区表的整盘」记 `sectors = 0`，于是连「该格多大」都无从算起。
+
+实现要点：
+
+- **block_srv 补 NSZE**：`Volume`/`VolumeDesc.sectors` 的含义从「整盘其余部分，未知」改为
+  **真实容量**。做法是初始化阶段对每个 namespace 发一次 `Identify Namespace`(CNS=0)，取返回
+  数据偏移 0 的 `NSZE`（u64，512 B 逻辑块下即扇区数），缓存在 `NVME_NS_SECTORS`。
+  走 **Admin 队列**（只在 init 发一次，不占 I/O 队列）；顺带删掉了原先那条「发 NSID=1 的
+  Identify 却从不读结果」的死代码，改成按 namespace 列表逐个查询。
+  `sectors == 0` 仍保留「未知」语义（IDE PIO 回退路径取不到容量），需要容量的上层必须
+  按默认值兜底，**不能把 0 当成零长度卷**。
+- **mfs_srv 按几何格式化**：`mfs_format_total_blocks()` = `卷容量 / 8 扇区每块`，夹在
+  `[MFS_MIN_TOTAL_BLOCKS = 64, MFS_MAX_BLOCKS]` 之间；容量未知时退回 `MFS_DEFAULT_TOTAL_BLOCKS`。
+  新增下限是因为卷再小也得放得下两份超级块 + 根目录 + inode 表。
+- **挂载时校验容量**：超级块记录的总块数若超过该卷实际容量（换过镜像 / 卷号认领错 / 卷被
+  缩小过），该副本直接判为不可用 → 两份都不可用就走格式化。此前只有「不超过
+  `MFS_MAX_BLOCKS`」这一条上界检查，盘上记着比卷还大的尺寸时会一路读到盘外。
+- 顺带把卷表查询收敛成一个 `vol_find_desc(scratch, vol) -> Option<VolumeDesc>`，
+  `vol_kind_of` / `vol_sectors` 都基于它 —— 原来每加一个字段就要抄一遍扫描循环。
+- `mfs-dbg` 增 `volsec=`（卷容量扇区数）：`total × 8 == volsec` 一眼可验「文件系统铺满卷」。
+
+**验证（已通过）**：
+- **FS-21 自测**：断言 `MFS 总块数 × 8 == 它所在卷的 sectors`。一条关系式同时锁两件事 ——
+  NSZE 真的填进了卷表（整盘卷此前恒为 0），以及格式化确实按几何取尺寸。若把
+  `mfs_format` 改回写死 4096 块，在 64 MiB 测试卷上这条立刻失败。
+- 测试卷默认由 16 MiB 提到 **64 MiB**（`MFS_MIB ?= 64`）：卷比旧的写死值大，「按几何定尺寸」
+  这条路径才会被真正走到（16 MiB 卷上新旧行为恰好相同，测不出差别）。
+  实测 `mfs-dbg: vol=1 total=16384 free=16378 gen=3 snap=0 volsec=131072` —— 16384 块 × 4 KiB
+  = 64 MiB = 131072 扇区。
+- 全量回归 `SELFTEST DONE 1 / FAILED+PANIC 0`（覆盖 FS-1..FS-21）；`make clippy` 三 crate 0 warning。
+
+**M7 未覆盖**：
+- **总量上限仍是 ≈119 MiB**：空闲位图内联在超级块 payload 里（3832 字节 → 30656 块），
+  超过就被 `clamp` 截断 —— 而校验是等号，所以测试卷一旦超过 119 MiB，FS-21 会**刻意失败**，
+  提醒该做下面这件事。要放开必须先**把位图挪出超级块**（独立位图块 + 按窗口读写），
+  并由 GC 分块多趟扫描（mark/seen 两张全盘位图现在常驻内存，1 TB 卷光位图就几十 MB）。
+- **MFS 仍不参与额外卷自动挂载**：`mount_extra_volumes` 明确排除 MFS（持久卷 + 自动格式化
+  语义，多卷会误伤）。新硬盘上的 MFS 分区要能被用，还需要**显式格式化入口** +
+  严格护栏（只认 MFS magic 或用户显式指定，绝不自动吞 NTFS/exFAT 分区）。
+- IDE PIO 回退路径没有容量信息（`sectors = 0`），MFS 在它上面只能用默认尺寸。
 
 ### 阶段 4 — 远期
 
