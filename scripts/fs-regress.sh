@@ -27,7 +27,7 @@ dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=no
 if [ "${MFS_KEEP:-0}" = "1" ]; then
   echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
 else
-  dd if=/dev/zero of="$OUT_DIR/mfs.img" bs=1M count="${MFS_MIB:-64}" status=none
+  dd if=/dev/zero of="$OUT_DIR/mfs.img" bs=1M count="${MFS_MIB:-256}" status=none
   echo "== 重置 MFS 卷: $OUT_DIR/mfs.img -> 空白 (首次挂载自动格式化)"
 fi
 

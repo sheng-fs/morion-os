@@ -2153,7 +2153,7 @@ fn readdir_into(
             }
 
             let file_size = read_u32(unsafe { entry.add(28) });
-            let mut de = vfs::DirEntry::short([0; 11], file_size, is_dir as u32);
+            let mut de = vfs::DirEntry::short([0; 11], file_size as u64, is_dir as u32);
             unsafe {
                 core::ptr::copy_nonoverlapping(entry, de.name.as_mut_ptr(), 11);
             }
@@ -3501,12 +3501,19 @@ fn fat32_main() {
                 let req: vfs::ReadReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
                 };
+                // 协议 offset 是 u64, 但 FAT32 的文件大小字段只有 32 位: 偏移一旦超出
+                // u32 就不可能落在合法数据上, 直接判失败 (而不是截断成一个错的偏移)。
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
+                let offset = req.offset as u32;
                 let n = match fd_lookup(req.fd) {
                     Some(node) if !node.is_dir => read_file_range(
                         &bpb,
                         node.start_cluster,
                         node.file_size,
-                        req.offset,
+                        offset,
                         req.count,
                         fat_buf as *mut u8,
                         file_buf as *mut u8,
@@ -3520,12 +3527,17 @@ fn fat32_main() {
                 let req: vfs::WriteReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::WriteReq)
                 };
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
+                let offset = req.offset as u32;
                 let n = match fd_lookup(req.fd) {
                     Some(mut node) if !node.is_dir => {
                         let written = write_file_range(
                             &bpb,
                             &mut node,
-                            req.offset,
+                            offset,
                             req.count,
                             fat_buf as *mut u8,
                             file_buf as *mut u8,
@@ -3742,7 +3754,7 @@ fn fat32_main() {
                 {
                     Some(info) => {
                         let is_dir = u32::from(info.attr & ATTR_DIRECTORY != 0);
-                        let st = vfs::Stat::plain(info.file_size, is_dir);
+                        let st = vfs::Stat::plain(info.file_size as u64, is_dir);
                         unsafe {
                             core::ptr::write_unaligned(buf as *mut vfs::Stat, st);
                         }
@@ -3777,7 +3789,7 @@ fn fs11_write_pages(fd: u64, off: u32, pages: u32, tag: u8) -> bool {
                 core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
                 4096,
             );
-            vfs::write(fd, off + i * 4096, slice)
+            vfs::write(fd, (off + i * 4096) as u64, slice)
         };
         if n != 4096 {
             return false;
@@ -3791,7 +3803,7 @@ fn fs11_write_pages(fd: u64, off: u32, pages: u32, tag: u8) -> bool {
 fn fs11_verify_pages(fd: u64, off: u32, pages: u32, tag: u8) -> bool {
     let mut i = 0u32;
     while i < pages {
-        let n = vfs::read(fd, off + i * 4096, 4096);
+        let n = vfs::read(fd, (off + i * 4096) as u64, 4096);
         if n != 4096 {
             return false;
         }
@@ -3835,7 +3847,7 @@ fn fs13_perm(mode: u16) -> u16 {
 
 /// FS-13 辅助: 读 `fd` 的 [off, off+count) 并确认整段为 0 (稀疏区验证用)。
 fn fs13_all_zero(fd: u64, off: u32, count: u32) -> bool {
-    if vfs::read(fd, off, count) != count as u64 {
+    if vfs::read(fd, off as u64, count) != count as u64 {
         return false;
     }
     let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, count as usize) };
@@ -4549,7 +4561,7 @@ fn app_main() {
                     core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
                     4096,
                 );
-                vfs::write(gfd, off, slice)
+                vfs::write(gfd, off as u64, slice)
             };
             if n != 4096 {
                 println("app: FS10 chunked write FAILED");
@@ -4619,7 +4631,7 @@ fn app_main() {
                 core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
                 4096,
             );
-            vfs::write(cfd10, coff, slice)
+            vfs::write(cfd10, coff as u64, slice)
         };
         if n != 4096 {
             println("app: FS10 churn write FAILED");
@@ -5543,7 +5555,7 @@ fn app_main() {
                 buf[i] = pat(written + i);
                 i += 1;
             }
-            if vfs::write(fd, written as u32, &buf[..n]) != n as u64 {
+            if vfs::write(fd, written as u64, &buf[..n]) != n as u64 {
                 println("app: FS16 write FAILED");
                 return;
             }
@@ -5567,7 +5579,7 @@ fn app_main() {
         let mut off = 0usize;
         while off < total {
             let n = (total - off).min(4096);
-            if vfs::read(rfd, off as u32, n as u32) != n as u64 {
+            if vfs::read(rfd, off as u64, n as u32) != n as u64 {
                 println("app: FS16 read back FAILED");
                 return;
             }
@@ -5853,7 +5865,7 @@ fn app_main() {
                 buf[i] = pat(written + i);
                 i += 1;
             }
-            if vfs::write(fd, written as u32, &buf[..n]) != n as u64 {
+            if vfs::write(fd, written as u64, &buf[..n]) != n as u64 {
                 println("app: FS18 write FAILED");
                 return;
             }
@@ -5881,7 +5893,7 @@ fn app_main() {
         let mut off = 0usize;
         while off < total {
             let n = (total - off).min(4096);
-            if vfs::read(rfd, off as u32, n as u32) != n as u64 {
+            if vfs::read(rfd, off as u64, n as u32) != n as u64 {
                 println("app: FS18 read back FAILED");
                 return;
             }
@@ -6307,8 +6319,9 @@ fn app_main() {
     //       MFS 总块数 × 8 扇区/块 == 它所在卷的 sectors
     //     它同时证明两件事: (a) Identify Namespace 的 NSZE 真填进了卷表 —— 整盘卷
     //     此前 `sectors` 恒为 0(容量未知); (b) 格式化确实按卷几何取尺寸。
-    //     ⚠️ 等号只在卷容量未超「内联位图上限」(MFS_MAX_BLOCKS ≈ 119 MiB) 时成立;
-    //     测试卷超过它时这里会失败 —— 那正是该去把位图挪出超级块的信号。
+    //     MFS7 起位图已外置到独立数据块 (见 FS-23(a)), 上界提到 ≈127.25 GiB
+    //     (`MFS_MAX_BLOCKS`), 故 256 MiB 测试卷不再触发 clamp —— 这条等号在测试卷
+    //     尺寸下恒成立。
     {
         let usage = vfs::mfs_stat();
         if usage == u64::MAX {
@@ -6462,6 +6475,170 @@ fn app_main() {
                 println("app: FS22 primary volume content mismatch FAILED");
                 return;
             }
+        }
+    }
+
+    // 26. FS-23(a) 自测 (S3a): 位图外置后的**多块位图**容量路径。
+    //     MFS7 把空闲位图从超级块里挪出来 (独立位图数据块 + 位图头块), 容量上限从
+    //     内联位图的 30656 块 (≈119 MiB) 提到 `MFS_MAX_BLOCKS` = 1018 × 32768
+    //     ≈ 127.25 GiB。一个 4 KiB 位图数据块覆盖 32768 块 (= 128 MiB), 故卷超过
+    //     128 MiB 时 bb ≥ 2 —— 这正是本自测要走的路径 (默认测试卷 256 MiB → bb = 2)。
+    //     断言 (只盯几何关系, 不真写满 128 MiB 数据: IPC 往返代价不可接受):
+    //       (a) MFS 总块数 × 8 扇区/块 == 该卷 sectors —— 格式化按卷几何定尺寸仍成立;
+    //       (b) 总块数 > 一个位图数据块的覆盖范围 (32768), 即 bb ≥ 2 —— 多块位图确实在用。
+    //     多块位图的**读回 / CRC 校验 / 重建**由每次挂载校验 (逐 chunk 比对 CRC32) 与
+    //     GC 全量重建覆盖: FS-12 每轮做 3 次全卷 GC, 会把所有 chunk 置脏并整体落盘。
+    {
+        // `mfs_stat` 报的是**当前卷**, 而 FS-22 刚在额外卷上折腾过 —— 先对主卷做一次
+        // 操作把服务的内存态锚回主卷, 免得量到的是一块小卷。
+        let probe = vfs::creat("/mfs/FS23PROBE.TXT");
+        if probe == u64::MAX {
+            println("app: FS23 pin primary volume FAILED");
+            return;
+        }
+        vfs::close(probe);
+        let usage = vfs::mfs_stat();
+        if usage == u64::MAX {
+            println("app: FS23 mfs_stat FAILED");
+            return;
+        }
+        let total = usage >> 32;
+        // 主卷必须跨过单个位图数据块的覆盖范围 (32768 块) -> bb ≥ 2, 多块位图在用。
+        if total <= 32768 {
+            println("app: FS23 primary volume too small for multi-chunk bitmap FAILED");
+            return;
+        }
+        let n = block_list_volumes(vfs::RESULT_BUF as *mut u8, 16);
+        if n == 0 || n == u64::MAX {
+            println("app: FS23 list volumes FAILED");
+            return;
+        }
+        let mut i = 0u64;
+        let mut found = false;
+        while i < n {
+            let d = vol_desc(vfs::RESULT_BUF as *const u8, i as usize);
+            if d.nsid == 2 && d.start_lba == 0 {
+                found = true;
+                if total * 8 != d.sectors as u64 {
+                    println("app: FS23 fs does not fill its volume FAILED");
+                    return;
+                }
+            }
+            i += 1;
+        }
+        if !found {
+            println("app: FS23 mfs disk missing from volume table FAILED");
+        }
+    }
+
+    // 27. FS-23(b) 自测 (S3b): 单文件 >4 GiB (稀疏) —— u64 offset 端到端 + 三级间接块。
+    //     在 /mfs 上建文件并 truncate 到 5 GiB + 12345 字节 (稀疏扩展, 不真写数据, 代价可
+    //     接受); 再在**跨过 4 GiB 边界**的偏移 (4 GiB + 4 KiB) 写 16 字节已知内容, 同偏移
+    //     读回逐字节校验。二级间接区的字节上限约 3.98 GiB
+    //     ((1005 + 1022 + 1022²) × 4088), 故该偏移必然落在**三级间接区** —— 这条断言同时
+    //     覆盖「u64 offset 端到端」与「三级间接块被真正使用」。
+    const FS23B_OFF: u64 = 4 * 1024 * 1024 * 1024 + 4096;
+    const FS23B_SIZE: u64 = 5 * 1024 * 1024 * 1024 + 12345;
+    const FS23B_PAT: [u8; 16] = [0xA5; 16];
+    {
+        let fd = vfs::creat("/mfs/FS23BIG.BIN");
+        if fd == u64::MAX {
+            println("app: FS23 creat big file FAILED");
+            return;
+        }
+        if vfs::truncate(fd, FS23B_SIZE) != 1 {
+            println("app: FS23 truncate to 5GiB FAILED");
+            vfs::close(fd);
+            return;
+        }
+        // size 必须如实报出 5 GiB + 12345 (u64, 而不是被截窄到 32 位的值)。
+        match fs13_stat("/mfs/FS23BIG.BIN") {
+            Some(s) if s.size == FS23B_SIZE => {}
+            _ => {
+                println("app: FS23 big file size FAILED");
+                vfs::close(fd);
+                return;
+            }
+        }
+        // 起始处仍是空洞: 整页读回必须全 0 (稀疏扩展不分配块)。
+        if !fs13_all_zero(fd, 0, 4096) {
+            println("app: FS23 head hole FAILED");
+            vfs::close(fd);
+            return;
+        }
+        // 跨 4 GiB 边界写 16 字节 (count ≤ 一页), 同偏移读回逐字节校验。
+        if vfs::write(fd, FS23B_OFF, &FS23B_PAT) != 16 {
+            println("app: FS23 write past 4GiB FAILED");
+            vfs::close(fd);
+            return;
+        }
+        if vfs::read(fd, FS23B_OFF, 16) != 16 {
+            println("app: FS23 read past 4GiB FAILED");
+            vfs::close(fd);
+            return;
+        }
+        {
+            let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 16) };
+            if got != FS23B_PAT {
+                println("app: FS23 past-4GiB content mismatch FAILED");
+                vfs::close(fd);
+                return;
+            }
+        }
+        vfs::close(fd);
+    }
+
+    // 28. FS-23(c) 自测 (S3b): 三级块在重新打开与 GC 后仍可达。
+    //     重新 open 后读同一偏移内容一致 -> size/指针已正确持久化, 不依赖内存态;
+    //     再调 MFS 显式 GC 后复读一致 -> GC 的可达性标记正确覆盖了 MFI3 (漏标会把三级块
+    //     当垃圾回收并重新分配出去, 这条读取就会失败或读到错内容)。
+    {
+        let fd = vfs::open("/mfs/FS23BIG.BIN");
+        if fd == u64::MAX {
+            println("app: FS23 reopen FAILED");
+            return;
+        }
+        if vfs::read(fd, FS23B_OFF, 16) != 16 {
+            println("app: FS23 read after reopen FAILED");
+            vfs::close(fd);
+            return;
+        }
+        {
+            let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 16) };
+            if got != FS23B_PAT {
+                println("app: FS23 content lost after reopen FAILED");
+                vfs::close(fd);
+                return;
+            }
+        }
+        vfs::close(fd);
+        if vfs::mfs_gc() == u64::MAX {
+            println("app: FS23 GC FAILED");
+            return;
+        }
+        let fd = vfs::open("/mfs/FS23BIG.BIN");
+        if fd == u64::MAX {
+            println("app: FS23 reopen after GC FAILED");
+            return;
+        }
+        if vfs::read(fd, FS23B_OFF, 16) != 16 {
+            println("app: FS23 read after GC FAILED");
+            vfs::close(fd);
+            return;
+        }
+        {
+            let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 16) };
+            if got != FS23B_PAT {
+                println("app: FS23 content lost after GC FAILED");
+                vfs::close(fd);
+                return;
+            }
+        }
+        vfs::close(fd);
+        // 清理: 删掉这个 5 GiB 稀疏文件, 避免污染后续回归与下一轮持久卷。
+        if vfs::unlink("/mfs/FS23BIG.BIN") != 1 {
+            println("app: FS23 cleanup unlink FAILED");
+            return;
         }
     }
     println("app: SELFTEST DONE");
@@ -6732,7 +6909,7 @@ fn shell_ls(st: &ShellState, arg: &str) {
             print(" links=");
             print_u64(de.nlink as u64);
             print(" size=");
-            print_u64_pad(de.size as u64, 8);
+            print_u64_pad(de.size, 8);
             print("  ");
             print_time(de.mtime);
             print("  ");
@@ -6743,7 +6920,7 @@ fn shell_ls(st: &ShellState, arg: &str) {
             print_entry_name(de);
             if de.is_dir == 0 {
                 print("  size=");
-                print_u64(de.size as u64);
+                print_u64(de.size);
             }
             println("");
         }
@@ -6906,8 +7083,9 @@ fn shell_truncate(st: &ShellState, arg: &str) {
             return;
         }
     };
+    // size 现在是 u64: 不再把上限卡在 4 GiB, 与协议 / MFS 的能力对齐。
     let size = match parse_dec(size_s) {
-        Some(v) if v <= u32::MAX as u64 => v as u32,
+        Some(v) => v,
         _ => {
             print("truncate: bad size: ");
             println(size_s);
@@ -6931,7 +7109,7 @@ fn shell_truncate(st: &ShellState, arg: &str) {
     vfs::close(fd);
     if r == 1 {
         print("truncate: size=");
-        print_u64(size as u64);
+        print_u64(size);
         print(" ");
         println(path);
     } else {
@@ -6980,7 +7158,7 @@ fn shell_stat(st: &ShellState, arg: &str, no_follow: bool) {
     print("  Links: ");
     print_u64(st.nlink as u64);
     print("  Size:  ");
-    print_u64(st.size as u64);
+    print_u64(st.size);
     print("  Modify: ");
     print_time(st.mtime);
     print("  Change: ");
@@ -8050,18 +8228,24 @@ fn tmpfs_main() {
                 let req: vfs::ReadReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
                 };
+                // tmpfs 节点 size 是 u32 (存储 32 KiB), 协议 offset 超出 u32 直接失败。
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
+                let offset = req.offset as u32;
                 let n = match tmp_fd_node(req.fd) {
                     Some(idx) => {
                         let nd = tmp_node_at(idx);
                         if nd.is_dir {
                             u64::MAX
-                        } else if req.offset >= nd.size {
+                        } else if offset >= nd.size {
                             0
                         } else {
-                            let cnt = (req.count).min(nd.size - req.offset) as usize;
+                            let cnt = (req.count).min(nd.size - offset) as usize;
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
-                                    tmp_data_ptr(nd.data_off as usize + req.offset as usize),
+                                    tmp_data_ptr(nd.data_off as usize + offset as usize),
                                     req.buf as *mut u8,
                                     cnt,
                                 );
@@ -8077,9 +8261,14 @@ fn tmpfs_main() {
                 let req: vfs::WriteReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::WriteReq)
                 };
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
+                let offset = req.offset as u32;
                 let n = match tmp_fd_node(req.fd) {
                     Some(idx) if !tmp_node_at(idx).is_dir => {
-                        let end = req.offset as usize + req.count as usize;
+                        let end = offset as usize + req.count as usize;
                         let (mut off, mut cap) = {
                             let nd = tmp_node_at(idx);
                             (nd.data_off as usize, nd.cap as usize)
@@ -8105,7 +8294,7 @@ fn tmpfs_main() {
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
                                     req.buf as *const u8,
-                                    tmp_data_ptr(off + req.offset as usize),
+                                    tmp_data_ptr(off + offset as usize),
                                     req.count as usize,
                                 );
                             }
@@ -8158,7 +8347,7 @@ fn tmpfs_main() {
                             }
                             let mut e = vfs::DirEntry::short(
                                 [0u8; 11],
-                                if child.is_dir { 0 } else { child.size },
+                                if child.is_dir { 0 } else { child.size as u64 },
                                 if child.is_dir { 1 } else { 0 },
                             );
                             tmp_name_83(cp, &mut e.name);
@@ -8265,7 +8454,7 @@ fn tmpfs_main() {
                     Some(n) => match tmp_find(&canon[..n]) {
                         Some(idx) => {
                             let nd = tmp_node_at(idx);
-                            let st = vfs::Stat::plain(nd.size, u32::from(nd.is_dir));
+                            let st = vfs::Stat::plain(nd.size as u64, u32::from(nd.is_dir));
                             unsafe {
                                 core::ptr::write_unaligned(buf as *mut vfs::Stat, st);
                             }
@@ -8304,7 +8493,7 @@ fn tmpfs_main() {
 //
 // 统一块布局: [ magic u32 | crc32 u32 | payload 4088 ]
 //   目录 payload: nentries u32 | pad u32 | entries[170] { name[16] | block u32 | type u32 }
-//   文件 payload: size u32 | nblocks u32 | blocks[1020] u32
+//   文件 payload: size u64 | nblocks u32 | pad u32 | 直接指针 + 一/二/三级间接指针
 //   数据 payload: 文件字节 (每块最多 4088 字节)
 //
 // 名称沿用 8.3 短名 (转大写), 与 libvfs 的 DirEntry ABI 及 shell 显示一致。
@@ -8342,17 +8531,20 @@ const MFS_SB_COPIES: u32 = 2;
 /// 超级块内快照表容量。
 const MFS_MAX_SNAP: usize = 8;
 
-/// 超级块 magic: "MFS6"（空闲位图 + 空间回收 + 大文件间接块 + 变长目录项 + 元数据 +
-/// inode 号间接层）。
+/// 超级块 magic: "MFS8"（文件 size 改 u64 + 三级间接块 → 单文件上限与卷容量同量级）。
 ///
 /// magic 携带布局修订: `MFS1` = 纯 COW, `MFS2` = +空闲位图, `MFS3` = +文件间接块,
 /// `MFS4` = +变长目录项/多块目录, `MFS5` = +节点元数据（目录块头部 8 → 48）,
-/// `MFS6` = +inode 表（目录项改存 inode 号，块号经表映射）。
+/// `MFS6` = +inode 表（目录项改存 inode 号，块号经表映射）,
+/// `MFS7` = +位图外置（位图改为独立数据块 + 头块，超级块 payload 不再内联位图）,
+/// `MFS8` = +文件 size u64 +三级间接块（缩直接区 4 字节腾出 ind3 槽位，元数据偏移不变）。
 /// 旧修订缺少新布局所需的字段/语义, 挂载时一律视为无效 -> 自动重新格式化
 /// (卷层仍同时认各修订, 见 `vol_detect_kind`)。
-const MFS_MAGIC_SUPER: u32 = 0x4D46_5336; // "MFS6"
+const MFS_MAGIC_SUPER: u32 = 0x4D46_5338; // "MFS8"
 /// 超级块内的格式版本 (magic 之外的二次校验)。
-const MFS_VERSION: u32 = 6;
+const MFS_VERSION: u32 = 8;
+/// 位图头块 magic: "MFBH"（记录 gen / 总块数 / 位图数据块数 + 各数据块 CRC32）。
+const MFS_MAGIC_BMPHDR: u32 = 0x4D46_4248; // "MFBH"
 /// 目录块 (base 节点或扩展块): ext + 元数据 + 变长条目区。
 const MFS_MAGIC_DIR: u32 = 0x4D46_4449; // "MFDI"
 /// 目录扩展索引块 (槽位全是扩展目录块指针)。
@@ -8365,6 +8557,8 @@ const MFS_MAGIC_DATA: u32 = 0x4D46_4441; // "MFDA"
 const MFS_MAGIC_IND: u32 = 0x4D46_494E; // "MFIN"
 /// 二级间接块 (槽位全是一级间接块指针)。
 const MFS_MAGIC_IND2: u32 = 0x4D46_4932; // "MFI2"
+/// 三级间接块 (槽位全是二级间接块指针)。
+const MFS_MAGIC_IND3: u32 = 0x4D46_4933; // "MFI3"
 
 // 节点元数据: 文件与目录布局相同, 只是所在偏移不同 (目录紧跟 ext 之后, 文件在 inode
 // 尾部保留区)。三种时间都是 Unix 秒 (由 CMOS RTC 提供)。
@@ -8421,44 +8615,61 @@ const MFS_NAME_MAX: usize = 255;
 /// 扩展索引块的槽位数 (整个 payload 都是扩展目录块指针)。
 const MFS_DIR_SLOTS: usize = MFS_PAYLOAD / 4;
 
-// 文件块 payload 布局:
-//   +0 size(u32) / +4 nblocks(u32) / +8 起 1008 个直接块指针
-//   / 其后 一级间接指针 + 二级间接指针 / 末尾 40 字节保留 (预留给元数据)。
+// 文件块 payload 布局 (MFS8):
+//   +0 size(u64) / +8 nblocks(u32) / +12 pad(u32) / +16 起 1005 个直接块指针
+//   / 其后 一级 + 二级 + 三级间接指针 / 末尾 40 字节保留 (预留给元数据)。
 //
-// 逻辑块索引 (`bi`) 到物理块的映射分三段: 直接区 -> 一级间接区 -> 二级间接区;
-// 每段容量见下, 合计 `MFS_FILE_MAX_BLOCKS` ≈ 4 GiB (实际受空闲位图容量限制,
-// 即单文件上限 = 整卷可用块数 ≈ 119 MiB)。
+// 逻辑块索引 (`bi`) 到物理块的映射分四段: 直接区 -> 一级 -> 二级 -> **三级**间接区;
+// 每段容量见下。合计 `MFS_FILE_MAX_BLOCKS` 已远超位图能描述的块数, 故单文件上限实际
+// 等于整卷可用块数 (即单文件与卷容量同量级; MFS7 起位图外置, ≈127.25 GiB)。
 /// inode 内的直接块指针数 (直接区覆盖 ≈3.9 MiB, 小文件不产生额外 I/O)。
-const MFS_FILE_DIRECT: usize = 1008;
+///
+/// 由 1008 缩到 1005: size 由 u32 变 u64 (+4 字节)、新增 4 字节 pad (+4) 各让出
+/// 一个槽位, 再把 `MFS_FILE_IND3_OFF` 需要的 4 字节腾出来 —— 合计缩掉 3 个指针
+/// (12 字节), 使三个间接指针仍结束于 4056, 元数据偏移保持不变。
+const MFS_FILE_DIRECT: usize = 1005;
+/// 文件大小 (u64) 在块内的偏移。
+const MFS_FILE_SIZE_OFF: usize = MFS_HDR;
+/// 已分配逻辑块数 (u32) 在块内的偏移。
+const MFS_FILE_NBLOCKS_OFF: usize = MFS_HDR + 8;
+/// 直接块指针区在块内的起点。
+const MFS_FILE_DIRECT_OFF: usize = MFS_HDR + 16;
 /// 一级间接块指针在 inode 中的偏移。
-const MFS_FILE_IND1_OFF: usize = MFS_HDR + 8 + MFS_FILE_DIRECT * 4;
+const MFS_FILE_IND1_OFF: usize = MFS_FILE_DIRECT_OFF + MFS_FILE_DIRECT * 4;
 /// 二级间接块指针在 inode 中的偏移。
 const MFS_FILE_IND2_OFF: usize = MFS_FILE_IND1_OFF + 4;
-/// inode 保留区起点 (留给后续元数据: 时间戳 / 权限 / 链接数)。
-const MFS_FILE_RESERVED_OFF: usize = MFS_FILE_IND2_OFF + 4;
+/// 三级间接块指针在 inode 中的偏移 (缩直接区腾出的槽位)。
+const MFS_FILE_IND3_OFF: usize = MFS_FILE_IND2_OFF + 4;
+/// inode 保留区起点 (留给元数据: 时间戳 / 权限 / 链接数); 必须仍为 4056。
+const MFS_FILE_RESERVED_OFF: usize = MFS_FILE_IND3_OFF + 4;
 /// inode 保留区字节数。
 const MFS_FILE_RESERVED: usize = MFS_BLOCK - MFS_FILE_RESERVED_OFF;
 
 // 软链接块 payload 布局 (M5c) —— **沿用文件布局**, 这样所有元数据读写函数用
 // `is_dir = false` 就能直接作用于软链接, 不必给它们再加一种节点类型分支:
 //
-//   +0 size(u32)  ← 复用文件的大小字段, 这里存**目标路径字节数** (`lstat` 的 size)
-//   +4 nblocks    ← 未用 (恒 0)
+//   +0 size(u64)  ← 复用文件的大小字段, 这里存**目标路径字节数** (`lstat` 的 size)
 //   +8 起         ← 目标路径字节 (UTF-8, 无结尾 NUL), 见 `MFS_LINK_TARGET_OFF`
+//                    (紧接 u64 size 之后, 顺带覆盖未用的 nblocks / 直接指针区)
 //   ...
 //   +MFS_FILE_RESERVED_OFF 起 40 字节元数据 (与文件同偏移)
 //
 // 目标内联在节点里 (fast symlink), 不占数据块 —— 软链接不参与硬链接, nlink 恒为 1。
-/// 软链接目标路径在节点 payload 里的起始偏移 (复用文件的直接块指针区)。
+/// 软链接目标路径在节点 payload 里的起始偏移 (紧接 u64 size 之后)。
 const MFS_LINK_TARGET_OFF: usize = MFS_HDR + 8;
 /// 软链接目标路径长度上限 (实际还受单条 IPC 路径长度约束, 见 `MFS_PATH_MAX`)。
 const MFS_LINK_MAX: usize = MFS_FILE_RESERVED_OFF - MFS_LINK_TARGET_OFF;
-/// 布局自检: 直接指针区 + 两个间接指针 + 保留区正好铺满一个 4 KiB 块。
+/// 布局自检: 直接指针区 + 三个间接指针 + 保留区正好铺满一个 4 KiB 块。
 const _: () = assert!(MFS_FILE_RESERVED >= 40);
 /// 每个间接块的指针槽数 (整个 payload 都是指针)。
 const MFS_IND_CAP: usize = MFS_PAYLOAD / 4;
-/// 单个文件的逻辑块上限 = 直接 + 一级 + 二级容量。
-const MFS_FILE_MAX_BLOCKS: usize = MFS_FILE_DIRECT + MFS_IND_CAP + MFS_IND_CAP * MFS_IND_CAP;
+/// 单个文件的逻辑块上限 = 直接 + 一级 + 二级 + 三级容量。
+///
+/// 三级槽数 (1022³ ≈ 1.07e9) 在 usize 上算, 避免中间量溢出。
+const MFS_FILE_MAX_BLOCKS: usize = MFS_FILE_DIRECT
+    + MFS_IND_CAP
+    + MFS_IND_CAP * MFS_IND_CAP
+    + MFS_IND_CAP * MFS_IND_CAP * MFS_IND_CAP;
 /// 单个数据块可存放的文件字节数。
 const MFS_DATA_CAP: usize = MFS_PAYLOAD;
 // 路径解析链最大深度 / 打开文件上限。
@@ -8504,7 +8715,8 @@ const MFS_ROOT_INO: u32 = 1;
 // 超级块 payload 布局 (除下列区段外均为保留):
 //   +0 version / +4 block_size / +8 total_blocks / +12 ino_count / +16 alloc_hint
 //   +20 snap_count / +24 gen(u64) / +32 itab_root / +36 ino_hint
-//   / +48 快照表(8 × 24B) / +256 空闲位图。
+//   / +48 快照表(8 × 24B) / +256 起预留
+// (MFS7 起空闲位图已移出超级块, +256 那片区域留空保留 —— 见位图头块布局。)
 const MFS_SB_BLOCK_SIZE: usize = 4;
 const MFS_SB_TOTAL: usize = 8;
 const MFS_SB_INO_COUNT: usize = 12;
@@ -8519,11 +8731,29 @@ const MFS_SB_INO_HINT: usize = 36;
 const MFS_SB_SNAPS: usize = 48;
 /// 单条快照记录字节数: gen(u64) + itab_root/ino_hint/alloc_hint/reserved (4 × u32)。
 const MFS_SNAP_REC: usize = 24;
-const MFS_SB_BITMAP_OFF: usize = 256;
-/// 空闲位图字节数 (= 超级块 payload 中位图区的大小)。
-const MFS_BITMAP_BYTES: usize = MFS_PAYLOAD - MFS_SB_BITMAP_OFF;
-/// 位图能描述的最大块数 (30656 块 ≈ 119 MiB)。
-const MFS_MAX_BLOCKS: u32 = (MFS_BITMAP_BYTES * 8) as u32;
+// 位图头块 payload 布局 (MFS7): +0 gen(u64) / +8 total_blocks(u32) / +12 data_blocks(u32)
+//   / +16 CRC32 数组 (每个位图数据块一项)。
+/// 位图头块 payload: 代际 (必须与对应超级块副本的 gen 一致)。
+const MFS_BMPH_GEN: usize = 0;
+/// 位图头块 payload: 总块数 (必须与超级块一致)。
+const MFS_BMPH_TOTAL: usize = 8;
+/// 位图头块 payload: 位图数据块数 bb (必须等于该卷的 bb)。
+const MFS_BMPH_DATA_BLOCKS: usize = 12;
+/// 位图头块 payload: CRC32 数组起点。
+const MFS_BMPH_CRC: usize = 16;
+
+// MFS7 盘上布局 (位图外置):
+//   块 0/1        = 超级块 A/B
+//   块 2/3        = 位图头 A/B (magic "MFBH")
+//   块 4..4+bb    = 位图数据副本 A (裸 4096 字节, 无块头)
+//   块 4+bb..4+2bb = 位图数据副本 B
+//   MFS_DATA_START = 4 + 2*bb; 它之前的块一律强制标记占用, 不参与分配。
+/// 一个位图数据块覆盖的块数 (4096 字节 × 8 位 = 32768 块 = 128 MiB)。
+const MFS_BMP_BLOCK_SPAN: u32 = (MFS_BLOCK * 8) as u32;
+/// 位图数据块数上限 (= 位图头块 payload 里 CRC 数组的容量)。
+const MFS_MAX_BMP_DATA_BLOCKS: u32 = ((MFS_PAYLOAD - MFS_BMPH_CRC) / 4) as u32;
+/// 位图能描述的最大块数 (1018 × 32768 = 33_357_824 块 ≈ 127.25 GiB)。
+const MFS_MAX_BLOCKS: u32 = MFS_MAX_BMP_DATA_BLOCKS * MFS_BMP_BLOCK_SPAN;
 /// 低水位分频: 空闲块 < `总块数 / MFS_GC_LOW_WATER_DIV` 时, 服务空闲即自动回收。
 const MFS_GC_LOW_WATER_DIV: u32 = 16;
 /// 回收遍历栈容量 (只压入目录块, 深度优先)。
@@ -8553,6 +8783,21 @@ const MFS_ITABX_VADDR: u64 = 0x0000_0080_0011_2000;
 /// GC 遍历时翻译 ino 用的表块缓冲页 (GC 的主体缓冲在 `MFS_GC_VADDR`, 两个不能共用)。
 const MFS_GC_TAB_VADDR: u64 = 0x0000_0080_0011_3000;
 
+// MFS7 位图窗口 (页数动态, 见 `mfs_win_ensure`)。
+//
+// 旧版把空闲位图 / GC 标记 / 本根已访问三个位图放在**编译期定长数组**里; 新容量上限
+// 需要 ≈4.17 MB/窗口, 静态放不下 —— 改为按卷容量逐页分配的窗口。三个窗口都**只增不缩**
+// (卷变小也不 sys_unmap: 窗口页共享给了 block_srv, 回收要走引用计数, 不值当)。
+/// 主空闲位图窗口: 第 k 页 ↔ 该副本第 k 个位图数据块, 直接作 `block_read/write_dev`
+/// 的缓冲 (免拷贝)。**必须**共享给 block_srv 供其 DMA 写入。
+const MFS_BMP_VADDR: u64 = 0x0000_0080_0100_0000;
+/// GC 可达标记窗口 (服务私有, 不共享)。
+const MFS_MARK_VADDR: u64 = 0x0000_0080_0140_0000;
+/// GC「本根已访问」窗口 (服务私有, 不共享)。
+const MFS_SEEN_VADDR: u64 = 0x0000_0080_0180_0000;
+/// 位图头块缓冲页 (单页)。同样共享给 block_srv —— 头块经它读入 / 写出。
+const MFS_BMPH_VADDR: u64 = 0x0000_0080_0016_2000;
+
 fn mfs_a() -> *mut u8 {
     MFS_BUF_A_VADDR as *mut u8
 }
@@ -8577,6 +8822,9 @@ fn mfs_itabx_buf() -> *mut u8 {
 fn mfs_gc_tab_buf() -> *mut u8 {
     MFS_GC_TAB_VADDR as *mut u8
 }
+fn mfs_bmph_buf() -> *mut u8 {
+    MFS_BMPH_VADDR as *mut u8
+}
 
 // 超级块/分配状态 (内存镜像, 与磁盘副本同步)。
 /// inode 表索引块号 (根目录恒为 `MFS_ROOT_INO`)。
@@ -8591,21 +8839,28 @@ static mut MFS_ITAB_CACHE_IDX: u32 = u32::MAX;
 static mut MFS_ALLOC_NEXT: u32 = 0;
 static mut MFS_TOTAL_BLOCKS: u32 = 0;
 static mut MFS_GEN: u64 = 0;
-static mut MFS_SB_COPY: u32 = 0;
 static mut MFS_SNAP_COUNT: usize = 0;
-/// 空闲块数 (由 `MFS_BITMAP` 派生, 由 `mfs_bmp_set/clear` 增量维护)。
+/// 空闲块数 (由位图窗口派生, 由 `mfs_bmp_set/clear` 增量维护)。
 static mut MFS_FREE_BLOCKS: u32 = 0;
-/// 空闲位图 (1 = 已占用): 块分配的权威依据, 随超级块持久化。
-static mut MFS_BITMAP: [u8; MFS_BITMAP_BYTES] = [0; MFS_BITMAP_BYTES];
-/// GC 标记位图: 先离线构建, 遍历成功后才整体替换 `MFS_BITMAP`。
-static mut MFS_GC_MARK: [u8; MFS_BITMAP_BYTES] = [0; MFS_BITMAP_BYTES];
-/// GC 的「本根已访问」位图 (每换一个可达根就清零)。
+/// 三个位图窗口当前已分配的页数 (只增不缩, 见各窗口 VADDR 处的说明)。
+static mut MFS_BMP_PAGES: u32 = 0;
+static mut MFS_MARK_PAGES: u32 = 0;
+static mut MFS_SEEN_PAGES: u32 = 0;
+/// 位图数据块数 bb (当前卷; 0 = 未挂载)。
+static mut MFS_BMP_DATA_BLOCKS: u32 = 0;
+/// 位图数据块**脏位图**的字节数 (每位对应一个位图数据块)。
+const MFS_BMP_DIRTY_BYTES: usize = (MFS_MAX_BMP_DATA_BLOCKS as usize).div_ceil(8);
+/// 位图数据块的脏位图: 提交时只把变动过的区间落盘 (见 `mfs_bmp_flush`)。
+static mut MFS_BMP_DIRTY: [u8; MFS_BMP_DIRTY_BYTES] = [0; MFS_BMP_DIRTY_BYTES];
+/// 常驻 CRC32 数组 (每个位图数据块一项): 落盘进位图头块, 加载时逐块比对。
+static mut MFS_BMP_CRC: [u32; MFS_MAX_BMP_DATA_BLOCKS as usize] =
+    [0; MFS_MAX_BMP_DATA_BLOCKS as usize];
+/// GC 的「本根已访问」位图 (每换一个可达根就清零; 现居 `MFS_SEEN_VADDR` 窗口)。
 ///
 /// 必须与可达位图分开: 同一个目录块可能同时被当前树与某快照引用, 而块内条目的
 /// ino 在不同根的表下会翻译成**不同**的对象块 —— 所以每个根都得重新遍历一遍。
 /// 若拿可达位图当访问集去重, 快照那次就会被跳过, 快照引用的旧块漏标而被回收
 /// (M5 之前目录项直接存块号, 不存在这个差异; 引入 inode 表后必须分开)。
-static mut MFS_GC_SEEN: [u8; MFS_BITMAP_BYTES] = [0; MFS_BITMAP_BYTES];
 /// GC 遍历栈 (待展开的目录块)。
 static mut MFS_GC_STACK: [u32; MFS_GC_STACK_MAX] = [0; MFS_GC_STACK_MAX];
 /// GC 遍历栈顶指针 (跨函数传递, 故用静态量)。
@@ -8760,25 +9015,54 @@ fn mfs_write_blk(block_no: u32, src: *const u8) -> bool {
 // 判定, 不可达的老版本块会被归还给空闲池。
 
 fn mfs_bmp_byte(i: usize) -> *mut u8 {
-    unsafe { core::ptr::addr_of_mut!(MFS_BITMAP).cast::<u8>().add(i) }
+    (MFS_BMP_VADDR as *mut u8).wrapping_add(i)
 }
 fn mfs_mark_byte(i: usize) -> *mut u8 {
-    unsafe { core::ptr::addr_of_mut!(MFS_GC_MARK).cast::<u8>().add(i) }
+    (MFS_MARK_VADDR as *mut u8).wrapping_add(i)
 }
 fn mfs_seen_byte(i: usize) -> *mut u8 {
-    unsafe { core::ptr::addr_of_mut!(MFS_GC_SEEN).cast::<u8>().add(i) }
+    (MFS_SEEN_VADDR as *mut u8).wrapping_add(i)
+}
+/// 位图需覆盖的字节数 (按当前卷总块数动态算)。
+fn mfs_bmp_bytes() -> usize {
+    (unsafe { MFS_TOTAL_BLOCKS } as usize).div_ceil(8)
+}
+/// 把块 `b` 所在的位图数据块标脏 (提交时只落盘变动过的区间)。
+fn mfs_bmp_touch(b: u32) {
+    let c = (b / MFS_BMP_BLOCK_SPAN) as usize;
+    if c < MFS_MAX_BMP_DATA_BLOCKS as usize {
+        unsafe {
+            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(c >> 3) |= 1u8 << (c & 7);
+        }
+    }
+}
+/// 清空整个标记窗口 (GC 每轮的起点)。
+fn mfs_mark_clear_all() {
+    for i in 0..mfs_bmp_bytes() {
+        unsafe {
+            *mfs_mark_byte(i) = 0;
+        }
+    }
+}
+/// 清空整个「本根已访问」窗口 (每换一个可达根都要清)。
+fn mfs_seen_clear_all() {
+    for i in 0..mfs_bmp_bytes() {
+        unsafe {
+            *mfs_seen_byte(i) = 0;
+        }
+    }
 }
 /// 本根是否已访问过块 `b` (去重与防环)。
 fn mfs_seen_get(b: u32) -> bool {
-    let i = b as usize;
-    if i >> 3 >= MFS_BITMAP_BYTES {
+    if b >= unsafe { MFS_TOTAL_BLOCKS } {
         return false;
     }
+    let i = b as usize;
     unsafe { *mfs_seen_byte(i >> 3) & (1u8 << (i & 7)) != 0 }
 }
 fn mfs_seen_set(b: u32) {
-    let i = b as usize;
-    if i >> 3 < MFS_BITMAP_BYTES {
+    if b < unsafe { MFS_TOTAL_BLOCKS } {
+        let i = b as usize;
         unsafe {
             *mfs_seen_byte(i >> 3) |= 1u8 << (i & 7);
         }
@@ -8789,35 +9073,37 @@ fn mfs_stack_slot(i: usize) -> *mut u32 {
 }
 
 fn mfs_bmp_get(b: u32) -> bool {
-    let i = b as usize;
-    if i >> 3 >= MFS_BITMAP_BYTES {
+    if b >= unsafe { MFS_TOTAL_BLOCKS } {
         return false;
     }
+    let i = b as usize;
     unsafe { *mfs_bmp_byte(i >> 3) & (1u8 << (i & 7)) != 0 }
 }
 fn mfs_bmp_set(b: u32) {
-    let i = b as usize;
-    if i >> 3 >= MFS_BITMAP_BYTES {
+    if b >= unsafe { MFS_TOTAL_BLOCKS } {
         return;
     }
+    let i = b as usize;
     let p = mfs_bmp_byte(i >> 3);
     unsafe {
         if *p & (1u8 << (i & 7)) == 0 {
             *p |= 1u8 << (i & 7);
             MFS_FREE_BLOCKS = MFS_FREE_BLOCKS.saturating_sub(1);
+            mfs_bmp_touch(b);
         }
     }
 }
 fn mfs_bmp_clear(b: u32) {
-    let i = b as usize;
-    if i >> 3 >= MFS_BITMAP_BYTES {
+    if b >= unsafe { MFS_TOTAL_BLOCKS } {
         return;
     }
+    let i = b as usize;
     let p = mfs_bmp_byte(i >> 3);
     unsafe {
         if *p & (1u8 << (i & 7)) != 0 {
             *p &= !(1u8 << (i & 7));
             MFS_FREE_BLOCKS += 1;
+            mfs_bmp_touch(b);
         }
     }
 }
@@ -8859,17 +9145,28 @@ fn mfs_mark_itab_meta(itab: u32) {
     }
 }
 
+/// 位图数据块数 `bb = ceil(total / 32768)` (一个数据块 = 4096 字节位图 = 32768 块)。
+fn mfs_bb_for(total: u32) -> u32 {
+    total.div_ceil(MFS_BMP_BLOCK_SPAN)
+}
+
+/// 数据区起点 (块 0/1 超级块 + 块 2/3 位图头 + 两副本位图数据); 之前的块一律强制占用。
+fn mfs_data_start() -> u32 {
+    4 + 2 * mfs_bb_for(unsafe { MFS_TOTAL_BLOCKS })
+}
+
 /// 从位图中取一个空闲块, **不**触发回收; 空间耗尽返回 None。
 ///
 /// 这里不做 GC: 调用点常在一次 COW 操作中间 (已分配但尚未被根引用的块), GC 会把
 /// 它们误判成垃圾。回收改在服务空闲时分派前统一触发 (见 `mfs_maybe_gc`)。
 fn mfs_alloc_block() -> Option<u32> {
     let total = unsafe { MFS_TOTAL_BLOCKS };
-    if total <= MFS_SB_COPIES {
+    let start = mfs_data_start();
+    if total <= start {
         return None;
     }
-    // 先扫 [游标, 末尾), 再回头扫 [副本数, 游标), 避免每次都从头找。
-    let hint = unsafe { MFS_ALLOC_NEXT }.clamp(MFS_SB_COPIES, total);
+    // 先扫 [游标, 末尾), 再回头扫 [数据区起点, 游标), 避免每次都从头找。
+    let hint = unsafe { MFS_ALLOC_NEXT }.clamp(start, total);
     let mut b = hint;
     while b < total {
         if !mfs_bmp_get(b) {
@@ -8877,7 +9174,7 @@ fn mfs_alloc_block() -> Option<u32> {
         }
         b += 1;
     }
-    b = MFS_SB_COPIES;
+    b = start;
     while b < hint {
         if !mfs_bmp_get(b) {
             return Some(mfs_bmp_take(b));
@@ -8911,10 +9208,10 @@ fn mfs_mark_set(b: u32, total: usize) {
     }
 }
 fn mfs_mark_get(b: u32) -> bool {
-    let i = b as usize;
-    if i >> 3 >= MFS_BITMAP_BYTES {
+    if b >= unsafe { MFS_TOTAL_BLOCKS } {
         return false;
     }
+    let i = b as usize;
     unsafe { *mfs_mark_byte(i >> 3) & (1u8 << (i & 7)) != 0 }
 }
 
@@ -9007,14 +9304,12 @@ fn mfs_gc() -> u64 {
     if total == 0 || total > MFS_MAX_BLOCKS as usize {
         return u64::MAX;
     }
-    for i in 0..MFS_BITMAP_BYTES {
-        unsafe {
-            *mfs_mark_byte(i) = 0;
-        }
+    mfs_mark_clear_all();
+    // 元数据区 (超级块 / 位图头 / 位图数据块) 一律视为可达, 绝不回收。
+    let meta_end = mfs_data_start();
+    for b in 0..meta_end {
+        mfs_mark_set(b, total);
     }
-    // 超级块两份副本常驻占用。
-    mfs_mark_set(0, total);
-    mfs_mark_set(1, total);
     // 可达根 = (当前 inode 表, 根 ino) + 每个快照的 (表, 根 ino); 根号恒为 1。
     let sn = unsafe { MFS_SNAP_COUNT };
     let mut roots = [(0u32, 0u32); MFS_MAX_SNAP + 1];
@@ -9028,11 +9323,7 @@ fn mfs_gc() -> u64 {
             return u64::MAX;
         }
         // 换根: 清空「本根已访问」, 保证这棵树用**它自己的表**重新展开一遍。
-        for i in 0..MFS_BITMAP_BYTES {
-            unsafe {
-                *mfs_seen_byte(i) = 0;
-            }
-        }
+        mfs_seen_clear_all();
         let rblk = match mfs_gc_ino_block(root_ino) {
             Some(b) if b != 0 => b,
             _ => return u64::MAX,
@@ -9057,9 +9348,9 @@ fn mfs_gc() -> u64 {
     }
     unsafe {
         MFS_FREE_BLOCKS = total as u32 - used;
-        MFS_ALLOC_NEXT = MFS_SB_COPIES;
+        MFS_ALLOC_NEXT = mfs_data_start();
     }
-    if !mfs_write_super() {
+    if !mfs_bmp_flush() {
         return u64::MAX;
     }
     (total as u32 - used).saturating_sub(free_before) as u64
@@ -9108,7 +9399,7 @@ fn mfs_gc_drain(total: usize) -> bool {
                 }
             }
         } else if mfs_ok(gb, MFS_MAGIC_FILE) {
-            // 文件节点: 直接槽逐个标记 (未用槽恒为 0), 一/二级间接块入栈展开。
+            // 文件节点: 直接槽逐个标记 (未用槽恒为 0), 一/二/三级间接块入栈展开。
             // 不看 nblocks: 计数若损坏, 少标就会把仍在用的数据块回收掉。
             for i in 0..MFS_FILE_DIRECT {
                 let c = mfs_file_direct(gb, i);
@@ -9116,7 +9407,11 @@ fn mfs_gc_drain(total: usize) -> bool {
                     mfs_mark_set(c, total);
                 }
             }
-            if !mfs_gc_push(mfs_file_ind1(gb), total) || !mfs_gc_push(mfs_file_ind2(gb), total) {
+            // ind3 必须一并入栈: 漏标会让三级块被当作垃圾回收, 进而损坏 >4 GiB 文件。
+            if !mfs_gc_push(mfs_file_ind1(gb), total)
+                || !mfs_gc_push(mfs_file_ind2(gb), total)
+                || !mfs_gc_push(mfs_file_ind3(gb), total)
+            {
                 return false;
             }
         } else if mfs_ok(gb, MFS_MAGIC_IND) {
@@ -9129,6 +9424,13 @@ fn mfs_gc_drain(total: usize) -> bool {
             }
         } else if mfs_ok(gb, MFS_MAGIC_IND2) {
             // 二级间接块: 槽位全是一级间接块。
+            for i in 0..MFS_IND_CAP {
+                if !mfs_gc_push(mfs_ind_slot(gb, i), total) {
+                    return false;
+                }
+            }
+        } else if mfs_ok(gb, MFS_MAGIC_IND3) {
+            // 三级间接块: 槽位全是二级间接块。
             for i in 0..MFS_IND_CAP {
                 if !mfs_gc_push(mfs_ind_slot(gb, i), total) {
                     return false;
@@ -9261,7 +9563,7 @@ fn mfs_itab_flush() -> bool {
     unsafe {
         MFS_ITAB = nb;
     }
-    mfs_write_super()
+    mfs_bmp_flush()
 }
 
 /// 在卷 `vol` 上写入一个全新的 MFS 文件系统 (**擦除**该卷现有内容), 成功后把该卷
@@ -9416,30 +9718,86 @@ fn mfs_build_super(buf: *mut u8) {
         write_u32(mfs_atm(buf, off + 12), s.ino_hint);
         write_u32(mfs_atm(buf, off + 16), s.alloc_next);
     }
-    // 空闲位图随超级块一起持久化 (两份副本各带完整位图, CRC 覆盖)。
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(MFS_BITMAP).cast::<u8>(),
-            mfs_atm(buf, p + MFS_SB_BITMAP_OFF),
-            MFS_BITMAP_BYTES,
-        );
-    }
+    // MFS7: 空闲位图不再内联在超级块里 (payload +256 起留空保留), 位图改由
+    // `mfs_bmp_flush` 写入独立的位图数据块 + 头块。
     mfs_seal(buf, MFS_MAGIC_SUPER);
 }
 
-/// 代际 +1 后写入另一份超级块副本 (交替, 保留上一代)。
-fn mfs_write_super() -> bool {
+/// 构建位图头块 (magic "MFBH"): gen / 总块数 / 位图数据块数 bb + 各数据块 CRC32。
+fn mfs_build_bmp_header(buf: *mut u8) {
+    zero_bytes(buf, MFS_BLOCK);
+    let p = MFS_HDR;
+    unsafe {
+        write_u64(mfs_atm(buf, p + MFS_BMPH_GEN), MFS_GEN);
+        write_u32(mfs_atm(buf, p + MFS_BMPH_TOTAL), MFS_TOTAL_BLOCKS);
+        write_u32(mfs_atm(buf, p + MFS_BMPH_DATA_BLOCKS), MFS_BMP_DATA_BLOCKS);
+        for i in 0..MFS_BMP_DATA_BLOCKS as usize {
+            write_u32(
+                mfs_atm(buf, p + MFS_BMPH_CRC + i * 4),
+                *core::ptr::addr_of!(MFS_BMP_CRC).cast::<u32>().add(i),
+            );
+        }
+    }
+    mfs_seal(buf, MFS_MAGIC_BMPHDR);
+}
+
+/// 把常驻位图窗口按副本落盘 (只写脏区间), 再写头块 + 超级块 —— **唯一**提交出口。
+///
+/// 取代 MFS6 的 `mfs_write_super`。流程 (代际 +1 后):
+///   1. 清空脏位图, 重新计算本次要写的区间的 CRC;
+///   2. 对 copy ∈ {0,1} 依次: 写脏的位图数据块 → 写该副本头块 (gen/total/bb + 全量 CRC) →
+///      写该副本超级块 (带新 gen);
+///   3. 两份都写完后清 dirty。
+///
+/// 崩溃在任一步骤时, 另一份仍是**旧代但自洽**的 (gen 不同 → 加载取 gen 高者), 因此
+/// 不需要额外的副本选择状态 (`MFS_SB_COPY` 已删)。
+fn mfs_bmp_flush() -> bool {
     unsafe {
         MFS_GEN += 1;
     }
-    let buf = mfs_s();
-    mfs_build_super(buf);
-    let copy = (MFS_SB_COPIES - 1) - unsafe { MFS_SB_COPY };
-    if !mfs_write_blk(copy, buf) {
-        return false;
+    let bb = unsafe { MFS_BMP_DATA_BLOCKS };
+    let (a_start, b_start) = (4u32, 4 + bb);
+    let head = mfs_bmph_buf();
+    // 重新计算全部位图数据块的 CRC (脏区间之外的块内容未变, 但 CRC 数组整体落盘,
+    // 故这里统一按窗口内容算, 保证数组与数据块始终一致)。
+    for c in 0..bb as usize {
+        let p = (MFS_BMP_VADDR as *const u8).wrapping_add(c * MFS_BLOCK);
+        let crc = unsafe { mfs_crc32(core::slice::from_raw_parts(p, MFS_BLOCK)) };
+        unsafe {
+            *core::ptr::addr_of_mut!(MFS_BMP_CRC).cast::<u32>().add(c) = crc;
+        }
     }
-    unsafe {
-        MFS_SB_COPY = copy;
+    for copy in 0..MFS_SB_COPIES {
+        let data_start = if copy == 0 { a_start } else { b_start };
+        // 位图数据块: 直接以窗口页作 I/O 缓冲 (免拷贝), 只写脏区间。
+        for c in 0..bb as usize {
+            let dirty = unsafe {
+                *core::ptr::addr_of!(MFS_BMP_DIRTY).cast::<u8>().add(c >> 3) & (1u8 << (c & 7)) != 0
+            };
+            if !dirty {
+                continue;
+            }
+            let p = (MFS_BMP_VADDR as *const u8).wrapping_add(c * MFS_BLOCK);
+            if !mfs_write_blk(data_start + c as u32, p) {
+                return false;
+            }
+        }
+        // 头块 (gen/total/bb + 全量 CRC 数组)。
+        mfs_build_bmp_header(head);
+        if !mfs_write_blk(2 + copy, head) {
+            return false;
+        }
+        // 超级块 (带新 gen)。
+        let sb = mfs_s();
+        mfs_build_super(sb);
+        if !mfs_write_blk(copy, sb) {
+            return false;
+        }
+    }
+    for i in 0..MFS_BMP_DIRTY_BYTES {
+        unsafe {
+            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(i) = 0;
+        }
     }
     true
 }
@@ -9452,6 +9810,7 @@ fn mfs_write_super() -> bool {
 fn mfs_load_state() -> bool {
     let mut found = false;
     let mut best_gen = 0u64;
+    let mut bitmap_ok = false;
     for copy in 0..MFS_SB_COPIES {
         let buf = mfs_a();
         if !mfs_read_blk(copy, buf) || !mfs_ok(buf, MFS_MAGIC_SUPER) {
@@ -9462,7 +9821,11 @@ fn mfs_load_state() -> bool {
             continue;
         }
         let gen = read_u64(mfs_at(buf, p + MFS_SB_GEN));
-        if found && gen <= best_gen {
+        // 取代际更高者; 同代时**优先已成功载入位图的那份**。MFS7 起一次提交把两份
+        // 副本写成同一 gen, 若只按 `gen <= best_gen` 跳过, 先试的副本位图坏了就会
+        // 白白触发重建 —— 即使另一份完好。同代时两份超级块内容一致, 重复采用同一份
+        // 内存态无副作用。
+        if found && (gen < best_gen || (gen == best_gen && bitmap_ok)) {
             continue;
         }
         let total = read_u32(mfs_at(buf, p + MFS_SB_TOTAL));
@@ -9484,16 +9847,21 @@ fn mfs_load_state() -> bool {
         }
         let alloc = read_u32(mfs_at(buf, p + MFS_SB_ALLOC_HINT));
         let scount = (read_u32(mfs_at(buf, p + MFS_SB_SNAP_COUNT)) as usize).min(MFS_MAX_SNAP);
+        let bb = mfs_bb_for(total);
         unsafe {
             MFS_TOTAL_BLOCKS = total;
+            MFS_BMP_DATA_BLOCKS = bb;
             MFS_ALLOC_NEXT = alloc;
             MFS_GEN = gen;
-            MFS_SB_COPY = copy;
             MFS_SNAP_COUNT = scount;
             MFS_ITAB = itab;
             MFS_INO_COUNT = read_u32(mfs_at(buf, p + MFS_SB_INO_COUNT));
             MFS_INO_HINT = read_u32(mfs_at(buf, p + MFS_SB_INO_HINT)).max(MFS_ROOT_INO + 1);
             MFS_ITAB_CACHE_IDX = u32::MAX;
+        }
+        // 位图窗口必须容得下本卷的 bb 页 (首次挂载时 `mfs_main` 已按卷容量预算过)。
+        if !mfs_win_ensure(bb) {
+            continue;
         }
         // 索引块内容载入内存镜像。
         if !mfs_itab_reload() {
@@ -9511,29 +9879,127 @@ fn mfs_load_state() -> bool {
                 },
             );
         }
-        // 位图随超级块持久化, 必须先载回内存: 新进程的 `MFS_BITMAP` 是空的, 若直接
-        // 重算就会把整盘当作空闲, 分配会立刻覆盖当前树与快照仍在引用的块。
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                mfs_at(buf, p + MFS_SB_BITMAP_OFF),
-                core::ptr::addr_of_mut!(MFS_BITMAP).cast::<u8>(),
-                MFS_BITMAP_BYTES,
-            );
-        }
-        // 位图是分配的唯一依据: 重算空闲块数, 并强制保留超级块与**所有可达根的
-        // inode 表元数据** (当前表 + 每张快照的表) —— 万一位图缺了这几位 (例如上次
-        // 回收失败留下的陈旧位图), 立刻纠正, 绝不会把元数据块分配出去。
-        mfs_bmp_recount();
-        mfs_bmp_set(0);
-        mfs_bmp_set(1);
-        mfs_mark_itab_meta(itab);
-        for i in 0..scount {
-            mfs_mark_itab_meta(mfs_snap(i).itab);
-        }
+        // 位图数据按副本独立存放: 校验该副本头块与逐块 CRC, 通过则读进窗口。失败时
+        // 只是本轮 `bitmap_ok = false` —— 所有候选都失败才走下面的重建兜底。
+        bitmap_ok = mfs_load_bitmap_copy(copy);
         best_gen = gen;
         found = true;
     }
-    found
+    if !found {
+        return false;
+    }
+    if bitmap_ok {
+        // 位图是分配的唯一依据: 重算空闲块数, 并强制保留元数据区 (超级块 / 位图头 /
+        // 位图数据) 与**所有可达根的 inode 表元数据** (当前表 + 每张快照的表) ——
+        // 万一位图缺了这几位 (例如上次回收失败留下的陈旧位图), 立刻纠正, 绝不会把
+        // 元数据块分配出去。
+        mfs_bmp_recount();
+        let meta_end = mfs_data_start();
+        for b in 0..meta_end {
+            mfs_bmp_set(b);
+        }
+        mfs_mark_itab_meta(unsafe { MFS_ITAB });
+        for i in 0..unsafe { MFS_SNAP_COUNT } {
+            mfs_mark_itab_meta(mfs_snap(i).itab);
+        }
+    } else if !mfs_rebuild_bitmap() {
+        return false;
+    }
+    true
+}
+
+/// 载入某个副本的位图: 校验头块 (magic / gen / total / bb) 与逐块 CRC32。
+///
+/// 校验通过时把数据块读进 `MFS_BMP_VADDR` 窗口 (直接以窗口页作 I/O 缓冲, 免拷贝),
+/// 并把各块 CRC 填进常驻 `MFS_BMP_CRC`; 任一不符立即返回 false。
+/// 副本 `copy` 的位图数据位于 `4 + copy*bb` 起的连续 `bb` 个块, 头块在块 `2+copy`。
+fn mfs_load_bitmap_copy(copy: u32) -> bool {
+    let bb = unsafe { MFS_BMP_DATA_BLOCKS };
+    let total = unsafe { MFS_TOTAL_BLOCKS };
+    let head = mfs_bmph_buf();
+    if !mfs_read_blk(2 + copy, head) || !mfs_ok(head, MFS_MAGIC_BMPHDR) {
+        return false;
+    }
+    let hp = MFS_HDR;
+    if read_u64(mfs_at(head, hp + MFS_BMPH_GEN)) != unsafe { MFS_GEN } {
+        return false;
+    }
+    if read_u32(mfs_at(head, hp + MFS_BMPH_TOTAL)) != total {
+        return false;
+    }
+    if read_u32(mfs_at(head, hp + MFS_BMPH_DATA_BLOCKS)) != bb {
+        return false;
+    }
+    let data_start = 4 + copy * bb;
+    for c in 0..bb as usize {
+        let dp = (MFS_BMP_VADDR as *mut u8).wrapping_add(c * MFS_BLOCK);
+        if !mfs_read_blk(data_start + c as u32, dp) {
+            return false;
+        }
+        let crc = unsafe { mfs_crc32(core::slice::from_raw_parts(dp as *const u8, MFS_BLOCK)) };
+        if crc != read_u32(mfs_at(head, hp + MFS_BMPH_CRC + c * 4)) {
+            return false;
+        }
+        unsafe {
+            *core::ptr::addr_of_mut!(MFS_BMP_CRC).cast::<u32>().add(c) = crc;
+        }
+    }
+    true
+}
+
+/// 位图两份副本都不可用时的兜底: 先把位图整体置「占用」(FREE = 0 的安全态), 再跑
+/// `mfs_gc()` 从可达根重建 —— **不格式化**。
+///
+/// 全置占用是安全方向: 即使 GC 中途失败, 最坏结果是「空间没被回收」, 绝不会把仍在
+/// 使用的块当成空闲发出去。盘上目录树完好、只是位图坏了的情形正是靠这条路径救回。
+fn mfs_rebuild_bitmap() -> bool {
+    let bb = unsafe { MFS_BMP_DATA_BLOCKS } as usize;
+    for i in 0..bb * MFS_BLOCK {
+        unsafe {
+            *mfs_bmp_byte(i) = 0xFF;
+        }
+    }
+    // 位图全为占用 -> 空闲块数为 0, 交给 GC 重建后重算。
+    unsafe {
+        MFS_FREE_BLOCKS = 0;
+    }
+    mfs_gc() != u64::MAX
+}
+
+/// 确保三个位图窗口至少各 `pages` 页 (**只增不缩**)。新增的 BMP 窗口页要共享给
+/// block_srv (位图数据块直接以窗口页作 DMA 缓冲)。失败返回 false。
+fn mfs_win_ensure(pages: u32) -> bool {
+    while unsafe { MFS_BMP_PAGES } < pages {
+        let n = unsafe { MFS_BMP_PAGES } as u64;
+        let va = MFS_BMP_VADDR + n * MFS_BLOCK as u64;
+        if sys_alloc_page(va) != 1 || sys_share_page(va, BLOCK_DOMAIN) != 1 {
+            return false;
+        }
+        unsafe {
+            MFS_BMP_PAGES += 1;
+        }
+    }
+    while unsafe { MFS_MARK_PAGES } < pages {
+        let n = unsafe { MFS_MARK_PAGES } as u64;
+        let va = MFS_MARK_VADDR + n * MFS_BLOCK as u64;
+        if sys_alloc_page(va) != 1 {
+            return false;
+        }
+        unsafe {
+            MFS_MARK_PAGES += 1;
+        }
+    }
+    while unsafe { MFS_SEEN_PAGES } < pages {
+        let n = unsafe { MFS_SEEN_PAGES } as u64;
+        let va = MFS_SEEN_VADDR + n * MFS_BLOCK as u64;
+        if sys_alloc_page(va) != 1 {
+            return false;
+        }
+        unsafe {
+            MFS_SEEN_PAGES += 1;
+        }
+    }
+    true
 }
 
 /// 切换当前卷到 `vol` (必须是**已格式化**的 MFS 卷): 更新卷号 / 容量后重新载入
@@ -9563,8 +10029,8 @@ fn mfs_mount_or_format() -> bool {
 /// 首次格式化该用多少块: 按**卷的真实容量**算 (每块 4 KiB = 8 扇区), 夹在
 /// [`MFS_MIN_TOTAL_BLOCKS`, `MFS_MAX_BLOCKS`] 之间; 容量未知时退回默认值。
 ///
-/// 上界是硬约束: 空闲位图内联在超级块 payload 里, 只能覆盖 `MFS_MAX_BLOCKS` 块,
-/// 超出的块没有位来记录占用 —— 想要更大的卷必须先把位图挪出超级块。
+/// 上界是硬约束: 位图头块的 CRC 数组只能放 `MFS_MAX_BMP_DATA_BLOCKS` 项, 每项覆盖
+/// 32768 块 —— 即 `MFS_MAX_BLOCKS` (≈127.25 GiB)。更大的卷需要再加一层位图间接。
 fn mfs_format_total_blocks() -> u32 {
     let sectors = unsafe { MFS_CUR_SECTORS } as u64;
     if sectors == 0 {
@@ -9574,28 +10040,47 @@ fn mfs_format_total_blocks() -> u32 {
     blocks.clamp(MFS_MIN_TOTAL_BLOCKS as u64, MFS_MAX_BLOCKS as u64) as u32
 }
 
-/// 首次格式化 (含旧格式升级): 清空位图 -> 保留超级块副本 -> 建空根目录 (ino 1) ->
-/// 建 inode 表 -> 写超级块。
+/// 首次格式化 (含旧格式升级): 清空位图 -> 占用元数据区 -> 建空根目录 (ino 1) ->
+/// 建 inode 表 -> 提交 (写位图数据块 + 位图头块 + 超级块)。
 fn mfs_format() -> bool {
+    let total = mfs_format_total_blocks();
     unsafe {
-        MFS_TOTAL_BLOCKS = mfs_format_total_blocks();
-        MFS_ALLOC_NEXT = MFS_SB_COPIES;
+        MFS_TOTAL_BLOCKS = total;
+        MFS_BMP_DATA_BLOCKS = mfs_bb_for(total);
+    }
+    let bb = unsafe { MFS_BMP_DATA_BLOCKS } as usize;
+    // 位图窗口按本卷的 bb 页铺开 (mfs_main 已按容量预算; 这里兜底「mkfs 到更大卷」)。
+    if !mfs_win_ensure(bb as u32) {
+        return false;
+    }
+    unsafe {
+        MFS_ALLOC_NEXT = mfs_data_start();
         MFS_GEN = 0;
         MFS_SNAP_COUNT = 0;
         MFS_INO_COUNT = 0;
         MFS_INO_HINT = MFS_ROOT_INO + 1;
         MFS_ITAB = 0;
         MFS_ITAB_CACHE_IDX = u32::MAX;
-        for i in 0..MFS_BITMAP_BYTES {
+        // 整个位图窗口清零 (含末尾余量), 让 CRC 可复现。
+        for i in 0..bb * MFS_BLOCK {
             *mfs_bmp_byte(i) = 0;
         }
-        MFS_FREE_BLOCKS = MFS_TOTAL_BLOCKS;
+        MFS_FREE_BLOCKS = total;
+    }
+    // 位图内容整体重置: 所有数据块都必须落盘 (不能只靠脏位增量)。
+    for c in 0..bb {
+        unsafe {
+            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(c >> 3) |= 1u8 << (c & 7);
+        }
     }
     for k in 0..MFS_ITAB_SLOTS {
         mfs_set_itab_table(k as u32, 0); // 空索引镜像
     }
-    mfs_bmp_set(0); // 块 0/1 是超级块副本, 常驻占用
-    mfs_bmp_set(1);
+    // 元数据区 (超级块 0/1 + 位图头 2/3 + 两副本位图数据) 一律常驻占用。
+    let meta_end = mfs_data_start();
+    for b in 0..meta_end {
+        mfs_bmp_set(b);
+    }
     // 根目录节点块: 无扩展索引块 + 覆盖全区的单个大空槽 + 系统属主 (格式化时无调用者)。
     let buf = mfs_a();
     zero_bytes(buf, MFS_BLOCK);
@@ -9605,9 +10090,6 @@ fn mfs_format() -> bool {
         Some(b) => b,
         None => return false,
     };
-    unsafe {
-        MFS_SB_COPY = 1; // write_super 写另一份 -> 副本 0
-    }
     // 先落一个空索引块, 再登记 ino 1 (登记本身会分配表块并重新 COW 索引块)。
     if !mfs_itab_flush() {
         return false;
@@ -9619,7 +10101,7 @@ fn mfs_format() -> bool {
         MFS_INO_COUNT = 1;
         MFS_INO_HINT = MFS_ROOT_INO + 1;
     }
-    mfs_write_super()
+    mfs_bmp_flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -10226,24 +10708,24 @@ fn mfs_dir_delete(loc: &MfsLoc) -> bool {
     mfs_dir_store_loc(loc)
 }
 
-fn mfs_file_size(buf: *const u8) -> u32 {
-    read_u32(mfs_at(buf, MFS_HDR))
+fn mfs_file_size(buf: *const u8) -> u64 {
+    read_u64(mfs_at(buf, MFS_FILE_SIZE_OFF))
 }
-fn mfs_file_set_size(buf: *mut u8, v: u32) {
-    write_u32(mfs_atm(buf, MFS_HDR), v);
+fn mfs_file_set_size(buf: *mut u8, v: u64) {
+    write_u64(mfs_atm(buf, MFS_FILE_SIZE_OFF), v);
 }
 fn mfs_file_nblocks(buf: *const u8) -> u32 {
-    read_u32(mfs_at(buf, MFS_HDR + 4))
+    read_u32(mfs_at(buf, MFS_FILE_NBLOCKS_OFF))
 }
 fn mfs_file_set_nblocks(buf: *mut u8, v: u32) {
-    write_u32(mfs_atm(buf, MFS_HDR + 4), v);
+    write_u32(mfs_atm(buf, MFS_FILE_NBLOCKS_OFF), v);
 }
 /// 直接块指针 (i < `MFS_FILE_DIRECT`)。
 fn mfs_file_direct(buf: *const u8, i: usize) -> u32 {
-    read_u32(mfs_at(buf, MFS_HDR + 8 + i * 4))
+    read_u32(mfs_at(buf, MFS_FILE_DIRECT_OFF + i * 4))
 }
 fn mfs_file_set_direct(buf: *mut u8, i: usize, b: u32) {
-    write_u32(mfs_atm(buf, MFS_HDR + 8 + i * 4), b);
+    write_u32(mfs_atm(buf, MFS_FILE_DIRECT_OFF + i * 4), b);
 }
 fn mfs_file_ind1(buf: *const u8) -> u32 {
     read_u32(mfs_at(buf, MFS_FILE_IND1_OFF))
@@ -10257,6 +10739,12 @@ fn mfs_file_ind2(buf: *const u8) -> u32 {
 fn mfs_file_set_ind2(buf: *mut u8, b: u32) {
     write_u32(mfs_atm(buf, MFS_FILE_IND2_OFF), b);
 }
+fn mfs_file_ind3(buf: *const u8) -> u32 {
+    read_u32(mfs_at(buf, MFS_FILE_IND3_OFF))
+}
+fn mfs_file_set_ind3(buf: *mut u8, b: u32) {
+    write_u32(mfs_atm(buf, MFS_FILE_IND3_OFF), b);
+}
 /// 间接块内的第 `slot` 个指针。
 fn mfs_ind_slot(buf: *const u8, slot: usize) -> u32 {
     read_u32(mfs_at(buf, MFS_HDR + slot * 4))
@@ -10266,16 +10754,18 @@ fn mfs_ind_set_slot(buf: *mut u8, slot: usize, b: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// 逻辑块映射 (直接 -> 一级间接 -> 二级间接)
+// 逻辑块映射 (直接 -> 一级 -> 二级 -> 三级间接)
 // ---------------------------------------------------------------------------
 
 /// 逻辑块 `bi` 的映射位置。
 ///
 /// `kind` 0 = inode 直接槽 (只用 `slot1`), 1 = 一级间接 (只用 `slot1`),
-/// 2 = 二级间接 (`slot2` 定位一级块, `slot1` 定位块内槽位)。
+/// 2 = 二级间接 (`slot2` 定位一级块, `slot1` 定位块内槽位),
+/// 3 = 三级间接 (`slot3` 定位二级块, `slot2` 定位一级块, `slot1` 定位块内槽位)。
 #[derive(Clone, Copy)]
 struct MfsMapPlan {
     kind: u32,
+    slot3: usize,
     slot2: usize,
     slot1: usize,
 }
@@ -10283,23 +10773,36 @@ struct MfsMapPlan {
 /// 把逻辑块索引算成映射位置; 超出 `MFS_FILE_MAX_BLOCKS` 返回 None。
 fn mfs_map_plan(bi: usize) -> Option<MfsMapPlan> {
     if bi < MFS_FILE_DIRECT {
-        return Some(MfsMapPlan { kind: 0, slot2: 0, slot1: bi });
+        return Some(MfsMapPlan { kind: 0, slot3: 0, slot2: 0, slot1: bi });
     }
     let idx = bi - MFS_FILE_DIRECT;
     if idx < MFS_IND_CAP {
-        return Some(MfsMapPlan { kind: 1, slot2: 0, slot1: idx });
+        return Some(MfsMapPlan { kind: 1, slot3: 0, slot2: 0, slot1: idx });
     }
     let idx = idx - MFS_IND_CAP;
-    let slot2 = idx / MFS_IND_CAP;
-    if slot2 >= MFS_IND_CAP {
+    if idx < MFS_IND_CAP * MFS_IND_CAP {
+        let slot2 = idx / MFS_IND_CAP;
+        return Some(MfsMapPlan { kind: 2, slot3: 0, slot2, slot1: idx % MFS_IND_CAP });
+    }
+    // 三级间接: idx3 先按二级块的容量 (CAP²) 切出 slot3, 余下再按一级块容量切。
+    let idx3 = idx - MFS_IND_CAP * MFS_IND_CAP;
+    let slot3 = idx3 / (MFS_IND_CAP * MFS_IND_CAP);
+    if slot3 >= MFS_IND_CAP {
         return None;
     }
-    Some(MfsMapPlan { kind: 2, slot2, slot1: idx % MFS_IND_CAP })
+    let rest = idx3 % (MFS_IND_CAP * MFS_IND_CAP);
+    Some(MfsMapPlan {
+        kind: 3,
+        slot3,
+        slot2: rest / MFS_IND_CAP,
+        slot1: rest % MFS_IND_CAP,
+    })
 }
 
 /// 读路径: 逻辑块 `bi` 的物理块号 (0 = 空洞); 读盘/校验失败返回 None。
 ///
-/// 用 B 缓冲承载间接块 (读路径 A = inode, C = 数据块, B 空闲)。
+/// 用 B 缓冲承载间接块 (读路径 A = inode, C = 数据块, B 空闲); 每级读完立刻取走需要
+/// 的槽值再复用, 故单缓冲即可逐级下降。
 fn mfs_file_map(a: *const u8, bi: usize) -> Option<u32> {
     let p = mfs_map_plan(bi)?;
     if p.kind == 0 {
@@ -10308,8 +10811,25 @@ fn mfs_file_map(a: *const u8, bi: usize) -> Option<u32> {
     let b = mfs_b();
     let l1 = if p.kind == 1 {
         mfs_file_ind1(a)
-    } else {
+    } else if p.kind == 2 {
         let l2 = mfs_file_ind2(a);
+        if l2 == 0 {
+            return Some(0);
+        }
+        if !mfs_read_blk(l2, b) || !mfs_ok(b, MFS_MAGIC_IND2) {
+            return None;
+        }
+        mfs_ind_slot(b, p.slot2)
+    } else {
+        // 三级: ind3 -> ind2 -> ind1, 任一指针为 0 即空洞。
+        let l3 = mfs_file_ind3(a);
+        if l3 == 0 {
+            return Some(0);
+        }
+        if !mfs_read_blk(l3, b) || !mfs_ok(b, MFS_MAGIC_IND3) {
+            return None;
+        }
+        let l2 = mfs_ind_slot(b, p.slot3);
         if l2 == 0 {
             return Some(0);
         }
@@ -10433,10 +10953,20 @@ fn mfs_ind_load(a: *mut u8, bi: usize, cache: &mut MfsIndCache) -> bool {
 }
 
 /// 写路径: 读逻辑块 `bi` 当前的物理块号 (0 = 空洞), 顺带把它的间接块载入缓存。
+///
+/// 三级间接块 (kind 3) 不由缓存承载: 先 flush 并清空缓存, 再走 `mfs_ind_peek3` ——
+/// 否则缓存里的一级块内容会与三级链路共用的 B 缓冲相互覆盖。
 fn mfs_ind_peek(a: *mut u8, bi: usize, cache: &mut MfsIndCache) -> Option<u32> {
     let p = mfs_map_plan(bi)?;
     if p.kind == 0 {
         return Some(mfs_file_direct(a, p.slot1));
+    }
+    if p.kind == 3 {
+        if !mfs_ind_flush(a, cache) {
+            return None;
+        }
+        *cache = MFS_IND_CACHE_EMPTY;
+        return mfs_ind_peek3(a, &p);
     }
     if !mfs_ind_load(a, bi, cache) {
         return None;
@@ -10444,9 +10974,103 @@ fn mfs_ind_peek(a: *mut u8, bi: usize, cache: &mut MfsIndCache) -> Option<u32> {
     Some(mfs_ind_slot(mfs_b(), p.slot1))
 }
 
-/// 写路径: 把逻辑块 `bi` 指向 `db` (直接槽写 inode; 否则写进缓存中的一级间接块)。
+/// 写路径 (三级间接专用): 链式读取 ind3 -> ind2 -> ind1, 返回 ind1 里 `slot1` 的数据
+/// 块号 (0 = 空洞)。
 ///
-/// 调用前必须对同一个 `bi` 调过 `mfs_ind_peek` (保证目标组已载入缓存)。
+/// 三级只服务 >4 GiB 文件, 为保持缓存实现简单而走**无缓存链路** (常规文件不受影响);
+/// 每级读完立刻取走所需槽值, 全程只用 B 一页缓冲。
+fn mfs_ind_peek3(a: *mut u8, plan: &MfsMapPlan) -> Option<u32> {
+    let b = mfs_b();
+    let l3 = mfs_file_ind3(a);
+    if l3 == 0 {
+        return Some(0);
+    }
+    if !mfs_read_blk(l3, b) || !mfs_ok(b, MFS_MAGIC_IND3) {
+        return None;
+    }
+    let l2 = mfs_ind_slot(b, plan.slot3);
+    if l2 == 0 {
+        return Some(0);
+    }
+    if !mfs_read_blk(l2, b) || !mfs_ok(b, MFS_MAGIC_IND2) {
+        return None;
+    }
+    let l1 = mfs_ind_slot(b, plan.slot2);
+    if l1 == 0 {
+        return Some(0);
+    }
+    if !mfs_read_blk(l1, b) || !mfs_ok(b, MFS_MAGIC_IND) {
+        return None;
+    }
+    Some(mfs_ind_slot(b, plan.slot1))
+}
+
+/// 写路径 (三级间接专用): 把 `bi` 指向 `db`, 自下而上逐级「读-改-COW」回写 ——
+/// COW ind1 -> 写回父 ind2 的 `slot2` -> COW ind2 -> 写回 ind3 的 `slot3` -> COW ind3
+/// -> 写回 inode 的 ind3 指针。中间级不存在时当场建空块 (与 `mfs_ind_load` 同策略)。
+///
+/// 全程只用 B 一页缓冲: 每级校验/建好之后立刻取走所需槽值, 再复用该页写下一级。
+fn mfs_ind_link3(a: *mut u8, plan: &MfsMapPlan, db: u32) -> bool {
+    let b = mfs_b();
+    // 自上而下取出三级、二级、一级块号 (只读, 读完即取走槽值)。
+    let l3 = mfs_file_ind3(a);
+    let l2 = if l3 == 0 {
+        0
+    } else {
+        if !mfs_read_blk(l3, b) || !mfs_ok(b, MFS_MAGIC_IND3) {
+            return false;
+        }
+        mfs_ind_slot(b, plan.slot3)
+    };
+    let l1 = if l2 == 0 {
+        0
+    } else {
+        if !mfs_read_blk(l2, b) || !mfs_ok(b, MFS_MAGIC_IND2) {
+            return false;
+        }
+        mfs_ind_slot(b, plan.slot2)
+    };
+    // 一级: 载入 (不存在则清零当空块) -> 改 slot1 -> COW。
+    if l1 == 0 {
+        zero_bytes(b, MFS_BLOCK);
+    } else if !mfs_read_blk(l1, b) || !mfs_ok(b, MFS_MAGIC_IND) {
+        return false;
+    }
+    mfs_ind_set_slot(b, plan.slot1, db);
+    let new_l1 = match mfs_commit(b, MFS_MAGIC_IND) {
+        Some(x) => x,
+        None => return false,
+    };
+    // 二级: 载入 -> 改 slot2 指向新一级块 -> COW。
+    if l2 == 0 {
+        zero_bytes(b, MFS_BLOCK);
+    } else if !mfs_read_blk(l2, b) || !mfs_ok(b, MFS_MAGIC_IND2) {
+        return false;
+    }
+    mfs_ind_set_slot(b, plan.slot2, new_l1);
+    let new_l2 = match mfs_commit(b, MFS_MAGIC_IND2) {
+        Some(x) => x,
+        None => return false,
+    };
+    // 三级: 载入 -> 改 slot3 指向新二级块 -> COW -> 回写 inode 指针。
+    if l3 == 0 {
+        zero_bytes(b, MFS_BLOCK);
+    } else if !mfs_read_blk(l3, b) || !mfs_ok(b, MFS_MAGIC_IND3) {
+        return false;
+    }
+    mfs_ind_set_slot(b, plan.slot3, new_l2);
+    let new_l3 = match mfs_commit(b, MFS_MAGIC_IND3) {
+        Some(x) => x,
+        None => return false,
+    };
+    mfs_file_set_ind3(a, new_l3);
+    true
+}
+
+/// 写路径: 把逻辑块 `bi` 指向 `db` (直接槽写 inode; 三级块走无缓存链路; 否则写进缓存
+/// 中的一级间接块)。
+///
+/// 调用前必须对同一个 `bi` 调过 `mfs_ind_peek` (保证目标组已载入缓存; 三级块除外)。
 fn mfs_ind_link(a: *mut u8, bi: usize, db: u32, cache: &mut MfsIndCache) -> bool {
     let p = match mfs_map_plan(bi) {
         Some(p) => p,
@@ -10455,6 +11079,9 @@ fn mfs_ind_link(a: *mut u8, bi: usize, db: u32, cache: &mut MfsIndCache) -> bool
     if p.kind == 0 {
         mfs_file_set_direct(a, p.slot1, db);
         return true;
+    }
+    if p.kind == 3 {
+        return mfs_ind_link3(a, &p, db);
     }
     if cache.kind != p.kind || cache.slot2 != p.slot2 {
         return false;
@@ -10692,7 +11319,7 @@ fn mfs_resolve_ex(canon: &[u8], follow_leaf: bool) -> Option<u32> {
 ///
 /// **空洞按 0 返回**: 逻辑块未分配 (`db == 0`) 或超出 `nblocks` 时, 该段视为稀疏空洞,
 /// 填 0 后继续 —— 若在这里 break, 稀疏文件 (truncate 扩展出来的区段) 会读成短读。
-fn mfs_read_file(ino: u32, offset: u32, count: u32, dst: *mut u8) -> u64 {
+fn mfs_read_file(ino: u32, offset: u64, count: u32, dst: *mut u8) -> u64 {
     let a = mfs_a();
     let block = match mfs_ino_block(ino) {
         Some(b) if b != 0 => b,
@@ -10705,12 +11332,12 @@ fn mfs_read_file(ino: u32, offset: u32, count: u32, dst: *mut u8) -> u64 {
     if offset >= size {
         return 0;
     }
-    let end = core::cmp::min(offset as u64 + count as u64, size as u64) as u32;
-    let n = end - offset;
+    let end = core::cmp::min(offset + count as u64, size);
+    let n = (end - offset) as u32;
     let c = mfs_c();
     let mut done = 0u32;
     while done < n {
-        let pos = offset + done;
+        let pos = offset + done as u64;
         let bi = (pos as usize) / MFS_DATA_CAP;
         let boff = (pos as usize) % MFS_DATA_CAP;
         let chunk = core::cmp::min(MFS_DATA_CAP - boff, (n - done) as usize);
@@ -10744,9 +11371,9 @@ fn mfs_read_file(ino: u32, offset: u32, count: u32, dst: *mut u8) -> u64 {
     done as u64
 }
 
-/// 写文件 `ino` 的 [offset, offset+count) 区间, COW 数据块 (必要时含一/二级间接块) +
+/// 写文件 `ino` 的 [offset, offset+count) 区间, COW 数据块 (必要时含一/二/三级间接块) +
 /// 文件节点, 再同步它在 inode 表里的槽位。返回写入字节数, 失败 `u64::MAX`。
-fn mfs_write_file(ino: u32, offset: u32, count: u32, src: *const u8) -> u64 {
+fn mfs_write_file(ino: u32, offset: u64, count: u32, src: *const u8) -> u64 {
     let a = mfs_a();
     let block = match mfs_ino_block(ino) {
         Some(b) if b != 0 => b,
@@ -10758,16 +11385,16 @@ fn mfs_write_file(ino: u32, offset: u32, count: u32, src: *const u8) -> u64 {
     let old_size = mfs_file_size(a);
     let mut nblocks = mfs_file_nblocks(a) as usize;
     let c = mfs_c();
-    // 结束位置按 64 位算再收窄: 大文件已能逼近 u32 上限, 溢出会静默写坏 size。
-    let end64 = offset as u64 + count as u64;
-    if end64 > u32::MAX as u64 {
+    // 结束位置按 64 位算: 文件上限已与卷容量同量级, 只需挡住超出结构可寻址范围的写入。
+    let end = offset + count as u64;
+    let max_bytes = MFS_FILE_MAX_BLOCKS as u64 * MFS_DATA_CAP as u64;
+    if end > max_bytes {
         return u64::MAX;
     }
-    let end = end64 as u32;
     let mut cache = MFS_IND_CACHE_EMPTY;
     let mut done = 0u32;
     while done < count {
-        let pos = offset + done;
+        let pos = offset + done as u64;
         let bi = (pos as usize) / MFS_DATA_CAP;
         let boff = (pos as usize) % MFS_DATA_CAP;
         let chunk = core::cmp::min(MFS_DATA_CAP - boff, (count - done) as usize);
@@ -10819,6 +11446,7 @@ fn mfs_write_file(ino: u32, offset: u32, count: u32, src: *const u8) -> u64 {
 
 /// 清掉逻辑块 `bi` 的映射 (直接槽或间接块槽位置 0), 返回是否成功。
 ///
+/// 三级块经无缓存链路 (`mfs_ind_peek3` / `mfs_ind_link3`) 处理; 一/二级仍走缓存。
 /// 只清指针、不回收块 —— 块由 GC 按可达性回收, 故这里无需关心"谁还在用"。
 fn mfs_unmap_block(a: *mut u8, bi: usize, cache: &mut MfsIndCache) -> bool {
     let old = match mfs_ind_peek(a, bi, cache) {
@@ -10834,10 +11462,10 @@ fn mfs_unmap_block(a: *mut u8, bi: usize, cache: &mut MfsIndCache) -> bool {
 /// 把文件 `ino` 的长度改到 `new_size` 字节, 成功返回 1, 失败 `u64::MAX`。
 ///
 /// - `new_size < 现有长度`: 截短。保留前 `keep = ceil(new_size / MFS_DATA_CAP)` 个逻辑块,
-///   其余映射一律清 0。整组不再需要时直接丢一/二级指针 (块本体交给 GC), 只有部分保留的
-///   那一组才逐槽清理。
+///   其余映射一律清 0。整段不再需要时直接丢一/二/三级指针 (块本体交给 GC), 只有部分保留
+///   的那一段才逐槽清理。
 /// - `new_size > 现有长度`: 稀疏扩展 —— 只抬高 `size`, 不分配块 (未写过的区间读回 0)。
-fn mfs_truncate(ino: u32, new_size: u32) -> u64 {
+fn mfs_truncate(ino: u32, new_size: u64) -> u64 {
     let a = mfs_a();
     let block = match mfs_ino_block(ino) {
         Some(b) if b != 0 => b,
@@ -10863,7 +11491,8 @@ fn mfs_truncate(ino: u32, new_size: u32) -> u64 {
     let keep = (new_size as usize).div_ceil(MFS_DATA_CAP);
     let old_nb = mfs_file_nblocks(a) as usize;
     let dir_end = MFS_FILE_DIRECT;
-    let ind_end = dir_end + MFS_IND_CAP;
+    let ind1_end = dir_end + MFS_IND_CAP;
+    let ind2_end = ind1_end + MFS_IND_CAP * MFS_IND_CAP;
     let mut cache = MFS_IND_CACHE_EMPTY;
     // 1) 直接区尾部逐槽清零。
     let mut bi = keep;
@@ -10877,7 +11506,7 @@ fn mfs_truncate(ino: u32, new_size: u32) -> u64 {
             mfs_file_set_ind1(a, 0);
         } else {
             let mut b = keep.max(dir_end);
-            while b < ind_end && b < old_nb {
+            while b < ind1_end && b < old_nb {
                 if !mfs_unmap_block(a, b, &mut cache) {
                     return u64::MAX;
                 }
@@ -10885,12 +11514,26 @@ fn mfs_truncate(ino: u32, new_size: u32) -> u64 {
             }
         }
     }
-    // 3) 二级间接区同理。
-    if old_nb > ind_end {
-        if keep <= ind_end {
+    // 3) 二级间接区同理 (循环上界到 ind2_end, 三级区留给下一步)。
+    if old_nb > ind1_end {
+        if keep <= ind1_end {
             mfs_file_set_ind2(a, 0);
         } else {
-            let mut b = keep.max(ind_end);
+            let mut b = keep.max(ind1_end);
+            while b < ind2_end && b < old_nb {
+                if !mfs_unmap_block(a, b, &mut cache) {
+                    return u64::MAX;
+                }
+                b += 1;
+            }
+        }
+    }
+    // 4) 三级间接区: 不在保留范围内就整段丢指针; 否则逐槽清理 (走无缓存链路)。
+    if old_nb > ind2_end {
+        if keep <= ind2_end {
+            mfs_file_set_ind3(a, 0);
+        } else {
+            let mut b = keep.max(ind2_end);
             while b < old_nb {
                 if !mfs_unmap_block(a, b, &mut cache) {
                     return u64::MAX;
@@ -10902,7 +11545,7 @@ fn mfs_truncate(ino: u32, new_size: u32) -> u64 {
     if !mfs_ind_flush(a, &mut cache) {
         return u64::MAX;
     }
-    // 4) 最后一个保留块若只用到一半, 把尾部清零 —— 否则日后扩展回来会读出截断前的旧数据
+    // 5) 最后一个保留块若只用到一半, 把尾部清零 —— 否则日后扩展回来会读出截断前的旧数据
     //    (Linux ftruncate 同样会清掉部分块的尾部, 这里与之一致; 只在非块对齐时付一次块 COW)。
     let tail = new_size as usize % MFS_DATA_CAP;
     if keep > 0 && tail != 0 {
@@ -11229,6 +11872,7 @@ fn mfs_main() {
         || sys_alloc_page(mfs_itab_buf() as u64) != 1
         || sys_alloc_page(mfs_itabx_buf() as u64) != 1
         || sys_alloc_page(mfs_gc_tab_buf() as u64) != 1
+        || sys_alloc_page(mfs_bmph_buf() as u64) != 1
     {
         println("mfs: alloc block buffers FAILED");
         return;
@@ -11243,6 +11887,7 @@ fn mfs_main() {
         || sys_share_page(mfs_itab_buf() as u64, BLOCK_DOMAIN) != 1
         || sys_share_page(mfs_itabx_buf() as u64, BLOCK_DOMAIN) != 1
         || sys_share_page(mfs_gc_tab_buf() as u64, BLOCK_DOMAIN) != 1
+        || sys_share_page(mfs_bmph_buf() as u64, BLOCK_DOMAIN) != 1
     {
         println("mfs: share block buffers FAILED");
         return;
@@ -11256,6 +11901,22 @@ fn mfs_main() {
         // 服务起点就是主卷: 之后只有请求明确要求别的卷时才切。
         MFS_CUR_VOL = MFS_VOL;
         MFS_CUR_SECTORS = MFS_VOL_SECTORS;
+    }
+    // 位图窗口必须在**挂载前**铺开 (挂载路径要直接拿窗口页作位图 I/O 缓冲)。此刻盘上
+    // 的 bb 还读不到, 故按**卷容量**预算上界: 每 32768 块占一个 4 KiB 位图数据块,
+    // 即窗口页数 = ceil(卷块数 / 32768)。只增不缩: 之后切到更大卷由 `mfs_win_ensure` 补页。
+    {
+        let secs = unsafe { MFS_CUR_SECTORS } as u64;
+        let vol_blocks = if secs == 0 {
+            MFS_DEFAULT_TOTAL_BLOCKS as u64
+        } else {
+            secs / MFS_SECTORS_PER_BLOCK as u64
+        };
+        let blocks = vol_blocks.clamp(MFS_MIN_TOTAL_BLOCKS as u64, MFS_MAX_BLOCKS as u64);
+        if !mfs_win_ensure(mfs_bb_for(blocks as u32)) {
+            println("mfs: alloc bitmap windows FAILED");
+            return;
+        }
     }
     // 安全护栏: 只允许挂载「已是 MFS」或「整盘无文件系统 (UNKNOWN, 需格式化)」的卷。
     // 卷号回退一旦算错 (例如接了真 U 盘、换了镜像布局), 自动格式化会把别人的分区
@@ -11507,7 +12168,7 @@ fn mfs_main() {
                 unsafe {
                     MFS_SNAP_COUNT = idx + 1;
                 }
-                let r = if mfs_write_super() { idx as u64 } else { u64::MAX };
+                let r = if mfs_bmp_flush() { idx as u64 } else { u64::MAX };
                 sys_reply(r);
             }
             vfs::MFS_SNAPLIST_TAG => {
@@ -11536,7 +12197,7 @@ fn mfs_main() {
                     // 索引镜像必须跟着换成快照那一版, 否则 ino 会翻译到回滚后的对象上。
                     if !mfs_itab_reload() {
                         u64::MAX
-                    } else if mfs_write_super() {
+                    } else if mfs_bmp_flush() {
                         1
                     } else {
                         u64::MAX
@@ -11783,7 +12444,7 @@ fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
     // 目标内联进节点 (复用文件布局的 size 字段存目标长度)。
     let c = mfs_c();
     zero_bytes(c, MFS_BLOCK);
-    mfs_file_set_size(c, tb.len() as u32);
+    mfs_file_set_size(c, tb.len() as u64);
     mfs_file_set_nblocks(c, 0);
     unsafe {
         core::ptr::copy_nonoverlapping(tb.as_ptr(), mfs_atm(c, MFS_LINK_TARGET_OFF), tb.len());
@@ -12300,12 +12961,12 @@ fn ext2_make_entry(name: &[u8], ftype: u8, ino: u32) -> vfs::DirEntry {
     let mut long = [0u8; vfs::DIR_LONG_MAX];
     let llen = ext2_copy_long(name, &mut long);
     let mut is_dir = ftype == EXT2_FT_DIR;
-    let mut size = 0u32;
+    let mut size = 0u64;
     if let Some(inode) = ext2_read_inode_b(ino) {
         // file_type 在旧版 ext2 可能为 0, 这时以 inode 的 mode 为准。
         is_dir = inode.mode & EXT2_S_IFMT == EXT2_S_IFDIR;
         if !is_dir {
-            size = inode.size;
+            size = inode.size as u64;
         }
     }
     vfs::DirEntry::with_long(short, long, llen, size, if is_dir { 1 } else { 0 })
@@ -13298,9 +13959,14 @@ fn ext2_main() {
                 let req: vfs::ReadReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
                 };
+                // ext2 inode 的 size 是 u32: 协议 offset 超出 u32 直接失败。
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 let n = match ext2_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
-                        ext2_read_data(fd.ino, req.offset, req.count, req.buf as *mut u8)
+                        ext2_read_data(fd.ino, req.offset as u32, req.count, req.buf as *mut u8)
                             .unwrap_or(u64::MAX)
                     }
                     _ => u64::MAX,
@@ -13326,7 +13992,7 @@ fn ext2_main() {
                         Some(inode) => {
                             // ext2 侧不做元数据映射 (M5 只覆盖 MFS), 大小按类型给。
                             let st = vfs::Stat::plain(
-                                if is_dir { 0 } else { inode.size },
+                                if is_dir { 0 } else { inode.size as u64 },
                                 u32::from(is_dir),
                             );
                             unsafe {
@@ -13908,11 +14574,7 @@ fn exfat_make_direntry(e: &ExfatEntry) -> vfs::DirEntry {
     let short = ext2_short_name(name);
     let mut long = [0u8; vfs::DIR_LONG_MAX];
     let llen = ext2_copy_long(name, &mut long);
-    let size = if e.is_dir {
-        0
-    } else {
-        e.size.min(u32::MAX as u64) as u32
-    };
+    let size = if e.is_dir { 0 } else { e.size };
     let mut de = vfs::DirEntry::with_long(short, long, llen, size, u32::from(e.is_dir));
     de.mtime = e.mtime;
     de
@@ -14561,6 +15223,11 @@ fn exfat_main() {
                 let req: vfs::ReadReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
                 };
+                // exFAT 侧的内部偏移/计数仍是 32 位: 协议 offset 超出 u32 直接失败。
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 let n = match exfat_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
                         let path = unsafe {
@@ -14568,7 +15235,7 @@ fn exfat_main() {
                         };
                         match exfat_resolve(path) {
                             Some(e) => {
-                                exfat_read_file(&e, req.offset, req.count, req.buf as *mut u8)
+                                exfat_read_file(&e, req.offset as u32, req.count, req.buf as *mut u8)
                                     .unwrap_or(u64::MAX)
                             }
                             None => u64::MAX,
@@ -14602,11 +15269,7 @@ fn exfat_main() {
                 let n = match exfat_resolve(path) {
                     Some(e) => {
                         let st = vfs::Stat {
-                            size: if e.is_dir {
-                                0
-                            } else {
-                                e.size.min(u32::MAX as u64) as u32
-                            },
+                            size: if e.is_dir { 0 } else { e.size },
                             is_dir: u32::from(e.is_dir),
                             mode: if e.is_dir { 0o755 } else { 0o644 },
                             owner: 0,
@@ -14644,6 +15307,10 @@ fn exfat_main() {
                 let req: vfs::WriteReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::WriteReq)
                 };
+                if req.offset > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 let n = match exfat_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
                         let mut nm = [0u8; vfs::DIR_LONG_MAX];
@@ -14658,7 +15325,7 @@ fn exfat_main() {
                                         &e,
                                         parent_first,
                                         &nm[..nlen],
-                                        req.offset,
+                                        req.offset as u32,
                                         req.count,
                                         req.buf as *const u8,
                                     )
@@ -14677,6 +15344,10 @@ fn exfat_main() {
                 let req: vfs::TruncateReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::TruncateReq)
                 };
+                if req.size > u32::MAX as u64 {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 let n = match exfat_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
                         let mut nm = [0u8; vfs::DIR_LONG_MAX];
@@ -14687,7 +15358,7 @@ fn exfat_main() {
                                 p[..plen].copy_from_slice(&fd.path[..plen]);
                                 let path = unsafe { core::str::from_utf8_unchecked(&p[..plen]) };
                                 match exfat_resolve(path) {
-                                    Some(e) => exfat_truncate(&e, parent_first, &nm[..nlen], req.size)
+                                    Some(e) => exfat_truncate(&e, parent_first, &nm[..nlen], req.size as u32)
                                         .unwrap_or(u64::MAX),
                                     None => u64::MAX,
                                 }

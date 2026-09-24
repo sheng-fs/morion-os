@@ -62,10 +62,11 @@ NVME_IMG      ?= $(OUT_DIR)/nvme.img
 # (= 32 KiB 簇) 单独验证。
 NVME_CLU      ?= 8
 # MorionFS (MFS) 磁盘镜像: 纯空白 raw, 由 mfs_srv 首次挂载时自动格式化 (namespace 2)
-# 大小刻意取 64 MiB (而非 16): mfs_srv 现在按**卷的真实容量**格式化, 镜像比默认值大
-# 才能让「按几何定尺寸」这条路径真正被走到 (见 FS-21 自测)。
+# 大小刻意取 256 MiB (而非 16): mfs_srv 现在按**卷的真实容量**格式化, 镜像比默认值大
+# 才能让「按几何定尺寸」这条路径真正被走到 (见 FS-21 自测); 且 MFS7 起位图外置后
+# 超过 128 MiB 会走到**多块位图**路径 (bb ≥ 2, 见 FS-23(a))。
 MFS_IMG       ?= $(OUT_DIR)/mfs.img
-MFS_MIB       ?= 64
+MFS_MIB       ?= 256
 # ext2 磁盘镜像: 由宿主 mke2fs 预格式化 + debugfs 预置测试文件 (namespace 3, 只读)
 EXT2_IMG      ?= $(OUT_DIR)/ext2.img
 EXT2_MIB      ?= 16

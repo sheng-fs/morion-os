@@ -174,6 +174,8 @@ commands:
 - 成功打印 `truncate: size=<n> <path>`；非法 size：`truncate: bad size: <size>`。
 - 失败（目录 / 无法打开）：`truncate: failed (directory or bad file): <path>`。
 - 只支持 MFS。
+- **S3b 起 size 是 64 位**（不再卡在 `u32::MAX`）：MFS 上可以截到 **>4 GiB**（如 5 GiB）并稀疏扩展，
+  `stat` / `ls -l` 也会如实报出 64 位大小；跨 4 GiB 的读写走文件的**三级间接块**。
 
 ### `stat <path>`
 

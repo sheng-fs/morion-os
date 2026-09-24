@@ -343,28 +343,29 @@ fn cap_guard(fd: u64) -> bool {
 }
 
 /// READ 请求 (序列化进 IPC payload, 24 字节)。数据写入 `buf` 指向的共享结果页。
+///
+/// `offset` 是 u64 —— 单文件可超过 4 GiB, 偏移必须端到端 64 位; `count` 仍是 u32,
+/// 单次 I/O 上限一页 (4096 字节), 用不到 64 位。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReadReq {
     pub fd: u32,
-    pub offset: u32,
     pub count: u32,
-    /// 对齐填充 (使 `buf` 8 字节对齐)。
-    pub _pad: u32,
-    /// 结果数据写入的缓冲页虚拟地址 (须已共享给 fat32_srv)。
+    pub offset: u64,
+    /// 结果数据写入的缓冲页虚拟地址 (须已共享给目标文件服务)。
     pub buf: u64,
 }
 
 /// WRITE 请求 (序列化进 IPC payload, 24 字节)。数据从 `buf` 指向的共享写缓冲读取。
+///
+/// `offset` u64 / `count` u32 的理由同 `ReadReq`。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WriteReq {
     pub fd: u32,
-    pub offset: u32,
     pub count: u32,
-    /// 对齐填充 (使 `buf` 8 字节对齐)。
-    pub _pad: u32,
-    /// 数据来源缓冲页虚拟地址 (须已共享给 fat32_srv)。
+    pub offset: u64,
+    /// 数据来源缓冲页虚拟地址 (须已共享给目标文件服务)。
     pub buf: u64,
 }
 
@@ -379,13 +380,15 @@ pub struct DirReq {
     pub buf: u64,
 }
 
-/// 截断请求 (序列化进 IPC payload, 8 字节)。
+/// 截断请求 (序列化进 IPC payload, 16 字节)。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TruncateReq {
     pub fd: u32,
+    /// 对齐填充 (使 `size` 8 字节对齐)。
+    pub _pad: u32,
     /// 目标长度 (字节); 小于现有长度则截短, 大于则稀疏扩展。
-    pub size: u32,
+    pub size: u64,
 }
 
 /// 双路径请求 (rename / 将来的 link 共用), 序列化进 IPC payload (16 字节)。
@@ -452,7 +455,7 @@ pub struct DirEntry {
     /// 长名 (UTF-8, 最多 `DIR_LONG_MAX` 字节); `long_len == 0` 时内容无意义。
     pub long: [u8; DIR_LONG_MAX],
     /// 文件大小 (目录为 0)。
-    pub size: u32,
+    pub size: u64,
     /// 1 = 目录, 0 = 普通文件。
     pub is_dir: u32,
     /// 权限位 (仅 MFS 提供; 其它服务填 0755/0644)。仅展示。
@@ -467,7 +470,7 @@ pub struct DirEntry {
 
 impl DirEntry {
     /// 只有 8.3 短名的条目 (内部只按短名寻址的文件服务: tmpfs / MFS)。
-    pub const fn short(name: [u8; 11], size: u32, is_dir: u32) -> Self {
+    pub const fn short(name: [u8; 11], size: u64, is_dir: u32) -> Self {
         Self {
             name,
             long_len: 0,
@@ -483,7 +486,7 @@ impl DirEntry {
     }
 
     /// 带长名的条目 (VFAT 长名 / ext2 名字)。
-    pub const fn with_long(name: [u8; 11], long: [u8; DIR_LONG_MAX], long_len: u8, size: u32, is_dir: u32) -> Self {
+    pub const fn with_long(name: [u8; 11], long: [u8; DIR_LONG_MAX], long_len: u8, size: u64, is_dir: u32) -> Self {
         Self {
             name,
             long_len,
@@ -509,7 +512,7 @@ impl DirEntry {
 #[derive(Clone, Copy)]
 pub struct Stat {
     /// 文件大小 (目录为 0)。
-    pub size: u32,
+    pub size: u64,
     /// 1 = 目录, 0 = 普通文件。
     pub is_dir: u32,
     /// 权限位 (低 12 位: setuid/setgid/sticky + rwxrwxrwx)。仅存储/显示, **不强制**。
@@ -528,7 +531,7 @@ pub struct Stat {
 
 impl Stat {
     /// 元数据缺省值: 按类型给常规权限, 其余置 0 ("未知")。
-    pub const fn plain(size: u32, is_dir: u32) -> Self {
+    pub const fn plain(size: u64, is_dir: u32) -> Self {
         Self {
             size,
             is_dir,
@@ -593,20 +596,19 @@ pub fn open(path: &str) -> u64 {
 
 /// 从 fd 的 `offset` 起读最多 `count` 字节到 `RESULT_BUF`。
 /// 返回实际读取字节数, 失败返回 `u64::MAX`。
-pub fn read(fd: u64, offset: u32, count: u32) -> u64 {
+pub fn read(fd: u64, offset: u64, count: u32) -> u64 {
     read_into(fd, offset, count, RESULT_BUF)
 }
 
 /// 同 `read`, 但结果写入指定的共享缓冲页 `buf` (须已共享给目标服务域)。
-pub fn read_into(fd: u64, offset: u32, count: u32, buf: u64) -> u64 {
+pub fn read_into(fd: u64, offset: u64, count: u32, buf: u64) -> u64 {
     if !cap_guard(fd) {
         return u64::MAX;
     }
     let req = ReadReq {
         fd: fd_local(fd),
-        offset,
         count,
-        _pad: 0,
+        offset,
         buf,
     };
     let payload = unsafe {
@@ -620,12 +622,12 @@ pub fn read_into(fd: u64, offset: u32, count: u32, buf: u64) -> u64 {
 
 /// 把 `data` (最多一页) 拷入共享写缓冲 `WRITE_BUF`, 并从 fd 的 `offset` 起写
 /// `data.len()` 字节。返回实际写入字节数, 失败返回 `u64::MAX`。
-pub fn write(fd: u64, offset: u32, data: &[u8]) -> u64 {
+pub fn write(fd: u64, offset: u64, data: &[u8]) -> u64 {
     write_into(fd, offset, data, WRITE_BUF)
 }
 
 /// 同 `write`, 但数据来自指定的共享写缓冲页 `buf` (须已共享给目标服务域)。
-pub fn write_into(fd: u64, offset: u32, data: &[u8], buf: u64) -> u64 {
+pub fn write_into(fd: u64, offset: u64, data: &[u8], buf: u64) -> u64 {
     if !cap_guard(fd) {
         return u64::MAX;
     }
@@ -635,9 +637,8 @@ pub fn write_into(fd: u64, offset: u32, data: &[u8], buf: u64) -> u64 {
     }
     let req = WriteReq {
         fd: fd_local(fd),
-        offset,
         count: n as u32,
-        _pad: 0,
+        offset,
         buf,
     };
     let payload = unsafe {
@@ -871,11 +872,11 @@ pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
 /// 把文件 `fd` 的长度截断/扩展到 `size` 字节, 成功返回 1, 失败 `u64::MAX`。
 ///
 /// 截短会释放尾部数据块; 扩展为**稀疏**(未写过的区间读回 0)。目录不支持截断。
-pub fn truncate(fd: u64, size: u32) -> u64 {
+pub fn truncate(fd: u64, size: u64) -> u64 {
     if !cap_guard(fd) {
         return u64::MAX;
     }
-    let req = TruncateReq { fd: fd_local(fd), size };
+    let req = TruncateReq { fd: fd_local(fd), _pad: 0, size };
     let payload = unsafe {
         core::slice::from_raw_parts(
             &req as *const TruncateReq as *const u8,
