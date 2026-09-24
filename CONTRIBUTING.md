@@ -115,12 +115,35 @@ make run-nokvm    # 无硬件虚拟化环境
 - 提交前确保通过检查：
 
 ```bash
-make fmt      # 代码格式
-make clippy   # Clippy 检查（-D warnings）
 make check    # 编译检查
+make clippy   # Clippy 检查（-D warnings）
 ```
 
 - 注释使用中文，与现有代码保持一致。
+
+### 关于 `make fmt`
+
+`make fmt`（`cargo fmt --all -- --check`）**目前不纳入 CI 门禁**：本仓库的代码是**手写的紧凑
+单行风格**（如 `struct Color { b: u8, g: u8, r: u8, a: u8 }`、单行 `const fn`），而仓库里没有
+`rustfmt.toml`，默认配置会把它们全部展开 —— 实测报 **244 处**差异，遍布 `boot` / `kernel` /
+`kernel_test` / `user`。试过用 `use_small_heuristics = "Max"` + `fn_single_line` 等选项去贴合
+现有风格，差异反而涨到 351 处，所以「调一份配置对上」这条路走不通。
+
+**若要把 fmt 纳入门禁**，第一步必须是**先跑一次全仓库 `cargo fmt` 并单独成一次提交**（纯风格
+改动，别和功能改动混在一个 commit 里），此后再逐步收紧。
+
+## CI
+
+`.github/workflows/` 下有两个工作流：
+
+| 工作流 | 触发 | 内容 |
+| --- | --- | --- |
+| `ci.yml` | 每次 push / PR 到 `main` / `master` | `make check` → `make clippy`（只编译，不跑 QEMU，几分钟出结果） |
+| `fs-regress.yml` | **手动**（Actions → Run workflow） | 构建 ISO 与 6 张测试盘 → `bash scripts/fs-regress.sh`（QEMU 全量自测） |
+
+`fs-regress.yml` 之所以不挂在 push 上：公共 runner 通常没有 `/dev/kvm`，QEMU 只能走 TCG，
+本地 KVM 下约 6 分钟的整套自测会慢好几倍。需要时手动触发即可（想定时跑就把该文件里的
+`schedule` 打开）。
 
 ## Issue 规范
 
@@ -146,7 +169,7 @@ make check    # 编译检查
 1. 从 `main` 切出你自己的功能分支进行开发（见上方「贡献工作流」）
 2. 遵循提交规范与代码风格
 3. 使用 PR 模板填写变更说明、关联 Issue 与测试情况
-4. 确保 CI 检查（`check` / `fmt` / `clippy`）全部通过
+4. 确保 CI 检查（`check` / `clippy`）全部通过
 5. 由维护者 review 通过后合并到 `main`
 
 ## 许可证

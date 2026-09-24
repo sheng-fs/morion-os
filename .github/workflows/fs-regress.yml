@@ -1,0 +1,81 @@
+# ============================================================
+# QEMU 全量 FS 回归 (app 的 FS-1..FS-24 自测)
+# ------------------------------------------------------------
+# **只手动触发** (Actions → Run workflow): 公共 runner 上通常没有 /dev/kvm, QEMU 只能
+# 走 TCG, 本地 KVM 下约 6 分钟的整套自测会慢好几倍, 不适合挂在每次 push 上 ——
+# 每次 push 的门禁只做编译/格式/clippy (见 ci.yml)。
+#
+# 想定时跑就把下面的 schedule 打开。
+# ============================================================
+
+name: FS regression (QEMU)
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 18 * * 0'   # 每周日 02:00 (UTC+8)
+
+jobs:
+  regress:
+    runs-on: ubuntu-latest
+    # TCG 下整套自测可能到 20 分钟以上, 给足余量。
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src,rustfmt,clippy,llvm-tools-preview
+          rustup target add --toolchain nightly \
+            x86_64-unknown-none x86_64-unknown-uefi
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # 造盘 / 建 ISO / 跑 QEMU 要用的宿主工具 (见 Makefile 的各镜像目标):
+      #   mkfs.fat -> dosfstools, mke2fs+debugfs -> e2fsprogs, mkfs.exfat -> exfatprogs,
+      #   sfdisk -> util-linux, mformat/mcopy -> mtools, xorriso, qemu-system-x86_64。
+      - name: Install build & QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf mtools dosfstools e2fsprogs exfatprogs util-linux xorriso
+
+      # Makefile 与回归脚本按 Arch 的路径写死了 OVMF (/usr/share/edk2/x64/OVMF.4m.fd),
+      # Ubuntu 装在 /usr/share/OVMF/ 下且文件名带 4M —— 按实际存在的文件补软链。
+      - name: Provide OVMF at the expected path
+        run: |
+          sudo mkdir -p /usr/share/edk2/x64
+          code=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -n1)
+          vars=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -n1)
+          test -n "$code" && test -n "$vars"
+          sudo ln -sf "$code" /usr/share/edk2/x64/OVMF.4m.fd
+          sudo ln -sf "$vars" /usr/share/edk2/x64/OVMF_VARS.fd
+
+      # 自测依赖的 6 张盘: nvme/ext2/parts/exfat 由 Makefile 造; mfs.img 与 spare.img
+      # 由回归脚本自己 dd 成空白 (首次挂载自动格式化 / 供 mkfs.mfs 自测)。
+      - name: Build ISO & disk images
+        run: make iso build/nvme.img build/ext2.img build/parts.img build/exfat.img
+
+      # 无 KVM 时脚本自动退回 TCG; 默认 600 s 的等待上限是按 KVM 定的, 这里放宽。
+      - name: FS self-test regression
+        env:
+          REGRESS_TIMEOUT_S: '1500'
+        run: bash scripts/fs-regress.sh
+
+      - name: Upload QEMU log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fs-regress-log
+          path: /tmp/morion-fs-regress.log
+          if-no-files-found: ignore

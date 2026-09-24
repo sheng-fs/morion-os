@@ -1,0 +1,63 @@
+# ============================================================
+# CI 门禁: 编译检查 + clippy (-D warnings)
+# ------------------------------------------------------------
+# 只**编译**不运行 QEMU, 所以不需要 KVM, 几分钟内出结果 —— 每次 push / PR 都跑。
+# QEMU 全量 FS 回归另见 fs-regress.yml (无 KVM 时 TCG 太慢, 只手动触发)。
+#
+# 为什么没有 `make fmt`: 本仓库的代码是**手写的紧凑单行风格** (如
+# `struct Color { b: u8, g: u8, r: u8, a: u8 }`、单行 `const fn`), 而仓库里没有
+# rustfmt.toml, 默认配置会把它们全部展开 —— 实测 `cargo fmt --all -- --check` 报
+# 244 处差异, 遍布 boot / kernel / kernel_test / user。故 fmt 不纳入门禁
+# (详见 CONTRIBUTING.md「代码风格」)。
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: check / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 通道 / 组件 / 目标都以仓库内的 rust-toolchain.toml 为准; 这里显式装一遍,
+      # 免得 runner 预装的 rustup 因为缺组件而在第一次 cargo 调用时才失败。
+      - name: Setup Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src,rustfmt,clippy,llvm-tools-preview
+          rustup target add --toolchain nightly \
+            x86_64-unknown-none x86_64-unknown-uefi
+
+      # 三个 crate 目标各不相同, 且都要 `-Z build-std` 从源码重建 core/compiler_builtins
+      # (每个目标一份), 不缓存的话每次都是几分钟。键里带 Cargo.lock 哈希: 依赖变了才失效。
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check
+        run: make check
+
+      - name: Clippy
+        run: make clippy
