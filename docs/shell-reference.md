@@ -211,15 +211,25 @@ commands:
   **绝不自动吞掉**。命令与 FS-22 自测走同一条路径，判定只有一处。
 - 成功后：卷上有一个空 MorionFS 根目录；若该卷**不是** MFS 主卷，会立刻挂到 `/usb<卷号>`；
   若就是主卷（`/mfs`），原地重建。
-- 输出：`mkfs.mfs: volume <vol> formatted (non-default volumes are mounted at /usb<volume-id>)`；
+- **同时把这卷标记为主卷**：超级块里记下「主卷序号 = 现有最大 + 1」，于是**下次启动** `/mfs`
+  就是它 —— 这就是「切换主卷」的手段，与卷表扫描顺序无关。序号只增不减，所以重复格式化
+  同一块卷它仍会胜出。本次运行的挂载点不变（换主卷要重启才生效）。
+- 输出：`mkfs.mfs: volume <vol> formatted, marked primary (serial <n>) -> /mfs after next boot;
+  other volumes mount at /usb<volume-id>`（`serial` 是**从盘上回读**的序号，即为标记已落盘的证据）；
   被拒或失败：`mkfs.mfs: refused volume <vol> (not blank, not MFS, or no such volume)`。
 - 缺参数 / 非数字：`mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)`。
 - 相关诊断（服务端打印，属正常护栏证据）：`mfs: mkfs refused (volume holds another filesystem)`、
-  `mfs: mkfs refused (no such volume)`。
+  `mfs: mkfs refused (no such volume)`、`mfs: mkfs OK but primary mark missing on disk`（异常）。
 
 > 典型用法（真盘上「新买一块盘」）：启动日志里找到目标卷的 `vol:` 行（例如
 > `vol: 6 nsid=6 lba=0 sectors=32768 kind=unknown`），敲 `mkfs.mfs 6`，然后
-> `ls /usb6` / `touch /usb6/T.TXT`。
+> `ls /usb6` / `touch /usb6/T.TXT`。此后这台机器重启，`/mfs` 就落在卷 6 上。
+> 想切回去，就在卷 1 上再 `mkfs.mfs 1`（**会擦除**）。
+
+> ⚠️ 主卷标记是**持久**的：跑过自测的镜像上，`spare.img` 会被 FS-22/FS-24 格成 MFS 并逐步
+> 升到更高序号 —— 再次 `make run-nvme` 而不重置镜像时，`/mfs` 就落在那块 16 MiB 的空白盘上
+> （`fs-regress.sh` 每轮都会重置两份卷，故回归不受影响）。想复位就在 shell 里 `mkfs.mfs 1`
+> 或删掉 `build/spare.img`。
 
 ### `clear`
 

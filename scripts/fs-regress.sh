@@ -1,10 +1,13 @@
 #!/bin/bash
 # 模拟镜像全量 FS 回归: 6 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘) 上跑
-# app 的 FS-1..FS-22 自测, 由日志判定通过与否。
+# app 的 FS-1..FS-24 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
-# ⏱️ 整套约 4~4.5 分钟: 约 2 万个块请求, IPC 一跳 ≈ 一个时钟 tick, 故有效吞吐
+# 环境变量: MFS_KEEP=1 保留既有 MFS 卷; REGRESS_TIMEOUT_S 放宽等待上限 (无 KVM 的 CI);
+#           QEMU_EXTRA 追加 QEMU 参数; BIOS 覆盖 OVMF 路径。
+#
+# ⏱️ 有 KVM 时整套约 6 分钟: 约 2 万个块请求, IPC 一跳 ≈ 一个时钟 tick, 故有效吞吐
 # 约 100 请求/s。期间日志会长时间「只有 shell 提示符、没有新行」, 这不是卡死。
 # 耗时集中在 FS-12 (MFS 目录与长名: 200 项 + 每次 3 遍显式全卷 GC), 单它就 ~170 s。
 #
@@ -38,6 +41,16 @@ t0=$(date +%s)
 QEMU=${QEMU:-qemu-system-x86_64}
 BIOS=${BIOS:-/usr/share/edk2/x64/OVMF.4m.fd}
 
+# 加速: 有 KVM 就用 (-enable-kvm); 没有 (多数 CI runner) 退回 TCG —— 结果一样但要慢
+# 好几倍, 故等待上限用 REGRESS_TIMEOUT_S 放宽 (默认 600 s, 按 KVM 下 ~6 分钟定的)。
+accel=""
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+  accel="-enable-kvm"
+else
+  echo "== 无可用 /dev/kvm: QEMU 走 TCG, 会明显变慢 (用 REGRESS_TIMEOUT_S 放宽等待)"
+fi
+timeout_s=${REGRESS_TIMEOUT_S:-600}
+
 $QEMU \
   -machine q35 -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
   -cdrom "$OUT_DIR/morion-os.iso" \
@@ -48,11 +61,12 @@ $QEMU \
   -drive file="$OUT_DIR/parts.img",if=none,id=n4,format=raw -device nvme-ns,drive=n4,bus=nvme0,nsid=4 \
   -drive file="$OUT_DIR/exfat.img",if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
   -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
-  -display none -monitor none -serial file:"$log" -no-reboot ${QEMU_EXTRA:-} -enable-kvm &
+  -display none -monitor none -serial file:"$log" -no-reboot ${accel} ${QEMU_EXTRA:-} \
+  >/dev/null 2>&1 &
 pid=$!
 
-# 出现结论或失败即提前收工; 否则最多等 10 分钟。
-for _ in $(seq 1 120); do
+# 出现结论或失败即提前收工; 否则最多等 timeout_s 秒 (每 5 s 轮询一次)。
+for _ in $(seq 1 $((timeout_s / 5))); do
   sleep 5
   if grep -qE 'SELFTEST DONE|KERNEL PANIC|FAILED' "$log" 2>/dev/null; then break; fi
   kill -0 "$pid" 2>/dev/null || break
@@ -64,7 +78,7 @@ wait "$pid" 2>/dev/null
 done_n=$(grep -c 'SELFTEST DONE' "$log" 2>/dev/null || true)
 fail_n=$(grep -cE 'FAILED|PANIC' "$log" 2>/dev/null || true)
 echo "== 日志: $log"
-echo "== 耗时: $(($(date +%s) - t0)) 秒 (出现结论即停, 最长等 10 分钟)"
+echo "== 耗时: $(($(date +%s) - t0)) 秒 (出现结论即停, 最长等 ${timeout_s} 秒)"
 echo "== SELFTEST DONE 次数: $done_n"
 echo "== FAILED/PANIC 次数: $fail_n"
 echo "== 卷表 (block_srv vol: 行) =="

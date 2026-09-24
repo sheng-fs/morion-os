@@ -2675,7 +2675,7 @@ fn vol_print_table() {
 
 /// 按卷首若干字节的签名判断文件系统类型。
 ///
-/// 判据 (先强特征后弱特征): exFAT `"EXFAT   "` (偏移 3) → MFS magic `"MFS1".."MFS4"`
+/// 判据 (先强特征后弱特征): exFAT `"EXFAT   "` (偏移 3) → MFS magic `"MFS0".."MFS9"`
 /// (偏移 0) → ext2 magic `0xEF53` (偏移 1080) → FAT 引导扇区尾 `0x55AA` (偏移 510)。
 fn vol_detect_kind(buf: *const u8) -> u32 {
     let mut exfat = true;
@@ -2995,6 +2995,9 @@ fn vol_desc(list: *const u8, i: usize) -> VolumeDesc {
 /// 先在卷表里找第一个 `kind` 匹配的卷; 找不到则回退 `fallback` (约定卷号)。
 /// 需要回退的原因: 空白 MFS 盘没有 magic, 必须先格式化才能被探测到。
 /// `scratch` 必须是本域**已共享给 block_srv** 的缓冲页 (卷描述符经它回传)。
+///
+/// MFS **不用**这个函数: 一块盘上可以有多块 MFS 卷, 「第一个」不够用 —— 它按主卷
+/// 序号认领 (见 `mfs_vol_claim`)。
 fn vol_claim(scratch: *mut u8, max: u32, kind: u32, fallback: u64) -> u64 {
     let n = block_list_volumes(scratch, max);
     if n == 0 || n == u64::MAX {
@@ -3003,6 +3006,49 @@ fn vol_claim(scratch: *mut u8, max: u32, kind: u32, fallback: u64) -> u64 {
     match vol_find_kind(scratch, n, kind) {
         Some(v) => v as u64,
         None => fallback,
+    }
+}
+
+/// MFS 服务的卷认领 (取代通用 `vol_claim`)。
+///
+/// MFS 与其它文件系统不同: 一台机器上可能有多块 MFS 卷, 而**只有一块**该挂到 `/mfs`
+/// —— 以前取「卷表里第一个」, 于是 `/mfs` 落在哪块卷上只由扫描顺序决定, 显式
+/// `mkfs.mfs` 过谁毫无影响, 既不可控也无法解释。改为按**主卷序号**认领:
+///
+///   ① 序号最大且 > 0 的 MFS 卷 —— 序号由 `mkfs.mfs` 置成「现有最大 + 1」, 故它就是
+///      「最近一次显式格式化过的卷」(见 `MFS_SB_PRIMARY`);
+///   ② 都是 0 (老卷 / 只被首次挂载自动格式化过) 时退回卷表里第一个 MFS 卷;
+///   ③ 一个 MFS 卷都没有时回退约定卷号 (空白盘没有 magic, 必须先格式化才会被探测到)。
+fn mfs_vol_claim(scratch: *mut u8, max: u32) -> u64 {
+    let n = block_list_volumes(scratch, max);
+    if n == 0 || n == u64::MAX {
+        return MFS_VOL_FALLBACK;
+    }
+    let esize = core::mem::size_of::<VolumeDesc>();
+    let mut best: Option<(u64, u32)> = None;
+    let mut first: Option<u32> = None;
+    let mut i = 0u64;
+    while i < n {
+        let d = unsafe {
+            core::ptr::read_unaligned(scratch.add(i as usize * esize) as *const VolumeDesc)
+        };
+        if d.kind == VOL_KIND_MFS {
+            if first.is_none() {
+                first = Some(d.id);
+            }
+            let serial = mfs_primary_of_vol(d.id as u64);
+            if serial > 0 {
+                match best {
+                    Some((s, _)) if s >= serial => {}
+                    _ => best = Some((serial, d.id)),
+                }
+            }
+        }
+        i += 1;
+    }
+    match best {
+        Some((_, v)) => v as u64,
+        None => first.map_or(MFS_VOL_FALLBACK, |v| v as u64),
     }
 }
 
@@ -6427,7 +6473,9 @@ fn app_main() {
         vfs::close(kfd);
 
         // (b) 格式化空白卷; 成功后 mfs_srv 会把它挂到 `/usb<卷号>`。
-        if vfs::mfs_mkfs(spare_vol) != 1 {
+        // 回复是落盘后的主卷序号 (>0) —— 格式化同时把这块卷标记为主卷, 但那要**下次
+        // 启动**才生效 (FS-24 会专门盯这条链路), 本次运行 `/mfs` 仍是原主卷。
+        if vfs::mfs_mkfs(spare_vol) == u64::MAX {
             println("app: FS22 mkfs on blank volume FAILED");
             return;
         }
@@ -6640,6 +6688,78 @@ fn app_main() {
             println("app: FS23 cleanup unlink FAILED");
             return;
         }
+    }
+
+    // 29. FS-24 自测 (S2 补齐): **主卷切换的持久化标记**。
+    //     `mkfs.mfs <卷号>` 把该卷标记为主卷 (超级块 `+256` 的序号 = 现有最大 + 1),
+    //     从此**下次启动** `/mfs` 认领的就是它 —— 与卷表扫描顺序无关 (M8 未覆盖项的收口)。
+    //     会话内不能重启, 故把这条链路拆成三个可观测环节:
+    //       (a) mkfs 回复的序号是**从盘上回读**的 (>0) —— 标记确实写进超级块且能再读出;
+    //       (b) 再次 mkfs 同一卷, 序号严格变大 —— 这就是「最近 mkfs 的卷胜出」的判据;
+    //       (c) 两次 mkfs 之间对该卷做一次**普通写提交**, 序号仍继续变大 —— 证明标记在
+    //           普通提交里被保留 (`mfs_load_state` 回读 + `mfs_build_super` 回写)。
+    //           若标记被一次普通写盘抹成 0, (b)(c) 的序号会掉回 1, 断言立刻失败。
+    //       (d) 全程主卷 `/mfs` 照常可读 —— 给别的卷换标不扰动正在服务的卷。
+    {
+        let nvol = block_list_volumes(vfs::RESULT_BUF as *mut u8, 16);
+        if nvol == u64::MAX {
+            println("app: FS24 list volumes FAILED");
+            return;
+        }
+        let mut spare_vol = u64::MAX;
+        let mut i = 0u64;
+        while i < nvol {
+            let d = vol_desc(vfs::RESULT_BUF as *const u8, i as usize);
+            if d.nsid == 6 {
+                spare_vol = d.id as u64;
+            }
+            i += 1;
+        }
+        if spare_vol == u64::MAX {
+            println("app: FS24 spare volume missing FAILED");
+            return;
+        }
+
+        // (a) 序号来自盘上回读 (FS-22 已格式化过一次, 这里再格一次同样应拿到正序号)。
+        let s1 = vfs::mfs_mkfs(spare_vol);
+        if s1 == u64::MAX || s1 == 0 {
+            println("app: FS24 primary mark not on disk FAILED");
+            return;
+        }
+        // (b) 同一卷再格式化: 序号必须严格变大。
+        let s2 = vfs::mfs_mkfs(spare_vol);
+        if s2 == u64::MAX || s2 <= s1 {
+            println("app: FS24 primary serial not increasing FAILED");
+            return;
+        }
+
+        // (c) 对该卷做一次普通写提交 (走 /usb<卷号> 挂载点, 会切到该卷并提交超级块)。
+        let mut pbuf = [0u8; 32];
+        pbuf[..4].copy_from_slice(b"/usb");
+        let rl = 4 + dec_to_str(spare_vol, &mut pbuf[4..]);
+        let suffix = b"/FS24.TXT";
+        pbuf[rl..rl + suffix.len()].copy_from_slice(suffix);
+        let path = unsafe { core::str::from_utf8_unchecked(&pbuf[..rl + suffix.len()]) };
+        let fd = vfs::creat(path);
+        if fd == u64::MAX || vfs::write(fd, 0, b"M") != 1 {
+            println("app: FS24 write on marked volume FAILED");
+            return;
+        }
+        vfs::close(fd);
+
+        let s3 = vfs::mfs_mkfs(spare_vol);
+        if s3 == u64::MAX || s3 <= s2 {
+            println("app: FS24 primary mark lost across commit FAILED");
+            return;
+        }
+
+        // (d) 主卷未被扰动 (FS-23(a) 落下的探针文件仍在)。
+        let fd = vfs::open("/mfs/FS23PROBE.TXT");
+        if fd == u64::MAX {
+            println("app: FS24 primary volume damaged by mkfs FAILED");
+            return;
+        }
+        vfs::close(fd);
     }
     println("app: SELFTEST DONE");
 }
@@ -7200,6 +7320,8 @@ fn shell_readlink(st: &ShellState, arg: &str) {
 /// 卷号来自块服务启动时打印的卷表 (`vol: <卷号> nsid=... kind=...`)。护栏不在这里
 /// 而在服务端: mfs_srv 只接受 `kind=mfs` (重新格式化) 或 `kind=unknown` (未格式化)
 /// 的卷, FAT / exFAT / ext2 一律拒绝 —— 命令与自测走同一条路径, 判定只有一处。
+///
+/// 格式化同时把这卷标记为**主卷**: **下次启动** `/mfs` 就是它 (本次运行的挂载不变)。
 fn shell_mkfs(arg: &str) {
     let vol = match parse_dec(arg) {
         Some(v) => v,
@@ -7208,10 +7330,13 @@ fn shell_mkfs(arg: &str) {
             return;
         }
     };
-    if vfs::mfs_mkfs(vol) == 1 {
+    let serial = vfs::mfs_mkfs(vol);
+    if serial != u64::MAX {
         print("mkfs.mfs: volume ");
         print_u64(vol);
-        println(" formatted (non-default volumes are mounted at /usb<volume-id>)");
+        print(" formatted, marked primary (serial ");
+        print_u64(serial);
+        println(") -> /mfs after next boot; other volumes mount at /usb<volume-id>");
     } else {
         print("mkfs.mfs: refused volume ");
         print_u64(vol);
@@ -8716,7 +8841,8 @@ const MFS_ROOT_INO: u32 = 1;
 //   +0 version / +4 block_size / +8 total_blocks / +12 ino_count / +16 alloc_hint
 //   +20 snap_count / +24 gen(u64) / +32 itab_root / +36 ino_hint
 //   / +48 快照表(8 × 24B) / +256 起预留
-// (MFS7 起空闲位图已移出超级块, +256 那片区域留空保留 —— 见位图头块布局。)
+// (MFS7 起空闲位图已移出超级块, +256 那片区域留空保留 —— 见位图头块布局;
+//  其中 `MFS_SB_PRIMARY` 从 +256 起占了 8 字节, 其余仍保留。)
 const MFS_SB_BLOCK_SIZE: usize = 4;
 const MFS_SB_TOTAL: usize = 8;
 const MFS_SB_INO_COUNT: usize = 12;
@@ -8731,6 +8857,16 @@ const MFS_SB_INO_HINT: usize = 36;
 const MFS_SB_SNAPS: usize = 48;
 /// 单条快照记录字节数: gen(u64) + itab_root/ino_hint/alloc_hint/reserved (4 × u32)。
 const MFS_SNAP_REC: usize = 24;
+/// **主卷序号** (u64, 0 = 不是主卷) —— `MFS7` 起 payload `+256` 整片是保留区, 这里取头 8 字节。
+///
+/// 一台机器上可以有多块 MFS 卷; 谁当 `/mfs` 以前只由**卷表扫描顺序**决定, 显式
+/// `mkfs.mfs` 过谁完全不影响 —— 这既不可控也无法解释。改为: `mkfs.mfs` 把目标卷的
+/// 序号置成「现有最大 + 1」(见 `mfs_mkfs_volume`), 认领时取**序号最大**的 MFS 卷
+/// (见 `mfs_vol_claim`)。于是「最近一次显式格式化的卷」稳定地就是下次启动的主卷。
+///
+/// 序号只增不清: 不需要回写别的卷就能表达「我更新」, 单主卷由「最大者胜出」保证。
+/// 全为 0 (老卷 / 只被首次挂载自动格式化过) 时退回「第一个 MFS 卷」的旧行为。
+const MFS_SB_PRIMARY: usize = 256;
 // 位图头块 payload 布局 (MFS7): +0 gen(u64) / +8 total_blocks(u32) / +12 data_blocks(u32)
 //   / +16 CRC32 数组 (每个位图数据块一项)。
 /// 位图头块 payload: 代际 (必须与对应超级块副本的 gen 一致)。
@@ -8840,6 +8976,10 @@ static mut MFS_ALLOC_NEXT: u32 = 0;
 static mut MFS_TOTAL_BLOCKS: u32 = 0;
 static mut MFS_GEN: u64 = 0;
 static mut MFS_SNAP_COUNT: usize = 0;
+/// **当前卷**的主卷序号 (超级块 `MFS_SB_PRIMARY`; 0 = 不是主卷)。
+///
+/// 必须随每次提交一并写回: 否则一次普通的写盘就会把标记抹成 0, 下次启动主卷就丢了。
+static mut MFS_PRIMARY_SERIAL: u64 = 0;
 /// 空闲块数 (由位图窗口派生, 由 `mfs_bmp_set/clear` 增量维护)。
 static mut MFS_FREE_BLOCKS: u32 = 0;
 /// 三个位图窗口当前已分配的页数 (只增不缩, 见各窗口 VADDR 处的说明)。
@@ -9005,6 +9145,59 @@ fn mfs_write_blk(block_no: u32, src: *const u8) -> bool {
         MFS_SECTORS_PER_BLOCK,
         src as *mut u8,
     )
+}
+
+/// 读**任意卷** `vol` 超级块里的主卷序号; 0 = 非主卷 / 不是 MFS / 两份都读不出。
+///
+/// 直接用 `block_read_dev` 指定卷号, 与本服务的「当前卷」无关 —— 认领主卷要把**所有**
+/// MFS 卷扫一遍, 不能靠切内存态 (那会把正在服务的卷换掉)。两份副本取较大者: 一次提交
+/// 把两份写成同一序号, 崩溃在中途时落后的那份序号必不大于新的, 取大即取新。
+///
+/// 缓冲借用位图头块页 (`mfs_bmph_buf`) —— 该页只在 `mfs_bmp_flush` 内部使用, 而本函数
+/// 只从启动认领与 `mkfs` **之前**调用, 与提交路径不重叠。
+fn mfs_primary_of_vol(vol: u64) -> u64 {
+    let buf = mfs_bmph_buf();
+    let mut best = 0u64;
+    for copy in 0..MFS_SB_COPIES {
+        let lba = copy * MFS_SECTORS_PER_BLOCK as u32;
+        if !block_read_dev(vol, lba, MFS_SECTORS_PER_BLOCK, buf) {
+            continue;
+        }
+        if !mfs_ok(buf, MFS_MAGIC_SUPER) {
+            continue;
+        }
+        let p = MFS_HDR;
+        if read_u32(mfs_at(buf, p)) != MFS_VERSION {
+            continue;
+        }
+        best = best.max(read_u64(mfs_at(buf, p + MFS_SB_PRIMARY)));
+    }
+    best
+}
+
+/// 目标卷 `target` 应得的主卷序号: 现有**所有** MFS 卷与 `target` 自身的最大序号 + 1。
+///
+/// 只加 1、不回写别的卷 —— 序号只增, 「最大者胜出」由认领端 (`mfs_vol_claim`) 保证。
+/// 重复格式化同一块卷会让它继续胜出 (序号同样 +1), 正是「最近 mkfs 过的卷当主卷」。
+fn mfs_next_primary_serial(scratch: *mut u8, target: u64) -> u64 {
+    // 目标卷此刻的 kind 可能还是卷表里的旧值 (卷表在启动时就冻结了, 之后 mkfs 出来的
+    // 卷在表里仍是 unknown), 故先按卷号直接读一次, 与卷表无关。
+    let mut max = mfs_primary_of_vol(target);
+    let n = block_list_volumes(scratch, VOL_MAX as u32);
+    if n != 0 && n != u64::MAX {
+        let esize = core::mem::size_of::<VolumeDesc>();
+        let mut i = 0u64;
+        while i < n {
+            let d = unsafe {
+                core::ptr::read_unaligned(scratch.add(i as usize * esize) as *const VolumeDesc)
+            };
+            if d.kind == VOL_KIND_MFS && d.id as u64 != target {
+                max = max.max(mfs_primary_of_vol(d.id as u64));
+            }
+            i += 1;
+        }
+    }
+    max + 1
 }
 
 // ---------------------------------------------------------------------------
@@ -9567,10 +9760,14 @@ fn mfs_itab_flush() -> bool {
 }
 
 /// 在卷 `vol` 上写入一个全新的 MFS 文件系统 (**擦除**该卷现有内容), 成功后把该卷
-/// 挂到 `/usb<卷号>` 立即可用。成功返回 1, 失败 `u64::MAX`。
+/// 挂到 `/usb<卷号>` 立即可用。成功返回该卷落盘后的**主卷序号** (>0), 失败 `u64::MAX`。
 ///
 /// 护栏: 只接受「**已是 MFS**」或「**整盘无文件系统**」的卷 —— FAT / exFAT / ext2
 /// 等别人的分区一律拒绝, 绝不自动吞掉。真盘上卷号认错时, 这里就是最后一道闸。
+///
+/// **主卷语义**: 格式化会把该卷标记为主卷 (序号 = 现有最大 + 1), 于是**下一次启动**
+/// `/mfs` 就认领到它 —— 这就是「切换主卷」的手段。本次运行的主卷不变: 换主卷是要重启
+/// 才生效的事, 在跑的会话里换挂载点会让所有已打开的路径句柄失效。
 ///
 /// 格式化期间内存态被改写成新卷, 故结束后必须把**原卷**的状态重新载回来; 那里只用
 /// `mfs_load_state` (只载入), 不会因原卷此刻读不出来而把它格式化掉。
@@ -9588,14 +9785,16 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
     }
     let prev_vol = unsafe { MFS_CUR_VOL };
     let prev_sectors = unsafe { MFS_CUR_SECTORS };
+    let serial = mfs_next_primary_serial(mfs_a(), vol);
     unsafe {
         MFS_CUR_VOL = vol;
         MFS_CUR_SECTORS = desc.sectors; // 格式化尺寸按目标卷的真实容量算 (M7)
+        MFS_PRIMARY_SERIAL = serial; // 提交时随超级块写盘, 下次启动据此认领主卷
         MFS_LEAF = MFS_LOC_EMPTY;
     }
     let ok = mfs_format();
-    // 切回原卷并重建它的内存态 (位图 / inode 表 / 快照 / 各游标): 格式化已经把内存
-    // 态写成了新卷, 不重建的话后续对原卷的读写会用错的总块数与位图。
+    // 切回原卷并重建它的内存态 (位图 / inode 表 / 快照 / 各游标 / 主卷序号): 格式化已经
+    // 把内存态写成了新卷, 不重建的话后续对原卷的读写会用错的总块数与位图。
     unsafe {
         MFS_CUR_VOL = prev_vol;
         MFS_CUR_SECTORS = prev_sectors;
@@ -9612,7 +9811,14 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
     if vol != unsafe { MFS_VOL } && vfs::mount_vol(vfs::MFS_DOMAIN, vol) == u64::MAX {
         println("mfs: mkfs OK but mount FAILED (mount table full?)");
     }
-    1
+    // 回复**从盘上回读**的序号, 而不是刚才设进内存的那个: 前者证明「标记确实写进了
+    // 超级块并能再读出来」, 后者只说明「我记得我设过」。回读为 0 说明没落盘。
+    let landed = mfs_primary_of_vol(vol);
+    if landed == 0 {
+        println("mfs: mkfs OK but primary mark missing on disk");
+        return u64::MAX;
+    }
+    landed
 }
 
 /// 设置 ino 的槽位 (`blk == 0` 表示释放该 ino)。
@@ -9718,8 +9924,11 @@ fn mfs_build_super(buf: *mut u8) {
         write_u32(mfs_atm(buf, off + 12), s.ino_hint);
         write_u32(mfs_atm(buf, off + 16), s.alloc_next);
     }
-    // MFS7: 空闲位图不再内联在超级块里 (payload +256 起留空保留), 位图改由
-    // `mfs_bmp_flush` 写入独立的位图数据块 + 头块。
+    // 主卷序号: 认领 `/mfs` 的依据 (见 `mfs_vol_claim`)。必须每次都写 —— 提交走的是
+    // 「重写整块超级块」而不是原地改字段, 漏写就会把标记清掉。
+    write_u64(mfs_atm(buf, p + MFS_SB_PRIMARY), unsafe { MFS_PRIMARY_SERIAL });
+    // MFS7: 空闲位图不再内联在超级块里, 位图改由 `mfs_bmp_flush` 写入独立的位图
+    // 数据块 + 头块。原内联区 (+256 起) 只留 `MFS_SB_PRIMARY` 一项, 其余为保留。
     mfs_seal(buf, MFS_MAGIC_SUPER);
 }
 
@@ -9857,6 +10066,8 @@ fn mfs_load_state() -> bool {
             MFS_ITAB = itab;
             MFS_INO_COUNT = read_u32(mfs_at(buf, p + MFS_SB_INO_COUNT));
             MFS_INO_HINT = read_u32(mfs_at(buf, p + MFS_SB_INO_HINT)).max(MFS_ROOT_INO + 1);
+            // 主卷序号随内存态一起载入: 后续任何一次提交都会把它原样写回, 标记不会丢。
+            MFS_PRIMARY_SERIAL = read_u64(mfs_at(buf, p + MFS_SB_PRIMARY));
             MFS_ITAB_CACHE_IDX = u32::MAX;
         }
         // 位图窗口必须容得下本卷的 bb 页 (首次挂载时 `mfs_main` 已按卷容量预算过)。
@@ -10022,6 +10233,11 @@ fn mfs_switch_vol(vol: u64) -> bool {
 fn mfs_mount_or_format() -> bool {
     if mfs_load_state() {
         return true;
+    }
+    // 自动格式化**不**认领主卷: 主卷标记只由显式 `mkfs.mfs` 设置 (见 `mfs_mkfs_volume`)。
+    // 这里清掉可能残留在内存态里的上一卷序号, 免得把别的卷的标记写进这块新盘。
+    unsafe {
+        MFS_PRIMARY_SERIAL = 0;
     }
     mfs_format()
 }
@@ -11892,9 +12108,10 @@ fn mfs_main() {
         println("mfs: share block buffers FAILED");
         return;
     }
-    // 认领卷: 先按 MFS magic 找; 空白盘没有 magic, 回退到约定卷号 1。
+    // 认领卷: 优先「主卷序号最大」的 MFS 卷 (= 最近一次 `mkfs.mfs` 过的那块), 其次
+    // 第一个 MFS 卷; 空白盘没有 magic, 回退到约定卷号 1 (见 `mfs_vol_claim`)。
     unsafe {
-        MFS_VOL = vol_claim(mfs_a(), 16, VOL_KIND_MFS, MFS_VOL_FALLBACK);
+        MFS_VOL = mfs_vol_claim(mfs_a(), 16);
         // 卷容量 (扇区数): 首次格式化按它决定文件系统大小; 也用于校验盘上记录的总
         // 块数没超出卷的实际容量。0 = 未知 (IDE 回退等), 上层按默认值兜底。
         MFS_VOL_SECTORS = vol_sectors(mfs_a(), MFS_VOL);
