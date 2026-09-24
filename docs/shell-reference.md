@@ -43,6 +43,7 @@ shell: type 'help' for commands
 | `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间（**跟随**软链接） |
 | `lstat` | `lstat <path>` | 同 `stat`，但作用于**链接自身**（不跟随；悬空链接也能看） |
 | `readlink` | `readlink <link>` | 打印软链接的目标字符串 |
+| `mkfs.mfs` | `mkfs.mfs <vol>` | 在指定卷上创建 MorionFS（**擦除**该卷；只接受空白卷或已有 MFS 卷） |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
@@ -69,6 +70,7 @@ commands:
   stat <path>    show metadata (mode / owner / links / times)
   lstat <path>   like stat but on the link itself (no follow)
   readlink <link>  print a symbolic link's target (no follow)
+  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
@@ -196,6 +198,27 @@ commands:
 - 路径不是软链接（或为悬空链接之外的一般失败）：`readlink: not a symbolic link: <link>`。
 - 缺参数：`readlink: missing operand`；路径过长：`readlink: path too long`。
 
+### `mkfs.mfs <vol>`
+
+在**卷号**为 `<vol>` 的卷上写一个全新的 MorionFS 文件系统。**会擦除该卷原有内容。**
+
+- `<vol>` 取自块服务启动时打印的卷表：每卷一行
+  `vol: <卷号> nsid=<n> lba=<n> sectors=<n> kind=<名>`（`kind=unknown` 表示该卷没有文件系统）。
+- **护栏在 mfs_srv 里，不在 shell 里**：只接受 `kind=mfs`（重新格式化）或
+  `kind=unknown`（未格式化）的卷。FAT / exFAT / ext2 等别人的分区与不存在的卷号一律被拒，
+  **绝不自动吞掉**。命令与 FS-22 自测走同一条路径，判定只有一处。
+- 成功后：卷上有一个空 MorionFS 根目录；若该卷**不是** MFS 主卷，会立刻挂到 `/usb<卷号>`；
+  若就是主卷（`/mfs`），原地重建。
+- 输出：`mkfs.mfs: volume <vol> formatted (non-default volumes are mounted at /usb<volume-id>)`；
+  被拒或失败：`mkfs.mfs: refused volume <vol> (not blank, not MFS, or no such volume)`。
+- 缺参数 / 非数字：`mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)`。
+- 相关诊断（服务端打印，属正常护栏证据）：`mfs: mkfs refused (volume holds another filesystem)`、
+  `mfs: mkfs refused (no such volume)`。
+
+> 典型用法（真盘上「新买一块盘」）：启动日志里找到目标卷的 `vol:` 行（例如
+> `vol: 6 nsid=6 lba=0 sectors=32768 kind=unknown`），敲 `mkfs.mfs 6`，然后
+> `ls /usb6` / `touch /usb6/T.TXT`。
+
 ### `clear`
 
 调用 `SYS_CLEAR`：清屏 + 复位历史环形缓冲 / 输入行 / 光标 / 回滚偏移，
@@ -233,7 +256,7 @@ commands:
 | `/ext2` | ext2_srv (12) | ext2 **只读**（NVMe `nsid=3`，宿主预格式化的既有分区） |
 | `/usb` | exfat_srv (13) | exFAT（**读 + 写**；NVMe `nsid=5`，宿主 `mkfs.exfat` 预格式化） |
 | `/` | fat32_srv (6) | FAT32（NVMe `nsid=1`） |
-| `/usb<卷号>` | fat32_srv (6) / ext2_srv (12) / exfat_srv (13) | **额外卷（M1b）**：各服务把自己那类的非默认卷自动挂到这里（`<卷号>` = block_srv 卷表里的 id，如 `/usb3` = FAT32 分区、`/usb4` = ext2 分区）。MFS 不参与。 |
+| `/usb<卷号>` | fat32_srv (6) / ext2_srv (12) / exfat_srv (13) / mfs_srv (11) | **额外卷（M1b）**：各服务把自己那类的非默认卷自动挂到这里（`<卷号>` = block_srv 卷表里的 id，如 `/usb3` = FAT32 分区、`/usb4` = ext2 分区、`/usb6` = `mkfs.mfs` 格出来的 MFS 卷）。卷层探测不出文件系统的空白卷**不会**被自动挂载 —— MFS 的空白卷要先 `mkfs.mfs <卷号>`。 |
 
 - 匹配是**组件边界敏感**的：`/tmpfoo` **不会**匹配到 `/tmp`，而会落到 `/`。
 - 跨服务操作需显式写路径：`cp` 之类命令尚未提供，`cat /mfs/X` 与 `ls /tmp` 各自路由。

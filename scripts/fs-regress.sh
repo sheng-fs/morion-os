@@ -1,6 +1,6 @@
 #!/bin/bash
-# 模拟镜像全量 FS 回归: 5 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT) 上跑
-# app 的 FS-1..FS-20 自测, 由日志判定通过与否。
+# 模拟镜像全量 FS 回归: 6 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘) 上跑
+# app 的 FS-1..FS-22 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
@@ -21,6 +21,9 @@ rm -f "$log"
 # 且对每个根完整重走一遍 —— 于是同一个二进制**越跑越慢** (实测: 空白卷自测 258 s,
 # 快照环饱和后 524 s; FS-12 由 171 s 涨到 274 s)。故默认把卷重置成空白
 # (mfs_srv 首次挂载会自动格式化), 让每轮耗时可比。想留着上一轮的卷用 MFS_KEEP=1。
+# 空白盘 (spare.img) 每轮都重置: FS-22 要验证的正是「格式化一块**没有文件系统**的卷」,
+# 保留上一轮格好的卷会让这条路径根本没被走到。
+dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=none
 if [ "${MFS_KEEP:-0}" = "1" ]; then
   echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
 else
@@ -44,6 +47,7 @@ $QEMU \
   -drive file="$OUT_DIR/ext2.img",if=none,id=n3,format=raw -device nvme-ns,drive=n3,bus=nvme0,nsid=3 \
   -drive file="$OUT_DIR/parts.img",if=none,id=n4,format=raw -device nvme-ns,drive=n4,bus=nvme0,nsid=4 \
   -drive file="$OUT_DIR/exfat.img",if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
+  -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -display none -monitor none -serial file:"$log" -no-reboot ${QEMU_EXTRA:-} -enable-kvm &
 pid=$!
 
@@ -63,8 +67,12 @@ echo "== 日志: $log"
 echo "== 耗时: $(($(date +%s) - t0)) 秒 (出现结论即停, 最长等 10 分钟)"
 echo "== SELFTEST DONE 次数: $done_n"
 echo "== FAILED/PANIC 次数: $fail_n"
+echo "== 卷表 (block_srv vol: 行) =="
+grep -nE '^vol: ' "$log" 2>/dev/null || echo "(无)"
 echo "== 额外卷挂载 (mount-dbg) =="
 grep -nE 'mount-dbg' "$log" 2>/dev/null || echo "(无)"
+echo "== 显式格式化 (mkfs) =="
+grep -nE 'mfs: mkfs refused|mfs: mkfs FAILED|mfs: reload state after mkfs' "$log" 2>/dev/null || echo "(无拒绝/无失败)"
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 

@@ -176,6 +176,19 @@ pub const MFS_SNAPRESTORE_TAG: u64 = 0x4D53_4E52; // "MSNR"
 pub const MFS_GC_TAG: u64 = 0x4D53_4743; // "MSGC"
 /// 查询空间用量: 回复 `(总块数 << 32) | 空闲块数`。
 pub const MFS_STAT_TAG: u64 = 0x4D53_5354; // "MSST"
+/// 在指定卷上创建 MorionFS (**擦除**该卷现有内容): payload = 卷号 (u64 LE)。
+///
+/// 与其余 MFS tag 不同, 它**按卷号而不是按路径**寻址 (还没有文件系统时没有路径可走),
+/// 故直接发给 mfs_srv, 不经挂载层路由。回复 1 / `u64::MAX`。
+pub const VFS_MKFS_TAG: u64 = 0x4D4B_4653; // "MKFS"
+
+/// 在卷 `vol` 上创建 MorionFS 文件系统 (会**擦除**该卷现有内容), 成功返回 1。
+///
+/// mfs_srv 只接受「已是 MFS」或「整盘无文件系统」的卷, 别人的分区 (FAT/exFAT/ext2)
+/// 会被拒绝 —— 调用方应把失败当作「该卷不可格式化」而不是磁盘错误。
+pub fn mfs_mkfs(vol: u64) -> u64 {
+    sys_call_payload(MFS_DOMAIN, VFS_MKFS_TAG, &vol.to_le_bytes())
+}
 
 /// 触发 MorionFS 空间回收 (回收不可达的 COW 旧块), 成功返回回收的块数。
 ///

@@ -65,12 +65,14 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | --- | --- |
 | `make run` | 最简运行（`-machine pc`，无磁盘） |
 | `make run-nokvm` | 无硬件虚拟化环境（CI） |
-| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，五 namespace |
+| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，六 namespace |
 | `make run-ide` | IDE PIO 回退路径验证 |
 
 ### `make run-nvme` 的磁盘布局（重要）
 
-单控制器五 namespace，`dev`（BlockReq 高位）现在是**卷号**，由 block_srv 扫描各盘分区表后分配：
+单控制器六 namespace，`dev`（BlockReq 高位）现在是**卷号**，由 block_srv 扫描各盘分区表后分配：
+block_srv 启动时会把整张卷表打成 `vol: <卷号> nsid=<n> lba=<n> sectors=<n> kind=<名>` 行
+（`mkfs.mfs <卷号>` 的卷号就取自这里；`kind=unknown` = 该卷没有文件系统）。
 
 | namespace | 后端镜像 | 文件系统 | 挂载点 |
 | --- | --- | --- | --- |
@@ -79,10 +81,13 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `nsid=3` | `build/ext2.img`（宿主机 `mke2fs -t ext2`） | ext2（只读） | `/ext2` |
 | `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | `/usb3`（FAT32 分区）、`/usb4`（ext2 分区） |
 | `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
+| `nsid=6` | `build/spare.img`（纯空白 raw，16 MiB） | **无**（`kind=unknown`） | 由 `mkfs.mfs` 格式化后挂到 `/usb6` |
 
 前三个镜像**没有分区表**，各成一个「整盘卷」，卷号恰为 0/1/2 —— 与引入卷层前一致
 （`nsid=5` 的 exFAT 整盘卷号为 5）。
 `build/parts.img` 是额外的一卷测试盘，用于验证 MBR 解析与类型探测。
+`build/spare.img` 是**空白盘**：卷层探测不到文件系统（`kind=unknown`），正是真盘上
+「刚买一块盘」的样子，专供 `mkfs.mfs` 自测（FS-22）走「格式化空白卷 → 挂成额外卷 → 读写」。
 
 **额外卷自动挂载（M1b）**：每个文件服务认领**一个**默认卷（fat32 → 卷 0、mfs → 卷 1、
 ext2 → 卷 2、exfat → 卷 5），随后把自己那类的**其余卷**上报给 mount_srv，自动挂到
@@ -94,7 +99,10 @@ mount-dbg: /usb3 domain=6 slot=7        # FAT 分区 → fat32_srv
 mount-dbg: /usb4 domain=12 slot=6       # ext2 分区 → ext2_srv
 ```
 
-MFS **不参与**额外卷（持久卷 + 自动格式化语义，多卷会误伤），故 `/usb<卷号>` 下不会出现 MFS。
+MFS 从 S2 起**也参与**额外卷：真盘上可以有多块 MFS 卷，非主卷的会被挂到 `/usb<卷号>`。
+与别的服务不同的是 MFS **的内存态只有一份**（位图 / inode 表 / 快照对应一个卷），所以它是
+**按请求切卷**：请求带的卷号与当前卷不同时，先把新卷的超级块载回内存（`mfs_switch_vol`）。
+没有文件系统的额外卷**不会**被自动格式化 —— 必须显式 `mkfs.mfs <卷号>`（见 `docs/shell-reference.md`）。
 
 ### 接入真实 U 盘（只读）
 
@@ -119,6 +127,13 @@ qemu-system-x86_64 \
 > 仍然安全（多读者无冲突），但**绝不要**去掉 `readonly`：宿主与来宾同时写同一分区会毁数据。
 > 另外 **NTFS 无法挂载**（没有 NTFS 驱动），这类盘会被卷层识别成一个「未知类型」卷，
 > 各服务都不会认领它 —— 既不会挂上，也不会写坏。
+
+**在盘上写（新盘 / 无重要数据的盘）**：把 `readonly=on` 去掉即可，卷层会正常探测类型。
+要用 MorionFS，先在启动日志里找目标卷的 `vol:` 行，再在 shell 里 `mkfs.mfs <卷号>` ——
+护栏只放行 `kind=unknown`（空白）或 `kind=mfs`（重新格式化）的卷，FAT / NTFS / ext2 等
+别人的分区一律拒绝，所以**去掉 `readonly=on` 也不会误格式化既有分区**；格式化完的卷会
+立刻挂到 `/usb<卷号>`。（`scripts/usb-ro.sh` 仍固定只读，它用 QEMU 层的 `readonly=on`
+兜底，用于**读**别人的盘。）
 
 **块请求语义（M6c）**：`BlockReq.count` 单位是 512 B 扇区。单条 NVMe 命令上限 **256 扇区
 （128 KiB，`NVME_MAX_SECTORS`）**；`count` 超过 256 时由 block_srv 按 256 扇区**切段**并连续提交，
@@ -241,7 +256,7 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-21）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-22）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -262,6 +277,11 @@ app 的 FS 自测（FS-1..FS-21）成功时几乎静默（末尾打印一行 `ap
 以及格式化确实按卷几何取尺寸。把 `mfs_format` 改回写死 4096 块，在 64 MiB 测试卷上立刻失败。
 ⚠️ 等号只在卷容量未超内联位图上限（≈119 MiB）时成立；测试卷一旦超过它，这条**刻意失败**，
 提醒该去做「位图挪出超级块」。
+**FS-22（S2）** 验证 `mkfs.mfs` + 额外 MFS 卷：① 护栏 —— 对 FAT / ext2 / 不存在的卷号调
+`mkfs.mfs` 必须被拒；② 空白盘（`nsid=6`）格式化成功后作为额外卷挂到 `/usb6` 并可独立读写；
+③ 格式化**别的**卷之后主卷 `/mfs` 的标记文件内容仍完好（证明 mfs_srv 把内存态正确重建回了
+主卷，而不是继续用新卷的位图）；④ 在额外卷与主卷间交替读写，两边内容不串（证明按请求切卷生效）。
+失败会打印 `app: FS22 … FAILED`。
 这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 另有一条**启动期**（不属于 FS 自测）的能力自测：域 0/1/3 走通「能力随 IPC 传递」后会打印
 `receiver: capability passing OK (handle moved + SendTo(3) delegated)`。它是**正面证据** ——
@@ -289,6 +309,10 @@ app 的 FS 自测（FS-1..FS-21）成功时几乎静默（末尾打印一行 `ap
 一行给出 exFAT 挂载后的卷参数，用于与宿主 `mkfs.exfat` 的参数对齐核对。
 **exFAT 写路径**另用宿主 `fsck.exfat -n build/exfat.img` 交叉验证：回归后应为
 `clean. directories 1, files 0`（写盘的位图 / FAT / entry set 一致性由 exfatprogs 独立判定）。
+**卷表**在 block_srv 起来后立刻逐卷打印（`vol: <卷号> nsid=… lba=… sectors=… kind=…`），
+是 `mkfs.mfs <卷号>` 的卷号来源。`mfs: mkfs refused (volume holds another filesystem)` /
+`(no such volume)` 是护栏**生效**的证据（自测故意去格 FAT/ext2），不是故障；
+`mfs: mkfs FAILED` / `mfs: reload state after mkfs FAILED` 才是真失败。
 
 ### 键盘注入（monitor socket）
 

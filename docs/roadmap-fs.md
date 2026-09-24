@@ -167,6 +167,7 @@ shell 交互 `ls /mfs` / `cat /mfs/PERSIST.TXT` / `ls /ext2` / `cat /ext2/HELLO.
 | M6b ✅ | exFAT 读写 | 位图分配/释放、FAT 链扩展、entry set 增删 + set checksum / NameHash 生成；`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE` | M6a |
 | M6c ✅ | 大容量卷（块层多页 DMA + exFAT 去上限） | 块层 PRP 表（单命令 ≤ 128 KiB，更大的请求自动切分）；exFAT 去掉 4 KiB 簇 / 4 KiB 位图 / 8 KiB upcase 三处硬上限（集群缓冲按簇大小分配、位图与 upcase 改为按需扇区窗口）；另加 MFS「非 MFS 卷拒绝格式化」护栏 | M6b |
 | M7 ✅ | MFS 按卷几何格式化（容量前置） | block_srv 补 `Identify Namespace`(CNS=0) 的 **NSZE**，整盘卷的 `sectors` 不再恒为 0；`mfs_format` 按该卷真实容量定总块数（此前写死 4096 块 = 16 MiB），挂载时校验盘上总块数不超过卷容量；卷表查询辅助收敛为 `vol_find_desc` | M2 |
+| M8 ✅ | MFS 显式格式化 + 多卷（S2） | 新 tag `MKFS` + 护栏（**只接受 `MFS` / `UNKNOWN` 卷**，「新盘可格式化、别人的分区绝不吞」）；`mfs_load_state` 拆出（切卷只载入不格式化）；mfs_srv **按请求切卷**并参与额外卷挂载 `/usb<卷号>`；block_srv 打印卷表；shell 加 `mkfs.mfs <卷号>` | M7 |
 
 #### M1 已完成 ✅
 
@@ -271,7 +272,7 @@ Kali U 盘（53.6 GB FAT32 + 5 GB ext3）、多分区移动硬盘都读不了。
 
 - **NTFS**：`sda` 这类整盘 NTFS 的移动硬盘仍**无法挂载**（卷层只把它判成未知类型）——
   需要新的文件服务，不在本阶段。
-- MFS 不参与额外卷挂载（MFS 是自有格式，暂不把第二个 MFS 卷挂到 `/usb<卷号>`）。
+- MFS 不参与额外卷挂载（MFS 是自有格式，暂不把第二个 MFS 卷挂到 `/usb<卷号>`）。**→ 已由 M8 补上**（新增显式格式化入口 + 按请求切卷）。
 
 #### M2 已完成 ✅
 
@@ -887,10 +888,59 @@ exFAT 去上限：
   超过就被 `clamp` 截断 —— 而校验是等号，所以测试卷一旦超过 119 MiB，FS-21 会**刻意失败**，
   提醒该做下面这件事。要放开必须先**把位图挪出超级块**（独立位图块 + 按窗口读写），
   并由 GC 分块多趟扫描（mark/seen 两张全盘位图现在常驻内存，1 TB 卷光位图就几十 MB）。
-- **MFS 仍不参与额外卷自动挂载**：`mount_extra_volumes` 明确排除 MFS（持久卷 + 自动格式化
-  语义，多卷会误伤）。新硬盘上的 MFS 分区要能被用，还需要**显式格式化入口** +
-  严格护栏（只认 MFS magic 或用户显式指定，绝不自动吞 NTFS/exFAT 分区）。
+- **MFS 额外卷与显式格式化已由 M8 补上**（见下）；M7 遗留的只有「容量」这一条。
 - IDE PIO 回退路径没有容量信息（`sectors = 0`），MFS 在它上面只能用默认尺寸。
+
+#### M8 已完成 ✅
+
+**目标**：让 MorionFS 能当**主力文件系统**用 —— 真盘上「新买一块盘 → 格式化 → 立刻用」这条路
+要能走通，同时**绝不能**碰到盘上别人的分区。
+
+实现要点：
+- **显式格式化入口**：新增 VFS tag `MKFS`（`vfs::mfs_mkfs(vol)`，payload 就是卷号）。
+  它**按卷号寻址**（还没有文件系统时没有路径可走），故不经挂载层路由，直接发给 mfs_srv。
+- **护栏**（`mfs_mkfs_volume`）：先 `vol_find_desc` 取卷描述符，**只接受 `VOL_KIND_MFS`
+  （重新格式化）或 `VOL_KIND_UNKNOWN`（未格式化）**；FAT / exFAT / ext2 分区与不存在的卷号
+  一律拒绝并打印 `mfs: mkfs refused (...)`。判定只有一处，shell 命令与 FS-22 自测走同一条路径。
+- **`mfs_load_state` 从 `mfs_mount_or_format` 拆出**：前者**只载入不格式化**，后者 = 载得动就载、
+  载不动才格式化。切卷路径必须用前者 —— 用后者的话，一块暂时读不出来的盘会被直接抹掉。
+- **按请求切卷**：MFS 的内存态（`MFS_BITMAP` / `MFS_ITAB_MEM` / 快照表 / 各游标）只有**一份**，
+  对应**一个**卷，所以它不能像 fat32/ext2/exFAT 那样靠「切卷重解析几何」共享状态 —— 换卷就是
+  换整套状态。新增 `MFS_CUR_VOL` / `MFS_CUR_SECTORS`：请求 tag 高位的卷编码（fd 类请求则由
+  新增的 `MfsFd.vol` 决定，因为 `close`/`read` 这类请求不带路径）与当前卷不同时，
+  `mfs_switch_vol` 设好卷号与容量再 `mfs_load_state()` 把新卷的超级块（含空闲位图）载回内存。
+  **能这样切的前提是每次改动都随超级块落盘**（`mfs_itab_set` → `mfs_itab_flush` →
+  `mfs_write_super`），故请求边界上盘上状态总是自洽的 —— 这与 fat32 切卷要重读 BPB 是同一类
+  论证，只是 MFS 要重读的东西多得多。
+- **MFS 参与额外卷挂载**：`mount_extra_volumes(..., VOL_KIND_MFS, ...)`，非主卷挂到 `/usb<卷号>`。
+  注意只挂卷层**已探测为 MFS** 的额外卷：空白额外卷**不会**被自动格式化（要显式 `mkfs.mfs`）——
+  这正是「自动格式化」与「多卷」两者此前冲突的地方，现在由「显式入口」解开。
+- **内核补授权**：mfs_srv 此前没有 `Capability::SendTo(mount_srv)`（不参与额外卷就不需要）。
+  缺这条时 `ipc::call` 被**静默拒绝**（返回 `u64::MAX`、不报错），额外卷会挂不上且无任何日志。
+- **卷表打印**（block_srv）：启动时逐卷打印 `vol: <卷号> nsid=… lba=… sectors=… kind=…`。
+  卷号由扫描顺序决定，不打出来 `mkfs.mfs <卷号>` 就只能靠猜 —— 这是让命令可用的前提。
+- **shell 命令**：`mkfs.mfs <卷号>`（护栏在服务端，shell 只做参数解析与结果打印）。
+- **测试盘**：Makefile 新增 `build/spare.img`（16 MiB 纯零，**不含任何文件系统**）作 nsid 6，
+  正是真盘上「新买一块盘」的样子；`scripts/fs-regress.sh` 每轮把它重置为空白。
+
+**验证（已通过）**：
+- **FS-22 自测**（四段）：① 对 FAT 卷 / ext2 卷 / 不存在的卷号调 `mfs_mkfs` 必须被拒；
+  ② 空白盘格式化成功并作为额外卷挂到 `/usb6`，能在上面建文件并读回；
+  ③ 格式化**别的**卷之后主卷 `/mfs` 的标记文件内容仍完好 —— 证明内存态被正确重建回主卷
+  （若忘了重建，后续会用新卷的位图去写主卷，很快毁数据）；④ 在额外卷与主卷间交替读写，
+  两边内容不串 —— 证明按请求切卷生效。
+- 实测日志：`vol: 6 nsid=6 lba=0 sectors=32768 kind=unknown` → `mfs: mkfs refused (...)`
+  ×3（护栏）→ `mount-dbg: /usb6 domain=11 slot=8`（格式化后自动挂上）。
+- 全量回归 `SELFTEST DONE 1 / FAILED+PANIC 0`（覆盖 FS-1..FS-22），**268 s** —— 与 M7 时的
+  268 s 完全一致，说明切卷/多卷没有引入额外开销；`make clippy` 三 crate 0 warning。
+
+**M8 未覆盖**：
+- **总量上限仍是 ≈119 MiB**（内联位图，见上）—— 与 M7 同一条遗留，S3 解决。
+- **`mkfs.mfs` 不写分区表**：只能格式化卷层**已经存在**的卷（整盘卷或 MBR/GPT 里已有条目的
+  分区）。「在没有分区表的盘上创建新分区」还需要 block_srv 的写分区表路径（删卷同理）。
+- **没有「切换主卷」**：`vol_claim` 仍是「第一个 MFS 卷」（空白盘回退卷号 1），故重启后 `/mfs`
+  指向哪一个 MFS 卷由卷表顺序决定，跟你上一次 `mkfs.mfs` 过谁无关；非主卷要靠 `/usb<卷号>` 访问。
+- IDE PIO 回退路径下 `sectors = 0`，格式化只能用默认尺寸（与 M7 相同）。
 
 ### 阶段 4 — 远期
 

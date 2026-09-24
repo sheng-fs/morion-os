@@ -341,6 +341,8 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(fat32_domain, cap::Capability::SendTo(mount_domain));
     cap::grant(ext2_domain, cap::Capability::SendTo(mount_domain));
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
+    // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
+    cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
     video::println("[OK] IPC + capability + pager initialized (14 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。

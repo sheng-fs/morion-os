@@ -77,6 +77,11 @@ EXFAT_MIB     ?= 16
 EXFAT_CLU     ?=
 # 分区测试盘: MBR 两个主分区 (FAT32 + ext2), 用于验证 block_srv 卷层的分区解析 (namespace 4)
 PARTS_IMG     ?= $(OUT_DIR)/parts.img
+# 空白测试盘 (namespace 6): 纯零, **不含任何文件系统** —— 卷层探测为 unknown, 正是真盘上
+# 「新买一块盘」的样子。`mkfs.mfs <卷号>` 拿它验证「格式化空白卷 -> 作为额外卷挂载」这条
+# 路径 (见 FS-22); FS-21 之前的用例不碰它。
+SPARE_IMG     ?= $(OUT_DIR)/spare.img
+SPARE_MIB     ?= 16
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -247,15 +252,16 @@ run-nokvm: iso
 		-vga virtio \
 		-no-reboot
 
-# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + 单控制器四 namespace)
+# 文件系统阶段: 挂载 NVMe 磁盘运行 (q35 + 单控制器六 namespace)
 #   nsid=1 -> $(NVME_IMG)  (FAT32, 挂载 /)
 #   nsid=2 -> $(MFS_IMG)   (MorionFS, 挂载 /mfs, 首次挂载自动格式化)
 #   nsid=3 -> $(EXT2_IMG)  (ext2 只读, 挂载 /ext2, 宿主预格式化)
 #   nsid=4 -> $(PARTS_IMG) (MBR 分区测试盘: FAT32 + ext2, 验证卷层分区解析)
 #   nsid=5 -> $(EXFAT_IMG) (exFAT 读写, 挂载 /usb, 宿主 mkfs.exfat 预格式化)
+#   nsid=6 -> $(SPARE_IMG) (空白盘, 供 `mkfs.mfs` 自测: 格式化后作额外卷挂到 /usb<卷号>)
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT)..."
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白)..."
 	$(QEMU) \
 		-machine q35 \
 		-m $(QEMU_MEM) \
@@ -272,9 +278,18 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG)
 		-device nvme-ns,drive=nvme0n4,bus=nvme0,nsid=4 \
 		-drive file=$(EXFAT_IMG),if=none,id=nvme0n5,format=raw \
 		-device nvme-ns,drive=nvme0n5,bus=nvme0,nsid=5 \
+		-drive file=$(SPARE_IMG),if=none,id=nvme0n6,format=raw \
+		-device nvme-ns,drive=nvme0n6,bus=nvme0,nsid=6 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
+
+# 空白测试盘: 纯零 raw。**不预格式化** —— 留给 `mkfs.mfs` 在客户机里格式化。
+$(SPARE_IMG):
+	@echo "==> 创建空白测试盘 ($(SPARE_MIB)MiB, 无文件系统, 供 mkfs.mfs 自测)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(SPARE_IMG) bs=1M count=$(SPARE_MIB) status=none
+	@echo "  ✓ 空白盘: $(SPARE_IMG)"
 
 # MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
 $(MFS_IMG):

@@ -4,7 +4,7 @@
 #   bash scripts/probe-shell.sh "ls -l /mfs" "ln -s /mfs/A.TXT /mfs/L1" "cat /mfs/L1"
 #
 # 用途: 调文件系统时**不必等整套 3.5~4 分钟的自测**就能看到 shell 级现象 ——
-# 自测要跑完全部 FS-1..FS-19 才轮到出问题的用例, 而本脚本约 1 分钟就能复现并给出
+# 自测要跑完全部 FS-1..FS-22 才轮到出问题的用例, 而本脚本约 1 分钟就能复现并给出
 # 服务端日志 (自测仍在后台跑, 不干扰这几条命令)。
 #
 # ⚠️ 按键注入有两个坑 (都踩过):
@@ -38,6 +38,7 @@ $QEMU \
   -drive file=build/ext2.img,if=none,id=n3,format=raw -device nvme-ns,drive=n3,bus=nvme0,nsid=3 \
   -drive file=build/parts.img,if=none,id=n4,format=raw -device nvme-ns,drive=n4,bus=nvme0,nsid=4 \
   -drive file=build/exfat.img,if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
+  -drive file=build/spare.img,if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -display none -monitor unix:"$sock",server,nowait -serial file:"$log" -no-reboot \
   ${QEMU_EXTRA:-} -enable-kvm &
 qpid=$!
