@@ -9286,6 +9286,7 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
     }
     let prev_vol = unsafe { MFS_CUR_VOL };
     let prev_sectors = unsafe { MFS_CUR_SECTORS };
+    let prev_leaf = unsafe { MFS_LEAF };
     unsafe {
         MFS_CUR_VOL = vol;
         MFS_CUR_SECTORS = desc.sectors; // 格式化尺寸按目标卷的真实容量算 (M7)
@@ -9297,9 +9298,13 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
     unsafe {
         MFS_CUR_VOL = prev_vol;
         MFS_CUR_SECTORS = prev_sectors;
+        MFS_LEAF = prev_leaf;
     }
     if !mfs_load_state() {
         println("mfs: reload state after mkfs FAILED");
+        // 把卷号设成无效值，强制后续请求重新走 mfs_switch_vol，防止在内存状态与
+        // 实际卷不匹配的情况下继续服务原卷，导致数据损坏。
+        unsafe { MFS_CUR_VOL = u64::MAX; }
         return u64::MAX;
     }
     if !ok {
@@ -9542,6 +9547,9 @@ fn mfs_load_state() -> bool {
 /// 失败时内存态已不可信 —— 调用方必须放弃本次请求 (见服务循环), 不能继续用旧卷的
 /// 位图去写新卷。
 fn mfs_switch_vol(vol: u64) -> bool {
+    let prev_vol = unsafe { MFS_CUR_VOL };
+    let prev_sectors = unsafe { MFS_CUR_SECTORS };
+    let prev_leaf = unsafe { MFS_LEAF };
     let sectors = vol_sectors(mfs_a(), vol);
     unsafe {
         MFS_CUR_VOL = vol;
@@ -9549,7 +9557,17 @@ fn mfs_switch_vol(vol: u64) -> bool {
         // 上一卷的叶子位置 (块号) 在新卷上没有意义, 清掉以免被误用。
         MFS_LEAF = MFS_LOC_EMPTY;
     }
-    mfs_load_state()
+    if mfs_load_state() {
+        return true;
+    }
+    // 加载新卷失败: 恢复原来的卷号, 避免后续请求错误地命中新卷并用旧内存状态
+    // (位图 / inode 表) 操作错误的物理卷, 导致静默数据损坏。
+    unsafe {
+        MFS_CUR_VOL = prev_vol;
+        MFS_CUR_SECTORS = prev_sectors;
+        MFS_LEAF = prev_leaf;
+    }
+    false
 }
 
 /// 挂载: 能载入就载入, 否则格式化 (首次使用 / 旧格式升级)。
