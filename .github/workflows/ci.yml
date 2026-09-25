@@ -60,24 +60,28 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # shell 显式写 bash: 默认 shell 只有 `-e`, 而这里靠管道 + tee 留日志,
+      # 必须 `-o pipefail` 才能让 make 的失败传出来 (bash 关键字自带 -eo pipefail)。
       - name: Check
-        run: |
-          set -o pipefail
-          make check 2>&1 | tee /tmp/check.log && exit 0
-          # 日志要登录 GitHub 才能看, 故把报错尾部经 ::error:: 提进 Checks 注解 (公开可读)。
-          # 先剥 ANSI 颜色: 否则 "error" 前面是转义序列, 既匹配不上也读不清。
-          msg=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/check.log \
-                | grep -v '^[[:space:]]*$' | tail -n 14 \
-                | tr '\n' '|' | tr -d '%' | cut -c1-900)
-          echo "::error title=make check 失败::${msg:-无输出}"
-          exit 1
+        shell: bash
+        run: make check 2>&1 | tee /tmp/check.log
 
       - name: Clippy
+        shell: bash
+        run: make clippy 2>&1 | tee /tmp/clippy.log
+
+      # 失败时把两个日志里的报错提进 Checks 注解 (公开可读, 日志要登录)。
+      # cargo 输出可能带 ANSI 颜色, 先剥掉, 否则 "error" 前是转义序列, 既匹配不上也读不清。
+      # 只看结尾是不够的: cargo 会把 manifest 的 warning 摘要留在最后, 真正编译错误在上文。
+      - name: 失败摘要 → Checks 注解
+        if: failure()
+        shell: bash
         run: |
-          set -o pipefail
-          make clippy 2>&1 | tee /tmp/clippy.log && exit 0
-          msg=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/clippy.log \
-                | grep -v '^[[:space:]]*$' | tail -n 14 \
-                | tr '\n' '|' | tr -d '%' | cut -c1-900)
-          echo "::error title=make clippy 失败::${msg:-无输出}"
-          exit 1
+          strip='s/\x1b\[[0-9;]*[A-Za-z]//g'
+          for f in /tmp/check.log /tmp/clippy.log; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            errs=$(sed -e "$strip" "$f" | grep -iE -B2 -A6 'error(\[|:)' | head -n 40 \
+                   | tr '\n' '|' | tr -d '%' | cut -c1-1200)
+            echo "::error title=${name} 报错行::${errs:-（日志里没有 error 行）}"
+          done
