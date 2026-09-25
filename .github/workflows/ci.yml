@@ -56,8 +56,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # 失败时把真正的报错**提到 Checks 注解里**: 步骤日志要登录 GitHub 才能看, 而注解
+      # 是公开的 (API 可读), 排查不必等有账号的人在浏览器里翻日志。
       - name: Check
-        run: make check
+        run: |
+          set -o pipefail
+          make check 2>&1 | tee /tmp/check.log && exit 0
+          msg=$(grep -E '^(error|make)' /tmp/check.log | head -n 6 | tr '\n' '|' | tr -d '%' | cut -c1-900)
+          echo "::error title=make check 失败::${msg:-make check 失败, 见步骤日志}"
+          exit 1
 
       - name: Clippy
-        run: make clippy
+        run: |
+          set -o pipefail
+          make clippy 2>&1 | tee /tmp/clippy.log && exit 0
+          msg=$(grep -E '^(error|warning|make)' /tmp/clippy.log | head -n 6 | tr '\n' '|' | tr -d '%' | cut -c1-900)
+          echo "::error title=make clippy 失败::${msg:-make clippy 失败, 见步骤日志}"
+          exit 1
