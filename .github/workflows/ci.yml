@@ -9,6 +9,10 @@
 # rustfmt.toml, 默认配置会把它们全部展开 —— 实测 `cargo fmt --all -- --check` 报
 # 244 处差异, 遍布 boot / kernel / kernel_test / user。故 fmt 不纳入门禁
 # (详见 CONTRIBUTING.md「代码风格」)。
+#
+# 关于注解: 步骤日志要**登录 GitHub** 才能看 ("Sign in to view logs"), 而 Checks
+# 注解是公开的 (API 可读), 所以工具链版本与失败原因都经 `::notice::` / `::error::`
+# 提到注解里 —— 排查 CI 不必等有账号的人在浏览器里翻日志。
 # ============================================================
 
 name: CI
@@ -23,9 +27,6 @@ on:
       - main
       - master
   workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   lint:
@@ -43,6 +44,9 @@ jobs:
             --component rust-src,rustfmt,clippy,llvm-tools-preview
           rustup target add --toolchain nightly \
             x86_64-unknown-none x86_64-unknown-uefi
+          # 记下这次实际用的工具链: rust-toolchain.toml 写的是浮动 `nightly`,
+          # 「本地能过、CI 过不去」十有八九就是这里的版本漂移。
+          echo "::notice title=工具链::$(rustc -V) / $(cargo -V) / targets: $(rustup target list --installed | tr '\n' ' ')"
 
       # 三个 crate 目标各不相同, 且都要 `-Z build-std` 从源码重建 core/compiler_builtins
       # (每个目标一份), 不缓存的话每次都是几分钟。键里带 Cargo.lock 哈希: 依赖变了才失效。
@@ -56,20 +60,24 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # 失败时把真正的报错**提到 Checks 注解里**: 步骤日志要登录 GitHub 才能看, 而注解
-      # 是公开的 (API 可读), 排查不必等有账号的人在浏览器里翻日志。
       - name: Check
         run: |
           set -o pipefail
           make check 2>&1 | tee /tmp/check.log && exit 0
-          msg=$(grep -E '^(error|make)' /tmp/check.log | head -n 6 | tr '\n' '|' | tr -d '%' | cut -c1-900)
-          echo "::error title=make check 失败::${msg:-make check 失败, 见步骤日志}"
+          # 日志要登录 GitHub 才能看, 故把报错尾部经 ::error:: 提进 Checks 注解 (公开可读)。
+          # 先剥 ANSI 颜色: 否则 "error" 前面是转义序列, 既匹配不上也读不清。
+          msg=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/check.log \
+                | grep -v '^[[:space:]]*$' | tail -n 14 \
+                | tr '\n' '|' | tr -d '%' | cut -c1-900)
+          echo "::error title=make check 失败::${msg:-无输出}"
           exit 1
 
       - name: Clippy
         run: |
           set -o pipefail
           make clippy 2>&1 | tee /tmp/clippy.log && exit 0
-          msg=$(grep -E '^(error|warning|make)' /tmp/clippy.log | head -n 6 | tr '\n' '|' | tr -d '%' | cut -c1-900)
-          echo "::error title=make clippy 失败::${msg:-make clippy 失败, 见步骤日志}"
+          msg=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/clippy.log \
+                | grep -v '^[[:space:]]*$' | tail -n 14 \
+                | tr '\n' '|' | tr -d '%' | cut -c1-900)
+          echo "::error title=make clippy 失败::${msg:-无输出}"
           exit 1
