@@ -451,8 +451,16 @@ clean:
 # boot: x86_64-unknown-uefi), 没有单一 target 能覆盖全工作区, 故逐个检查 ——
 # 直接用 `cargo check --workspace` 会退化到宿主 target, 在 no_std bin 上报
 # `#[panic_handler] required` 而失败。
+#
+# 依赖 $(KERNEL_EMBED) —— 两个 crate 都靠 include_bytes! 嵌生成物, 干净树上必须先生成:
+#   kernel/src/main.rs   → build/user/user.bin   (USER_BIN)
+#   boot/src/main.rs     → boot/loader/morion-kernel.elf (KERNEL_EMBED, 见 .gitignore)
+# $(KERNEL_EMBED) 的依赖链已经把 USER_BIN 带上 (KERNEL_EMBED ← KERNEL_ELF ← USER_BIN),
+# 所以写这一个就够。缺了它, 干净克隆上第一个包就报
+# `error: couldn't read .../user.bin: No such file or directory`。
+# 本地不易发现: build/ 早被前面的 `make` 填好了 —— CI 是干净树, 才暴露。
 .PHONY: check
-check:
+check: $(KERNEL_EMBED)
 	$(CARGO) check --package morion-kernel --target $(KERNEL_TARGET)
 	$(CARGO) check --package morion-user \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
@@ -465,8 +473,9 @@ fmt:
 	$(CARGO) fmt --all -- --check
 
 # clippy 是**门禁**: `-D warnings`, 三个 crate 任一有告警即失败。
+# 同样依赖 $(KERNEL_EMBED): clippy 也会展开 kernel / boot 的 include_bytes! (见上)。
 .PHONY: clippy
-clippy:
+clippy: $(KERNEL_EMBED)
 	$(CARGO) clippy --package morion-kernel --target $(KERNEL_TARGET) -- -D warnings
 	$(CARGO) clippy --package morion-user \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
