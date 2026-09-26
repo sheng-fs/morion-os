@@ -6790,6 +6790,100 @@ fn app_main() {
         }
         vfs::close(fd);
     }
+
+    // 30. FS-25 自测 (S2 补齐): **只改标记、不动数据**地换主卷 (`mfs.primary`)。
+    //     mkfs 也能换主卷, 但它会**擦掉**卷上的文件 —— 日常换主卷必须有一条不动数据的
+    //     路, 否则「把已有数据的盘升为主卷」就等于「把数据删掉」。本自测自给自足:
+    //       (a) 先 `mfs_mkfs` 把目标卷置成确定状态 (幂等准备, 不依赖 FS-24 的残留),
+    //           它同时给出**主卷序号基线**;
+    //       (b) 在目标卷落一个文件 —— 建立「改标前数据完好」的基线;
+    //       (c) `mfs_set_primary` 后: 序号必须**严格大于** (a) 的基线 —— 证明 mkfs 与
+    //           set-primary 共用同一个只增计数器 (各自计数的话「最近的胜出」会失效);
+    //           且该文件必须**原样可读、逐字节一致** —— 这是与 mkfs 的本质区别, 实现里
+    //           若误走格式化路径, 这里立刻失败;
+    //       (d) 对**非 MFS 卷 / 不存在的卷号**一律拒绝 —— 这条护栏比 mkfs 更严, 因为
+    //           目标卷上放着用户的文件, 认错卷号绝不能有破坏性后果。
+    {
+        let nvol = block_list_volumes(vfs::RESULT_BUF as *mut u8, 16);
+        if nvol == u64::MAX {
+            println("app: FS25 list volumes FAILED");
+            return;
+        }
+        let mut spare_vol = u64::MAX;
+        let mut fat_vol = u64::MAX;
+        let mut i = 0u64;
+        while i < nvol {
+            let d = vol_desc(vfs::RESULT_BUF as *const u8, i as usize);
+            if d.nsid == 6 {
+                spare_vol = d.id as u64;
+            }
+            if d.nsid == 1 {
+                fat_vol = d.id as u64;
+            }
+            i += 1;
+        }
+        if spare_vol == u64::MAX || fat_vol == u64::MAX {
+            println("app: FS25 test volumes missing FAILED");
+            return;
+        }
+
+        // (a) 幂等准备 + 序号基线。
+        let s_mkfs = vfs::mfs_mkfs(spare_vol);
+        if s_mkfs == u64::MAX || s_mkfs == 0 {
+            println("app: FS25 prep mkfs FAILED");
+            return;
+        }
+
+        // (b) 在目标卷上落一个文件。
+        let mut pbuf = [0u8; 32];
+        pbuf[..4].copy_from_slice(b"/usb");
+        let rl = 4 + dec_to_str(spare_vol, &mut pbuf[4..]);
+        let suffix = b"/FS25.DAT";
+        pbuf[rl..rl + suffix.len()].copy_from_slice(suffix);
+        let path = unsafe { core::str::from_utf8_unchecked(&pbuf[..rl + suffix.len()]) };
+        let fd = vfs::creat(path);
+        if fd == u64::MAX || vfs::write(fd, 0, b"FS25MARK") != 8 {
+            println("app: FS25 write payload FAILED");
+            return;
+        }
+        vfs::close(fd);
+
+        // (c) 只改标记: 序号递增 (与 mkfs 同一计数器)。
+        let s_set = vfs::mfs_set_primary(spare_vol);
+        if s_set == u64::MAX || s_set == 0 {
+            println("app: FS25 set-primary FAILED");
+            return;
+        }
+        if s_set <= s_mkfs {
+            println("app: FS25 serial not increasing across paths FAILED");
+            return;
+        }
+
+        // (c) 数据必须原样还在 —— 与 mkfs 的本质区别。
+        let fd = vfs::open(path);
+        if fd == u64::MAX || vfs::read(fd, 0, 8) != 8 {
+            println("app: FS25 payload LOST after set-primary FAILED");
+            return;
+        }
+        vfs::close(fd);
+        {
+            let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 8) };
+            if got != b"FS25MARK" {
+                println("app: FS25 payload content mismatch FAILED");
+                return;
+            }
+        }
+
+        // (d) 护栏: 非 MFS 卷与不存在的卷号都必须被拒。
+        if vfs::mfs_set_primary(fat_vol) != u64::MAX {
+            println("app: FS25 set-primary on FAT volume NOT refused FAILED");
+            return;
+        }
+        if vfs::mfs_set_primary(4242) != u64::MAX {
+            println("app: FS25 set-primary on nonexistent volume NOT refused FAILED");
+            return;
+        }
+    }
     println("app: SELFTEST DONE");
 }
 
@@ -6987,6 +7081,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  lstat <path>   like stat but on the link itself (no follow)");
             println("  readlink <link>  print a symbolic link's target (no follow)");
             println("  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)");
+            println("  mfs.primary <vol>   mark a MorionFS volume primary (keeps data)");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
             println(
@@ -7009,6 +7104,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "lstat" => shell_stat(st, arg, true),
         "readlink" => shell_readlink(st, arg),
         "mkfs.mfs" => shell_mkfs(arg),
+        "mfs.primary" => shell_mfs_primary(arg),
         "clear" => {
             sys_clear();
         }
@@ -7377,6 +7473,35 @@ fn shell_mkfs(arg: &str) {
         print("mkfs.mfs: refused volume ");
         print_u64(vol);
         println(" (not blank, not MFS, or no such volume)");
+    }
+}
+
+/// `mfs.primary <卷号>` — 把一块**已经有数据**的 MFS 卷换成主卷 (**不动数据**)。
+///
+/// 与 `mkfs.mfs <卷号>` 的区别: 后者建新文件系统、会**擦掉**卷上的文件; 本命令只改
+/// 超级块里的主卷序号, 卷上的文件原样保留 —— 日常换主卷用这个。
+///
+/// 只接受已经是 MFS 的卷 (空盘 / FAT / ext2 / exFAT 一律拒绝), 也不会自动格式化。
+/// 生效时机与 mkfs 一致: **下次启动** `/mfs` 认领到它, 本次运行的挂载点不变。
+fn shell_mfs_primary(arg: &str) {
+    let vol = match parse_dec(arg) {
+        Some(v) => v,
+        None => {
+            println("mfs.primary: usage: mfs.primary <volume-id>   (see the 'vol:' lines in the boot log)");
+            return;
+        }
+    };
+    let serial = vfs::mfs_set_primary(vol);
+    if serial != u64::MAX {
+        print("mfs.primary: volume ");
+        print_u64(vol);
+        print(" marked primary (serial ");
+        print_u64(serial);
+        println(") -> /mfs after next boot; data on it was NOT touched");
+    } else {
+        print("mfs.primary: refused volume ");
+        print_u64(vol);
+        println(" (not a MorionFS volume, or no such volume)");
     }
 }
 
@@ -9215,17 +9340,21 @@ fn mfs_write_blk(block_no: u32, src: *const u8) -> bool {
     )
 }
 
-/// 读**任意卷** `vol` 超级块里的主卷序号; 0 = 非主卷 / 不是 MFS / 两份都读不出。
+/// 探测**任意卷** `vol` 的超级块: 只要能读出一份有效的 MFS 超级块, 就返回其中的主卷
+/// 序号 (0 = 是 MFS, 只是还没被标成主卷); 两份都读不出 / 根本不是 MFS 时返回 `None`。
+///
+/// 「不是 MFS」与「是 MFS 但序号为 0」必须分得开: 前者不能当主卷目标 (要拒绝),
+/// 后者可以 (它只是还没标记过) —— 见 `mfs_set_primary_volume`。
 ///
 /// 直接用 `block_read_dev` 指定卷号, 与本服务的「当前卷」无关 —— 认领主卷要把**所有**
 /// MFS 卷扫一遍, 不能靠切内存态 (那会把正在服务的卷换掉)。两份副本取较大者: 一次提交
 /// 把两份写成同一序号, 崩溃在中途时落后的那份序号必不大于新的, 取大即取新。
 ///
 /// 缓冲借用位图头块页 (`mfs_bmph_buf`) —— 该页只在 `mfs_bmp_flush` 内部使用, 而本函数
-/// 只从启动认领与 `mkfs` **之前**调用, 与提交路径不重叠。
-fn mfs_primary_of_vol(vol: u64) -> u64 {
+/// 只从启动认领与 `mkfs` / `set-primary` 的**提交之外**环节调用, 与提交路径不重叠。
+fn mfs_sb_probe(vol: u64) -> Option<u64> {
     let buf = mfs_bmph_buf();
-    let mut best = 0u64;
+    let mut best: Option<u64> = None;
     for copy in 0..MFS_SB_COPIES {
         let lba = copy * MFS_SECTORS_PER_BLOCK as u32;
         if !block_read_dev(vol, lba, MFS_SECTORS_PER_BLOCK, buf) {
@@ -9238,9 +9367,15 @@ fn mfs_primary_of_vol(vol: u64) -> u64 {
         if read_u32(mfs_at(buf, p)) != MFS_VERSION {
             continue;
         }
-        best = best.max(read_u64(mfs_at(buf, p + MFS_SB_PRIMARY)));
+        let s = read_u64(mfs_at(buf, p + MFS_SB_PRIMARY));
+        best = Some(best.map_or(s, |b: u64| b.max(s)));
     }
     best
+}
+
+/// 卷 `vol` 的主卷序号 (0 = 非主卷 / 不是 MFS)。
+fn mfs_primary_of_vol(vol: u64) -> u64 {
+    mfs_sb_probe(vol).unwrap_or(0)
 }
 
 /// 目标卷 `target` 应得的主卷序号: 现有**所有** MFS 卷与 `target` 自身的最大序号 + 1。
@@ -9892,6 +10027,70 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
     let landed = mfs_primary_of_vol(vol);
     if landed == 0 {
         println("mfs: mkfs OK but primary mark missing on disk");
+        return u64::MAX;
+    }
+    landed
+}
+
+/// 把**已格式化**的 MFS 卷 `vol` 标记为主卷, **不动它上面的数据**; 成功返回落盘后的
+/// 主卷序号 (>0), 失败 `u64::MAX`。
+///
+/// 与 `mfs_mkfs_volume` 的分工: mkfs 是「建一个新文件系统」(必然擦数据), 本函数是
+/// 「在已有数据的卷上换主卷」—— 后者才是日常要用的那个 (前者会把 `/mfs` 的数据清掉)。
+///
+/// 护栏比 mkfs 更严: **只**接受已经是 MFS 的卷。空白盘 / 别人的分区一律拒绝 —— 这里
+/// 没有「格式化兜底」可言, 目标卷上放着用户的文件, 认错卷号绝不能有破坏性后果。
+fn mfs_set_primary_volume(vol: u64) -> u64 {
+    let desc = match vol_find_desc(mfs_a(), vol) {
+        Some(d) => d,
+        None => {
+            println("mfs: set-primary refused (no such volume)");
+            return u64::MAX;
+        }
+    };
+    if mfs_sb_probe(vol).is_none() {
+        println("mfs: set-primary refused (not a MorionFS volume)");
+        return u64::MAX;
+    }
+    let prev_vol = unsafe { MFS_CUR_VOL };
+    let prev_sectors = unsafe { MFS_CUR_SECTORS };
+    let serial = mfs_next_primary_serial(mfs_a(), vol);
+    unsafe {
+        MFS_CUR_VOL = vol;
+        MFS_CUR_SECTORS = desc.sectors;
+        MFS_LEAF = MFS_LOC_EMPTY;
+    }
+    // 载入目标卷的内存态 (只载入, 不格式化 —— 它必须有可用的超级块, 上面已探测过)。
+    if !mfs_load_state() {
+        println("mfs: set-primary load FAILED");
+        unsafe {
+            MFS_CUR_VOL = prev_vol;
+            MFS_CUR_SECTORS = prev_sectors;
+        }
+        let _ = mfs_load_state();
+        return u64::MAX;
+    }
+    unsafe {
+        MFS_PRIMARY_SERIAL = serial;
+    }
+    // 提交: 只改了超级块里的序号, 位图没有脏块, 故 flush 实际只写头块 + 超级块两份。
+    let ok = mfs_bmp_flush();
+    unsafe {
+        MFS_CUR_VOL = prev_vol;
+        MFS_CUR_SECTORS = prev_sectors;
+    }
+    if !mfs_load_state() {
+        println("mfs: reload state after set-primary FAILED");
+        return u64::MAX;
+    }
+    if !ok {
+        println("mfs: set-primary FAILED");
+        return u64::MAX;
+    }
+    // 与 mkfs 同样回复**盘上回读**的序号: 回读为 0 说明标记没落盘。
+    let landed = mfs_primary_of_vol(vol);
+    if landed == 0 {
+        println("mfs: set-primary OK but primary mark missing on disk");
         return u64::MAX;
     }
     landed
@@ -12595,6 +12794,11 @@ fn mfs_main() {
             vfs::VFS_MKFS_TAG => {
                 let vol = read_u64(msg.payload.as_ptr());
                 sys_reply(mfs_mkfs_volume(vol));
+            }
+            // 换主卷 (S2 补齐): 只改超级块里的主卷序号, 不动卷上的数据。
+            vfs::MFS_SETPRIMARY_TAG => {
+                let vol = read_u64(msg.payload.as_ptr());
+                sys_reply(mfs_set_primary_volume(vol));
             }
             _ => {
                 sys_reply(u64::MAX);

@@ -44,6 +44,7 @@ shell: type 'help' for commands
 | `lstat` | `lstat <path>` | 同 `stat`，但作用于**链接自身**（不跟随；悬空链接也能看） |
 | `readlink` | `readlink <link>` | 打印软链接的目标字符串 |
 | `mkfs.mfs` | `mkfs.mfs <vol>` | 在指定卷上创建 MorionFS（**擦除**该卷；只接受空白卷或已有 MFS 卷） |
+| `mfs.primary` | `mfs.primary <vol>` | 把一块已有数据的 MFS 卷换为主卷（**不动数据**；只接受 MFS 卷） |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
@@ -71,6 +72,7 @@ commands:
   lstat <path>   like stat but on the link itself (no follow)
   readlink <link>  print a symbolic link's target (no follow)
   mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)
+  mfs.primary <vol>   mark a MorionFS volume primary (keeps data)
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
@@ -224,12 +226,30 @@ commands:
 > 典型用法（真盘上「新买一块盘」）：启动日志里找到目标卷的 `vol:` 行（例如
 > `vol: 6 nsid=6 lba=0 sectors=32768 kind=unknown`），敲 `mkfs.mfs 6`，然后
 > `ls /usb6` / `touch /usb6/T.TXT`。此后这台机器重启，`/mfs` 就落在卷 6 上。
-> 想切回去，就在卷 1 上再 `mkfs.mfs 1`（**会擦除**）。
+> 想切回去，用 `mfs.primary 1`（**不动数据**）；只有在确实想重建卷 1 时才用
+> `mkfs.mfs 1`（那会**擦除**卷上的文件）。
 
-> ⚠️ 主卷标记是**持久**的：跑过自测的镜像上，`spare.img` 会被 FS-22/FS-24 格成 MFS 并逐步
-> 升到更高序号 —— 再次 `make run-nvme` 而不重置镜像时，`/mfs` 就落在那块 16 MiB 的空白盘上
-> （`fs-regress.sh` 每轮都会重置两份卷，故回归不受影响）。想复位就在 shell 里 `mkfs.mfs 1`
-> 或删掉 `build/spare.img`。
+> ⚠️ 主卷标记是**持久**的：跑过自测的镜像上，`spare.img` 会被 FS-22/FS-24/FS-25 格成 MFS
+> 并逐步升到更高序号 —— 再次 `make run-nvme` 而不重置镜像时，`/mfs` 就落在那块 16 MiB 的
+> 空白盘上（`fs-regress.sh` 每轮都会重置两份卷，故回归不受影响）。想复位就用 `mfs.primary 1`
+> 把主卷换回卷 1（不动数据），或删掉 `build/spare.img` 重新来。参考 [roadmap-fs.md](roadmap-fs.md) 的「S2 补齐」。
+
+### `mfs.primary <vol>`
+
+把**已经有数据**的 MorionFS 卷 `<vol>` 升为主卷 —— **不改变卷上的一个字节**。
+
+- 与 `mkfs.mfs <vol>` 的分工：`mkfs` 建新文件系统、会**擦除**卷上的文件；本命令只改超级块里
+  的主卷序号。把它俩分开，是因为「把一块已有数据的盘升为主卷」在 `mkfs` 下等同于删数据。
+- **只接受已经是 MFS 的卷**（读得出有效超级块），空白盘 / FAT / exFAT / ext2 / 不存在的卷号
+  一律被拒 —— 这里**没有**「格式化兜底」，因为目标卷上放着用户的文件。
+- 序号取「现有最大 + 1」（与 `mkfs` **共用**同一个只增计数器），故它同样只增不减。**下次启动**
+  `/mfs` 就认领到这块卷；本次运行的挂载点不变（换主卷要重启才生效）。
+- 输出：`mfs.primary: volume <vol> marked primary (serial <n>) -> /mfs after next boot;
+  data on it was NOT touched`（`serial` 是**从盘上回读**的序号，即为标记已落盘的证据）；
+  被拒或失败：`mfs.primary: refused volume <vol> (not a MorionFS volume, or no such volume)`。
+- 缺参数 / 非数字：`mfs.primary: usage: mfs.primary <volume-id>   (see the 'vol:' lines in the boot log)`。
+- 相关诊断（服务端打印）：`mfs: set-primary refused (no such volume)`、
+  `mfs: set-primary refused (not a MorionFS volume)`、`mfs: set-primary OK but primary mark missing on disk`（异常）。
 
 ### `clear`
 

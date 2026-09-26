@@ -256,7 +256,7 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-22）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+app 的 FS 自测（FS-1..FS-25）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -298,6 +298,11 @@ app 的 FS 自测（FS-1..FS-22）成功时几乎静默（末尾打印一行 `ap
 序号仍继续变大 —— 证明标记在普通提交里被保留（`mfs_load_state` 回读 + `mfs_build_super` 回写），
 若被一次普通写盘抹成 0，序号会掉回 1 而断言失败；④ 全程主卷 `/mfs` 照常可读。失败打印
 `app: FS24 … FAILED`。
+**FS-25（S2 补齐）** 盯**只改标记、不动数据地换主卷**（`mfs.primary`）：与 `mkfs.mfs` 的
+本质区别是**不擦除**卷上的文件。自给自足（不依赖 FS-24 残留）：① 先 `mfs_mkfs` 把目标卷
+置成确定状态并记下序号基线；② 在卷上写一个文件；③ `mfs_set_primary` 后序号**严格大于**基线
+（证明与 mkfs **共用**同一个只增计数器）且文件**逐字节一致**（证明数据没被动）；④ 对 FAT 卷 /
+不存在的卷号调 `mfs.primary` 一律被拒（**没有**格式化兜底）。失败打印 `app: FS25 … FAILED`。
 这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 另有一条**启动期**（不属于 FS 自测）的能力自测：域 0/1/3 走通「能力随 IPC 传递」后会打印
 `receiver: capability passing OK (handle moved + SendTo(3) delegated)`。它是**正面证据** ——
