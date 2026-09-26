@@ -58,6 +58,8 @@ pub const SYS_CAP_SEND: u64 = 33;
 pub const SYS_IRQ_POLL: u64 = 34;
 /// 打开 NVMe 控制器的 MSI-X (驱动写好表项后调用; PCI 配置空间写留在内核, 阶段 4)。
 pub const SYS_MSIX_ENABLE: u64 = 35;
+/// 阻塞等待 MSI/MSI-X 向量的中断, 最多 `rsi` 毫秒 (超时返回 0 —— 调用方据此回退轮询)。
+pub const SYS_IRQ_WAIT: u64 = 36;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -325,6 +327,36 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 打开 NVMe 控制器的 MSI-X (驱动已写好表项)。只有该控制器的驱动域能调用,
             // 且只能成功一次; 配置空间写因此不会被下放到驱动域。
             if crate::nvme::enable_msix() {
+                1
+            } else {
+                0
+            }
+        }
+        SYS_IRQ_WAIT => {
+            // 阻塞等待 `a1` (MSI/MSI-X 向量) 的中断, 最多 `a2` 毫秒: 期间到达过中断
+            // 返回 1, 超时返回 0。需持有 `Capability::Irq(vector)` 且必须正是该向量的
+            // 注册者。syscall 入口已用 SFMASK 清 IF, 故「查标志 → 阻塞」之间不会插进
+            // 中断处理, 不存在「标志刚置上就被我们错过」的丢唤醒。
+            if a1 > u8::MAX as u64 {
+                return 0;
+            }
+            let domain = crate::scheduler::current_domain();
+            let vector = a1 as u8;
+            if !crate::cap::has(domain, crate::cap::Capability::Irq(vector))
+                || !crate::irq::is_registered_by(vector, domain)
+            {
+                return 0;
+            }
+            if crate::irq::take_pending(vector, domain) {
+                return 1;
+            }
+            crate::scheduler::block_current_timeout_ms(
+                crate::scheduler::irq_wait_token(vector),
+                a2,
+            );
+            // 醒来的原因可能是被中断唤醒, 也可能是超时: 只有标志真在才算等到。
+            // 若中断恰好落在「阻塞前」的窗口, 标志会留在位上, 本次即取到。
+            if crate::irq::take_pending(vector, domain) {
                 1
             } else {
                 0

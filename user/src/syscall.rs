@@ -44,6 +44,7 @@ pub const SYS_HANDLE_SEND: u64 = 32;
 pub const SYS_CAP_SEND: u64 = 33;
 pub const SYS_IRQ_POLL: u64 = 34;
 pub const SYS_MSIX_ENABLE: u64 = 35;
+pub const SYS_IRQ_WAIT: u64 = 36;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -129,10 +130,19 @@ pub fn sys_register_irq(irq: u64) -> u64 {
 
 /// 非阻塞取走 MSI/MSI-X 向量 `vector` 的「待处理」标志: 有中断到达返回 1。
 ///
-/// 中断不投 IPC 消息 (那会和驱动的请求邮箱混在一起), 故驱动用本调用 + `sys_yield`
-/// 轮等: 只有中断处理器置位才能让本调用返回 1。需持有 `Capability::Irq(vector)`。
+/// 中断不投 IPC 消息 (那会和驱动的请求邮箱混在一起), 故驱动用本调用取位: 只有中断
+/// 处理器置位才能让本调用返回 1。需持有 `Capability::Irq(vector)`。
 pub fn sys_irq_poll(vector: u64) -> u64 {
     unsafe { syscall(SYS_IRQ_POLL, vector, 0, 0) }
+}
+
+/// 阻塞等待 MSI/MSI-X 向量 `vector` 的中断, 最多等 `timeout_ms` 毫秒。
+///
+/// 期间到达过中断返回 1, 超时返回 0 (调用方据此回退轮询)。等中断期间本域处于阻塞态,
+/// CPU 交给别的域 (通常是空闲任务 `hlt`), 不占用时间片空转 —— 这正是与 `sys_irq_poll`
+/// 自旋的本质区别。需持有 `Capability::Irq(vector)` 且是它的注册者。
+pub fn sys_irq_wait(vector: u64, timeout_ms: u64) -> u64 {
+    unsafe { syscall(SYS_IRQ_WAIT, vector, timeout_ms, 0) }
 }
 
 /// 打开本域所属设备的 MSI-X (需在写好 MSI-X 表项后调用), 成功返回 1。

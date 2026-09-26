@@ -14,10 +14,10 @@ mod vfs;
 use syscall::{
     print, print_hex, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
     sys_call_payload, sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send,
-    sys_irq_poll, sys_map_anon, sys_msix_enable, sys_page_fault_reply, sys_port_in16, sys_port_in8,
-    sys_port_out16, sys_port_out8, sys_readline, sys_recv, sys_recv_msg, sys_register_irq,
-    sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page, sys_term_left,
-    sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, sys_yield, CAP_KIND_IRQ,
+    sys_irq_poll, sys_irq_wait, sys_map_anon, sys_msix_enable, sys_page_fault_reply, sys_port_in16,
+    sys_port_in8, sys_port_out16, sys_port_out8, sys_readline, sys_recv, sys_recv_msg,
+    sys_register_irq, sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page,
+    sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, CAP_KIND_IRQ,
     CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
 };
 
@@ -546,11 +546,13 @@ fn write_msix_table_entry(cfg: &NvmeConfig, vector: u64) {
 // 完成路径: 中断驱动 (MSI-X) 与轮询回退
 // ---------------------------------------------------------------------------
 
-/// 中断模式下「等中断」的预算: 每轮没等到中断就踢一次宿主 (见等待循环里的 CSTS 读)。
+/// 中断模式下「等中断」的口径: 每次阻塞最多 `NVME_IRQ_WAIT_TIMEOUT_MS` 毫秒,
+/// 最多等 `NVME_IRQ_WAIT_ROUNDS` 轮 (合计约 160 ms)。
 ///
-/// 预算耗尽的唯一解释是 MSI-X 没能真正投递中断 (配置被拒 / 设备未投), 那时永久
-/// 回退轮询 —— 一次 I/O 不能把整个块服务卡死。
-const NVME_IRQ_WAIT_BUDGET: u32 = 200_000;
+/// 等不到中断的唯一解释是 MSI-X 没能真正投递中断 (配置被拒 / 设备未投), 那时永久
+/// 回退轮询 —— 一次 I/O 不能把整个块服务卡死。这里的轮数/超时就是那个看门狗。
+const NVME_IRQ_WAIT_TIMEOUT_MS: u64 = 10;
+const NVME_IRQ_WAIT_ROUNDS: u32 = 16;
 
 /// 中断模式是否启用 (粘性: 一旦回退就不再回到中断路径)。
 static mut NVME_IRQ_MODE: bool = false;
@@ -674,14 +676,19 @@ fn submit_wait(
     wr32(sq_doorbell, *tail);
 
     // 路径一: 中断驱动。设备 post CQE 后会投递一条 MSI-X 中断; 内核处理器只置
-    // 「待处理位」(不投 IPC —— 那会与块请求混在同一个邮箱里, 还会改写内核记录的
-    // 回复目标), 故这里非阻塞取位 + 踢宿主 + 偶尔让出 CPU。顺序是**先等中断, 再查
-    // CQE**: 设备保证「先写 CQE 再发中断」, 所以中断到了就一定有完成可取。
+    // 「待处理位」并唤醒本域 (不投 IPC —— 那会与块请求混在同一个邮箱里, 还会改写内核
+    // 记录的回复目标)。顺序是**先等中断, 再查 CQE**: 设备保证「先写 CQE 再发中断」,
+    // 所以中断到了就一定有完成可取。
     if nvme_irq_mode() {
         let vector = unsafe { NVME_IRQ_VECTOR };
-        let mut budget = NVME_IRQ_WAIT_BUDGET;
+        let mut rounds = NVME_IRQ_WAIT_ROUNDS;
         loop {
-            if sys_irq_poll(vector) == 1 {
+            // 快路径: 非阻塞取位即可命中 (设备 post CQE 与投中断都在门铃那次 MMIO exit
+            // 之后就完成了), 命中就不必真睡; 未命中才阻塞等下一次中断 (本域进入阻塞态,
+            // CPU 交给别的域, 不空转)。
+            let got =
+                sys_irq_poll(vector) == 1 || sys_irq_wait(vector, NVME_IRQ_WAIT_TIMEOUT_MS) == 1;
+            if got {
                 unsafe { NVME_IRQ_OBSERVED += 1 };
                 if let Some(ok) = try_complete(cq_vaddr, cq_doorbell, qdepth, &sqe, head, phase) {
                     unsafe { NVME_IRQ_CMDS += 1 };
@@ -691,21 +698,12 @@ fn submit_wait(
                 // 陈旧中断 (其 CQE 已被取走): 继续等本命令自己的中断。
                 continue;
             }
-            if budget == 0 {
+            rounds -= 1;
+            if rounds == 0 {
                 // 等不到任何中断: 粘性回退 (本次运行内不再走中断路径)。
                 unsafe { NVME_IRQ_MODE = false };
-                println("nvme: irq wait exhausted, fallback to polling");
+                println("nvme: irq wait timed out, fallback to polling");
                 break;
-            }
-            budget -= 1;
-            // 读 CSTS 强制一次 VM exit: 宿主的设备模型是在主循环里 post CQE 并投递中断
-            // 的, 而 `syscall` 在 KVM 里不产生 VM exit —— 只自旋等中断会让宿主主循环
-            // 停摆, 每条命令都要等到下一个时钟 tick 才被投递 (实测吞吐掉一半):
-            // 41 条/s (纯自旋) vs 82 条/s (每轮踢一次)。
-            let _ = rd32(mmio + REG_CSTS);
-            // 每 64 轮让出一次 CPU, 给其它域留出推进机会。
-            if budget.is_multiple_of(64) {
-                sys_yield();
             }
         }
     }
@@ -947,7 +945,7 @@ fn nvme_main() {
     // 0. 选择完成路径 (阶段 4 MSI/MSI-X)。三步缺一不可, 任一步失败都退回轮询:
     //    ① 写 MSI-X 表项 0 (表在 BAR0 里, 由本域写 —— 内核到不了这个 BAR);
     //    ② `sys_msix_enable` 请内核打开 MSI-X (配置空间写留在内核);
-    //    ③ 注册向量, 之后用 `sys_irq_poll` 等完成中断。
+    //    ③ 注册向量, 之后用 `sys_irq_poll` 取位 / `sys_irq_wait` 阻塞等完成中断。
     //    vector = 0 表示内核没能准备 MSI-X (无 LAPIC / 无该能力 / 表不在 BAR0)。
     if cfg.msix_vector != 0 {
         let vector = cfg.msix_vector as u64;

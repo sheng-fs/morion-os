@@ -48,13 +48,23 @@ pub fn register_vector(vector: u8, domain: u64) {
     VECTORS.lock()[vector as usize] = Some(domain);
 }
 
-/// MSI/MSI-X 向量处理器调用: 置该向量的待处理位。
+/// `domain` 是否正是 `vector` 的注册者 (`SYS_IRQ_WAIT` 的额外校验)。
+pub fn is_registered_by(vector: u8, domain: u64) -> bool {
+    VECTORS.lock()[vector as usize] == Some(domain)
+}
+
+/// MSI/MSI-X 向量处理器调用: 置该向量的待处理位, 并唤醒阻塞在该向量上的驱动域。
 ///
 /// 从向量处理器 (IF=0) 调用。未注册的向量只做 EOI (无人可读, 标志也不置)。
+/// 唤醒键(`irq_wait_token`)与 IPC 的域 id 不同, 故不会误唤醒等消息的任务。
 pub fn set_pending(vector: u8) {
-    if VECTORS.lock()[vector as usize].is_some() {
-        PENDING.lock()[vector as usize] = true;
+    // 两个锁各自取用后立即释放 (语句末即析构), 也**不**在持锁状态下进调度器:
+    // 调度器的锁在关中断下被多处持有, 与 IRQ 自己的锁不能形成嵌套。
+    if VECTORS.lock()[vector as usize].is_none() {
+        return;
     }
+    PENDING.lock()[vector as usize] = true;
+    crate::scheduler::wake_one(crate::scheduler::irq_wait_token(vector));
 }
 
 /// 取走 `vector` 的待处理标志 (`SYS_IRQ_POLL` 的落点); 取到返回 `true` 并清标志。

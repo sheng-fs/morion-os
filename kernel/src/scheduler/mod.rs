@@ -7,6 +7,8 @@
 //!
 //! 第 3 小步: 任务归属于保护域 (Domain), 切换任务时若域不同则切换 CR3。
 //! 第 4 小步: IPC 阻塞支持 — `Blocked` 状态 + `block_current`/`wake_one`。
+//! 第 5 小步: 带超时的阻塞 — `wake_deadline` + `block_current_timeout_ms`, 供
+//! `SYS_IRQ_WAIT` 阻塞等设备中断 (到期由时钟 tick 唤醒, 保证「等不到就回退」)。
 //!
 //! 抢占由时钟中断 (IRQ0, 100 Hz) 驱动, 每 10ms 一次;
 //! 协作式让出/睡眠由任务在运行中主动调用。
@@ -30,6 +32,18 @@ const STACK_SIZE: usize = 4096 * 8;
 /// 供 `SYS_READLINE` 阻塞 (block_current) 与 `video::term_put` 回车唤醒 (wake_one) 使用。
 /// 真实域 id 均为小整数, 故用 `u64::MAX - 1` 作哨兵不会冲突 (`u64::MAX` 已用作「无回复目标」)。
 pub const INPUT_WAIT: u64 = u64::MAX - 1;
+
+/// 伪等待键: 「等待某个 MSI/MSI-X 向量」的阻塞 (`SYS_IRQ_WAIT`)。
+///
+/// `vector` 对应的等待键取 `IRQ_WAIT_MARK - vector`, 落在 `[u64::MAX-511, u64::MAX-256]`,
+/// 与真实域 id (小整数) 和 `INPUT_WAIT` 都不重叠 —— 于是 `wake_one` 这一个按「等待键」
+/// 匹配的机制能同时服务 IPC 与中断等待, 且中断唤醒不会误撞 IPC 的唤醒。
+pub const IRQ_WAIT_MARK: u64 = u64::MAX - 0x100;
+
+/// `vector` 对应的等待键 (供 `SYS_IRQ_WAIT` 阻塞与 `irq::set_pending` 唤醒配对使用)。
+pub fn irq_wait_token(vector: u8) -> u64 {
+    IRQ_WAIT_MARK - vector as u64
+}
 
 /// 任务状态。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,8 +72,11 @@ pub struct Task {
     user_stack: u64,
     /// 睡眠唤醒的 tick 时刻 (仅 `Sleeping` 状态有效)。
     sleep_until: u64,
-    /// 阻塞等待的域 id (仅 `Blocked` 状态有效)。
+    /// 阻塞等待的等待键 (仅 `Blocked` 状态有效): 真实域 id 或 `INPUT_WAIT` /
+    /// `irq_wait_token` 伪键, 由 `wake_one` 匹配。
     wait_on: u64,
+    /// 阻塞超时的 tick 时刻 (仅带超时的 `Blocked` 状态有效, 0 表示无限等待)。
+    wake_deadline: u64,
     /// 最近一次 `receive` 到的消息来源域 id (用于 `reply` 路由回调用者)。
     /// `u64::MAX` 表示尚无有效回复目标。
     reply_target: u64,
@@ -141,6 +158,7 @@ impl Scheduler {
             user_stack,
             sleep_until: 0,
             wait_on: 0,
+            wake_deadline: 0,
             reply_target: u64::MAX,
             _stack: stack,
         });
@@ -247,16 +265,24 @@ fn schedule_next(current_state: TaskState) {
 /// 时钟中断处理: 递增 tick、唤醒到期任务、抢占调度。
 ///
 /// 由 IRQ0 调用 (IF=0)。被抢占任务的执行流之后经中断帧 iret 恢复中断。
+/// 两类到期唤醒: `Sleeping` 的睡眠到期, 以及**带超时 `Blocked`** (SYS_IRQ_WAIT)
+/// 的阻塞到期 —— 后者是「等不到中断就回退轮询」的兜底。
 pub fn tick() {
     {
         let mut guard = SCHEDULER.lock();
         let sched = guard.as_mut().expect("scheduler not initialized");
 
         sched.ticks += 1;
-        // 唤醒所有到期的睡眠任务。
+        // 唤醒所有到期的睡眠 / 带超时阻塞任务。
         for task in sched.tasks.iter_mut().flatten() {
             if task.state == TaskState::Sleeping && sched.ticks >= task.sleep_until {
                 task.state = TaskState::Ready;
+            } else if task.state == TaskState::Blocked
+                && task.wake_deadline != 0
+                && sched.ticks >= task.wake_deadline
+            {
+                task.state = TaskState::Ready;
+                task.wake_deadline = 0;
             }
         }
     }
@@ -320,30 +346,52 @@ pub fn current_reply_target() -> u64 {
         .reply_target
 }
 
-/// 阻塞当前任务: 标记为 `Blocked`, 记录等待的域, 切换到下一就绪任务。
+/// 阻塞当前任务: 标记为 `Blocked`, 记录等待键, 切换到下一就绪任务。
 ///
 /// 由 `ipc::receive` 在邮箱为空时调用 (IF=0)。被 `send` 唤醒后返回。
+/// 无限等待 (无超时) —— 等待设备中断请用 `block_current_timeout_ms`。
 pub fn block_current(on_domain: u64) {
     {
         let mut guard = SCHEDULER.lock();
         let sched = guard.as_mut().expect("scheduler not initialized");
-        sched.tasks[sched.current]
+        let task = sched.tasks[sched.current]
             .as_mut()
-            .expect("scheduler: no current task")
-            .wait_on = on_domain;
+            .expect("scheduler: no current task");
+        task.wait_on = on_domain;
+        task.wake_deadline = 0;
     }
     schedule_next(TaskState::Blocked);
 }
 
-/// 唤醒一个阻塞在指定域邮箱上的任务 (若存在), 置为就绪。
+/// 带超时地阻塞当前任务: 记录等待键与 tick 期限, 到期由 `tick` 唤醒。
 ///
-/// 由 `ipc::send` 在消息入队后调用 (IF=0)。
+/// 由 `SYS_IRQ_WAIT` 调用 (IF=0): 等待设备中断时**不能**无限阻塞 —— 中断真不来
+/// 也要能醒过来回退轮询, 否则一次 I/O 会把整个块服务挂死。
+/// 返回后须重新检查「事件是否真的到了」: 醒来的原因可能是超时, 也可能是被唤醒。
+pub fn block_current_timeout_ms(on: u64, ms: u64) {
+    {
+        let mut guard = SCHEDULER.lock();
+        let sched = guard.as_mut().expect("scheduler not initialized");
+        let deadline = sched.ticks + ms_to_ticks(ms);
+        let task = sched.tasks[sched.current]
+            .as_mut()
+            .expect("scheduler: no current task");
+        task.wait_on = on;
+        task.wake_deadline = deadline;
+    }
+    schedule_next(TaskState::Blocked);
+}
+
+/// 唤醒一个阻塞在指定等待键上的任务 (若存在), 置为就绪。
+///
+/// 由 `ipc::send` 在消息入队后、`irq::set_pending` 在中断到来时调用 (IF=0)。
 pub fn wake_one(domain: u64) {
     let mut guard = SCHEDULER.lock();
     let sched = guard.as_mut().expect("scheduler not initialized");
     for task in sched.tasks.iter_mut().flatten() {
         if task.state == TaskState::Blocked && task.wait_on == domain {
             task.state = TaskState::Ready;
+            task.wake_deadline = 0;
             break;
         }
     }

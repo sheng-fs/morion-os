@@ -87,11 +87,17 @@ fn load_user_program(domain_id: u64) {
 }
 
 /// 空闲任务: 当用户任务退出后兜底运行, 停机等待中断。
+///
+/// `hlt` 让出 CPU 的同时把控制权交还宿主 (KVM 里 vCPU 因此退出客户机,
+/// QEMU 的设备模型才有机会在主循环里 post 完成并投中断); `hlt` 返回后
+/// `yield_now` 让**刚被中断唤醒的域立刻接手**, 而不必再等一个时钟 tick ——
+/// 这是 `SYS_IRQ_WAIT` 阻塞等中断时唤醒延迟的关键一环。
 extern "C" fn task_idle() {
     // 首次进入时中断仍关闭 (run 未开启中断), 在此开启。
     x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();
+        scheduler::yield_now();
     }
 }
 
