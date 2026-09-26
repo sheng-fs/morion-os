@@ -48,7 +48,7 @@
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
-| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
+| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
@@ -315,6 +315,8 @@
 - [x] **MorionFS 容量扩容（位图外置）**（**S3a**：空闲位图移出超级块 —— 块 2/3 为 `MFBH` 位图头块、块 4 起为两份裸位图数据副本（`bb = ceil(total/32768)`）；`mfs_bmp_flush` 取代 `mfs_write_super` 作唯一提交出口，按脏区间增量落盘 + 每块 CRC32 校验；三张位图由编译期定长数组改为动态页窗口（挂载前按卷容量预算，只增不缩）；容量上限 ≈119 MiB → **≈127.25 GiB**；测试卷 64 → 256 MiB，新增 FS-23(a)）
 - [x] **MorionFS 单文件突破 4 GiB**（**S3b**：VFS 协议 `offset`/`size` 端到端 **u64**（含 `Stat`/`DirEntry`）；文件节点 `size` → u64 并新增**三级间接块** `MFI3`（直接区 1008 → 1005，元数据偏移不变），块映射四段、单文件上限 ≈ 整卷容量；内部仍 32 位的 fat32/tmpfs/ext2/exFAT 在协议边界加守卫；GC 补齐 `MFI3` 可达标记；新增 FS-23(b)(c)）
 - [x] **MorionFS 主卷切换**（**S2 补齐**：超级块 `+256` 存**主卷序号**（不升 magic，老卷为 0 = 非主卷）；`mkfs.mfs` 置「现有最大 + 1」并随提交落盘，认领时**序号最大者胜出** —— 于是「最近一次显式格式化过的卷」稳定地是**下次启动**的 `/mfs`，不再由卷表扫描顺序决定；`MKFS` 回复改为盘上回读的序号；新增 FS-24）
+- [x] **MorionFS 只改标记换主卷**（**S2 补齐**：新 tag `MFS_SETPRIMARY_TAG` + shell `mfs.primary <卷号>` —— **不动数据**地把一块**已有数据**的 MFS 卷升为主卷（`mkfs.mfs` 换主卷会擦除，等于删数据）；护栏**只接受已是 MFS 的卷**、没有格式化兜底；与 mkfs 共用同一个只增序号；新增 FS-25）
+- [x] **`df` 空间用量**（shell `df` 报 `/mfs` 的总量 / 已用 / 空闲块与使用率；目前**只有 MorionFS 上报容量**，其余服务不维护块分配，故不列）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 可执行文件加载（当前所有服务共用一份扁平二进制，按域 id 分流）
 - [ ] 帧缓冲对用户态开放 / GUI 服务

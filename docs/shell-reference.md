@@ -45,6 +45,7 @@ shell: type 'help' for commands
 | `readlink` | `readlink <link>` | 打印软链接的目标字符串 |
 | `mkfs.mfs` | `mkfs.mfs <vol>` | 在指定卷上创建 MorionFS（**擦除**该卷；只接受空白卷或已有 MFS 卷） |
 | `mfs.primary` | `mfs.primary <vol>` | 把一块已有数据的 MFS 卷换为主卷（**不动数据**；只接受 MFS 卷） |
+| `df` | `df` | 报告 `/mfs`（MorionFS）的空间用量 |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
@@ -73,6 +74,7 @@ commands:
   readlink <link>  print a symbolic link's target (no follow)
   mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)
   mfs.primary <vol>   mark a MorionFS volume primary (keeps data)
+  df             show MorionFS space usage (/mfs)
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
@@ -250,6 +252,19 @@ commands:
 - 缺参数 / 非数字：`mfs.primary: usage: mfs.primary <volume-id>   (see the 'vol:' lines in the boot log)`。
 - 相关诊断（服务端打印）：`mfs: set-primary refused (no such volume)`、
   `mfs: set-primary refused (not a MorionFS volume)`、`mfs: set-primary OK but primary mark missing on disk`（异常）。
+
+### `df`
+
+报告**已挂载文件系统**的空间用量。目前只有 `/mfs` 一行 —— **MorionFS 是唯一维护块分配、
+报得出容量的服务**（FAT32 / tmpfs / ext2 / exFAT 不维护空闲位图，没有「容量」可报）。
+
+- 数字来自 mfs_srv 的内存态（`MSST` tag）：`MSST` **不带卷参数**，服务端按**默认卷 = 主卷**
+  取数，所以这里报的就是 `/mfs`，与 `/usb<卷号>` 上那些额外 MFS 卷无关。
+- 单位是 **4 KiB 块**（与 MFS 内部块一致）：输出
+  `df: /mfs (MorionFS): total <T> blocks, used <U>, free <F> (<P>% used; 1 block = 4 KiB)`，
+  其中 `U = T - F`、`P` 为整数百分比（`U * 100 / T`，向下取整）。
+- 带参数：`df: usage: df   (only MorionFS reports capacity; other filesystems do not)`。
+- 查询失败（MorionFS 未挂载）：`df: /mfs unavailable (MorionFS not mounted?)`。
 
 ### `clear`
 

@@ -7082,6 +7082,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  readlink <link>  print a symbolic link's target (no follow)");
             println("  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)");
             println("  mfs.primary <vol>   mark a MorionFS volume primary (keeps data)");
+            println("  df             show MorionFS space usage (/mfs)");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
             println(
@@ -7105,6 +7106,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "readlink" => shell_readlink(st, arg),
         "mkfs.mfs" => shell_mkfs(arg),
         "mfs.primary" => shell_mfs_primary(arg),
+        "df" => shell_df(arg),
         "clear" => {
             sys_clear();
         }
@@ -7503,6 +7505,36 @@ fn shell_mfs_primary(arg: &str) {
         print_u64(vol);
         println(" (not a MorionFS volume, or no such volume)");
     }
+}
+
+/// `df` — 报告**已挂载文件系统**的空间用量。
+///
+/// 目前只有 MorionFS 有「容量」概念 (别的服务不维护块分配, 报不出数字), 故只有 `/mfs` 一行。
+/// 数字来自 mfs_srv 的内存态: `MSST` 不带卷参数, 服务端按**默认卷 = 主卷**取数, 故这里报的
+/// 就是 `/mfs` —— 与 `/usb<卷号>` 上那些额外 MFS 卷无关。
+fn shell_df(arg: &str) {
+    if !arg.is_empty() {
+        println("df: usage: df   (only MorionFS reports capacity; other filesystems do not)");
+        return;
+    }
+    let usage = vfs::mfs_stat();
+    if usage == u64::MAX {
+        println("df: /mfs unavailable (MorionFS not mounted?)");
+        return;
+    }
+    let total = usage >> 32;
+    let free = usage & 0xFFFF_FFFF;
+    let used = total.saturating_sub(free);
+    let pct = (used * 100).checked_div(total).unwrap_or(0);
+    print("df: /mfs (MorionFS): total ");
+    print_u64(total);
+    print(" blocks, used ");
+    print_u64(used);
+    print(", free ");
+    print_u64(free);
+    print(" (");
+    print_u64(pct);
+    println("% used; 1 block = 4 KiB)");
 }
 
 /// 按 8 / 10 进制解析无符号整数 (不带前缀, 空串/非法字符返回 None)。
