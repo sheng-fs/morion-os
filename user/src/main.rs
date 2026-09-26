@@ -1124,6 +1124,8 @@ const IDE_CMD: u16 = 0x1F7; // 命令寄存器 (写)
 const ATA_READ_SECTORS: u8 = 0x20;
 /// ATA 命令: WRITE SECTORS (28 位 LBA)。
 const ATA_WRITE_SECTORS: u8 = 0x30;
+/// ATA 命令: IDENTIFY DEVICE (回读 256 个 16 位字的设备参数, 含总扇区数)。
+const ATA_IDENTIFY: u8 = 0xEC;
 
 /// 状态寄存器位。
 const ATA_BSY: u8 = 0x80; // busy
@@ -1251,6 +1253,72 @@ fn write_sectors(lba: u32, count: u16, buf: *mut u8) -> bool {
         }
     }
     true
+}
+
+/// IDENTIFY DEVICE 的 512 字节回读缓冲 (仅 IDE 回退路径在启动时用一次)。
+static mut IDE_IDBUF: [u8; 512] = [0; 512];
+
+/// 向**主盘**发 ATA IDENTIFY DEVICE, 把 512 字节设备参数读进 `buf`。成功返回 true。
+///
+/// 状态判定遵循 ATA 规范: 写完命令后状态读回 **0** 说明端口上没有设备 (QEMU 未挂
+/// `-drive if=ide`); 否则等 BSY 清零 —— 期间 DRQ 置位即数据就绪, ERR/ABRT 置位即失败。
+fn ide_identify(buf: *mut u8) -> bool {
+    // IDENTIFY 要求扇区数与 LBA 寄存器清零, 驱动器寄存器选 master (0xA0)。
+    sys_port_out8(IDE_DRIVE, 0xA0);
+    sys_port_out8(IDE_SECT_CNT, 0);
+    sys_port_out8(IDE_LBA_LO, 0);
+    sys_port_out8(IDE_LBA_MID, 0);
+    sys_port_out8(IDE_LBA_HI, 0);
+    sys_port_out8(IDE_CMD, ATA_IDENTIFY);
+
+    // 端口上无设备时状态读回 0 (寄存器浮空), 这是唯一的「无盘」信号。
+    if sys_port_in8(IDE_STATUS) == 0 {
+        return false;
+    }
+    let mut ready = false;
+    for _ in 0..100_000 {
+        let s = sys_port_in8(IDE_STATUS);
+        if s & ATA_BSY != 0 {
+            continue;
+        }
+        if s & ATA_ERR != 0 {
+            return false;
+        }
+        if s & ATA_DRQ != 0 {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        return false;
+    }
+    for w in 0..256usize {
+        unsafe { read_sector_word(buf, w) };
+    }
+    true
+}
+
+/// 主盘容量 (512 字节扇区数); 取不到返回 0 (容量未知)。
+///
+/// 优先 LBA48 (word 100-103, 需 word 83 bit10 的支持位), 否则 LBA28 (word 60-61)。
+/// 两者都夹在 **28 位 LBA 上限** (`0x0FFF_FFFF` 扇区 = 128 GiB) 内: 本驱动的读写命令只发
+/// 28 位 LBA, 报出更大的容量会让上层往根本读不到的区域写。
+fn ide_capacity_sectors() -> u32 {
+    let buf = core::ptr::addr_of_mut!(IDE_IDBUF).cast::<u8>();
+    if !ide_identify(buf) {
+        return 0;
+    }
+    let lba48 = unsafe { read_u16(buf.add(83 * 2)) } & 0x0400 != 0;
+    let sectors = if lba48 {
+        let lo = unsafe { read_u32(buf.add(100 * 2)) } as u64;
+        let hi = unsafe { read_u32(buf.add(102 * 2)) } as u64;
+        (hi << 32) | lo
+    } else {
+        let lo = unsafe { read_u16(buf.add(60 * 2)) } as u64;
+        let hi = unsafe { read_u16(buf.add(61 * 2)) } as u64;
+        (hi << 16) | lo
+    };
+    sectors.min(0x0FFF_FFFF) as u32
 }
 
 /// 块设备请求 tag (block_srv 据此识别读/写请求)。
@@ -3129,8 +3197,11 @@ fn block_main() {
 /// 引入卷层之前完全一致, `dev > 0` 一律失败。IDE 盘的分区扫描留待后续。
 fn ide_block_main() {
     vol_reset();
-    vol_push(0, 0, 0, VOL_KIND_UNKNOWN);
-    // 卷表 (启动诊断): IDE 回退路径只有一个整盘卷, 容量未知 (sectors=0)。
+    // 容量向盘要 (ATA IDENTIFY DEVICE), 不再恒为「未知」—— 从前 `sectors = 0` 会让
+    // MFS 首次格式化退回 16 MiB 默认尺寸, 整块 IDE 盘也只用得上一点点。
+    let sectors = ide_capacity_sectors();
+    vol_push(0, 0, sectors, VOL_KIND_UNKNOWN);
+    // 卷表 (启动诊断): IDE 回退路径只有一个整盘卷; 问不到容量时 sectors=0。
     vol_print_table();
     loop {
         let mut msg = Message {
@@ -3178,12 +3249,13 @@ fn ide_block_main() {
                     0usize
                 };
                 if n == 1 {
+                    let v = vol_get(0).unwrap_or(VOL_EMPTY);
                     let d = VolumeDesc {
                         id: 0,
-                        nsid: 0,
-                        start_lba: 0,
-                        sectors: 0,
-                        kind: VOL_KIND_UNKNOWN,
+                        nsid: v.nsid,
+                        start_lba: v.start_lba,
+                        sectors: v.sectors,
+                        kind: v.kind,
                         _pad: 0,
                     };
                     unsafe {

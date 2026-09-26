@@ -66,7 +66,7 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `make run` | 最简运行（`-machine pc`，无磁盘） |
 | `make run-nokvm` | 无硬件虚拟化环境（CI） |
 | **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，六 namespace |
-| `make run-ide` | IDE PIO 回退路径验证 |
+| `make run-ide` | IDE PIO 回退路径验证（`build/disk.img` 1024 MiB；容量由 ATA IDENTIFY DEVICE 现问，`vol: 0 … sectors=2097152`） |
 
 ### `make run-nvme` 的磁盘布局（重要）
 

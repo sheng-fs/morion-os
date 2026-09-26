@@ -869,8 +869,9 @@ exFAT 去上限：
   数据偏移 0 的 `NSZE`（u64，512 B 逻辑块下即扇区数），缓存在 `NVME_NS_SECTORS`。
   走 **Admin 队列**（只在 init 发一次，不占 I/O 队列）；顺带删掉了原先那条「发 NSID=1 的
   Identify 却从不读结果」的死代码，改成按 namespace 列表逐个查询。
-  `sectors == 0` 仍保留「未知」语义（IDE PIO 回退路径取不到容量），需要容量的上层必须
-  按默认值兜底，**不能把 0 当成零长度卷**。
+  `sectors == 0` 仍保留「未知」语义（仅当连盘也问不出容量时），需要容量的上层必须
+  按默认值兜底，**不能把 0 当成零长度卷**。IDE PIO 回退路径后来也补上了容量探测
+  （ATA IDENTIFY DEVICE，见「M7 未覆盖」末条 → 已补）。
 - **mfs_srv 按几何格式化**：`mfs_format_total_blocks()` = `卷容量 / 8 扇区每块`，夹在
   `[MFS_MIN_TOTAL_BLOCKS = 64, MFS_MAX_BLOCKS]` 之间；容量未知时退回 `MFS_DEFAULT_TOTAL_BLOCKS`。
   新增下限是因为卷再小也得放得下两份超级块 + 根目录 + inode 表。
@@ -900,6 +901,11 @@ exFAT 去上限：
   上限提到 ≈127.25 GiB（见「S3a 已完成」）。
 - **MFS 额外卷与显式格式化已由 M8 补上**（见下）；M7 遗留的只有「容量」这一条。
 - IDE PIO 回退路径没有容量信息（`sectors = 0`），MFS 在它上面只能用默认尺寸。
+  **→ 已补**：block_srv 的 IDE 路径改从 **ATA IDENTIFY DEVICE**（`0xEC`）现问现取容量 ——
+  优先 LBA48（word 100-103，需 word 83 bit10），否则 LBA28（word 60-61），并夹在 **28 位 LBA
+  上限**（`0x0FFF_FFFF` 扇区 = 128 GiB）内（本驱动只发 28 位 LBA，报更大容量会让上层往读不到
+  的区域写）；问不出来（无盘 / ABRT / 超时）才退回 `sectors = 0`。实测 `make run-ide` 的
+  1024 MiB 盘由 `vol: 0 … sectors=0` 变成 `sectors=2097152`(= 1024 MiB)。
 
 #### M8 已完成 ✅
 
@@ -953,6 +959,8 @@ exFAT 去上限：
   指向哪一个 MFS 卷由卷表顺序决定，跟你上一次 `mkfs.mfs` 过谁无关；非主卷要靠 `/usb<卷号>` 访问。
   **→ 已由「S2 补齐」补上**（主卷序号持久化在超级块里，认领时序号最大者胜出，见下）。
 - IDE PIO 回退路径下 `sectors = 0`，格式化只能用默认尺寸（与 M7 相同）。
+  **→ 已补**（同 M7 末条）：IDE 路径改从 ATA IDENTIFY DEVICE 取容量，夹在 28 位 LBA 上限内；
+  只有问不出来时才退回默认尺寸。
 
 #### S3a 已完成 ✅
 

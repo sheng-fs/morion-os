@@ -310,7 +310,7 @@
 - [x] **MorionFS 节点元数据**（`MFS5`：时间戳（CMOS RTC）/权限/owner/链接数，`rename`（跨目录）/`truncate`（稀疏）/`chmod`，shell 增 `mv`/`chmod`/`truncate`/`stat`/`ls -l`）
 - [x] **MorionFS inode 号间接层 + 硬链接**（`MFS6`：目录项改存 inode 号，inode 表（索引块 → 表块）让多个名字共享一个对象；`ln` 落地；顺带删掉沿祖先链的逐级回写，写代价与目录深度无关）
 - [x] **MorionFS 软链接**（`MFSL` 节点类型：目标内联在节点里；路径解析跟随（绝对/相对/中间分量）+ 限深防环 16 层；`stat`/`cat` 跟随而 `rm`/`mv` 作用于链接自身；`ls -l` 显示 `l`；shell 增 `ln -s`；配套 `readlink`（读回目标）与 `lstat`（看链接自身）；跨文件系统目标创建即拒绝）
-- [x] **MorionFS 按卷几何格式化**（**M7**：block_srv 补 `Identify Namespace` 的 NSZE，整盘卷不再「容量未知」；首次格式化按该卷真实容量定尺寸 —— 此前无论卷多大都写死 16 MiB；挂载时校验盘上总块数不超过卷容量）
+- [x] **MorionFS 按卷几何格式化**（**M7**：block_srv 补 `Identify Namespace` 的 NSZE，整盘卷不再「容量未知」；首次格式化按该卷真实容量定尺寸 —— 此前无论卷多大都写死 16 MiB；挂载时校验盘上总块数不超过卷容量；**IDE PIO 回退路径也补上容量探测**（ATA IDENTIFY DEVICE，夹在 28 位 LBA 上限内），不再恒为 `sectors = 0`）
 - [x] **MorionFS 显式格式化 + 多卷**（**M8 / S2**：新 tag `MKFS` + shell `mkfs.mfs <卷号>`，护栏**只接受空白卷或 MFS 卷**，FAT/exFAT/ext2 分区与不存在的卷号一律拒绝 —— 「新盘可以格、别人的分区绝不吞」；`mfs_load_state` 拆出后 mfs_srv **按请求切卷**并把额外 MFS 卷挂到 `/usb<卷号>`；block_srv 启动打印卷表 `vol: <卷号> … kind=…`；新增空白测试盘 + FS-22）
 - [x] **MorionFS 容量扩容（位图外置）**（**S3a**：空闲位图移出超级块 —— 块 2/3 为 `MFBH` 位图头块、块 4 起为两份裸位图数据副本（`bb = ceil(total/32768)`）；`mfs_bmp_flush` 取代 `mfs_write_super` 作唯一提交出口，按脏区间增量落盘 + 每块 CRC32 校验；三张位图由编译期定长数组改为动态页窗口（挂载前按卷容量预算，只增不缩）；容量上限 ≈119 MiB → **≈127.25 GiB**；测试卷 64 → 256 MiB，新增 FS-23(a)）
 - [x] **MorionFS 单文件突破 4 GiB**（**S3b**：VFS 协议 `offset`/`size` 端到端 **u64**（含 `Stat`/`DirEntry`）；文件节点 `size` → u64 并新增**三级间接块** `MFI3`（直接区 1008 → 1005，元数据偏移不变），块映射四段、单文件上限 ≈ 整卷容量；内部仍 32 位的 fat32/tmpfs/ext2/exFAT 在协议边界加守卫；GC 补齐 `MFI3` 可达标记；新增 FS-23(b)(c)）
