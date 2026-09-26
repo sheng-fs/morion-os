@@ -350,10 +350,11 @@ pub extern "C" fn kernel_main() -> ! {
     video::println("[OK] IPC + capability + pager initialized (14 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
-    // 找到则映射 BAR0/队列/DMA 并授权 Mmio; 否则降级 (magic=0), block 回退 IDE PIO。
+    // 找到则配置 MSI-X、映射 BAR0/队列/DMA 并授权 Mmio/Irq; 否则降级 (magic=0),
+    // block 回退 IDE PIO。
     match arch::pci::find_nvme(&pci_devices) {
-        Some((_bus, _dev, _func, bar0)) => {
-            nvme::setup(block_domain, bar0);
+        Some((bus, dev, func, bar0)) => {
+            nvme::setup(block_domain, bus, dev, func, bar0);
             video::print("[OK] NVMe controller BAR0=0x");
             video::print_hex(bar0);
             video::println("");

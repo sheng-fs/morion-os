@@ -25,7 +25,7 @@
 | DMA 物理页 | ✅ 已补齐（阶段 0） | 分配**页对齐、物理连续**的队列与数据缓冲，映射到驱动域 |
 | 块设备能力 | 无 | 新增能力，让 `fat32_srv` 能调用 `nvme_srv` 读写块 |
 | 块设备协议 | 无 | 定义 `read_lba` / `write_lba` IPC 消息格式 |
-| 中断 | 仅 PIC；NVMe 需 MSI/MSI-X | **先轮询 CQ 完成队列**，MSI/MSI-X 后置 |
+| 中断 | ✅ 已补齐（阶段 39） | PIC + **LAPIC/MSI-X**：NVMe 完成走中断驱动，等不到中断则自动回退轮询 |
 
 ---
 
@@ -1191,9 +1191,59 @@ S3a 把位图移出超级块之后这片区域本就整片保留，所以：
 - 只有**主分区 / GPT 项**，不做扩展分区（EBR 链）、不做分区属性/名字的完整编辑（名字写死
   `MorionFS`），也不做分区**内容**迁移。
 
+### S3 NVMe 中断化（MSI/MSI-X）已完成 ✅
+
+**目标**：把 NVMe 的完成等待从「轮询 CQ（每轮读一次 CSTS 强制 VM exit）」换成**真正的完成中断**，
+并保留轮询作为保底 —— 中断化是优化，不该让盘上的任何一条 I/O 因此卡死。
+
+**实现要点**：
+
+- 内核侧（阶段 39）：`arch/apic.rs` 只做 MSI 必需的最小 LAPIC 支撑 —— 取 `IA32_APIC_BASE`
+  基址并确保 EN 置位、`SVR` 软使能、`TPR=0`、`LVT0` 保持「ExtINT + 不屏蔽」（LAPIC 一旦使能，
+  8259A 的中断改由 LINT0 透传；KVM 正是据此决定还投不投 PIC 中断，屏蔽掉的话时钟/键盘立刻死），
+  `eoi()` 写 `base+0xB0`。`arch/pci.rs` 补能力链表遍历 + MSI-X 定位（`table offset/BIR/size`）、
+  关 INTx、置 Enable/清 Function Mask。`arch/idt.rs` 为向量段 `0x50..0x5F` 装处理器。
+- **「中断即 IPC」在 MSI 上不适用**：中断与驱动收请求是同一个邮箱，投成 IPC 会被当成块请求消费，
+  还会改写内核记录的回复目标，`reply` 会投错域。故 MSI 中断只置一个**待处理位**（`irq::set_pending`），
+  驱动用新 syscall `SYS_IRQ_POLL`（非阻塞取位，需 `Capability::Irq(vector)`）主动取。
+- **分工**：内核管中断配置（LAPIC + PCI 配置空间 + 向量段），**驱动写 MSI-X 表**（表在 BAR0 内，
+  那个 BAR 由固件分配在 4 GiB 以上，内核的地址空间到不了；而它本就按非缓存映射给了驱动）。
+  顺序：驱动写表项 0 → `SYS_MSIX_ENABLE` 请内核打开 MSI-X（配置空间写留在内核，且只允许该控制器
+  的驱动域调用）→ `SYS_REGISTER_IRQ(vector)` 注册。
+- 驱动 `submit_wait` 变为「写门铃 → **先等中断**（设备保证先写 CQE 再发中断）→ 查 CQE」，
+  并保留原轮询路径：等不到中断（预算耗尽）就**粘性回退**轮询并打一行原因。CQE 判定与出错打印
+  由两条路径共用同一个 `try_complete`，避免「换了路径」顺带换了语义。
+- **踩到的坑（值得记）**：`Create I/O CQ` 的 CDW11 只写了 `PC=1`，漏了 **IEN=1** —— 该 CQ 于是
+  根本不投中断。轮询路径完全看不出来（CQE 照样写进内存），只有中断路径会一直等不到。
+- **踩到的坑（值得记）**：**纯自旋等中断会让宿主停摆**。`syscall`/`sysret` 在 KVM 里不产生 VM exit，
+  而 QEMU 的 NVMe 是在主循环里 post CQE 并投中断的 —— 「只等中断、不碰 MMIO」的等待循环会让每条
+  命令都拖到下一个时钟 tick（实测 41 条/s，比轮询慢一半，整套自测因此超时）。等待循环里每轮读一次
+  CSTS 强制 VM exit 后即与轮询持平（82 条/s）。即：单靠「改成中断」省不掉「踢宿主」，除非内核提供
+  让域真正阻塞（vCPU 得以 HLT）的等待原语。
+
+**证据（`bash scripts/fs-regress.sh`）**：内核启动打 `apic: enabled …`、`nvme: MSI-X prepared
+vector=0x50 …`；驱动打 `MSI-X table[0] programmed` 与内核的 `MSI-X enabled`；运行期打
+`nvme: after volume scan cmds=27 irq_cmds=27 poll_cmds=0 irqs=27 mode=irq`，随后每 4096 条命令一行
+（实测最后一行 `cmds=28672 irq_cmds=28672 poll_cmds=0 irqs=28672 mode=irq`）——即整轮自测的所有块 I/O
+都由中断完成，零回退，`SELFTEST DONE` 1 次、`FAILED/PANIC` 0 次、宿主 `sgdisk` 校验无问题。
+
+回退路径同样单独跑过一轮完整自测：把等待预算临时置 0，驱动在第一条命令上打
+`nvme: irq wait exhausted, fallback to polling` 并**粘性**回退，其后每行都是
+`cmds=28672 irq_cmds=0 poll_cmds=28672 irqs=0 mode=poll`，自测结论一致（`SELFTEST DONE` 1 次、
+`FAILED/PANIC` 0 次）——证明「等不到中断」不会把盘上的 I/O 卡死。
+
+**S3 未覆盖**：
+
+- 只有 **1 个中断向量**（所有队列共用一个）：够用但没做「每队列独立向量 / 多向量分发」。
+- LAPIC 只做 MSI 所需的最小集：没有 APIC 定时器、没有 I/O APIC、MSI（非 MSI-X）能力未用、
+  没有 `SYS_MSIX_ENABLE` 之外的 PCI 配置空间接口。
+- 中断只当「完成通知」，不做完成批量收割（一次中断收一条 CQE）。
+- 驱动侧等待仍是「自旋 + 每轮踢一次宿主」，不是阻塞等待（内核没有「中断唤醒阻塞域」的原语），
+  所以省不掉 VM exit —— 中断化在当前实现里换的是**语义**（完成由设备通知而非靠读 CQE 猜），
+  吞吐与轮询持平而非更高。
+
 ### 阶段 4 — 远期
 
-- MSI/MSI-X 中断替代 NVMe 轮询。
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。
 - exFAT/NTFS/ISO9660 之外的更多文件系统（读写 ext4、HFS+、UDF）。
 
@@ -1202,6 +1252,7 @@ S3a 把位图移出超级块之后这片区域本就整片保留，所以：
 ## 4. 主要风险
 
 1. **MSI/MSI-X 未支持** → 阶段 1 用轮询 CQ，功能优先，性能后补。
+   **→ 已由 S3 补上**（LAPIC + MSI-X 中断驱动完成等待，轮询保留为自动回退路径）。
 2. **OVMF 退出后 NVMe 状态未知** → 内核自己完整初始化控制器，不依赖固件（与之前 i8042 键盘同理）。
 3. **DMA 物理连续性** → NVMe 队列/缓冲必须物理连续且页对齐，帧分配器需支持连续多帧分配。
 4. **用户态 DMA 地址翻译** → 驱动域需拿到「物理地址」写进 SQE，须确保映射关系正确（内核提供 vaddr→paddr 解析）。

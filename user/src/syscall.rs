@@ -42,6 +42,8 @@ pub const SYS_CAP_LOOKUP: u64 = 30;
 pub const SYS_CAP_DROP: u64 = 31;
 pub const SYS_HANDLE_SEND: u64 = 32;
 pub const SYS_CAP_SEND: u64 = 33;
+pub const SYS_IRQ_POLL: u64 = 34;
+pub const SYS_MSIX_ENABLE: u64 = 35;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -123,6 +125,21 @@ pub fn sys_reply(tag: u64) -> u64 {
 
 pub fn sys_register_irq(irq: u64) -> u64 {
     unsafe { syscall(SYS_REGISTER_IRQ, irq, 0, 0) }
+}
+
+/// 非阻塞取走 MSI/MSI-X 向量 `vector` 的「待处理」标志: 有中断到达返回 1。
+///
+/// 中断不投 IPC 消息 (那会和驱动的请求邮箱混在一起), 故驱动用本调用 + `sys_yield`
+/// 轮等: 只有中断处理器置位才能让本调用返回 1。需持有 `Capability::Irq(vector)`。
+pub fn sys_irq_poll(vector: u64) -> u64 {
+    unsafe { syscall(SYS_IRQ_POLL, vector, 0, 0) }
+}
+
+/// 打开本域所属设备的 MSI-X (需在写好 MSI-X 表项后调用), 成功返回 1。
+///
+/// 只有该设备的驱动域能调用, 且只成功一次; 配置空间写留在内核。
+pub fn sys_msix_enable() -> u64 {
+    unsafe { syscall(SYS_MSIX_ENABLE, 0, 0, 0) }
 }
 
 pub fn sys_scroll_up() -> u64 {

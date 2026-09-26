@@ -12,12 +12,13 @@ mod syscall;
 mod vfs;
 
 use syscall::{
-    print, print_u64, println, sys_alloc_page, sys_backspace, sys_call, sys_call_payload,
-    sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send, sys_map_anon,
-    sys_page_fault_reply, sys_port_in16, sys_port_in8, sys_port_out16, sys_port_out8, sys_readline,
-    sys_recv, sys_recv_msg, sys_register_irq, sys_reply, sys_scroll_down, sys_scroll_up, sys_send,
-    sys_share_page, sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys,
-    CAP_KIND_IRQ, CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
+    print, print_hex, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
+    sys_call_payload, sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send,
+    sys_irq_poll, sys_map_anon, sys_msix_enable, sys_page_fault_reply, sys_port_in16, sys_port_in8,
+    sys_port_out16, sys_port_out8, sys_readline, sys_recv, sys_recv_msg, sys_register_irq,
+    sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page, sys_term_left,
+    sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, sys_yield, CAP_KIND_IRQ,
+    CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
 };
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
@@ -422,6 +423,12 @@ struct NvmeConfig {
     admin_qdepth: u16,
     io_qdepth: u16,
     page_size: u32,
+    /// MSI-X 中断向量 (0 = 未启用 MSI-X, 本驱动走轮询)。
+    msix_vector: u32,
+    /// MSI-X 表相对 BAR0 的字节偏移 (表在 BAR0 内, 已随 BAR0 映射到本域)。
+    msix_table_offset: u32,
+    /// MSI-X 中断消息地址 (低 32 位; 物理目的模式, 高 32 位恒 0)。
+    msix_addr: u32,
 }
 
 // NVMe 控制器寄存器偏移 (相对 BAR0, 见 NVMe 规范)。
@@ -511,10 +518,141 @@ fn wr64(addr: u64, val: u64) {
     unsafe { core::ptr::write_volatile(addr as *mut u64, val) }
 }
 
-/// 向指定队列提交一条命令并轮询其完成。返回状态码是否为 0 (成功)。
+/// 写 MSI-X 表项 0: 消息地址 + 数据 (= 向量) + 清屏蔽位。
+///
+/// 为什么只写表项 0: NVMe 的 Admin 完成队列固定用中断向量 0, 我们的 I/O 完成队列在
+/// `Create I/O CQ` 里也把 IV 填成 0 —— 两条队列共用向量 0, 一条表项就够。
+///
+/// 表在 BAR0 内 (已非缓存地映射到本域), 由**本驱动**写: 那个 BAR 由固件分配在 4 GiB
+/// 以上, 内核自己的地址空间到不了它, 而按微内核分工设备 MMIO 本就属于驱动。
+/// 内核负责的是写完之后打开 MSI-X (配置空间) 与 LAPIC/向量段。
+fn write_msix_table_entry(cfg: &NvmeConfig, vector: u64) {
+    let entry = cfg.mmio_vaddr + cfg.msix_table_offset as u64;
+    let p = entry as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(p, cfg.msix_addr); // 消息地址 (低 32 位)
+        core::ptr::write_volatile(p.add(1), 0); // 消息地址 (高 32 位); 物理目的模式恒 0
+        core::ptr::write_volatile(p.add(2), vector as u32); // 消息数据 = 中断向量
+        core::ptr::write_volatile(p.add(3), 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
+    }
+    print("nvme: MSI-X table[0] programmed addr=0x");
+    print_hex(cfg.msix_addr as u64);
+    print(" data=0x");
+    print_hex(vector);
+    println("");
+}
+
+// ---------------------------------------------------------------------------
+// 完成路径: 中断驱动 (MSI-X) 与轮询回退
+// ---------------------------------------------------------------------------
+
+/// 中断模式下「等中断」的预算: 每轮没等到中断就踢一次宿主 (见等待循环里的 CSTS 读)。
+///
+/// 预算耗尽的唯一解释是 MSI-X 没能真正投递中断 (配置被拒 / 设备未投), 那时永久
+/// 回退轮询 —— 一次 I/O 不能把整个块服务卡死。
+const NVME_IRQ_WAIT_BUDGET: u32 = 200_000;
+
+/// 中断模式是否启用 (粘性: 一旦回退就不再回到中断路径)。
+static mut NVME_IRQ_MODE: bool = false;
+/// 中断模式下等待的向量 (来自内核配置结构)。
+static mut NVME_IRQ_VECTOR: u64 = 0;
+
+/// 运行期计数: 「本次运行真的走了哪条完成路径」的证据 (每 `NVME_STATS_EVERY` 条打印一次)。
+static mut NVME_IRQ_OBSERVED: u64 = 0; // 取到中断的次数
+static mut NVME_IRQ_CMDS: u64 = 0; // 中断路径完成的命令数
+static mut NVME_POLL_CMDS: u64 = 0; // 轮询路径完成的命令数
+static mut NVME_CMDS_TOTAL: u64 = 0;
+/// 计数打印间隔 (证据行不能刷屏: 一整轮自测约 2 万条命令)。
+const NVME_STATS_EVERY: u64 = 4096;
+
+/// 中断模式是否处于启用状态。
+fn nvme_irq_mode() -> bool {
+    unsafe { NVME_IRQ_MODE }
+}
+
+/// 打印一次完成路径计数 (证据行)。
+fn nvme_stats_print(prefix: &str) {
+    unsafe {
+        print(prefix);
+        print("cmds=");
+        print_u64(NVME_CMDS_TOTAL);
+        print(" irq_cmds=");
+        print_u64(NVME_IRQ_CMDS);
+        print(" poll_cmds=");
+        print_u64(NVME_POLL_CMDS);
+        print(" irqs=");
+        print_u64(NVME_IRQ_OBSERVED);
+        print(" mode=");
+        println(if NVME_IRQ_MODE { "irq" } else { "poll" });
+    }
+}
+
+/// 计数并周期打印「两条完成路径各自走了多少条命令」。
+fn nvme_stats_tick() {
+    unsafe {
+        NVME_CMDS_TOTAL += 1;
+        if !NVME_CMDS_TOTAL.is_multiple_of(NVME_STATS_EVERY) {
+            return;
+        }
+    }
+    nvme_stats_print("nvme: stats ");
+}
+
+/// 尝试从完成队列取一条 CQE。
+///
+/// 取到则推进 head / 翻转 phase / 敲 CQ 门铃, 返回 `Some(状态码是否为 0)`;
+/// 队列里还没有新 CQE 返回 `None`。中断路径与轮询路径共用它 —— 两条路径的完成判定
+/// 与出错打印必须完全一致, 否则「换了路径」就变成「换了语义」。
+fn try_complete(
+    cq_vaddr: u64,
+    cq_doorbell: u64,
+    qdepth: u32,
+    sqe: &Sqe,
+    head: &mut u32,
+    phase: &mut u32,
+) -> Option<bool> {
+    let idx = (*head % qdepth) as u64;
+    let cqe: Cqe = unsafe { core::ptr::read_volatile((cq_vaddr + idx * 16) as *const Cqe) };
+    if (cqe.sf & 1) as u32 != *phase {
+        return None;
+    }
+    *head = (*head + 1) % qdepth;
+    if *head == 0 {
+        *phase ^= 1;
+    }
+    wr32(cq_doorbell, *head);
+    let sc = cqe.sf >> 1;
+    if sc != 0 {
+        print("nvme: CQE fail sc=");
+        print_u64(sc as u64);
+        print(" cid=");
+        print_u64(cqe.cid as u64);
+        print(" sqid=");
+        print_u64(cqe.sqid as u64);
+        print(" op=");
+        print_u64(sqe.opcode as u64);
+        print(" cdw10=");
+        print_u64(sqe.cdw10 as u64);
+        print(" cdw11=");
+        print_u64(sqe.cdw11 as u64);
+        print(" nlb-1=");
+        print_u64(sqe.cdw12 as u64);
+        print(" nsid=");
+        print_u64(sqe.nsid as u64);
+        print(" prp1=");
+        print_u64(sqe.prp1);
+        println("");
+    }
+    Some(sc == 0)
+}
+
+/// 向指定队列提交一条命令并等其完成。返回状态码是否为 0 (成功)。
 ///
 /// `sq_vaddr`/`cq_vaddr` 为队列内存虚拟地址, `sq_doorbell`/`cq_doorbell`
 /// 为门铃寄存器虚拟地址 (含 stride), `qdepth` 为队列深度。
+///
+/// 完成等待有两条路径: MSI-X 中断驱动 (`nvme_main` 里注册成功后启用) 与轮询 ——
+/// 轮询既是中断不可用时的保底, 也是中断路径等不到中断时的回退。
 #[allow(clippy::too_many_arguments)]
 fn submit_wait(
     sq_vaddr: u64,
@@ -535,41 +673,51 @@ fn submit_wait(
     *tail = (*tail + 1) % qdepth;
     wr32(sq_doorbell, *tail);
 
-    // 轮询完成队列。QEMU 用 timer 异步投递 CQE, 需要其主循环运行才会 post;
+    // 路径一: 中断驱动。设备 post CQE 后会投递一条 MSI-X 中断; 内核处理器只置
+    // 「待处理位」(不投 IPC —— 那会与块请求混在同一个邮箱里, 还会改写内核记录的
+    // 回复目标), 故这里非阻塞取位 + 踢宿主 + 偶尔让出 CPU。顺序是**先等中断, 再查
+    // CQE**: 设备保证「先写 CQE 再发中断」, 所以中断到了就一定有完成可取。
+    if nvme_irq_mode() {
+        let vector = unsafe { NVME_IRQ_VECTOR };
+        let mut budget = NVME_IRQ_WAIT_BUDGET;
+        loop {
+            if sys_irq_poll(vector) == 1 {
+                unsafe { NVME_IRQ_OBSERVED += 1 };
+                if let Some(ok) = try_complete(cq_vaddr, cq_doorbell, qdepth, &sqe, head, phase) {
+                    unsafe { NVME_IRQ_CMDS += 1 };
+                    nvme_stats_tick();
+                    return ok;
+                }
+                // 陈旧中断 (其 CQE 已被取走): 继续等本命令自己的中断。
+                continue;
+            }
+            if budget == 0 {
+                // 等不到任何中断: 粘性回退 (本次运行内不再走中断路径)。
+                unsafe { NVME_IRQ_MODE = false };
+                println("nvme: irq wait exhausted, fallback to polling");
+                break;
+            }
+            budget -= 1;
+            // 读 CSTS 强制一次 VM exit: 宿主的设备模型是在主循环里 post CQE 并投递中断
+            // 的, 而 `syscall` 在 KVM 里不产生 VM exit —— 只自旋等中断会让宿主主循环
+            // 停摆, 每条命令都要等到下一个时钟 tick 才被投递 (实测吞吐掉一半):
+            // 41 条/s (纯自旋) vs 82 条/s (每轮踢一次)。
+            let _ = rd32(mmio + REG_CSTS);
+            // 每 64 轮让出一次 CPU, 给其它域留出推进机会。
+            if budget.is_multiple_of(64) {
+                sys_yield();
+            }
+        }
+    }
+
+    // 路径二: 轮询完成队列。QEMU 用 timer 异步投递 CQE, 需要其主循环运行才会 post;
     // 而 guest 在 KVM 里纯轮询不会触发 VM exit, 主循环被阻塞。故每次迭代读一次
     // CSTS (MMIO) 强制 VM exit, 让 QEMU 主循环有机会 post CQE。
     for _ in 0..NVME_POLL_LIMIT {
-        let idx = (*head % qdepth) as u64;
-        let cqe: Cqe = unsafe { core::ptr::read_volatile((cq_vaddr + idx * 16) as *const Cqe) };
-        if (cqe.sf & 1) as u32 == *phase {
-            *head = (*head + 1) % qdepth;
-            if *head == 0 {
-                *phase ^= 1;
-            }
-            wr32(cq_doorbell, *head);
-            let sc = cqe.sf >> 1;
-            if sc != 0 {
-                print("nvme: CQE fail sc=");
-                print_u64(sc as u64);
-                print(" cid=");
-                print_u64(cqe.cid as u64);
-                print(" sqid=");
-                print_u64(cqe.sqid as u64);
-                print(" op=");
-                print_u64(sqe.opcode as u64);
-                print(" cdw10=");
-                print_u64(sqe.cdw10 as u64);
-                print(" cdw11=");
-                print_u64(sqe.cdw11 as u64);
-                print(" nlb-1=");
-                print_u64(sqe.cdw12 as u64);
-                print(" nsid=");
-                print_u64(sqe.nsid as u64);
-                print(" prp1=");
-                print_u64(sqe.prp1);
-                println("");
-            }
-            return sc == 0;
+        if let Some(ok) = try_complete(cq_vaddr, cq_doorbell, qdepth, &sqe, head, phase) {
+            unsafe { NVME_POLL_CMDS += 1 };
+            nvme_stats_tick();
+            return ok;
         }
         // 读 CSTS 触发 VM exit (无副作用, 只读状态寄存器)。
         let _ = rd32(mmio + REG_CSTS);
@@ -796,6 +944,31 @@ fn nvme_main() {
     }
     let mmio = cfg.mmio_vaddr;
 
+    // 0. 选择完成路径 (阶段 4 MSI/MSI-X)。三步缺一不可, 任一步失败都退回轮询:
+    //    ① 写 MSI-X 表项 0 (表在 BAR0 里, 由本域写 —— 内核到不了这个 BAR);
+    //    ② `sys_msix_enable` 请内核打开 MSI-X (配置空间写留在内核);
+    //    ③ 注册向量, 之后用 `sys_irq_poll` 等完成中断。
+    //    vector = 0 表示内核没能准备 MSI-X (无 LAPIC / 无该能力 / 表不在 BAR0)。
+    if cfg.msix_vector != 0 {
+        let vector = cfg.msix_vector as u64;
+        write_msix_table_entry(&cfg, vector);
+        if sys_msix_enable() != 1 {
+            println("nvme: msix_enable refused by kernel, polling mode");
+        } else if sys_register_irq(vector) == 1 {
+            unsafe {
+                NVME_IRQ_VECTOR = vector;
+                NVME_IRQ_MODE = true;
+            }
+            print("nvme: irq-driven completions, vector=0x");
+            print_hex(vector);
+            println("");
+        } else {
+            println("nvme: register_irq refused, polling mode");
+        }
+    } else {
+        println("nvme: polling mode (kernel gave no MSI-X vector)");
+    }
+
     // 1. 读 CAP, 计算门铃 stride (DSTRD 在 CAP 的 bits 32:35, stride = 4 << DSTRD 字节)。
     let cap = rd64(mmio + REG_CAP);
     let dstrd = ((cap >> 32) & 0xF) as u64;
@@ -924,7 +1097,12 @@ fn nvme_main() {
     sqe.cid = 3;
     sqe.prp1 = cfg.icq_paddr;
     sqe.cdw10 = 1 | ((cfg.io_qdepth as u32 - 1) << 16);
-    sqe.cdw11 = 1; // PC=1 (物理连续)
+    // CDW11: PC=1 (物理连续), IEN=1 (该 CQ **允许产生中断**), IV=0 (中断向量 0)。
+    //
+    // IEN 必须显式置位: 它默认是 0, 于是这个 I/O CQ 的完成根本不投中断 —— 轮询路径
+    // 看不出来 (CQE 照样写进内存), 但中断路径会一直等不到, 白等一轮预算。Admin 队列
+    // 的 IEN 不受本命令影响, 所以只错在 I/O 队列上。
+    sqe.cdw11 = 1 | (1 << 1);
     if !submit_wait(
         cfg.asq_vaddr,
         cfg.acq_vaddr,
@@ -1003,6 +1181,8 @@ fn nvme_main() {
     }
     // 卷表 (启动诊断, 也是 `mkfs.mfs <卷号>` 的卷号来源)。
     vol_print_table();
+    // 启动期完成路径证据: 卷扫描已经真的发起过块 I/O, 这行说明它们走的是哪条路径。
+    nvme_stats_print("nvme: after volume scan ");
 
     loop {
         let mut msg = Message {

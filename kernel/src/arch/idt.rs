@@ -6,6 +6,7 @@
 //!   - page fault (#PF, 向量 14)    : 内存管理核心异常
 //!   - timer (IRQ0, 向量 32)        : 时钟中断, 驱动抢占式调度
 //!   - keyboard (IRQ1, 向量 33)     : 键盘中断, 转发 scancode 给用户态驱动
+//!   - msi (向量 0x50..0x5F)        : MSI/MSI-X 向量段, 置待处理位 (阶段 4)
 
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -154,6 +155,52 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // 中断即 IPC: 把 scancode 作为消息 tag 转发给注册了 IRQ1 的驱动域。
     crate::irq::dispatch(1, scancode as u64);
     super::pic::send_eoi();
+}
+
+// ---------------------------------------------------------------------------
+// MSI/MSI-X 向量段 (阶段 4)
+// ---------------------------------------------------------------------------
+
+/// MSI/MSI-X 向量段的起始向量 (PIC 占 32..47, 伪中断占 0xFF, 故取 0x50)。
+pub const MSI_VECTOR_BASE: u8 = 0x50;
+/// 向量段长度 (与下面 `install_msi_vectors!` 的列表一一对应)。
+pub const MSI_VECTOR_COUNT: u8 = 16;
+
+/// 安装一个 MSI 向量处理器: 结束 LAPIC 中断 + 置该向量的待处理位。
+///
+/// MSI 中断不带数据 (设备只投一个向量号), 且与驱动收请求的邮箱共用同一个邮箱 ——
+/// 故这里不投 IPC, 只置位, 由驱动的 `SYS_IRQ_POLL` 主动取 (理由见 `irq.rs`)。
+/// 未注册的向量: 待处理位无人可读, 只需 EOI 就能继续收中断。
+macro_rules! install_msi_vector {
+    ($idt:expr, $vector:expr) => {{
+        extern "x86-interrupt" fn handler(_stack_frame: InterruptStackFrame) {
+            super::apic::eoi();
+            crate::irq::set_pending($vector);
+        }
+        $idt[$vector].set_handler_fn(handler);
+    }};
+}
+
+/// 安装整个 MSI 向量段 (0x50..=0x5F)。
+macro_rules! install_msi_vectors {
+    ($idt:expr) => {
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 0);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 1);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 2);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 3);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 4);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 5);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 6);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 7);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 8);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 9);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 10);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 11);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 12);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 13);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 14);
+        install_msi_vector!($idt, MSI_VECTOR_BASE + 15);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +364,9 @@ pub fn init() {
         // 硬件中断 (PIC 重映射后: 时钟 → 32, 键盘 → 33)
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
+
+        // MSI/MSI-X 向量段 (0x50..=0x5F): 设备经 LAPIC 直接投递向量 (见 arch/apic.rs)。
+        install_msi_vectors!(idt);
         idt
     });
     idt.load();

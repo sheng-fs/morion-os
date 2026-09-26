@@ -2,6 +2,7 @@
 //!
 //! 扫描 bus 0..=255 / device 0..=31 / function 0..=7, 枚举所有存在的
 //! PCI(e) 设备; 用于后续定位 NVMe 控制器 (class 01:08:02) 并读取其 BAR0。
+//! 另含能力链表遍历与 MSI-X 的定位/使能 (阶段 4: MSI/MSI-X 中断)。
 
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
@@ -10,6 +11,19 @@ use x86_64::instructions::port::Port;
 const CONFIG_ADDR: u16 = 0xCF8;
 /// 配置数据端口 (读写所选 32 位)。
 const CONFIG_DATA: u16 = 0xCFC;
+
+/// 配置空间寄存器偏移: 命令寄存器 (16 位)。
+const REG_COMMAND: u8 = 0x04;
+/// 状态寄存器 (16 位); bit4 = 支持能力链表。
+const REG_STATUS: u8 = 0x06;
+/// 能力链表头指针 (8 位, bits 7:2)。
+const REG_CAP_PTR: u8 = 0x34;
+/// 命令寄存器 bit10: 禁用 INTx 中断。
+const CMD_INTX_DISABLE: u16 = 1 << 10;
+/// 状态寄存器 bit4: 能力链表存在。
+const STATUS_CAP_LIST: u16 = 1 << 4;
+/// 能力 ID: MSI-X。
+const CAP_ID_MSIX: u8 = 0x11;
 
 /// 枚举到的一台 PCI 设备。
 #[derive(Clone, Copy, Debug)]
@@ -121,4 +135,103 @@ pub fn read_bar0(bus: u8, dev: u8, func: u8) -> Option<u64> {
     } else {
         Some((low & 0xFFFF_FFF0) as u64)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 配置空间读写 (含 8/16 位) 与能力链表
+// ---------------------------------------------------------------------------
+
+/// 读配置空间 16 位 (按 dword 读取后取对应半字)。
+pub fn config_read_word(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+    let dword = config_read_dword(bus, dev, func, offset & !0x3);
+    ((dword >> (u32::from(offset & 0x2) * 8)) & 0xFFFF) as u16
+}
+
+/// 读配置空间 8 位。
+pub fn config_read_byte(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+    let dword = config_read_dword(bus, dev, func, offset & !0x3);
+    ((dword >> (u32::from(offset & 0x3) * 8)) & 0xFF) as u8
+}
+
+/// 写配置空间 32 位 (type 1 访问)。
+pub fn config_write_dword(bus: u8, dev: u8, func: u8, offset: u8, value: u32) {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset as u32) & 0xFC);
+    unsafe {
+        let mut addr_port: Port<u32> = Port::new(CONFIG_ADDR);
+        let mut data_port: Port<u32> = Port::new(CONFIG_DATA);
+        addr_port.write(addr);
+        data_port.write(value);
+    }
+}
+
+/// 读-改-写一个 16 位配置寄存器 (`set` 位置 1, `clear` 位置 0), 返回改写前的值。
+fn config_update_word(bus: u8, dev: u8, func: u8, offset: u8, clear: u16, set: u16) -> u16 {
+    let dword_off = offset & !0x3;
+    let dword = config_read_dword(bus, dev, func, dword_off);
+    let shift = u32::from(offset & 0x2) * 8;
+    let cur = ((dword >> shift) & 0xFFFF) as u16;
+    let new = (cur & !clear) | set;
+    let merged = (dword & !(0xFFFFu32 << shift)) | ((new as u32) << shift);
+    config_write_dword(bus, dev, func, dword_off, merged);
+    cur
+}
+
+/// MSI-X 能力 (capability id 0x11) 的关键字段。
+#[derive(Clone, Copy, Debug)]
+pub struct MsixCap {
+    /// 能力结构在配置空间中的偏移 (使能位就在 `cap_ptr + 2`)。
+    pub cap_ptr: u8,
+    /// MSI-X 表相对其所属 BAR 的字节偏移 (低 3 位是 BIR)。
+    pub table_offset: u32,
+    /// MSI-X 表所在 BAR 的编号 (BIR)。
+    pub table_bir: u8,
+    /// 表项数 (消息控制寄存器 bits 10:0 加 1)。
+    pub table_size: u16,
+}
+
+/// 遍历能力链表, 返回第一个 MSI-X 能力。
+pub fn find_msix(bus: u8, dev: u8, func: u8) -> Option<MsixCap> {
+    if config_read_word(bus, dev, func, REG_STATUS) & STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    let mut ptr = config_read_byte(bus, dev, func, REG_CAP_PTR) & 0xFC;
+    // 链表节点数有限 (PCI 规范给的上限是 48), 循环上限同时挡住固件给出的环。
+    for _ in 0..48 {
+        // 能力结构的偏移必须 >= 0x40 (0x00..0x3F 是标准头)。
+        if ptr < 0x40 {
+            return None;
+        }
+        if config_read_byte(bus, dev, func, ptr) == CAP_ID_MSIX {
+            let ctrl = config_read_word(bus, dev, func, ptr + 2);
+            let table = config_read_dword(bus, dev, func, ptr + 4);
+            return Some(MsixCap {
+                cap_ptr: ptr,
+                table_offset: table & !0x7,
+                table_bir: (table & 0x7) as u8,
+                table_size: (ctrl & 0x7FF) + 1,
+            });
+        }
+        let next = config_read_byte(bus, dev, func, ptr + 1) & 0xFC;
+        if next == 0 {
+            return None;
+        }
+        ptr = next;
+    }
+    None
+}
+
+/// 置命令寄存器的 INTx 禁用位 (启用 MSI/MSI-X 前的标准动作: 避免两者同时触发)。
+pub fn disable_intx(bus: u8, dev: u8, func: u8) {
+    config_update_word(bus, dev, func, REG_COMMAND, 0, CMD_INTX_DISABLE);
+}
+
+/// 打开 MSI-X: 置消息控制寄存器 bit15 (Enable) 并清 bit14 (Function Mask)。
+///
+/// 调用顺序要求: 先关 INTx、先把表项写好, 再调本函数 —— 置位后设备随时可能投递中断。
+pub fn enable_msix(bus: u8, dev: u8, func: u8, cap_ptr: u8) {
+    config_update_word(bus, dev, func, cap_ptr + 2, 0x4000, 0x8000);
 }

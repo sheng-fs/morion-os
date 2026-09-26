@@ -138,13 +138,15 @@ ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态
 
 | 编号 | 封装 | 参数 | 返回 | 前置能力 | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| 14 | `sys_register_irq(irq)` | `rdi=irq` | 1/0 | `Irq(irq)` | 注册本域接收 `irq`（用户态设备驱动） |
+| 14 | `sys_register_irq(irq)` | `rdi=irq` | 1/0 | `Irq(irq)` | 注册本域接收 `irq`（用户态设备驱动）。`irq < 16` = PIC 的中断号（数据经 IPC 投递，如键盘 scancode）；`irq >= 32` = MSI/MSI-X 向量（只置待处理位，用 `sys_irq_poll` 取） |
 | 21 | `sys_map_mmio(bar, vaddr)` | `rdi=bar, rsi=vaddr` | 1/0 | `Mmio(bar)` | 把物理 MMIO 页（`bar`，页对齐）映射到本域 `vaddr`（非缓存） |
 | 29 | `sys_cap_issue(obj)` | `rdi=obj` | 句柄索引 | — | 「能力即句柄」：为不透明对象 `obj` 签发句柄，槽满返回 `u64::MAX` |
 | 30 | `sys_cap_lookup(handle)` | `rdi=handle` | 对象标识 | — | 校验句柄是否仍有效，被撤销 / 非法返回 `u64::MAX` |
 | 31 | `sys_cap_drop(handle)` | `rdi=handle` | 1/0 | — | 撤销句柄（关闭打开对象时调用） |
 | 32 | `sys_handle_send(to, handle)` | `rdi=to, rsi=handle` | 新句柄索引 | `SendTo(to)` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 指向的对象**移入** `to` 域，返回 `to` 域里的新句柄；失败返回 `u64::MAX` |
 | 33 | `sys_cap_send(to, kind, arg)` | `rdi=to, rsi=kind, rdx=arg` | 1/0 | `SendTo(to)` + 被委派的那项能力 | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力复制给 `to` 域；`kind` 取 `CAP_KIND_*` |
+| 34 | `sys_irq_poll(vector)` | `rdi=vector` | 1/0 | `Irq(vector)` | 非阻塞取走 MSI/MSI-X `vector` 的「待处理」标志（1 = 期间到达过中断）。MSI 中断不投 IPC，故驱动用它等完成中断；等待循环里每轮还须读一次设备 MMIO（如 CSTS）强制 VM exit，否则宿主设备模型的主循环停摆、中断迟迟不来 |
+| 35 | `sys_msix_enable()` | — | 1/0 | 该控制器的驱动域 | 打开 NVMe 的 MSI-X（**须先写好 MSI-X 表项**）；只成功一次，PCI 配置空间写留在内核 |
 
 **能力随 IPC 传递的两条路径**（[kernel/src/cap.rs](../kernel/src/cap.rs)）：
 

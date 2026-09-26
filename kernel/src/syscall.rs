@@ -54,6 +54,10 @@ pub const SYS_CAP_DROP: u64 = 31;
 pub const SYS_HANDLE_SEND: u64 = 32;
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 (不允许放大)。
 pub const SYS_CAP_SEND: u64 = 33;
+/// 非阻塞读取 MSI/MSI-X 向量的「待处理」标志 (中断驱动 I/O 的等待原语, 阶段 4)。
+pub const SYS_IRQ_POLL: u64 = 34;
+/// 打开 NVMe 控制器的 MSI-X (驱动写好表项后调用; PCI 配置空间写留在内核, 阶段 4)。
+pub const SYS_MSIX_ENABLE: u64 = 35;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -282,11 +286,45 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_REGISTER_IRQ => {
-            // 注册当前域接收 `a1` (IRQ), 需持有 `Capability::Irq(irq)`。
+            // 注册当前域接收 `a1`, 需持有 `Capability::Irq(a1)`。
+            //   a1 < 16  → PIC 的 IRQ, 中断数据经 IPC 投递 (见 irq::dispatch);
+            //   a1 >= 32 → MSI/MSI-X 向量, 中断只置待处理位 (见 irq::set_pending)。
+            // 16..31 是 CPU 异常向量, 不允许注册。
             let domain = crate::scheduler::current_domain();
             let irq = a1 as u8;
-            if crate::cap::has(domain, crate::cap::Capability::Irq(irq)) {
+            if !crate::cap::has(domain, crate::cap::Capability::Irq(irq)) {
+                return 0;
+            }
+            if irq < 16 {
                 crate::irq::register(irq, domain);
+                1
+            } else if irq >= 32 {
+                crate::irq::register_vector(irq, domain);
+                1
+            } else {
+                0
+            }
+        }
+        SYS_IRQ_POLL => {
+            // 非阻塞取走 `a1` (MSI/MSI-X 向量) 的待处理标志; 有中断到达返回 1。
+            // 需持有 `Capability::Irq(vector)`, 且必须正是该向量的注册者。
+            if a1 > u8::MAX as u64 {
+                return 0;
+            }
+            let domain = crate::scheduler::current_domain();
+            let vector = a1 as u8;
+            if crate::cap::has(domain, crate::cap::Capability::Irq(vector))
+                && crate::irq::take_pending(vector, domain)
+            {
+                1
+            } else {
+                0
+            }
+        }
+        SYS_MSIX_ENABLE => {
+            // 打开 NVMe 控制器的 MSI-X (驱动已写好表项)。只有该控制器的驱动域能调用,
+            // 且只能成功一次; 配置空间写因此不会被下放到驱动域。
+            if crate::nvme::enable_msix() {
                 1
             } else {
                 0

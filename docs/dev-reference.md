@@ -132,6 +132,8 @@ UEFI 固件
 | 31 | `SYS_CAP_DROP` | `rdi=handle` | 撤销句柄（关闭打开对象时调用），返回 1/0 |
 | 32 | `SYS_HANDLE_SEND` | `rdi=to, rsi=handle` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 槽里的不透明对象**移入** `to` 域，返回 `to` 域里的新句柄索引；**移动语义**（成功后本域该句柄立即失效）。需 `Capability::SendTo(to)`；源槽空 / 目标槽满返回 `u64::MAX` 且不改变任何状态 |
 | 33 | `SYS_CAP_SEND` | `rdi=to, rsi=kind, rdx=arg` | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力**复制**给 `to` 域，返回 1/0。需 `Capability::SendTo(to)`，且**不允许放大**（自己没持有的能力给不出去）；`to` 已持有该项时幂等成功、不占新槽。`kind` 取 `cap::CAP_KIND_*`：`0=SendTo / 1=MapInto / 2=Irq / 3=Mmio`，`arg` 为该能力的参数（目标域 id / IRQ 号 / 页对齐 MMIO 基址） |
+| 34 | `SYS_IRQ_POLL` | `rdi=vector` | 非阻塞取走 MSI/MSI-X `vector` 的「待处理」标志，有中断到达返回 1；需 `Capability::Irq(vector)` 且必须是该向量的注册者。中断不投 IPC（见「IRQ 转发」），驱动用它等完成中断（每轮仍须读一次 CSTS 强制 VM exit —— `syscall` 在 KVM 里不产生 exit，纯自旋会让宿主主循环停摆） |
+| 35 | `SYS_MSIX_ENABLE` | — | 打开 NVMe 控制器的 MSI-X（置 Enable、清 Function Mask）；只有该控制器的驱动域能调用且只成功一次，**PCI 配置空间写因此留在内核**。返回 1/0 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -248,11 +250,22 @@ UEFI 固件
 
 ### IRQ 转发（[kernel/src/irq.rs](../../kernel/src/irq.rs)）
 
-- `register(irq: u8, domain: u64)`（登记某域为 `irq` 的驱动域；调用者须先通过 `SYS_REGISTER_IRQ` 校验 `Capability::Irq(irq)`）
+- `register(irq: u8, domain: u64)`（登记某域为 PIC `irq` 的驱动域；调用者须先通过 `SYS_REGISTER_IRQ` 校验 `Capability::Irq(irq)`）
 - `dispatch(irq: u8, data: u64)`（把中断数据作为 IPC 消息 tag 转发给注册域；从 IRQ 处理器 IF=0 调用，非阻塞、不改变中断位）
-- 最多支持 16 个 IRQ（PIC master 8 + slave 8）；`HANDLERS` 为 `[Option<u64>; 16]`。
+- 最多支持 16 个 PIC IRQ（master 8 + slave 8）；`HANDLERS` 为 `[Option<u64>; 16]`。
+- **MSI/MSI-X 向量**（阶段 39）走另一条路：`register_vector(vector, domain)` / `set_pending(vector)` / `take_pending(vector, domain)`。
+  - 向量处理器只置一个「待处理位」，**不投 IPC**：那个邮箱同时也是驱动收请求的邮箱，拉取即消费，还会改写内核记录的回复目标，`reply` 会投错域。驱动改用 `SYS_IRQ_POLL` 主动取位。
+  - `VECTORS`/`PENDING` 均为 `[…; 256]`，以向量号为下标；`take_pending` 同时校验注册者，别的域读不到别人的中断。
 
 「中断即 IPC」模型：硬件 IRQ 处理器读设备数据（如键盘 scancode）→ `irq::dispatch` 投递到驱动域邮箱 → 驱动域循环 `SYS_RECV` 接收并处理，再 `send_eoi`。
+
+### LAPIC 最小支撑（[kernel/src/arch/apic.rs](../../kernel/src/arch/apic.rs)）
+
+MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一条消息**（`0xFEE0_0000 | (apic_id << 12)`，数据里带向量），没有 LAPIC 就永远收不到。`apic::init()` 只做必需的最小集：
+
+- `IA32_APIC_BASE`(MSR `0x1B`)：取基址并确保 bit11（EN）置位；`SVR`(base+0xF0) 置软使能 + 伪中断向量 `0xFF`；`TPR`(base+0x80) 置 0。
+- `LVT0`(base+0x350) 必须是「投递模式 ExtINT + 不屏蔽」：LAPIC 一旦使能，8259A 的 PIC 中断改由 LINT0 以 ExtINT 透传，KVM 正是据此判断「PIC 中断还要不要投」（`kvm_apic_accept_pic_intr`），LVT0 被屏蔽则时钟/键盘立刻失效。故只在它不满足时改写，从不覆盖固件已设好的值。
+- `eoi()`：MSI 向量处理器结束时写 `base+0xB0`；ExtINT 透传来的中断不经 LAPIC 的 ISR，仍由 `pic::send_eoi()` 收尾。
 
 ### 文件服务与挂载层（用户态）
 
@@ -277,10 +290,12 @@ UEFI 固件
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
 - `gdt::init()` / `gdt::set_rsp0(stack_top: u64)`
-- `idt::init()`
+- `idt::init()`（异常 0..31 + PIC 时钟 32 / 键盘 33 + **MSI 向量段 0x50..0x5F**）
 - `pic::init()` / `pic::send_eoi()`
 - `pit::init()`（100 Hz 定时器）
 - `keyboard::read_scancode()`
+- `apic::init() -> Option<u32>` / `apic::msi_address() -> u32` / `apic::eoi()`（LAPIC 最小支撑，见下）
+- `pci::enumerate()` / `pci::find_nvme()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
 
 ## 7. 构建 / 测试命令（Makefile）
 
@@ -357,3 +372,4 @@ UEFI 固件
 | 36 | MFS 只改标记换主卷（**S2 补齐**）：新 tag `MFS_SETPRIMARY_TAG`（`vfs::mfs_set_primary(vol)`）+ `mfs_set_primary_volume` —— **不动数据**地给一块已有 MFS 卷换主卷（`mkfs.mfs` 会擦除）；`mfs_sb_probe` 拆出以区分「不是 MFS」与「是 MFS 但序号 0」，**无格式化兜底**、非 MFS/不存在卷号一律拒；与 mkfs 共用 `mfs_next_primary_serial`；shell 加 `mfs.primary <卷号>`（含 `help`）；新增 FS-25 | ✅ |
 | 37 | IDE PIO 容量探测（**M7 遗留收口**）：IDE 回退路径的整盘卷不再恒报 `sectors = 0` —— 新增 `ide_identify`/`ide_capacity_sectors`，用 **ATA IDENTIFY DEVICE**（`0xEC`）现问容量（优先 LBA48 word 100-103，需 word 83 bit10 支持位；否则 LBA28 word 60-61），**夹在 28 位 LBA 上限**（`0x0FFF_FFFF` 扇区 = 128 GiB）内；`BLOCK_OP_LIST_VOLUMES` 改从卷表取真实值；问不出（无盘 / ABRT / 超时）才是容量未知。实测 1024 MiB 盘 → `sectors=2097152` | ✅ |
 | 38 | **block_srv 写分区表（S2 卷管理收口）**：opcode `3..7` = 建/删/清空/重读分区表 + 裸读一扇区，一律**按 nsid 寻址**（新增 `PartReq`，与 `BlockReq` 同尺寸）；表风格按盘自适应（空白盘默认 **GPT**，可 `mbr` 强制且仅限空白盘）；GPT 写全「保护性 MBR + 主头/主项数组 + 备份项数组/备份头」并把头与项数组 CRC32 算对（项数组 16 KiB 按页流式处理）；起点 1 MiB 对齐、GUID 确定性派生；**只动表不动数据**，删到最后一个就整表清空；改动后立即重扫重建卷表。shell 加 `part.create/del/wipe/reload`（shell → block_srv `SendTo`）；新增 `build/pt.img`（nsid 7，64 MiB）+ **FS-26**（含宿主 `sgdisk -v` 跨实现校验） | ✅ |
+| 39 | **NVMe 中断化（MSI/MSI-X）**：内核新增 LAPIC 最小支撑（`arch/apic.rs`：`IA32_APIC_BASE`/`SVR`/`TPR`/`LVT0`-ExtINT 透传/`EOI`）、PCI 能力链表遍历与 MSI-X 定位（`pci::find_msix`/`disable_intx`/`enable_msix`）、MSI 向量段 `0x50..0x5F` 的 IDT 处理器（`eoi` + 置待处理位）、向量注册与 `SYS_IRQ_POLL`/`SYS_MSIX_ENABLE`；分工 = 内核管中断配置（LAPIC + PCI 配置空间 + 向量段），驱动写 MSI-X 表（该 BAR 由固件分配在 4 GiB 以上，内核到不了，且本就非缓存映射给驱动）。`nvme::setup` 在内核侧准备向量 + 授权 `Irq`，驱动写表项 0 → 请内核开 MSI-X → 注册向量 → `submit_wait` 改「先等中断再查 CQE」（`create_iocq` 补 **IEN=1**，否则 I/O CQ 根本不投中断），等不到则**粘性回退轮询**；启动打 `MSI-X prepared/enabled` 与 `after volume scan cmds=/irq_cmds=/poll_cmds=/irqs=` 两路证据，运行期每 4096 条命令再打一行 | ✅ |
