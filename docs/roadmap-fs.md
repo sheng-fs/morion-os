@@ -1240,6 +1240,7 @@ vector=0x50 …`；驱动打 `MSI-X table[0] programmed` 与内核的 `MSI-X ena
 **S3 未覆盖**：
 
 - 只有 **1 个中断向量**（所有队列共用一个）：够用但没做「每队列独立向量 / 多向量分发」。
+  **→ 已由 S5 补上**（admin + 2 个 I/O CQ 各用独立向量，见下）。
 - LAPIC 只做 MSI 所需的最小集：没有 APIC 定时器、没有 I/O APIC、MSI（非 MSI-X）能力未用、
   没有 `SYS_MSIX_ENABLE` 之外的 PCI 配置空间接口。
 - 中断只当「完成通知」，不做完成批量收割（一次中断收一条 CQE）。
@@ -1263,8 +1264,11 @@ vector=0x50 …`；驱动打 `MSI-X table[0] programmed` 与内核的 `MSI-X ena
   复用现成的「按等待键唤醒」机制，不必给调度器再加一套 wakeup 通道；键不重叠这一点很关键 ——
   用真实域 id 当键的话，别的域给该域发消息会**误唤醒**等中断的驱动。
   锁序：`set_pending` 只在各自语句里短持 `VECTORS`/`PENDING`，释放后才进调度器。
+  > **（后续更正 · S5）**「按向量取键」只能表达「等一个向量」，`irq_wait_token` 在 S5 被改为
+  > **按域取键** + 掩码登记（`irq_wait_token(domain) = u64::MAX - 0x300 - domain`），以支持 `wait_any`。
 - **新 syscall `SYS_IRQ_WAIT(36)`**：`rdi=vector, rsi=timeout_ms` → 1/0。先查待处理位（命中即返回 1），
   未命中则 `block_current_timeout_ms(irq_wait_token(vector), ms)`，醒来再查一次位。
+  > **（后续更正 · S5）**入参已改为**掩码**，返回**命中的向量号**（不再返回 1/0）。
   不丢唤醒：syscall 入口的 SFMASK 已清 IF，「查标志 → 阻塞」之间插不进中断处理。
 - **空闲任务 `hlt(); yield_now();`**：`hlt` 把 CPU 交还宿主（KVM 里 vCPU 退出客户机，宿主设备模型
   才有机会 post 完成并投中断），返回后立刻让出，使**刚被唤醒的域马上接手**而不必再等一个时钟 tick。
@@ -1297,9 +1301,62 @@ vector=0x50 …`；驱动打 `MSI-X table[0] programmed` 与内核的 `MSI-X ena
 
 - 只有「一个向量配一个等待者」的直连唤醒：没做多等待者/WaitQueue，也没有 `SYS_IRQ_WAIT` 的
   「同时等多个向量」（真实驱动常要 `wait_any`）。
+  **→ `wait_any` 已由 S5 补上**（掩码语义）；「多等待者 / WaitQueue」仍未做。
 - 超时粒度是时钟 tick（10 ms），没有更细的 hrtimer，「160 ms 看门狗」因此只能以 tick 为单位调。
 - 中断唤醒**不做抢占**：唤醒只把域置回 `Ready`，靠空闲任务 `hlt` 后的 `yield_now` 或时钟 tick 让出 —— 
   若唤醒时跑的是另一个**忙**的用户域，仍可能等到一个 tick 才切换（本轮采用「不改调度器抢占路径」的保守做法）。
+
+### S5 多向量 + `wait_any` 已完成 ✅
+
+**目标**：S4 的等待原语只做到「一个向量配一个等待者」，而真实驱动常要 `wait_any`（同时等多条
+完成队列，谁先来先处理谁）；NVMe 多队列本也应当**每条队列一个独立向量**，而不是所有队列抢一个。
+
+**实现要点**：
+
+- **等待键按「域」而非按「向量」**：`scheduler::irq_wait_token(domain) = u64::MAX - 0x300 - domain`
+  （落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`，与真实域 id、`INPUT_WAIT` 都不重叠）。理由：
+  一个域同时只可能有一个任务在等中断，掩码等待天然属于「域」；按向量取键就没法表达「等一组」。
+- **内核侧掩码登记**：`irq` 新增 `ANY_MASK: [u64; ANY_MAX_DOMAINS]`（64 项，按域存「正在等的向量
+  掩码」）与 `set_any_mask` / `clear_any_mask` / `take_pending_any(mask, domain) -> Option<u8>`。
+  `take_pending_any` **只取掩码里且由自己注册**的那个待处理位，返回**命中的向量号**；`set_pending`
+  置位后算出「掩码含该向量」的域，**放锁后再**逐个 `wake_one(irq_wait_token(domain))`。
+- **syscall 34/36 改掩码语义**：`rdi` 从「向量号」改为**掩码**（位 `i` ↔ 向量
+  `idt::MSI_VECTOR_BASE + i`），返回**命中的向量号**（0 = 无 / 超时 / 非法）。掩码里**每个位**
+  都须持有 `Capability::Irq` 且是该向量的注册者，一个不满足即整体非法（不能拿别人的向量凑掩码）。
+- **NVMe 多队列 + 多向量**：`NVME_MSIX_VECTORS = 3`（`const` 断言 ≤ `MSI_VECTOR_COUNT`）、
+  `NVME_DMA_PAGES = 5 → 7`（多条 I/O 队列各一套 SQ/CQ），建 **admin（qid 0）+ 2 条 I/O 队列
+  （qid 1/2）**，每条完成队列**用自己下标的向量**（0x50/0x51/0x52）。驱动在三个顶层提交点
+  （卷扫描的每个 namespace、主读写循环的每段、分区表操作整段）用 `io_select_queue` **轮转选队列**，
+  I/O 完成等 `((1 << IO_QUEUES) - 1) << 1` 掩码、admin 等位 0 的掩码。
+
+**踩到的坑（IV 必须等于完成队列下标）**：`Create I/O CQ` 的 `CDW11` 里 `IV` 是**向量下标** ——
+完成队列 `qid` 用向量下标 `qid`（CQ 0 = admin、CQ 1 / 2 = 两条 I/O CQ），于是它们各投 0x50/0x51/0x52。
+第一版把 `IV` 写成 `q - 1` 之类的「I/O 队列序号」（qid 1 → IV = 0），于是 qid 1 的 CQ 与 admin
+**抢向量 0**：I/O 完成投出来的是 0x50，而驱动在等掩码位 1/2（向量 0x51/0x52），**永远等不到** ——
+症状是跑 13 条 admin 命令（建队列前）后就打 `irq wait timed out, fallback to polling`，`vecs=0x1`。
+修正为 `sqe.cdw11 = 1 | (1 << 1) | (qid << 16);`（`IV = 完成队列下标`）后一次通过。
+
+**实测**（全量回归 `scripts/fs-regress.sh`，从零重置盘）：
+
+| 项 | 结果 |
+|---|---|
+| 总耗时 | **314 s**（与 S4 持平，远低于 600 s 门禁；中断路径没因多队列/多向量变慢） |
+| 自测结论 | `SELFTEST DONE` 1 次，`FAILED` / `PANIC` 0 次，宿主 `sgdisk -v` 无问题 |
+| 中断路径 | 全程 `poll_cmds=0`，`irqs=cmds`，零回退 |
+| 多向量证据 | `nvme: MSI-X prepared vectors=0x50..0x52`、3 条表项分别 program（data=0x50/0x51/0x52）、`nvme: irq-driven completions, vectors=0x50..0x52`、`nvme: stats … vecs=0x7 mode=irq`（**三条向量都真实投递过**，`0x7` = 位 0/1/2 全亮） |
+
+**S5 未覆盖**：
+
+- 仍是「**一个域一个等待者**」：`ANY_MASK` 按域存，同一域里两个任务同时等中断会互相覆盖。
+  真实内核要的是按等待者（任务）挂队的 WaitQueue —— 本轮没做。
+- 不做**完成批量收割**：一次中断仍只收一条 CQE，多队列只是把完成分散到不同向量，没有「一次醒来
+  收干净所有 CQ」的收益路径。
+- **没有真并发**：驱动仍是「提交一条 → 等一条 → 收一条」，多队列只是轮转复用，不改变请求模型
+  （没有多请求在飞）。「I/O 队列数固定 2」，未按控制器 `QPN` / `MAXQ` 协商。
+- 「登记掩码 → 阻塞」之间**没有丢唤醒窗口**，靠的是 syscall 入口 SFMASK 关中断把两步裹在同一个
+  临界区里；这是**隐式契约**，代码里没有断言守着 —— 若将来有人在 syscall 处理中途开中断，这个
+  正确性就悄悄没了。另：`set_any_mask` 对 `domain >= 64` 返回 false，`SYS_IRQ_WAIT` 会把它当
+  超时返回 0（当前只有 14 个域，不可达，但这不是显式校验而是尺寸上限的副产品）。
 
 ### 阶段 4 — 远期
 

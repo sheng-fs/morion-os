@@ -74,7 +74,7 @@ UEFI 固件
 | exFAT 缓冲 | `USER_BASE + 0x11_4000` 起 | 集群缓冲（按簇大小最多 64 页，`..+0x15_4000`）+ 位图窗口 `+0x15_4000` + upcase 窗口 `+0x15_5000` + 单页暂存 `+0x15_6000`（M6c 起集群缓冲动态分配） |
 | block_srv 私有页 | `USER_BASE + 0x16_0000` 起 | 卷扫描页 `+0x16_0000` + PRP 表页 `+0x16_1000`（M6c；均不共享给任何域） |
 | 用户栈 | `USER_BASE + 0x3F_9000 .. +0x40_1000` | **8 页（32 KiB），栈顶 `+0x40_1000` 向下增长**。单页不够：VFS 请求/回复在栈上构造 `Message`（96 B payload）并层层调用，app 在最早的几次 VFS 调用就会越过一页栈底，过去靠按需分页静默补页（不可靠） |
-| 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 NVMe 配置、+0x2_0000 MMIO、+0x3_0000 DMA（5 页） |
+| 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 NVMe 配置、+0x2_0000 MMIO、+0x3_0000 DMA（7 页：admin 的 ASQ/ACQ + 两条 I/O 队列的 SQ/CQ + data 页，**S5 起**每条 I/O 队列各一套；与内核 `nvme::NVME_DMA_PAGES` 同值） |
 | 按需分页测试地址 | `USER_BASE + 0x1_0000_0000` | sender 触发的缺页演示 |
 
 > ⚠️ 程序镜像是**全部域共用**的同一镜像，新增代码会使其变大。所有固定映射地址必须留在
@@ -132,9 +132,9 @@ UEFI 固件
 | 31 | `SYS_CAP_DROP` | `rdi=handle` | 撤销句柄（关闭打开对象时调用），返回 1/0 |
 | 32 | `SYS_HANDLE_SEND` | `rdi=to, rsi=handle` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 槽里的不透明对象**移入** `to` 域，返回 `to` 域里的新句柄索引；**移动语义**（成功后本域该句柄立即失效）。需 `Capability::SendTo(to)`；源槽空 / 目标槽满返回 `u64::MAX` 且不改变任何状态 |
 | 33 | `SYS_CAP_SEND` | `rdi=to, rsi=kind, rdx=arg` | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力**复制**给 `to` 域，返回 1/0。需 `Capability::SendTo(to)`，且**不允许放大**（自己没持有的能力给不出去）；`to` 已持有该项时幂等成功、不占新槽。`kind` 取 `cap::CAP_KIND_*`：`0=SendTo / 1=MapInto / 2=Irq / 3=Mmio`，`arg` 为该能力的参数（目标域 id / IRQ 号 / 页对齐 MMIO 基址） |
-| 34 | `SYS_IRQ_POLL` | `rdi=vector` | 非阻塞取走 MSI/MSI-X `vector` 的「待处理」标志，有中断到达返回 1；需 `Capability::Irq(vector)` 且必须是该向量的注册者。中断不投 IPC（见「IRQ 转发」），驱动用它走「中断已到」的快路径，未命中再 `SYS_IRQ_WAIT` 阻塞 |
+| 34 | `SYS_IRQ_POLL` | `rdi=mask` | 非阻塞取走**掩码 `mask` 覆盖的 MSI/MSI-X 向量**中任意一个的「待处理」标志，命中返回**该向量号**，无 / 非法返回 0。位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`；掩码里每个位都须满足 `Capability::Irq(vector)` 且是该向量的注册者，否则整体非法。中断不投 IPC（见「IRQ 转发」），驱动用它走「中断已到」的快路径，未命中再 `SYS_IRQ_WAIT` 阻塞 |
 | 35 | `SYS_MSIX_ENABLE` | — | 打开 NVMe 控制器的 MSI-X（置 Enable、清 Function Mask）；只有该控制器的驱动域能调用且只成功一次，**PCI 配置空间写因此留在内核**。返回 1/0 |
-| 36 | `SYS_IRQ_WAIT` | `rdi=vector, rsi=timeout_ms` | **阻塞等待**该向量的中断：期间到达过返回 1，超时返回 0（调用方据此回退轮询）。阻塞期间本域让出 CPU（不空转），由中断处理器唤醒；超时由 `tick()` 兜底。校验同 `SYS_IRQ_POLL`。syscall 入口已用 SFMASK 清 IF，故「查标志 → 阻塞」之间不会插进中断处理 |
+| 36 | `SYS_IRQ_WAIT` | `rdi=mask, rsi=timeout_ms` | **阻塞等待掩码里任意一条向量**的中断（`wait_any`）：命中返回该向量号，超时返回 0（调用方据此回退轮询）。阻塞期间本域让出 CPU（不空转），由中断处理器唤醒；超时由 `tick()` 兜底。校验同 `SYS_IRQ_POLL`。syscall 入口已用 SFMASK 清 IF，故「查标志 → 登记掩码 → 阻塞」之间不会插进中断处理，不丢唤醒 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -211,7 +211,7 @@ UEFI 固件
 - `set_current_reply_target(target: u64)` / `current_reply_target() -> u64`（`reply` 回复目标追踪；`u64::MAX` 表示无）
 - `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口）
 - `INPUT_WAIT`（伪域 id `u64::MAX-1`：表示等待控制台输入行；`SYS_READLINE` 用 `block_current(INPUT_WAIT)`，`video::term_put` 回车时 `wake_one(INPUT_WAIT)`）
-- `IRQ_WAIT_MARK` / `irq_wait_token(vector: u8)`（另一组伪等待键 `u64::MAX-0x100-vector`：`SYS_IRQ_WAIT` 以它阻塞、`irq::set_pending` 以它唤醒。与真实域 id、`INPUT_WAIT` 都不重叠，故中断唤醒不会误撞 IPC 的唤醒）
+- `IRQ_WAIT_MARK` / `irq_wait_token(domain: u64)`（伪等待键 `u64::MAX-0x300-domain`，落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`：`SYS_IRQ_WAIT` 以它阻塞、`irq::set_pending` 按掩码命中后以它唤醒。**按域取键**而非按向量 —— 一个域同时只可能有一个任务在等中断，掩码等待天然属于「域」；与真实域 id、`INPUT_WAIT` 都不重叠，故中断唤醒不会误撞 IPC 的唤醒）
 - **空闲任务** `task_idle`（[kernel/src/main.rs](../../kernel/src/main.rs)）循环 `hlt(); yield_now();` —— `hlt` 交出 CPU（KVM 里 vCPU 因此退出客户机，宿主设备模型才有机会 post 完成并投中断），返回后立即让出，使**刚被中断唤醒的域马上接手**而不必再等一个时钟 tick。
 
 任务表常量：`MAX_TASKS = 16`，内核栈 `STACK_SIZE = 4096 * 8`（32 KiB）。
@@ -257,10 +257,10 @@ UEFI 固件
 - `register(irq: u8, domain: u64)`（登记某域为 PIC `irq` 的驱动域；调用者须先通过 `SYS_REGISTER_IRQ` 校验 `Capability::Irq(irq)`）
 - `dispatch(irq: u8, data: u64)`（把中断数据作为 IPC 消息 tag 转发给注册域；从 IRQ 处理器 IF=0 调用，非阻塞、不改变中断位）
 - 最多支持 16 个 PIC IRQ（master 8 + slave 8）；`HANDLERS` 为 `[Option<u64>; 16]`。
-- **MSI/MSI-X 向量**（阶段 39/40）走另一条路：`register_vector(vector, domain)` / `is_registered_by(vector, domain)` / `set_pending(vector)` / `take_pending(vector, domain)`。
-  - 向量处理器置一个「待处理位」并**唤醒**阻塞在该向量上的域，**不投 IPC**：那个邮箱同时也是驱动收请求的邮箱，拉取即消费，还会改写内核记录的回复目标，`reply` 会投错域。驱动改用 `SYS_IRQ_POLL` 取位 / `SYS_IRQ_WAIT` 阻塞等。
-  - `VECTORS`/`PENDING` 均为 `[…; 256]`，以向量号为下标；`take_pending` 同时校验注册者，别的域读不到别人的中断。
-  - `set_pending` 取用 IRQ 自己的锁后**立即释放**、再进 `scheduler::wake_one`（先 `VECTORS`、再 `PENDING`，最后调度器）：调度器的锁在关中断下被多处持有，不能与 IRQ 的锁形成嵌套。
+- **MSI/MSI-X 向量**（阶段 39/40/41）走另一条路：`register_vector(vector, domain)` / `is_registered_by(vector, domain)` / `set_pending(vector)` / `set_any_mask(domain, mask)` / `clear_any_mask(domain)` / `take_pending_any(mask, domain) -> Option<u8>`。
+  - 向量处理器置一个「待处理位」并**唤醒**等在**掩码**上的域，**不投 IPC**：那个邮箱同时也是驱动收请求的邮箱，拉取即消费，还会改写内核记录的回复目标，`reply` 会投错域。驱动改用 `SYS_IRQ_POLL` 取位 / `SYS_IRQ_WAIT` 阻塞等。
+  - `VECTORS`/`PENDING` 均为 `[…; 256]`，以向量号为下标；`take_pending_any` 遍历掩码里的位、**只取自己注册的那个**并同时校验注册者，别的域读不到别人的中断。`ANY_MASK` 是 `[u64; ANY_MAX_DOMAINS]`（`ANY_MAX_DOMAINS = 64`），按**域**存「正在等的向量掩码」—— 一个域同时只有一个等待者，故域即等待身份。
+  - `set_pending` 置位后在短持 `ANY_MASK` 内算出「掩码含该向量」的域，**放锁后再**逐个 `wake_one(irq_wait_token(domain))`（先 `VECTORS`、再 `PENDING`、再 `ANY_MASK`、最后调度器）：调度器的锁在关中断下被多处持有，不能与 IRQ 的锁形成嵌套。
 
 「中断即 IPC」模型：硬件 IRQ 处理器读设备数据（如键盘 scancode）→ `irq::dispatch` 投递到驱动域邮箱 → 驱动域循环 `SYS_RECV` 接收并处理，再 `send_eoi`。
 
@@ -378,4 +378,5 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 37 | IDE PIO 容量探测（**M7 遗留收口**）：IDE 回退路径的整盘卷不再恒报 `sectors = 0` —— 新增 `ide_identify`/`ide_capacity_sectors`，用 **ATA IDENTIFY DEVICE**（`0xEC`）现问容量（优先 LBA48 word 100-103，需 word 83 bit10 支持位；否则 LBA28 word 60-61），**夹在 28 位 LBA 上限**（`0x0FFF_FFFF` 扇区 = 128 GiB）内；`BLOCK_OP_LIST_VOLUMES` 改从卷表取真实值；问不出（无盘 / ABRT / 超时）才是容量未知。实测 1024 MiB 盘 → `sectors=2097152` | ✅ |
 | 38 | **block_srv 写分区表（S2 卷管理收口）**：opcode `3..7` = 建/删/清空/重读分区表 + 裸读一扇区，一律**按 nsid 寻址**（新增 `PartReq`，与 `BlockReq` 同尺寸）；表风格按盘自适应（空白盘默认 **GPT**，可 `mbr` 强制且仅限空白盘）；GPT 写全「保护性 MBR + 主头/主项数组 + 备份项数组/备份头」并把头与项数组 CRC32 算对（项数组 16 KiB 按页流式处理）；起点 1 MiB 对齐、GUID 确定性派生；**只动表不动数据**，删到最后一个就整表清空；改动后立即重扫重建卷表。shell 加 `part.create/del/wipe/reload`（shell → block_srv `SendTo`）；新增 `build/pt.img`（nsid 7，64 MiB）+ **FS-26**（含宿主 `sgdisk -v` 跨实现校验） | ✅ |
 | 39 | **NVMe 中断化（MSI/MSI-X）**：内核新增 LAPIC 最小支撑（`arch/apic.rs`：`IA32_APIC_BASE`/`SVR`/`TPR`/`LVT0`-ExtINT 透传/`EOI`）、PCI 能力链表遍历与 MSI-X 定位（`pci::find_msix`/`disable_intx`/`enable_msix`）、MSI 向量段 `0x50..0x5F` 的 IDT 处理器（`eoi` + 置待处理位）、向量注册与 `SYS_IRQ_POLL`/`SYS_MSIX_ENABLE`；分工 = 内核管中断配置（LAPIC + PCI 配置空间 + 向量段），驱动写 MSI-X 表（该 BAR 由固件分配在 4 GiB 以上，内核到不了，且本就非缓存映射给驱动）。`nvme::setup` 在内核侧准备向量 + 授权 `Irq`，驱动写表项 0 → 请内核开 MSI-X → 注册向量 → `submit_wait` 改「先等中断再查 CQE」（`create_iocq` 补 **IEN=1**，否则 I/O CQ 根本不投中断），等不到则**粘性回退轮询**；启动打 `MSI-X prepared/enabled` 与 `after volume scan cmds=/irq_cmds=/poll_cmds=/irqs=` 两路证据，运行期每 4096 条命令再打一行 | ✅ |
-| 40 | **阻塞等中断（等待原语）**：调度器加带超时阻塞（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒 `Sleeping` 与带超时 `Blocked` 两态）与伪等待键 `irq_wait_token(vector)`；`irq::set_pending` 置位后 `wake_one` 唤醒等待该向量的域（取完锁再进调度器，不形成锁嵌套）；新 syscall `SYS_IRQ_WAIT(36)`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，让被中断唤醒的域立刻接手而不必等一个时钟 tick。驱动 `submit_wait` 的中断路径改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**彻底去掉前一轮的每轮踢宿主自旋**，等不到中断仍是轮数 × 超时的看门狗后粘性回退。实测：中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 **314 s**（旧「每轮踢」实现 342 s，同轮轮询对照 174 s —— 这套 QEMU/KVM 下中断等待每条命令仍多约半个 tick） | ✅ |
+| 40 | **阻塞等中断（等待原语）**：调度器加带超时阻塞（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒 `Sleeping` 与带超时 `Blocked` 两态）与伪等待键 `irq_wait_token`（当时按向量取键，**S5 起改为按域取键**，见第 41 行）；`irq::set_pending` 置位后 `wake_one` 唤醒等待该向量的域（取完锁再进调度器，不形成锁嵌套）；新 syscall `SYS_IRQ_WAIT(36)`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，让被中断唤醒的域立刻接手而不必等一个时钟 tick。驱动 `submit_wait` 的中断路径改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**彻底去掉前一轮的每轮踢宿主自旋**，等不到中断仍是轮数 × 超时的看门狗后粘性回退。实测：中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 **314 s**（旧「每轮踢」实现 342 s，同轮轮询对照 174 s —— 这套 QEMU/KVM 下中断等待每条命令仍多约半个 tick） | ✅ |
+| 41 | **多向量 + `wait_any`（中断/等待原语做深）**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— 调度器 `irq_wait_token(domain) = u64::MAX-0x300-domain`（落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`，与真实域 id / `INPUT_WAIT` 不重叠），`irq` 侧加 `ANY_MASK: [u64; 64]` 记「每个域正在等的向量掩码」。`SYS_IRQ_POLL(34)` / `SYS_IRQ_WAIT(36)` 的入参 `rdi` 从「向量号」改为**掩码**（位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`），返回**命中的向量号**（0 = 无 / 超时 / 非法）；掩码里每个位都须持有 `Capability::Irq` 且是该向量的注册者，一个不满足即整体非法。`take_pending_any(mask, domain)` 只取自己注册的位，`set_pending` 置位后算出「掩码含该向量」的域、放锁后逐个 `wake_one(irq_wait_token(domain))`。NVMe 侧：`NVME_MSIX_VECTORS = 3`、`NVME_DMA_PAGES = 5 → 7`，建 **admin + 2 条 I/O 队列**，每条 CQ 用**自己的**向量（0x50/0x51/0x52），驱动按段**轮转选队列**、I/O 完成等 `1<<IO_QUEUES` 掩码（`wait_any`）。⚠️ 踩到的坑:`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**（admin CQ 恒 0），写成「队列序号」会让 qid 1 与 admin 抢向量 0 —— 症状是 I/O 完成投的是 0x50 而驱动在等掩码位 1/2，永远等不到、13 条命令后即回退轮询（`vecs=0x1`）。实测三条向量都真实投递：`after volume scan cmds=29 irq_cmds=29 poll_cmds=0 irqs=29 vecs=0x7 mode=irq`、运行期 `cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq` | ✅ |

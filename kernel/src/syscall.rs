@@ -54,11 +54,13 @@ pub const SYS_CAP_DROP: u64 = 31;
 pub const SYS_HANDLE_SEND: u64 = 32;
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 (不允许放大)。
 pub const SYS_CAP_SEND: u64 = 33;
-/// 非阻塞读取 MSI/MSI-X 向量的「待处理」标志 (中断驱动 I/O 的等待原语, 阶段 4)。
+/// 非阻塞取走**向量掩码**里任意一个 MSI/MSI-X 向量的「待处理」标志 (位 `i` ↔ 向量
+/// `idt::MSI_VECTOR_BASE + i`), 命中返回向量号 (阶段 39/40)。
 pub const SYS_IRQ_POLL: u64 = 34;
-/// 打开 NVMe 控制器的 MSI-X (驱动写好表项后调用; PCI 配置空间写留在内核, 阶段 4)。
+/// 打开 NVMe 控制器的 MSI-X (驱动写好表项后调用; PCI 配置空间写留在内核, 阶段 39)。
 pub const SYS_MSIX_ENABLE: u64 = 35;
-/// 阻塞等待 MSI/MSI-X 向量的中断, 最多 `rsi` 毫秒 (超时返回 0 —— 调用方据此回退轮询)。
+/// 阻塞等待**向量掩码**里任意一个向量的中断, 最多 `rsi` 毫秒 (返回命中的向量号;
+/// 超时返回 0 —— 调用方据此回退轮询)。
 pub const SYS_IRQ_WAIT: u64 = 36;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
@@ -156,6 +158,26 @@ fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
         buf.copy_from_slice(src);
         buf
     }
+}
+
+/// 掩码校验: 每一位都必须是本域**注册过的**向量, 且本域持有对应 `Capability::Irq`。
+///
+/// 掩码编码 (位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`) 与 `SYS_IRQ_POLL`/`SYS_IRQ_WAIT`
+/// 一致 —— 校验只认整段掩码: 有不属于自己的位就整体拒绝, 而不是静默少等几个向量。
+fn irq_mask_ok(domain: u64, mask: u64) -> bool {
+    use crate::arch::idt::{MSI_VECTOR_BASE, MSI_VECTOR_COUNT};
+    for i in 0..MSI_VECTOR_COUNT {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let vector = MSI_VECTOR_BASE + i;
+        if !crate::cap::has(domain, crate::cap::Capability::Irq(vector))
+            || !crate::irq::is_registered_by(vector, domain)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[no_mangle]
@@ -308,20 +330,14 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_IRQ_POLL => {
-            // 非阻塞取走 `a1` (MSI/MSI-X 向量) 的待处理标志; 有中断到达返回 1。
-            // 需持有 `Capability::Irq(vector)`, 且必须正是该向量的注册者。
-            if a1 > u8::MAX as u64 {
+            // 非阻塞取走 `a1` (MSI/MSI-X **向量掩码**) 里任意一个的待处理标志,
+            // 位 `i` 对应向量 `idt::MSI_VECTOR_BASE + i`; 返回**命中的向量号**, 没有则 0。
+            // 掩码每一位都须是本域注册的向量且持有 `Capability::Irq`。
+            let domain = crate::scheduler::current_domain();
+            if a1 == 0 || !irq_mask_ok(domain, a1) {
                 return 0;
             }
-            let domain = crate::scheduler::current_domain();
-            let vector = a1 as u8;
-            if crate::cap::has(domain, crate::cap::Capability::Irq(vector))
-                && crate::irq::take_pending(vector, domain)
-            {
-                1
-            } else {
-                0
-            }
+            crate::irq::take_pending_any(a1, domain).map_or(0, |v| v as u64)
         }
         SYS_MSIX_ENABLE => {
             // 打开 NVMe 控制器的 MSI-X (驱动已写好表项)。只有该控制器的驱动域能调用,
@@ -333,34 +349,31 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_IRQ_WAIT => {
-            // 阻塞等待 `a1` (MSI/MSI-X 向量) 的中断, 最多 `a2` 毫秒: 期间到达过中断
-            // 返回 1, 超时返回 0。需持有 `Capability::Irq(vector)` 且必须正是该向量的
-            // 注册者。syscall 入口已用 SFMASK 清 IF, 故「查标志 → 阻塞」之间不会插进
-            // 中断处理, 不存在「标志刚置上就被我们错过」的丢唤醒。
-            if a1 > u8::MAX as u64 {
-                return 0;
-            }
+            // 阻塞等待 `a1` (向量掩码, 编码同 `SYS_IRQ_POLL`) 里任意一个向量的中断,
+            // 最多 `a2` 毫秒: 返回**命中的向量号**, 超时/非法返回 0。
+            //
+            // 掩码里含该向量正是中断处理器唤醒本域的**唯一**条件 (`irq::set_any_mask`
+            // 记下掩码, `set_pending` 命中才 `wake_one`) —— 于是「等哪几个向量」这件事
+            // 不必在调度器里表达。syscall 入口已用 SFMASK 清 IF, 故「查标志 → 登记掩码
+            // → 阻塞」之间不会插进中断处理, 不存在丢唤醒。
             let domain = crate::scheduler::current_domain();
-            let vector = a1 as u8;
-            if !crate::cap::has(domain, crate::cap::Capability::Irq(vector))
-                || !crate::irq::is_registered_by(vector, domain)
-            {
+            let mask = a1;
+            if mask == 0 || !irq_mask_ok(domain, mask) {
                 return 0;
             }
-            if crate::irq::take_pending(vector, domain) {
-                return 1;
+            if let Some(vector) = crate::irq::take_pending_any(mask, domain) {
+                return vector as u64;
+            }
+            if !crate::irq::set_any_mask(domain, mask) {
+                return 0;
             }
             crate::scheduler::block_current_timeout_ms(
-                crate::scheduler::irq_wait_token(vector),
+                crate::scheduler::irq_wait_token(domain),
                 a2,
             );
+            crate::irq::clear_any_mask(domain);
             // 醒来的原因可能是被中断唤醒, 也可能是超时: 只有标志真在才算等到。
-            // 若中断恰好落在「阻塞前」的窗口, 标志会留在位上, 本次即取到。
-            if crate::irq::take_pending(vector, domain) {
-                1
-            } else {
-                0
-            }
+            crate::irq::take_pending_any(mask, domain).map_or(0, |v| v as u64)
         }
         SYS_SCROLL_UP => {
             crate::video::scroll_view_up();

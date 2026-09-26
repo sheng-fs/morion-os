@@ -26,8 +26,15 @@ pub const NVME_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x81_0000;
 pub const NVME_MMIO_VADDR: u64 = paging::USER_SPACE_BASE + 0x82_0000;
 pub const NVME_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x83_0000;
 
-/// DMA 区域页数: ASQ / ACQ / ISQ / ICQ / 数据缓冲, 共 5 页 (物理连续)。
-pub const NVME_DMA_PAGES: u64 = 5;
+/// DMA 区域页数: ASQ / ACQ / ISQ1 / ICQ1 / ISQ2 / ICQ2 / 数据缓冲, 共 7 页 (物理连续)。
+pub const NVME_DMA_PAGES: u64 = 7;
+
+/// 给 NVMe 分配的 MSI-X 向量数 (阶段 40 多向量): 完成队列**各用一条**中断向量
+/// —— admin CQ / I/O CQ1 / I/O CQ2, 于是驱动能分辨「是哪条队列完成了」。
+pub const NVME_MSIX_VECTORS: u32 = 3;
+
+/// 向量段至少要有这么多条 (运行时无从降级, 直接编译期钉住)。
+const _: () = assert!(NVME_MSIX_VECTORS <= crate::arch::idt::MSI_VECTOR_COUNT as u32);
 
 /// BAR0 需要映射进驱动域的页数。
 ///
@@ -54,12 +61,17 @@ pub struct NvmeConfig {
     pub acq_paddr: u64,
     pub isq_paddr: u64,
     pub icq_paddr: u64,
+    /// 第二条 I/O 队列 (qid 2) 的 SQ/CQ —— 多队列 + 多向量 (阶段 40)。
+    pub isq2_paddr: u64,
+    pub icq2_paddr: u64,
     pub data_paddr: u64,
     /// 各队列 / 缓冲虚拟地址 (驱动读写用)。
     pub asq_vaddr: u64,
     pub acq_vaddr: u64,
     pub isq_vaddr: u64,
     pub icq_vaddr: u64,
+    pub isq2_vaddr: u64,
+    pub icq2_vaddr: u64,
     pub data_vaddr: u64,
     /// Admin / I/O 队列深度 (条目数, 取 2 的幂)。
     ///
@@ -72,14 +84,19 @@ pub struct NvmeConfig {
     pub page_size: u32,
     /// MSI-X 中断向量 (0 = 未启用 MSI-X, 驱动走轮询)。
     ///
-    /// 非 0 时驱动的启用顺序是: ① 把表项 0 写到 `mmio_vaddr + msix_table_offset`;
+    /// 这是**向量段基址** (= 完成队列 0 的向量); 各队列的向量依次 +1, 共
+    /// `msix_vector_count` 条 (`NVME_MSIX_VECTORS`)。非 0 时驱动顺序是:
+    /// ① 把表项 `i` 写到 `mmio_vaddr + msix_table_offset + i*16`;
     /// ② `SYS_MSIX_ENABLE` 请内核打开 MSI-X (配置空间写留在内核); ③ `SYS_REGISTER_IRQ`
-    /// 注册本向量; ④ 之后用 `SYS_IRQ_POLL(vector)` 等完成中断。任一步失败都回退轮询。
+    /// 逐个注册这些向量; ④ 之后用 `SYS_IRQ_POLL(mask)` / `SYS_IRQ_WAIT(mask, ms)` 等完成
+    /// (掩码位 `i` ↔ 向量 `msix_vector + i`)。任一步失败都回退轮询。
     pub msix_vector: u32,
     /// MSI-X 表相对 BAR0 的字节偏移 (表在 BAR0 内, 已随 BAR0 一起映射给驱动)。
     pub msix_table_offset: u32,
     /// MSI-X 中断消息地址 (低 32 位; 物理目的模式, 高 32 位恒 0)。
     pub msix_addr: u32,
+    /// 内核为本控制器分配的 MSI-X 向量条数 (0 = 未启用)。
+    pub msix_vector_count: u32,
 }
 
 /// 配置 NVMe 服务域: 配置 MSI-X、分配 DMA、映射 BAR0 与 DMA、写入配置、授权能力。
@@ -109,19 +126,23 @@ pub fn setup(nvme_domain: u64, bus: u8, dev: u8, func: u8, bar0: u64) -> bool {
     };
 
     // 3. 各队列虚拟/物理地址 (DMA 区域内连续分布, 天然页对齐 + 物理连续)。
-    let (asq_paddr, acq_paddr, isq_paddr, icq_paddr, data_paddr) = (
+    let (asq_paddr, acq_paddr, isq_paddr, icq_paddr, isq2_paddr, icq2_paddr, data_paddr) = (
         dma_paddr,
         dma_paddr + PAGE,
         dma_paddr + 2 * PAGE,
         dma_paddr + 3 * PAGE,
         dma_paddr + 4 * PAGE,
+        dma_paddr + 5 * PAGE,
+        dma_paddr + 6 * PAGE,
     );
-    let (asq_vaddr, acq_vaddr, isq_vaddr, icq_vaddr, data_vaddr) = (
+    let (asq_vaddr, acq_vaddr, isq_vaddr, icq_vaddr, isq2_vaddr, icq2_vaddr, data_vaddr) = (
         NVME_DMA_VADDR,
         NVME_DMA_VADDR + PAGE,
         NVME_DMA_VADDR + 2 * PAGE,
         NVME_DMA_VADDR + 3 * PAGE,
         NVME_DMA_VADDR + 4 * PAGE,
+        NVME_DMA_VADDR + 5 * PAGE,
+        NVME_DMA_VADDR + 6 * PAGE,
     );
 
     // 4. 写配置结构到配置页 (恒等映射, 直接以物理地址作为指针写)。
@@ -133,11 +154,15 @@ pub fn setup(nvme_domain: u64, bus: u8, dev: u8, func: u8, bar0: u64) -> bool {
         acq_paddr,
         isq_paddr,
         icq_paddr,
+        isq2_paddr,
+        icq2_paddr,
         data_paddr,
         asq_vaddr,
         acq_vaddr,
         isq_vaddr,
         icq_vaddr,
+        isq2_vaddr,
+        icq2_vaddr,
         data_vaddr,
         admin_qdepth: 64,
         io_qdepth: 64,
@@ -145,6 +170,7 @@ pub fn setup(nvme_domain: u64, bus: u8, dev: u8, func: u8, bar0: u64) -> bool {
         msix_vector: msix.vector,
         msix_table_offset: msix.table_offset,
         msix_addr: msix.msg_addr,
+        msix_vector_count: msix.count,
     };
     unsafe {
         core::ptr::write(cfg_paddr as *mut NvmeConfig, cfg);
@@ -182,13 +208,16 @@ pub fn setup_empty(nvme_domain: u64) {
 
 /// MSI-X 的配置结果 (向量 0 = 未启用)。
 struct MsixSetup {
+    /// 向量段基址 (= 完成队列 0 的向量; 0 = 未启用)。
     vector: u32,
+    count: u32,
     table_offset: u32,
     msg_addr: u32,
 }
 
 const MSIX_DISABLED: MsixSetup = MsixSetup {
     vector: 0,
+    count: 0,
     table_offset: 0,
     msg_addr: 0,
 };
@@ -240,14 +269,18 @@ fn setup_msix(nvme_domain: u64, bus: u8, dev: u8, func: u8) -> MsixSetup {
             return MSIX_DISABLED;
         }
     };
-    // 表必须落在 BAR0 (BIR=0), 且要能被映射给驱动的那几页盖住。
+    // 表必须落在 BAR0 (BIR=0), 且要能被映射给驱动的那几页盖住。多向量要连续几条表项。
     if cap.table_bir != 0 {
         crate::video::print("nvme: MSI-X table in BAR");
         crate::video::print_u64(cap.table_bir as u64);
         crate::video::println(", not BAR0 -> polling");
         return MSIX_DISABLED;
     }
-    let table_end = cap.table_offset as u64 + cap.table_size as u64 * 16;
+    if cap.table_size < NVME_MSIX_VECTORS as u16 {
+        crate::video::println("nvme: MSI-X table too small for multi-vector -> polling");
+        return MSIX_DISABLED;
+    }
+    let table_end = cap.table_offset as u64 + NVME_MSIX_VECTORS as u64 * 16;
     if table_end > NVME_MMIO_PAGES * PAGE {
         crate::video::println("nvme: MSI-X table outside mapped BAR0 window -> polling");
         return MSIX_DISABLED;
@@ -257,6 +290,7 @@ fn setup_msix(nvme_domain: u64, bus: u8, dev: u8, func: u8) -> MsixSetup {
         crate::video::println("nvme: no LAPIC, MSI-X off (polling)");
         return MSIX_DISABLED;
     }
+    // 向量段够不够放这么多条 (每条队列一个向量) —— 由下面的 const 断言在编译期保证。
     let vector = idt::MSI_VECTOR_BASE as u32;
 
     // 先关 INTx (MSI-X 开起来后 INTx 必须不再触发), 再交给驱动写表、请内核打开。
@@ -268,11 +302,15 @@ fn setup_msix(nvme_domain: u64, bus: u8, dev: u8, func: u8) -> MsixSetup {
         func,
         cap_ptr: cap.cap_ptr,
     });
-    // 让驱动能 `SYS_REGISTER_IRQ(vector)` / `SYS_IRQ_POLL(vector)`。
-    crate::cap::grant(nvme_domain, crate::cap::Capability::Irq(vector as u8));
+    // 让驱动能 `SYS_REGISTER_IRQ` / `SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 每一条向量。
+    for i in 0..NVME_MSIX_VECTORS {
+        crate::cap::grant(nvme_domain, crate::cap::Capability::Irq((vector + i) as u8));
+    }
 
-    crate::video::print("nvme: MSI-X prepared vector=0x");
+    crate::video::print("nvme: MSI-X prepared vectors=0x");
     crate::video::print_hex(vector as u64);
+    crate::video::print("..0x");
+    crate::video::print_hex((vector + NVME_MSIX_VECTORS - 1) as u64);
     crate::video::print(" msi_addr=0x");
     crate::video::print_hex(apic::msi_address() as u64);
     crate::video::print(" table_off=0x");
@@ -282,6 +320,7 @@ fn setup_msix(nvme_domain: u64, bus: u8, dev: u8, func: u8) -> MsixSetup {
     crate::video::println("");
     MsixSetup {
         vector,
+        count: NVME_MSIX_VECTORS,
         table_offset: cap.table_offset,
         msg_addr: apic::msi_address(),
     }

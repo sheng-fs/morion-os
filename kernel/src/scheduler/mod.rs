@@ -33,16 +33,17 @@ const STACK_SIZE: usize = 4096 * 8;
 /// 真实域 id 均为小整数, 故用 `u64::MAX - 1` 作哨兵不会冲突 (`u64::MAX` 已用作「无回复目标」)。
 pub const INPUT_WAIT: u64 = u64::MAX - 1;
 
-/// 伪等待键: 「等待某个 MSI/MSI-X 向量」的阻塞 (`SYS_IRQ_WAIT`)。
+/// 伪等待键: 「等待一组 MSI/MSI-X 向量中任意一个」(`SYS_IRQ_WAIT` 的掩码等待)。
 ///
-/// `vector` 对应的等待键取 `IRQ_WAIT_MARK - vector`, 落在 `[u64::MAX-511, u64::MAX-256]`,
-/// 与真实域 id (小整数) 和 `INPUT_WAIT` 都不重叠 —— 于是 `wake_one` 这一个按「等待键」
-/// 匹配的机制能同时服务 IPC 与中断等待, 且中断唤醒不会误撞 IPC 的唤醒。
-pub const IRQ_WAIT_MARK: u64 = u64::MAX - 0x100;
+/// 按**域**取键 (`IRQ_WAIT_MARK - domain`)，因为一个域同时只可能有一个任务在等；
+/// 落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`，与真实域 id (小整数) 和 `INPUT_WAIT` 都不重叠。
+/// 掩码里到底等哪几个向量由 `irq::set_any_mask` 记在 `irq.rs` 侧 —— 唤醒要按键的
+/// 粒度匹配，而「哪些向量算数」是中断子系统的知识。
+pub const IRQ_WAIT_MARK: u64 = u64::MAX - 0x300;
 
-/// `vector` 对应的等待键 (供 `SYS_IRQ_WAIT` 阻塞与 `irq::set_pending` 唤醒配对使用)。
-pub fn irq_wait_token(vector: u8) -> u64 {
-    IRQ_WAIT_MARK - vector as u64
+/// `domain` 对应的「等一组向量」等待键 (供 `SYS_IRQ_WAIT` 阻塞与 `irq::set_pending` 唤醒配对)。
+pub fn irq_wait_token(domain: u64) -> u64 {
+    IRQ_WAIT_MARK - domain
 }
 
 /// 任务状态。

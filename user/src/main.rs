@@ -414,22 +414,44 @@ struct NvmeConfig {
     acq_paddr: u64,
     isq_paddr: u64,
     icq_paddr: u64,
+    /// 第二条 I/O 队列 (qid 2) 的 SQ/CQ 物理地址 —— 多队列 + 多向量 (阶段 40)。
+    isq2_paddr: u64,
+    icq2_paddr: u64,
     data_paddr: u64,
     asq_vaddr: u64,
     acq_vaddr: u64,
     isq_vaddr: u64,
     icq_vaddr: u64,
+    isq2_vaddr: u64,
+    icq2_vaddr: u64,
     data_vaddr: u64,
     admin_qdepth: u16,
     io_qdepth: u16,
     page_size: u32,
-    /// MSI-X 中断向量 (0 = 未启用 MSI-X, 本驱动走轮询)。
+    /// MSI-X **向量段基址** (0 = 未启用 MSI-X, 本驱动走轮询)。
+    ///
+    /// 完成队列 `i` 用向量 `msix_vector + i`, 也对应掩码里的位 `i` —— 于是「哪条队列
+    /// 完成了」既能从 `SYS_IRQ_WAIT` 返回的向量号看出来, 也能直接从队列下标对上。
     msix_vector: u32,
     /// MSI-X 表相对 BAR0 的字节偏移 (表在 BAR0 内, 已随 BAR0 映射到本域)。
     msix_table_offset: u32,
     /// MSI-X 中断消息地址 (低 32 位; 物理目的模式, 高 32 位恒 0)。
     msix_addr: u32,
+    /// 内核分配的 MSI-X 向量条数 (0 = 未启用)。
+    msix_vector_count: u32,
 }
+
+/// I/O 队列数 (qid 1..=IO_QUEUES; qid 0 是 admin 队列)。
+const IO_QUEUES: usize = 2;
+
+/// 内核为本控制器分配的 MSI-X 向量数上限 (镜像 `kernel/src/nvme.rs::NVME_MSIX_VECTORS`)。
+///
+/// 完成队列 `i` ↔ 表项 `i` ↔ 向量 `msix_vector + i` ↔ 等待掩码位 `i`, 故它同时也是
+/// 「本驱动支持的完成队列数上限」。集群小于实际分配数时按实际值用。
+const NVME_MSIX_MAX: usize = 3;
+
+/// 向量数必须盖住 admin + 全部 I/O 队列 —— 少了就没法给每条队列一条独立向量。
+const _: () = assert!(IO_QUEUES < NVME_MSIX_MAX);
 
 // NVMe 控制器寄存器偏移 (相对 BAR0, 见 NVMe 规范)。
 const REG_CAP: u64 = 0x00;
@@ -518,24 +540,26 @@ fn wr64(addr: u64, val: u64) {
     unsafe { core::ptr::write_volatile(addr as *mut u64, val) }
 }
 
-/// 写 MSI-X 表项 0: 消息地址 + 数据 (= 向量) + 清屏蔽位。
+/// 写 MSI-X 表项 `entry`: 消息地址 + 数据 (= 向量) + 清屏蔽位。
 ///
-/// 为什么只写表项 0: NVMe 的 Admin 完成队列固定用中断向量 0, 我们的 I/O 完成队列在
-/// `Create I/O CQ` 里也把 IV 填成 0 —— 两条队列共用向量 0, 一条表项就够。
+/// 完成队列 `i` 用表项 `i` 与向量 `msix_vector + i` —— 表项下标与 `Create I/O CQ` 里的
+/// IV 字段必须对上, 于是「哪条队列完成」直接由投递的向量区分 (阶段 40 多向量)。
 ///
 /// 表在 BAR0 内 (已非缓存地映射到本域), 由**本驱动**写: 那个 BAR 由固件分配在 4 GiB
 /// 以上, 内核自己的地址空间到不了它, 而按微内核分工设备 MMIO 本就属于驱动。
 /// 内核负责的是写完之后打开 MSI-X (配置空间) 与 LAPIC/向量段。
-fn write_msix_table_entry(cfg: &NvmeConfig, vector: u64) {
-    let entry = cfg.mmio_vaddr + cfg.msix_table_offset as u64;
-    let p = entry as *mut u32;
+fn write_msix_table_entry(cfg: &NvmeConfig, entry: usize, vector: u64) {
+    let base = cfg.mmio_vaddr + cfg.msix_table_offset as u64 + entry as u64 * 16;
+    let p = base as *mut u32;
     unsafe {
         core::ptr::write_volatile(p, cfg.msix_addr); // 消息地址 (低 32 位)
         core::ptr::write_volatile(p.add(1), 0); // 消息地址 (高 32 位); 物理目的模式恒 0
         core::ptr::write_volatile(p.add(2), vector as u32); // 消息数据 = 中断向量
         core::ptr::write_volatile(p.add(3), 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
     }
-    print("nvme: MSI-X table[0] programmed addr=0x");
+    print("nvme: MSI-X table[");
+    print_u64(entry as u64);
+    print("] programmed addr=0x");
     print_hex(cfg.msix_addr as u64);
     print(" data=0x");
     print_hex(vector);
@@ -556,8 +580,10 @@ const NVME_IRQ_WAIT_ROUNDS: u32 = 16;
 
 /// 中断模式是否启用 (粘性: 一旦回退就不再回到中断路径)。
 static mut NVME_IRQ_MODE: bool = false;
-/// 中断模式下等待的向量 (来自内核配置结构)。
+/// 中断模式下向量段的**基址** (= 完成队列 0 的向量, 来自内核配置结构)。
 static mut NVME_IRQ_VECTOR: u64 = 0;
+/// 见过哪些向量的中断 (位 `i` ↔ 完成队列 `i`) —— 「多向量真的分发到了」的证据。
+static mut NVME_IRQ_VEC_MASK: u64 = 0;
 
 /// 运行期计数: 「本次运行真的走了哪条完成路径」的证据 (每 `NVME_STATS_EVERY` 条打印一次)。
 static mut NVME_IRQ_OBSERVED: u64 = 0; // 取到中断的次数
@@ -584,6 +610,8 @@ fn nvme_stats_print(prefix: &str) {
         print_u64(NVME_POLL_CMDS);
         print(" irqs=");
         print_u64(NVME_IRQ_OBSERVED);
+        print(" vecs=0x");
+        print_hex(NVME_IRQ_VEC_MASK);
         print(" mode=");
         println(if NVME_IRQ_MODE { "irq" } else { "poll" });
     }
@@ -653,6 +681,9 @@ fn try_complete(
 /// `sq_vaddr`/`cq_vaddr` 为队列内存虚拟地址, `sq_doorbell`/`cq_doorbell`
 /// 为门铃寄存器虚拟地址 (含 stride), `qdepth` 为队列深度。
 ///
+/// `wait_mask` 是等待中断用的**向量掩码** (位 `i` ↔ 完成队列 `i`): 提交到 I/O 队列时
+/// 用「全部 I/O 队列」的掩码 —— 哪条队列先完成都算数, 返回值还告诉我们是哪一条。
+///
 /// 完成等待有两条路径: MSI-X 中断驱动 (`nvme_main` 里注册成功后启用) 与轮询 ——
 /// 轮询既是中断不可用时的保底, 也是中断路径等不到中断时的回退。
 #[allow(clippy::too_many_arguments)]
@@ -663,6 +694,7 @@ fn submit_wait(
     cq_doorbell: u64,
     qdepth: u32,
     mmio: u64,
+    wait_mask: u64,
     sqe: Sqe,
     tail: &mut u32,
     head: &mut u32,
@@ -680,16 +712,23 @@ fn submit_wait(
     // 记录的回复目标)。顺序是**先等中断, 再查 CQE**: 设备保证「先写 CQE 再发中断」,
     // 所以中断到了就一定有完成可取。
     if nvme_irq_mode() {
-        let vector = unsafe { NVME_IRQ_VECTOR };
+        let base = unsafe { NVME_IRQ_VECTOR };
         let mut rounds = NVME_IRQ_WAIT_ROUNDS;
         loop {
             // 快路径: 非阻塞取位即可命中 (设备 post CQE 与投中断都在门铃那次 MMIO exit
             // 之后就完成了), 命中就不必真睡; 未命中才阻塞等下一次中断 (本域进入阻塞态,
-            // CPU 交给别的域, 不空转)。
-            let got =
-                sys_irq_poll(vector) == 1 || sys_irq_wait(vector, NVME_IRQ_WAIT_TIMEOUT_MS) == 1;
-            if got {
-                unsafe { NVME_IRQ_OBSERVED += 1 };
+            // CPU 交给别的域, 不空转)。返回的是**命中的向量号** —— 相减即完成队列下标。
+            let hit = sys_irq_poll(wait_mask);
+            let hit = if hit != 0 {
+                hit
+            } else {
+                sys_irq_wait(wait_mask, NVME_IRQ_WAIT_TIMEOUT_MS)
+            };
+            if hit != 0 {
+                unsafe {
+                    NVME_IRQ_OBSERVED += 1;
+                    NVME_IRQ_VEC_MASK |= 1 << (hit - base);
+                }
                 if let Some(ok) = try_complete(cq_vaddr, cq_doorbell, qdepth, &sqe, head, phase) {
                     unsafe { NVME_IRQ_CMDS += 1 };
                     nvme_stats_tick();
@@ -772,6 +811,52 @@ const NVME_MAX_SECTORS: u16 = 256;
 /// 与 `VOL_SCRATCH_VADDR` 同理: 必须落在所有共享缓冲段之上 (见该常量处的地址分区表)。
 const PRP_LIST_VADDR: u64 = 0x0000_0080_0016_1000;
 
+/// 当前提交所用的 I/O 队列下标 (由 `io_select_queue` 在每次请求开始时轮转设定)。
+///
+/// 串行提交下同一时刻只有一条命令在飞, 故一份就够; 引入并发 (多条在飞) 时才需要
+/// 变成每请求一份。它决定 `nvme_rw_sectors` 用哪条队列的 SQ/CQ 内存。
+static mut NVME_CUR_Q: usize = 0;
+
+/// 取第 `q` 条 I/O 队列 (qid = `q + 1`) 的 (SQ 门铃, CQ 门铃) 地址。
+///
+/// 门铃区自 `DOORBELL_BASE` 起按 qid 排列: qid `n` 的 SQ 在 `2n * stride`, CQ 在 `2n+1`。
+fn io_q_doorbells(mmio: u64, stride: u64, q: usize) -> (u64, u64) {
+    let qid = (q + 1) as u64;
+    (
+        mmio + DOORBELL_BASE + 2 * qid * stride,
+        mmio + DOORBELL_BASE + (2 * qid + 1) * stride,
+    )
+}
+
+/// 取第 `q` 条 I/O 队列的 (SQ, CQ) 内存虚地址 —— 各占一页, 由内核分配并映射好。
+fn io_q_vaddrs(cfg: &NvmeConfig, q: usize) -> (u64, u64) {
+    if q == 0 {
+        (cfg.isq_vaddr, cfg.icq_vaddr)
+    } else {
+        (cfg.isq2_vaddr, cfg.icq2_vaddr)
+    }
+}
+
+/// 全部 I/O 队列的中断向量掩码 (位 `i` ↔ 完成队列 `i`; admin 是位 0, I/O 是 1..=IO_QUEUES)。
+fn io_wait_mask() -> u64 {
+    ((1u64 << IO_QUEUES) - 1) << 1
+}
+
+/// Admin 完成队列的中断向量掩码 (位 0 ↔ 完成队列 0 = admin)。
+const ADMIN_WAIT_MASK: u64 = 1;
+
+/// 轮转选下一条 I/O 队列, 并把「当前队列」记进 `NVME_CUR_Q`。
+///
+/// 返回 (队列下标, SQ 门铃, CQ 门铃) —— 调用方据此取该队列的 `io_tail[q]` / `io_head[q]` /
+/// `io_phase[q]`, 三者与这里的下标必须同源。
+fn io_select_queue(mmio: u64, stride: u64, rr: &mut usize) -> (usize, u64, u64) {
+    let q = *rr;
+    *rr = (*rr + 1) % IO_QUEUES;
+    unsafe { NVME_CUR_Q = q };
+    let (sq, cq) = io_q_doorbells(mmio, stride, q);
+    (q, sq, cq)
+}
+
 /// 经 NVMe I/O 队列读/写 `count` 个扇区到 `buf` (页对齐的用户页)。
 ///
 /// `buf` 为调用方共享给本域的缓冲页虚拟地址, 已映射; 先经 `sys_virt_to_phys`
@@ -847,13 +932,16 @@ fn nvme_rw_sectors(
     sqe.cdw10 = lba;
     sqe.cdw11 = 0; // SLBA 高 32 位 = 0
     sqe.cdw12 = (count as u32) - 1; // NLB (0-based)
+                                    // 用**当前队列**的 SQ/CQ 内存 (与调用方传进来的门铃同源, 见 `io_select_queue`)。
+    let (sq_vaddr, cq_vaddr) = io_q_vaddrs(cfg, unsafe { NVME_CUR_Q });
     submit_wait(
-        cfg.isq_vaddr,
-        cfg.icq_vaddr,
+        sq_vaddr,
+        cq_vaddr,
         isq_doorbell,
         icq_doorbell,
         cfg.io_qdepth as u32,
         mmio,
+        io_wait_mask(),
         sqe,
         tail,
         head,
@@ -905,6 +993,7 @@ fn nvme_ns_sectors(
         acq_doorbell,
         cfg.admin_qdepth as u32,
         mmio,
+        ADMIN_WAIT_MASK,
         sqe,
         tail,
         head,
@@ -942,26 +1031,43 @@ fn nvme_main() {
     }
     let mmio = cfg.mmio_vaddr;
 
-    // 0. 选择完成路径 (阶段 4 MSI/MSI-X)。三步缺一不可, 任一步失败都退回轮询:
-    //    ① 写 MSI-X 表项 0 (表在 BAR0 里, 由本域写 —— 内核到不了这个 BAR);
+    // 0. 选择完成路径 (阶段 39/40 MSI/MSI-X 多向量)。三步缺一不可, 任一步失败都退回轮询:
+    //    ① 逐条写 MSI-X 表项 `i` = 向量 `msix_vector + i` (表在 BAR0 里, 由本域写 ——
+    //       内核到不了这个 BAR);
     //    ② `sys_msix_enable` 请内核打开 MSI-X (配置空间写留在内核);
-    //    ③ 注册向量, 之后用 `sys_irq_poll` 取位 / `sys_irq_wait` 阻塞等完成中断。
-    //    vector = 0 表示内核没能准备 MSI-X (无 LAPIC / 无该能力 / 表不在 BAR0)。
+    //    ③ 逐条注册向量, 之后用 `sys_irq_poll(mask)` 取位 / `sys_irq_wait(mask, ms)` 阻塞等。
+    //    msix_vector = 0 表示内核没能准备 MSI-X (无 LAPIC / 无该能力 / 表不在 BAR0)。
+    //    每条队列一个向量: 完成队列 `i` ↔ 表项 `i` ↔ 向量 `msix_vector + i` ↔ 掩码位 `i`。
     if cfg.msix_vector != 0 {
-        let vector = cfg.msix_vector as u64;
-        write_msix_table_entry(&cfg, vector);
+        let base = cfg.msix_vector as u64;
+        let count = cfg.msix_vector_count.min(NVME_MSIX_MAX as u32).max(1) as u64;
+        let mut e = 0usize;
+        while (e as u64) < count {
+            write_msix_table_entry(&cfg, e, base + e as u64);
+            e += 1;
+        }
+        let mut registered = 0u64;
+        let mut i = 0u64;
+        while i < count {
+            if sys_register_irq(base + i) == 1 {
+                registered += 1;
+            }
+            i += 1;
+        }
         if sys_msix_enable() != 1 {
             println("nvme: msix_enable refused by kernel, polling mode");
-        } else if sys_register_irq(vector) == 1 {
+        } else if registered != count {
+            println("nvme: register_irq refused some vectors, polling mode");
+        } else {
             unsafe {
-                NVME_IRQ_VECTOR = vector;
+                NVME_IRQ_VECTOR = base;
                 NVME_IRQ_MODE = true;
             }
-            print("nvme: irq-driven completions, vector=0x");
-            print_hex(vector);
+            print("nvme: irq-driven completions, vectors=0x");
+            print_hex(base);
+            print("..0x");
+            print_hex(base + count - 1);
             println("");
-        } else {
-            println("nvme: register_irq refused, polling mode");
         }
     } else {
         println("nvme: polling mode (kernel gave no MSI-X vector)");
@@ -1025,6 +1131,7 @@ fn nvme_main() {
         acq_doorbell,
         cfg.admin_qdepth as u32,
         mmio,
+        ADMIN_WAIT_MASK,
         sqe,
         &mut admin_tail,
         &mut admin_head,
@@ -1089,63 +1196,86 @@ fn nvme_main() {
         }
     }
 
-    // 8. Create I/O Completion Queue (qid=1)。
-    sqe = Sqe::zero();
-    sqe.opcode = OP_CREATE_IO_CQ;
-    sqe.cid = 3;
-    sqe.prp1 = cfg.icq_paddr;
-    sqe.cdw10 = 1 | ((cfg.io_qdepth as u32 - 1) << 16);
-    // CDW11: PC=1 (物理连续), IEN=1 (该 CQ **允许产生中断**), IV=0 (中断向量 0)。
+    // 8/9. 建 IO_QUEUES 条 I/O 队列 (qid = 1..=IO_QUEUES), 每条 CQ 用**自己的**中断向量
+    //      (IV = 队列下标) —— 于是完成中断能直接区分是哪条队列, 等待时用一个掩码等全部
+    //      I/O 队列, 谁先完成都算数 (阶段 40 多向量 + 多队列)。
     //
-    // IEN 必须显式置位: 它默认是 0, 于是这个 I/O CQ 的完成根本不投中断 —— 轮询路径
-    // 看不出来 (CQE 照样写进内存), 但中断路径会一直等不到, 白等一轮预算。Admin 队列
-    // 的 IEN 不受本命令影响, 所以只错在 I/O 队列上。
-    sqe.cdw11 = 1 | (1 << 1);
-    if !submit_wait(
-        cfg.asq_vaddr,
-        cfg.acq_vaddr,
-        asq_doorbell,
-        acq_doorbell,
-        cfg.admin_qdepth as u32,
-        mmio,
-        sqe,
-        &mut admin_tail,
-        &mut admin_head,
-        &mut admin_phase,
-    ) {
-        println("nvme: Create I/O CQ FAILED");
-        return;
+    //      CDW11: PC=1 (物理连续), IEN=1 (该 CQ **允许产生中断**), IV=队列下标。
+    //
+    //      IEN 必须显式置位: 它默认是 0, 于是这个 I/O CQ 的完成根本不投中断 —— 轮询路径
+    //      看不出来 (CQE 照样写进内存), 但中断路径会一直等不到。Admin 队列的 IEN 不受
+    //      本命令影响, 所以只错在 I/O 队列上。
+    let mut q = 0usize;
+    while q < IO_QUEUES {
+        let (cq_paddr, sq_paddr) = if q == 0 {
+            (cfg.icq_paddr, cfg.isq_paddr)
+        } else {
+            (cfg.icq2_paddr, cfg.isq2_paddr)
+        };
+        let qid = q as u32 + 1;
+
+        sqe = Sqe::zero();
+        sqe.opcode = OP_CREATE_IO_CQ;
+        sqe.cid = 3 + (q as u16) * 2;
+        sqe.prp1 = cq_paddr;
+        sqe.cdw10 = qid | ((cfg.io_qdepth as u32 - 1) << 16);
+        // CDW11: PC=1 (物理连续), IEN=1 (该 CQ **允许产生中断**), IV = qid (完成队列下标)。
+        //
+        // IV 取 `qid` 而不是 `q`: 中断向量按**完成队列下标**分配 —— admin CQ 固定是 0
+        // (向量 `msix_vector + 0`), 故 qid 1 用 IV=1、qid 2 用 IV=2。写错成 `q` 会让
+        // qid 1 与 admin 抢向量 0, 于是 I/O 完成投的还是 admin 那条向量, 而驱动正在等的
+        // 是 I/O 队列的向量 —— 表现就是「一直等不到中断、白等一轮看门狗后回退轮询」。
+        sqe.cdw11 = 1 | (1 << 1) | (qid << 16);
+        if !submit_wait(
+            cfg.asq_vaddr,
+            cfg.acq_vaddr,
+            asq_doorbell,
+            acq_doorbell,
+            cfg.admin_qdepth as u32,
+            mmio,
+            ADMIN_WAIT_MASK,
+            sqe,
+            &mut admin_tail,
+            &mut admin_head,
+            &mut admin_phase,
+        ) {
+            println("nvme: Create I/O CQ FAILED");
+            return;
+        }
+
+        sqe = Sqe::zero();
+        sqe.opcode = OP_CREATE_IO_SQ;
+        sqe.cid = 4 + (q as u16) * 2;
+        sqe.prp1 = sq_paddr;
+        sqe.cdw10 = qid | ((cfg.io_qdepth as u32 - 1) << 16);
+        sqe.cdw11 = 1 | (qid << 16); // PC=1, CQID=qid (与本队列的 CQ 一一对应)
+        if !submit_wait(
+            cfg.asq_vaddr,
+            cfg.acq_vaddr,
+            asq_doorbell,
+            acq_doorbell,
+            cfg.admin_qdepth as u32,
+            mmio,
+            ADMIN_WAIT_MASK,
+            sqe,
+            &mut admin_tail,
+            &mut admin_head,
+            &mut admin_phase,
+        ) {
+            println("nvme: Create I/O SQ FAILED");
+            return;
+        }
+        q += 1;
     }
 
-    // 9. Create I/O Submission Queue (qid=1, 关联 CQ1)。
-    sqe = Sqe::zero();
-    sqe.opcode = OP_CREATE_IO_SQ;
-    sqe.cid = 4;
-    sqe.prp1 = cfg.isq_paddr;
-    sqe.cdw10 = 1 | ((cfg.io_qdepth as u32 - 1) << 16);
-    sqe.cdw11 = 1 | (1 << 16); // PC=1, CQID=1
-    if !submit_wait(
-        cfg.asq_vaddr,
-        cfg.acq_vaddr,
-        asq_doorbell,
-        acq_doorbell,
-        cfg.admin_qdepth as u32,
-        mmio,
-        sqe,
-        &mut admin_tail,
-        &mut admin_head,
-        &mut admin_phase,
-    ) {
-        println("nvme: Create I/O SQ FAILED");
-        return;
-    }
-    // 10. 进入块设备服务循环: 经 IPC 接收 BlockReq, 用 NVMe I/O 队列读扇区。
-    let isq_doorbell = mmio + DOORBELL_BASE + 2 * stride;
-    let icq_doorbell = mmio + DOORBELL_BASE + 3 * stride;
-    let mut io_tail: u32 = 0;
-    let mut io_head: u32 = 0;
+    // 10. 进入块设备服务循环: 经 IPC 接收 BlockReq, 轮转用各条 I/O 队列读扇区。
+    //     每条队列各有自己的 tail/head/phase (自己的 SQ/CQ 就是自己的环形队列);
+    //     提交哪条由 `io_select_queue` 轮转决定, 门铃与队列内存都由它给出。
+    let mut io_tail = [0u32; IO_QUEUES];
+    let mut io_head = [0u32; IO_QUEUES];
     // 与 Admin 队列同理: 首条 completion 的 phase tag 为 1。
-    let mut io_phase: u32 = 1;
+    let mut io_phase = [1u32; IO_QUEUES];
+    let mut io_rr = 0usize;
 
     // 10b. 卷层初始化: 分配扫描缓冲页, 逐 namespace 解析分区表并登记卷。
     //      此后 `dev` 一律是「卷号」, 实际 I/O 用 (vol.nsid, vol.start_lba + lba)。
@@ -1164,6 +1294,9 @@ fn nvme_main() {
     let mut nsi = 0usize;
     while nsi < nsn {
         let nsid = unsafe { NVME_NSIDS[nsi] };
+        // 每个 namespace 轮转一条队列 (启动扫描每次只发一条命令, 队列选择不影响正确性,
+        // 但会让「多队列都被真正用过」这件事在日志里留下痕迹)。
+        let (qi, isq_doorbell, icq_doorbell) = io_select_queue(mmio, stride, &mut io_rr);
         vol_scan_namespace(
             nsid,
             &cfg,
@@ -1171,9 +1304,9 @@ fn nvme_main() {
             isq_doorbell,
             icq_doorbell,
             scratch,
-            &mut io_tail,
-            &mut io_head,
-            &mut io_phase,
+            &mut io_tail[qi],
+            &mut io_head[qi],
+            &mut io_phase[qi],
         );
         nsi += 1;
     }
@@ -1232,6 +1365,9 @@ fn nvme_main() {
                 while done < total {
                     let chunk = (total - done).min(NVME_MAX_SECTORS as u64) as u16;
                     let seg_buf = (req.buf as *mut u8).wrapping_add((done * 512) as usize);
+                    // 每段换一条队列 (轮转): 于是多队列、多向量在整轮自测里都会被走到。
+                    let (qi, isq_doorbell, icq_doorbell) =
+                        io_select_queue(mmio, stride, &mut io_rr);
                     if !nvme_rw_sectors(
                         opcode,
                         vol.nsid,
@@ -1242,9 +1378,9 @@ fn nvme_main() {
                         base_lba.saturating_add(done as u32),
                         chunk,
                         seg_buf,
-                        &mut io_tail,
-                        &mut io_head,
-                        &mut io_phase,
+                        &mut io_tail[qi],
+                        &mut io_head[qi],
+                        &mut io_phase[qi],
                     ) {
                         ok = false;
                         break;
@@ -1282,14 +1418,17 @@ fn nvme_main() {
             | BLOCK_OP_PART_RELOAD | BLOCK_OP_DISK_READ => {
                 let preq: PartReq =
                     unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const PartReq) };
+                // 整个分区表操作固定用一条队列 (它内部会连发多条命令, 换队列没有好处);
+                // 具体哪条仍由轮转决定, 于是多队列都会被用到。
+                let (qi, isq_doorbell, icq_doorbell) = io_select_queue(mmio, stride, &mut io_rr);
                 let mut io = NvmeIo {
                     cfg: &cfg,
                     mmio,
                     isq: isq_doorbell,
                     icq: icq_doorbell,
-                    tail: &mut io_tail,
-                    head: &mut io_head,
-                    phase: &mut io_phase,
+                    tail: &mut io_tail[qi],
+                    head: &mut io_head[qi],
+                    phase: &mut io_phase[qi],
                 };
                 let nsid = preq.nsid as u32;
                 let r = match opcode_low {
