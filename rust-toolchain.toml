@@ -5,9 +5,24 @@
 #   - abi_efiapi    : UEFI 调用约定支持
 #   - inline asm    : 内联汇编 (x86_64 底层操作)
 #   - naked_functions : 裸函数 (中断入口)
+#
+# 为什么把 channel 固定到日期而不是浮动的 `nightly`:
+#   浮动的 nightly 让「本地能过、CI 过不去」变成看运气 —— CI 每天拉到的是当天的夜间版,
+#   而本地可能停在几周前的版本, 编译器/lint 一有变动就误判成代码问题。2026-09-25 就踩过
+#   一次: 当天的 cargo 新增了 `unused dependency` 检查, 报出 kernel/Cargo.toml 里三个死依赖,
+#   本地(8/16 的 nightly) 完全看不到。
+#   固定之后, 升级是一次**显式的改动**(见下面「如何升级」), 而不是每天随机发生的事。
+#
+# 如何升级:
+#   1. `rustup toolchain install nightly-YYYY-MM-DD --profile minimal \
+#         --component rust-src,rustfmt,clippy,llvm-tools-preview`
+#   2. 改下面的 channel; 3. `make fmt check clippy` 并跑一次 QEMU 回归;
+#   4. 单独一个提交 (工具链升级会牵动 fmt 结果, 别和功能改动混在一起)。
+#   注: 本机网络到 static.rust-lang.org 可能不通, 可用镜像
+#       RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static (清华镜像已剪掉旧日期)。
 
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-16"
 components = ["rust-src", "rustfmt", "clippy", "llvm-tools-preview"]
 targets = [
     "x86_64-unknown-none",

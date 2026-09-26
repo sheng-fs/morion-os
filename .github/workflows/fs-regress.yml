@@ -1,19 +1,19 @@
 # ============================================================
 # QEMU 全量 FS 回归 (app 的 FS-1..FS-24 自测)
 # ------------------------------------------------------------
-# **只手动触发** (Actions → Run workflow): 公共 runner 上通常没有 /dev/kvm, QEMU 只能
-# 走 TCG, 本地 KVM 下约 6 分钟的整套自测会慢好几倍, 不适合挂在每次 push 上 ——
-# 每次 push 的门禁只做编译/格式/clippy (见 ci.yml)。
+# 触发: **每周定时** + **手动** (Actions → Run workflow)。
 #
-# 想定时跑就把下面的 schedule 打开。
+# 不挂在 push/PR 上: 公共 runner 通常没有 /dev/kvm, QEMU 只能走 TCG, 本地 KVM 下约 6 分钟
+# 的整套自测会慢好几倍 —— 每次 push 的门禁只做编译/格式/clippy (见 ci.yml)。
 # ============================================================
 
 name: FS regression (QEMU)
 
 on:
+  # 每周日 02:00 (UTC+8) / 周六 18:00 UTC, 避开工作日。
+  schedule:
+    - cron: '0 18 * * 6'
   workflow_dispatch:
-  # schedule:
-  #   - cron: '0 18 * * 0'   # 每周日 02:00 (UTC+8)
 
 jobs:
   regress:

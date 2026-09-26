@@ -1,14 +1,13 @@
 # ============================================================
-# CI 门禁: 编译检查 + clippy (-D warnings)
+# CI 门禁: 格式 + 编译检查 + clippy (-D warnings)
 # ------------------------------------------------------------
 # 只**编译**不运行 QEMU, 所以不需要 KVM, 几分钟内出结果 —— 每次 push / PR 都跑。
-# QEMU 全量 FS 回归另见 fs-regress.yml (无 KVM 时 TCG 太慢, 只手动触发)。
+# QEMU 全量 FS 回归另见 fs-regress.yml (无 KVM 时 TCG 太慢, 定时 + 手动触发)。
 #
-# 为什么没有 `make fmt`: 本仓库的代码是**手写的紧凑单行风格** (如
-# `struct Color { b: u8, g: u8, r: u8, a: u8 }`、单行 `const fn`), 而仓库里没有
-# rustfmt.toml, 默认配置会把它们全部展开 —— 实测 `cargo fmt --all -- --check` 报
-# 244 处差异, 遍布 boot / kernel / kernel_test / user。故 fmt 不纳入门禁
-# (详见 CONTRIBUTING.md「代码风格」)。
+# fmt 能作为门禁, 是因为 2026-09 做过一次**全仓库** `cargo fmt` (37 个文件, +2839/-856):
+# 此前代码是手写的紧凑单行风格 (如 `struct Color { b: u8, g: u8, r: u8, a: u8 }`、
+# 单行 `const fn`), 与默认 rustfmt 相差 244 处, 没法当门禁。详见 CONTRIBUTING.md
+# 「代码风格」。
 #
 # 关于注解: 步骤日志要**登录 GitHub** 才能看 ("Sign in to view logs"), 而 Checks
 # 注解是公开的 (API 可读), 所以工具链版本与失败原因都经 `::notice::` / `::error::`
@@ -36,16 +35,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 通道 / 组件 / 目标都以仓库内的 rust-toolchain.toml 为准; 这里显式装一遍,
-      # 免得 runner 预装的 rustup 因为缺组件而在第一次 cargo 调用时才失败。
-      - name: Setup Rust nightly
+      # 通道 / 组件 / 目标全部以仓库内 rust-toolchain.toml 为唯一来源 (现在是固定日期的
+      # nightly-2026-08-16)。rustup 会自动把缺的装齐, 故这里不再重复列组件与 target ——
+      # 重复列的话两处会不同步。
+      - name: Setup Rust (按 rust-toolchain.toml)
         run: |
-          rustup toolchain install nightly --profile minimal \
-            --component rust-src,rustfmt,clippy,llvm-tools-preview
-          rustup target add --toolchain nightly \
-            x86_64-unknown-none x86_64-unknown-uefi
-          # 记下这次实际用的工具链: rust-toolchain.toml 写的是浮动 `nightly`,
-          # 「本地能过、CI 过不去」十有八九就是这里的版本漂移。
+          rustup show
+          # 记下这次实际用的工具链: 「本地能过、CI 过不去」往往就是版本对不上。
           echo "::notice title=工具链::$(rustc -V) / $(cargo -V) / targets: $(rustup target list --installed | tr '\n' ' ')"
 
       # 三个 crate 目标各不相同, 且都要 `-Z build-std` 从源码重建 core/compiler_builtins
@@ -62,6 +58,11 @@ jobs:
 
       # shell 显式写 bash: 默认 shell 只有 `-e`, 而这里靠管道 + tee 留日志,
       # 必须 `-o pipefail` 才能让 make 的失败传出来 (bash 关键字自带 -eo pipefail)。
+      # 顺序按「反馈快慢」排: fmt 不编译, 最先跑。
+      - name: Format
+        shell: bash
+        run: make fmt 2>&1 | tee /tmp/fmt.log
+
       - name: Check
         shell: bash
         run: make check 2>&1 | tee /tmp/check.log
@@ -70,7 +71,7 @@ jobs:
         shell: bash
         run: make clippy 2>&1 | tee /tmp/clippy.log
 
-      # 失败时把两个日志里的报错提进 Checks 注解 (公开可读, 日志要登录)。
+      # 失败时把三份日志里的报错提进 Checks 注解 (公开可读, 日志要登录)。
       # cargo 输出可能带 ANSI 颜色, 先剥掉, 否则 "error" 前是转义序列, 既匹配不上也读不清。
       # 只看结尾是不够的: cargo 会把 manifest 的 warning 摘要留在最后, 真正编译错误在上文。
       - name: 失败摘要 → Checks 注解
@@ -78,7 +79,7 @@ jobs:
         shell: bash
         run: |
           strip='s/\x1b\[[0-9;]*[A-Za-z]//g'
-          for f in /tmp/check.log /tmp/clippy.log; do
+          for f in /tmp/fmt.log /tmp/check.log /tmp/clippy.log; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
             errs=$(sed -e "$strip" "$f" | grep -iE -B2 -A6 'error(\[|:)' | head -n 40 \
