@@ -4,16 +4,16 @@
 
 #[repr(C)]
 pub struct BootInfo {
-    pub magic: u32,           // 0x4D4F5249 = "MORI"
-    pub version: u32,         // 2
-    pub fb_addr: u64,         // 帧缓冲物理地址
-    pub fb_width: u32,        // 宽度 (像素)
-    pub fb_height: u32,       // 高度 (像素)
-    pub fb_stride: u32,       // 行跨度 (像素)
-    pub fb_bpp: u32,          // 每像素位数
-    pub mmap_addr: u64,       // 内存图数据物理地址
-    pub mmap_entry_count: u64,// 内存图条目数
-    pub mmap_entry_size: u64, // 单个条目字节数
+    pub magic: u32,            // 0x4D4F5249 = "MORI"
+    pub version: u32,          // 2
+    pub fb_addr: u64,          // 帧缓冲物理地址
+    pub fb_width: u32,         // 宽度 (像素)
+    pub fb_height: u32,        // 高度 (像素)
+    pub fb_stride: u32,        // 行跨度 (像素)
+    pub fb_bpp: u32,           // 每像素位数
+    pub mmap_addr: u64,        // 内存图数据物理地址
+    pub mmap_entry_count: u64, // 内存图条目数
+    pub mmap_entry_size: u64,  // 单个条目字节数
 }
 
 /// Boot Info 所在的物理地址

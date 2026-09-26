@@ -61,7 +61,8 @@ static mut CUR_COL: usize = 0;
 // 键盘域经 SYS_TERM_PUT 编辑 CUR_LINE, 回车时把整行压入此队列并唤醒等待者;
 // 用户态 SYS_READLINE 阻塞取走一行。队列满时丢弃最旧行 (交互输入不阻塞内核)。
 const INPUT_QUEUE_LINES: usize = 4;
-static mut INPUT_QUEUE: [[u8; LINE_BYTES]; INPUT_QUEUE_LINES] = [[0; LINE_BYTES]; INPUT_QUEUE_LINES];
+static mut INPUT_QUEUE: [[u8; LINE_BYTES]; INPUT_QUEUE_LINES] =
+    [[0; LINE_BYTES]; INPUT_QUEUE_LINES];
 static mut INPUT_QUEUE_LEN: [usize; INPUT_QUEUE_LINES] = [0; INPUT_QUEUE_LINES];
 /// 最老行在队列中的下标。
 static mut INPUT_HEAD: usize = 0;
@@ -236,7 +237,11 @@ fn history_push(bytes: &[u8]) {
         } else {
             HISTORY_START = (HISTORY_START + 1) % HISTORY_LINES;
         }
-        let n = if bytes.len() > LINE_BYTES { LINE_BYTES } else { bytes.len() };
+        let n = if bytes.len() > LINE_BYTES {
+            LINE_BYTES
+        } else {
+            bytes.len()
+        };
         HISTORY[idx][..n].copy_from_slice(&bytes[..n]);
         HISTORY_LEN[idx] = n;
     }
@@ -258,7 +263,11 @@ fn commit_line() {
 fn input_queue_push(bytes: &[u8]) {
     unsafe {
         let idx = INPUT_TAIL;
-        let n = if bytes.len() > LINE_BYTES { LINE_BYTES } else { bytes.len() };
+        let n = if bytes.len() > LINE_BYTES {
+            LINE_BYTES
+        } else {
+            bytes.len()
+        };
         INPUT_QUEUE[idx][..n].copy_from_slice(&bytes[..n]);
         INPUT_QUEUE_LEN[idx] = n;
         INPUT_TAIL = (INPUT_TAIL + 1) % INPUT_QUEUE_LINES;
@@ -362,7 +371,11 @@ fn redraw() {
         bg_fill_rect(0, MARGIN, FB.width(), FB.height() - MARGIN);
         let visible = hist_visible();
         let total = HISTORY_COUNT;
-        let start = if total > visible { total - visible - SCROLL_OFFSET } else { 0 };
+        let start = if total > visible {
+            total - visible - SCROLL_OFFSET
+        } else {
+            0
+        };
 
         let mut y = MARGIN;
         for i in start..total {
@@ -551,7 +564,11 @@ pub fn print_logo() {
     let guard = PRINT_LOCK.lock();
 
     let cols = max_cols();
-    let indent = if cols > logo::WIDTH { (cols - logo::WIDTH) / 2 } else { 0 };
+    let indent = if cols > logo::WIDTH {
+        (cols - logo::WIDTH) / 2
+    } else {
+        0
+    };
 
     for line in logo::LOGO {
         for _ in 0..indent {
@@ -590,7 +607,11 @@ pub fn term_put(c: u8) {
             b'\n' => {
                 // 回车提交: 只把「用户输入段」(INPUT_BASE 起) 拷入输入行队列,
                 // 不含此前打印的提示符, 再清空输入行。
-                let base = if INPUT_ACTIVE { INPUT_BASE.min(CUR_LEN) } else { CUR_LEN };
+                let base = if INPUT_ACTIVE {
+                    INPUT_BASE.min(CUR_LEN)
+                } else {
+                    CUR_LEN
+                };
                 input_queue_push(&CUR_LINE[base..CUR_LEN]);
                 return_to_input();
                 commit_line();

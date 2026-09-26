@@ -100,9 +100,7 @@ impl AnimationEngine {
 
     /// 获取当前动画是否为指定状态
     pub fn is_finished(&self, slot: usize) -> bool {
-        self.animations[slot]
-            .as_ref()
-            .is_none_or(|a| a.finished)
+        self.animations[slot].as_ref().is_none_or(|a| a.finished)
     }
 }
 
@@ -113,14 +111,7 @@ impl Default for AnimationEngine {
 }
 
 /// 渲染原始 BGRA 帧数据到帧缓冲
-fn render_raw_frame(
-    fb: &mut FrameBuffer,
-    data: &[u8],
-    width: u32,
-    height: u32,
-    dx: i32,
-    dy: i32,
-) {
+fn render_raw_frame(fb: &mut FrameBuffer, data: &[u8], width: u32, height: u32, dx: i32, dy: i32) {
     for py in 0..height {
         for px in 0..width {
             let offset = ((py * width + px) * 4) as usize;

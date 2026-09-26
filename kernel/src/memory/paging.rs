@@ -203,7 +203,8 @@ pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     let mut allocator = KernelFrameAllocator;
     unsafe {

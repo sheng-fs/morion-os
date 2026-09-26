@@ -11,7 +11,7 @@ const SLAVE_CMD: u16 = 0xA0;
 const SLAVE_DATA: u16 = 0xA1;
 
 const CMD_INIT: u8 = 0x11; // ICW1: 需要 ICW4
-const CMD_EOI: u8 = 0x20;  // 结束中断命令
+const CMD_EOI: u8 = 0x20; // 结束中断命令
 const MODE_8086: u8 = 0x01; // ICW4: 8086 模式
 
 /// 重映射 PIC 并屏蔽除 IRQ0/IRQ1 外的所有中断
@@ -28,11 +28,11 @@ pub fn init() {
 
         // ICW2: 中断向量偏移
         master_data.write(32); // master → 32..=39
-        slave_data.write(40);  // slave  → 40..=47
+        slave_data.write(40); // slave  → 40..=47
 
         // ICW3: 级联关系
         master_data.write(4); // slave 接在 master 的 IRQ2
-        slave_data.write(2);  // slave 的级联标识
+        slave_data.write(2); // slave 的级联标识
 
         // ICW4: 8086 模式
         master_data.write(MODE_8086);
@@ -40,7 +40,7 @@ pub fn init() {
 
         // 屏蔽所有中断, 仅保留 IRQ0 (时钟) 与 IRQ1 (键盘)
         master_data.write(0xFC); // 1111_1100
-        slave_data.write(0xFF);  // 1111_1111
+        slave_data.write(0xFF); // 1111_1111
     }
 }
 

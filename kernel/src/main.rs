@@ -5,7 +5,9 @@
 #![no_std]
 #![no_main]
 
-use morion_kernel::{arch, bootinfo, cap, domain, ipc, memory, nvme, pager, scheduler, syscall, video};
+use morion_kernel::{
+    arch, bootinfo, cap, domain, ipc, memory, nvme, pager, scheduler, syscall, video,
+};
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -61,8 +63,7 @@ fn load_user_program(domain_id: u64) {
     let pages = (bytes.len() as u64).div_ceil(PAGE_SIZE);
 
     for i in 0..pages {
-        let frame =
-            memory::frame_allocator::allocate_frame().expect("allocate user program frame");
+        let frame = memory::frame_allocator::allocate_frame().expect("allocate user program frame");
         let vaddr = USER_BASE + i * PAGE_SIZE;
         memory::paging::map_user_page(domain_id, vaddr, frame);
 

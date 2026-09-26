@@ -79,9 +79,7 @@ pub fn init() {
 ///
 /// 调度器在切换任务时调用, 将 RSP0 指向新任务的内核栈顶。
 pub fn set_rsp0(stack_top: u64) {
-    let tss = TSS
-        .get()
-        .expect("gdt::set_rsp0: TSS not initialized") as *const TaskStateSegment
+    let tss = TSS.get().expect("gdt::set_rsp0: TSS not initialized") as *const TaskStateSegment
         as *mut TaskStateSegment;
     unsafe {
         (*tss).privilege_stack_table[0] = VirtAddr::new(stack_top);

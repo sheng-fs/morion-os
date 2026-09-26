@@ -29,8 +29,12 @@ impl<'fb> Renderer<'fb> {
         self.fb.resolution()
     }
 
-    pub fn width(&self) -> u32 { self.fb.width() }
-    pub fn height(&self) -> u32 { self.fb.height() }
+    pub fn width(&self) -> u32 {
+        self.fb.width()
+    }
+    pub fn height(&self) -> u32 {
+        self.fb.height()
+    }
 
     // ============================================================
     // 基础绘制
@@ -59,13 +63,21 @@ impl<'fb> Renderer<'fb> {
                 };
 
                 let inside = if dy < r {
-                    if dx < r { in_corner(r, r) }
-                    else if dx >= w as i32 - r { in_corner(w as i32 - r - 1, r) }
-                    else { true }
+                    if dx < r {
+                        in_corner(r, r)
+                    } else if dx >= w as i32 - r {
+                        in_corner(w as i32 - r - 1, r)
+                    } else {
+                        true
+                    }
                 } else if dy >= h as i32 - r {
-                    if dx < r { in_corner(r, h as i32 - r - 1) }
-                    else if dx >= w as i32 - r { in_corner(w as i32 - r - 1, h as i32 - r - 1) }
-                    else { true }
+                    if dx < r {
+                        in_corner(r, h as i32 - r - 1)
+                    } else if dx >= w as i32 - r {
+                        in_corner(w as i32 - r - 1, h as i32 - r - 1)
+                    } else {
+                        true
+                    }
                 } else {
                     true
                 };
@@ -149,9 +161,9 @@ impl<'fb> Renderer<'fb> {
 
                 let divisor = if count > 0 { count } else { 1 };
                 let blurred = Color {
-                    red:   ((r_sum / divisor) >> 12).min(255) as u8,
+                    red: ((r_sum / divisor) >> 12).min(255) as u8,
                     green: ((g_sum / divisor) >> 12).min(255) as u8,
-                    blue:  ((b_sum / divisor) >> 12).min(255) as u8,
+                    blue: ((b_sum / divisor) >> 12).min(255) as u8,
                     alpha: 255,
                 };
 
@@ -197,15 +209,21 @@ impl<'fb> Renderer<'fb> {
                 }
 
                 // cnt 为 0 时不写像素, checked_div 同时规避除零
-                if let (Some(r), Some(g), Some(b)) =
-                    (r_sum.checked_div(cnt), g_sum.checked_div(cnt), b_sum.checked_div(cnt))
-                {
-                    self.fb.put_pixel(px, py, Color {
-                        red:   r as u8,
-                        green: g as u8,
-                        blue:  b as u8,
-                        alpha: 255,
-                    });
+                if let (Some(r), Some(g), Some(b)) = (
+                    r_sum.checked_div(cnt),
+                    g_sum.checked_div(cnt),
+                    b_sum.checked_div(cnt),
+                ) {
+                    self.fb.put_pixel(
+                        px,
+                        py,
+                        Color {
+                            red: r as u8,
+                            green: g as u8,
+                            blue: b as u8,
+                            alpha: 255,
+                        },
+                    );
                 }
             }
         }

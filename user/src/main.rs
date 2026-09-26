@@ -12,13 +12,12 @@ mod syscall;
 mod vfs;
 
 use syscall::{
-    print, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
-    sys_call_payload, sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send,
-    sys_map_anon, sys_page_fault_reply, sys_port_in16, sys_port_in8,
-    sys_port_out8, sys_port_out16, sys_readline, sys_recv, sys_recv_msg, sys_register_irq,
-    sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page, sys_term_left,
-    sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, CAP_KIND_IRQ, CAP_KIND_MAP_INTO,
-    CAP_KIND_SEND_TO, PAYLOAD_LEN,
+    print, print_u64, println, sys_alloc_page, sys_backspace, sys_call, sys_call_payload,
+    sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send, sys_map_anon,
+    sys_page_fault_reply, sys_port_in16, sys_port_in8, sys_port_out16, sys_port_out8, sys_readline,
+    sys_recv, sys_recv_msg, sys_register_irq, sys_reply, sys_scroll_down, sys_scroll_up, sys_send,
+    sys_share_page, sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys,
+    CAP_KIND_IRQ, CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
 };
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
@@ -133,9 +132,7 @@ fn sender_main() {
         println("sender: delegate SendTo(3) FAILED");
     }
     // 同一项能力重复委派必须幂等 (不再占新槽): 连做两次都应成功。
-    if sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1
-        || sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1
-    {
+    if sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1 || sys_cap_send(1, CAP_KIND_MAP_INTO, 1) != 1 {
         println("sender: duplicate delegation NOT idempotent FAILED");
     }
 
@@ -232,9 +229,8 @@ fn pager_main() {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
 
         // 从 payload 前 24 字节解出缺页信息。
-        let info: PageFaultInfo = unsafe {
-            core::ptr::read_unaligned(msg.payload.as_ptr() as *const PageFaultInfo)
-        };
+        let info: PageFaultInfo =
+            unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const PageFaultInfo) };
 
         if sys_map_anon(info.fault_domain, info.fault_addr) != 1 {
             println("pager: map_anon FAILED");
@@ -319,7 +315,11 @@ fn key_char(sc: u8, shift: bool) -> Option<u8> {
     }
     let (base, shifted) = KEYMAP[i];
     let c = if shift { shifted } else { base };
-    if c == 0 { None } else { Some(c) }
+    if c == 0 {
+        None
+    } else {
+        Some(c)
+    }
 }
 
 /// 域 4 — 用户态键盘驱动: 注册接收 IRQ1, 循环接收 scancode 并解码成字符回显。
@@ -1387,8 +1387,7 @@ fn page_path(buf: u64) -> &'static [u8] {
 /// 路径走共享页而 payload 只带附加参数与缓冲地址 —— 单条 payload 装不下路径 +
 /// 地址, 且结果页要按客户端指定 (app 与 shell 的地址不同)。
 fn parse_path_req(payload: *const u8) -> (u64, &'static str) {
-    let req: vfs::PathReq =
-        unsafe { core::ptr::read_unaligned(payload as *const vfs::PathReq) };
+    let req: vfs::PathReq = unsafe { core::ptr::read_unaligned(payload as *const vfs::PathReq) };
     let p = page_path(req.buf);
     (req.buf, unsafe { core::str::from_utf8_unchecked(p) })
 }
@@ -1434,7 +1433,7 @@ struct Fat32Bpb {
     sectors_per_cluster: u8,
     reserved_sectors: u16,
     num_fats: u8,
-    fat_size: u32, // 单个 FAT 占用的扇区数
+    fat_size: u32,      // 单个 FAT 占用的扇区数
     total_sectors: u32, // BPB_TotSec32 (分区总扇区数)
     root_cluster: u32,
 }
@@ -1627,7 +1626,11 @@ fn find_free_cluster(bpb: &Fat32Bpb, fat_buf: *mut u8) -> Option<u32> {
     loop {
         if read_fat_entry(bpb, cluster, fat_buf) == 0 {
             unsafe {
-                FAT_ALLOC_HINT = if cluster + 1 > total + 1 { 2 } else { cluster + 1 };
+                FAT_ALLOC_HINT = if cluster + 1 > total + 1 {
+                    2
+                } else {
+                    cluster + 1
+                };
             }
             return Some(cluster);
         }
@@ -1931,7 +1934,14 @@ fn write_file_range(
 
     // 4. 目录项与节点描述符同步 (首簇号可能因从空文件分配而改变)。
     if (node.start_cluster != new_start || node.file_size != new_size)
-        && !update_dir_entry(bpb, node.dir_cluster, node.entry_offset, new_start, new_size, dir_buf)
+        && !update_dir_entry(
+            bpb,
+            node.dir_cluster,
+            node.entry_offset,
+            new_start,
+            new_size,
+            dir_buf,
+        )
     {
         return u64::MAX;
     }
@@ -2300,10 +2310,8 @@ fn find_entry_named(
             }
             let is_dir = attr & ATTR_DIRECTORY != 0;
             let is_dot = is_dir && first == b'.';
-            let long_match = !is_dot
-                && lfn.active
-                && lfn.checksum_ok(entry)
-                && lfn_name_eq(lfn.name(), query);
+            let long_match =
+                !is_dot && lfn.active && lfn.checksum_ok(entry) && lfn_name_eq(lfn.name(), query);
             lfn.reset();
 
             if let Some(sn) = sn {
@@ -2488,12 +2496,7 @@ fn resolve_parent(
 
 /// 判断目录 `dir_cluster` 是否为空 (只含 `.` 与 `..`, 或更少)。跨簇遍历, 跳过
 /// 已删除项 / 长文件名 / 卷标; 遇到第 3 个有效条目即非空。读盘失败视为非空 (安全)。
-fn dir_is_empty(
-    bpb: &Fat32Bpb,
-    dir_cluster: u32,
-    dir_buf: *mut u8,
-    fat_buf: *mut u8,
-) -> bool {
+fn dir_is_empty(bpb: &Fat32Bpb, dir_cluster: u32, dir_buf: *mut u8, fat_buf: *mut u8) -> bool {
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
     let mut valid = 0u32;
@@ -2973,9 +2976,8 @@ fn vol_find_kind(list: *const u8, count: u64, kind: u32) -> Option<u32> {
     let esize = core::mem::size_of::<VolumeDesc>();
     let mut i = 0u64;
     while i < count {
-        let d = unsafe {
-            core::ptr::read_unaligned(list.add(i as usize * esize) as *const VolumeDesc)
-        };
+        let d =
+            unsafe { core::ptr::read_unaligned(list.add(i as usize * esize) as *const VolumeDesc) };
         if d.kind == kind {
             return Some(d.id);
         }
@@ -3253,7 +3255,11 @@ fn fd_lookup(fd: u32) -> Option<OpenNode> {
     if (fd as usize) >= MAX_FD {
         return None;
     }
-    let node = unsafe { *core::ptr::addr_of!(FD_TABLE).cast::<Option<OpenNode>>().add(fd as usize) };
+    let node = unsafe {
+        *core::ptr::addr_of!(FD_TABLE)
+            .cast::<Option<OpenNode>>()
+            .add(fd as usize)
+    };
     if let Some(n) = node {
         unsafe {
             FAT_CUR_VOL = n.vol;
@@ -3358,9 +3364,7 @@ fn fat32_main() {
     }
 
     // 把缓冲页共享给 block_srv (同地址映射), 使其能直接写入读到的扇区数据。
-    if sys_share_page(bpb_buf, BLOCK_DOMAIN) != 1
-        || sys_share_page(fat_buf, BLOCK_DOMAIN) != 1
-    {
+    if sys_share_page(bpb_buf, BLOCK_DOMAIN) != 1 || sys_share_page(fat_buf, BLOCK_DOMAIN) != 1 {
         println("fat32: share buffer FAILED");
         return;
     }
@@ -3511,7 +3515,10 @@ fn fat32_main() {
         // tag 高位携带卷编码 (M1b): 路径类请求由它决定目标卷; fd 类请求由 fd 绑定的卷
         // 决定 (fd 是这些请求 payload 的首字段), 先探一次 fd, 使两类请求都对。
         let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { FAT_VOL });
-        if matches!(tag, vfs::VFS_READ_TAG | vfs::VFS_WRITE_TAG | vfs::VFS_READDIR_TAG) {
+        if matches!(
+            tag,
+            vfs::VFS_READ_TAG | vfs::VFS_WRITE_TAG | vfs::VFS_READDIR_TAG
+        ) {
             if let Some(n) = fd_lookup(read_u32(msg.payload.as_ptr())) {
                 vol = n.vol;
             }
@@ -3527,7 +3534,11 @@ fn fat32_main() {
         }
         match tag {
             vfs::VFS_OPEN_TAG => {
-                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let path_len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
                 let fd = match resolve_open_path(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8)
                 {
@@ -3620,7 +3631,11 @@ fn fat32_main() {
                 sys_reply(fd_free(fd));
             }
             vfs::VFS_CREAT_TAG => {
-                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let path_len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
                 let fd = match resolve_parent(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8) {
                     Some((parent, sn)) => match find_entry_sn(
@@ -3641,8 +3656,12 @@ fn fat32_main() {
                         Some(_) => u64::MAX, // 已存在目录
                         None => {
                             // 创建空文件 (首簇 0, 大小 0, 不预分配簇)。
-                            match find_dir_slot(&bpb, parent, dir_buf as *mut u8, fat_buf as *mut u8)
-                            {
+                            match find_dir_slot(
+                                &bpb,
+                                parent,
+                                dir_buf as *mut u8,
+                                fat_buf as *mut u8,
+                            ) {
                                 Some((off, dc))
                                     if write_dir_entry(
                                         &bpb,
@@ -3666,7 +3685,11 @@ fn fat32_main() {
                 sys_reply(fd);
             }
             vfs::VFS_MKDIR_TAG => {
-                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let path_len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
                 let r = match resolve_parent(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8) {
                     Some((parent, sn)) => {
@@ -3691,10 +3714,22 @@ fn fat32_main() {
                                             let dot = *b".          ";
                                             let dotdot = *b"..         ";
                                             if !write_dir_entry(
-                                                &bpb, free, 0, &dot, ATTR_DIRECTORY, free, 0,
+                                                &bpb,
+                                                free,
+                                                0,
+                                                &dot,
+                                                ATTR_DIRECTORY,
+                                                free,
+                                                0,
                                                 dir_buf as *mut u8,
                                             ) || !write_dir_entry(
-                                                &bpb, free, 32, &dotdot, ATTR_DIRECTORY, parent, 0,
+                                                &bpb,
+                                                free,
+                                                32,
+                                                &dotdot,
+                                                ATTR_DIRECTORY,
+                                                parent,
+                                                0,
                                                 dir_buf as *mut u8,
                                             ) {
                                                 u64::MAX
@@ -3708,7 +3743,13 @@ fn fat32_main() {
                                                 ) {
                                                     Some((off, dc))
                                                         if write_dir_entry(
-                                                            &bpb, dc, off, &sn, ATTR_DIRECTORY, free, 0,
+                                                            &bpb,
+                                                            dc,
+                                                            off,
+                                                            &sn,
+                                                            ATTR_DIRECTORY,
+                                                            free,
+                                                            0,
                                                             dir_buf as *mut u8,
                                                         ) =>
                                                     {
@@ -3729,7 +3770,11 @@ fn fat32_main() {
                 sys_reply(r);
             }
             vfs::VFS_UNLINK_TAG => {
-                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let path_len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
                 let r = match resolve_parent(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8) {
                     Some((parent, sn)) => match find_entry_sn(
@@ -3759,7 +3804,11 @@ fn fat32_main() {
                 sys_reply(r);
             }
             vfs::VFS_RMDIR_TAG => {
-                let path_len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let path_len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..path_len]) };
                 let r = match resolve_parent(&bpb, path, dir_buf as *mut u8, fat_buf as *mut u8) {
                     Some((parent, sn)) => match find_entry_sn(
@@ -3831,10 +3880,8 @@ fn fs11_write_pages(fd: u64, off: u32, pages: u32, tag: u8) -> bool {
                 4096,
             );
             buf.fill(want);
-            let slice = core::slice::from_raw_parts(
-                core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-                4096,
-            );
+            let slice =
+                core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
             vfs::write(fd, (off + i * 4096) as u64, slice)
         };
         if n != 4096 {
@@ -4019,19 +4066,16 @@ fn app_main() {
         return;
     }
     let bwrite = unsafe {
-        let slice = core::slice::from_raw_parts(
-            core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-            4096,
-        );
+        let slice =
+            core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
         vfs::write(bfd, 0, slice)
     };
     let bread = vfs::read(bfd, 0, 4096);
     if bwrite != 4096 || bread != 4096 {
         println("app: big write/read FAILED");
     } else {
-        let bcontent = unsafe {
-            core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, bread as usize)
-        };
+        let bcontent =
+            unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, bread as usize) };
         let mut ok = true;
         for (i, &b) in bcontent.iter().enumerate() {
             if b != (b'A' + (i % 26) as u8) {
@@ -4673,10 +4717,8 @@ fn app_main() {
     let mut coff = 0u32;
     while coff < 32768 {
         let n = unsafe {
-            let slice = core::slice::from_raw_parts(
-                core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-                4096,
-            );
+            let slice =
+                core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
             vfs::write(cfd10, coff as u64, slice)
         };
         if n != 4096 {
@@ -4794,8 +4836,7 @@ fn app_main() {
     //     - GC + 分配扰动后逐项读回: 目录扩展块/索引块若被误回收, 扰动会覆盖它们。
     const FS12_DIR: &str = "/mfs/DIR12";
     const FS12_FILES: u32 = 200;
-    const FS12_LONG: &str =
-        "/mfs/LONGFILE_WITH_A_REALLY_LONG_NAME_0123456789ABCDEFGHIJ.TXT";
+    const FS12_LONG: &str = "/mfs/LONGFILE_WITH_A_REALLY_LONG_NAME_0123456789ABCDEFGHIJ.TXT";
     // 幂等准备: 上一轮若在本段清理之前提前返回 (失败 / 被中断), 残留在盘上的目录与文件
     // 会让本次 `mkdir` 因「目录已存在」而失败, 把上一次的失败传染到本次 —— 与 FS-5 的
     // 处理相同 (MFS 是持久卷, 自测必须能反复重跑)。
@@ -4861,10 +4902,8 @@ fn app_main() {
                 4096,
             );
             buf.fill(i as u8);
-            let slice = core::slice::from_raw_parts(
-                core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-                4096,
-            );
+            let slice =
+                core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
             vfs::write(fd, 0, slice)
         };
         vfs::close(fd);
@@ -4914,9 +4953,8 @@ fn app_main() {
         println("app: FS12 readdir count FAILED");
         return;
     }
-    let drr = unsafe {
-        core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, dents)
-    };
+    let drr =
+        unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, dents) };
     for de in drr.iter() {
         if de.long_len as usize != 16 {
             println("app: FS12 readdir long name FAILED");
@@ -4935,10 +4973,8 @@ fn app_main() {
             4096,
         );
         buf.fill(0xA5);
-        let slice = core::slice::from_raw_parts(
-            core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-            4096,
-        );
+        let slice =
+            core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
         vfs::write(lfd, 0, slice)
     };
     vfs::close(lfd);
@@ -4970,13 +5006,13 @@ fn app_main() {
         return;
     }
     let ments = mn as usize / core::mem::size_of::<vfs::DirEntry>();
-    let marr = unsafe {
-        core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, ments)
-    };
+    let marr =
+        unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, ments) };
     let lwant = &FS12_LONG.as_bytes()[5..]; // 去掉 "/mfs/" 前缀
-    if !marr.iter().any(|de| {
-        de.long_len as usize == lwant.len() && &de.long[..lwant.len()] == lwant
-    }) {
+    if !marr
+        .iter()
+        .any(|de| de.long_len as usize == lwant.len() && &de.long[..lwant.len()] == lwant)
+    {
         println("app: FS12 readdir long name FAILED");
         return;
     }
@@ -5015,10 +5051,8 @@ fn app_main() {
             4096,
         );
         buf.fill(0x5A);
-        let slice = core::slice::from_raw_parts(
-            core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8,
-            4096,
-        );
+        let slice =
+            core::slice::from_raw_parts(core::ptr::addr_of!(BIG_WRITE_BUF) as *const u8, 4096);
         vfs::write(hfd, 0, slice)
     };
     vfs::close(hfd);
@@ -5337,11 +5371,9 @@ fn app_main() {
     let dlist13 =
         unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const vfs::DirEntry, dent13) };
     if dent13 != 2
-        || !dlist13
-            .iter()
-            .all(|de| fs13_perm(de.mode) != 0
-                && de.mtime >= FS13_EPOCH_FLOOR
-                && de.owner == APP_DOMAIN as u16)
+        || !dlist13.iter().all(|de| {
+            fs13_perm(de.mode) != 0 && de.mtime >= FS13_EPOCH_FLOOR && de.owner == APP_DOMAIN as u16
+        })
     {
         println("app: FS13 readdir meta FAILED");
         return;
@@ -5527,9 +5559,7 @@ fn app_main() {
         return;
     }
     // 清理: 最后一个名字摘掉后 inode 槽释放, 块由 GC 回收。
-    if vfs::unlink(FS14_D) != 1
-        || vfs::rmdir(FS14_DIR) != 1
-        || vfs::unlink("/mfs/CHURN6.BIN") != 1
+    if vfs::unlink(FS14_D) != 1 || vfs::rmdir(FS14_DIR) != 1 || vfs::unlink("/mfs/CHURN6.BIN") != 1
     {
         println("app: FS14 cleanup FAILED");
         return;
@@ -6287,8 +6317,7 @@ fn app_main() {
         }
         match fs13_stat(F20_L1) {
             Some(st)
-                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE
-                    && st.size == 4096 => {}
+                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE && st.size == 4096 => {}
             _ => {
                 println("app: FS20 stat-through-link FAILED");
                 return;
@@ -6311,9 +6340,8 @@ fn app_main() {
         }
         match fs20_lstat(F20_L3) {
             // "/S20NOPE.TXT" = 12 字节。
-            Some(st)
-                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK
-                    && st.size == 12 => {}
+            Some(st) if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_LINK && st.size == 12 => {
+            }
             _ => {
                 println("app: FS20 lstat dangling FAILED");
                 return;
@@ -6327,7 +6355,8 @@ fn app_main() {
         }
         // (g) lstat 对普通文件 / 目录与 stat 等价。
         match fs20_lstat(F20_T) {
-            Some(st) if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE && st.size == 4096 => {}
+            Some(st)
+                if st.mode & vfs::MODE_FTYPE_MASK == vfs::MODE_FTYPE_FILE && st.size == 4096 => {}
             _ => {
                 println("app: FS20 lstat file FAILED");
                 return;
@@ -6960,7 +6989,9 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
-            println("  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)");
+            println(
+                "  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)",
+            );
         }
         "echo" => println(arg),
         "pwd" => println(st.cwd_str()),
@@ -7262,7 +7293,11 @@ fn shell_stat(st: &ShellState, arg: &str, no_follow: bool) {
         vfs::stat_into(path, vfs::SHELL_RESULT_BUF)
     };
     if got != want {
-        print(if no_follow { "lstat: cannot stat " } else { "stat: cannot stat " });
+        print(if no_follow {
+            "lstat: cannot stat "
+        } else {
+            "stat: cannot stat "
+        });
         println(path);
         return;
     }
@@ -7307,9 +7342,8 @@ fn shell_readlink(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let raw = unsafe {
-        core::slice::from_raw_parts(vfs::SHELL_RESULT_BUF as *const u8, n as usize)
-    };
+    let raw =
+        unsafe { core::slice::from_raw_parts(vfs::SHELL_RESULT_BUF as *const u8, n as usize) };
     let target = unsafe { core::str::from_utf8_unchecked(raw) };
     print_sanitized(target);
     println("");
@@ -7326,7 +7360,9 @@ fn shell_mkfs(arg: &str) {
     let vol = match parse_dec(arg) {
         Some(v) => v,
         None => {
-            println("mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)");
+            println(
+                "mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)",
+            );
             return;
         }
     };
@@ -7506,9 +7542,8 @@ fn shell_cat(st: &ShellState, arg: &str) {
     if n == u64::MAX {
         println("cat: read failed (is it a directory?)");
     } else {
-        let content = unsafe {
-            core::slice::from_raw_parts(vfs::SHELL_RESULT_BUF as *const u8, n as usize)
-        };
+        let content =
+            unsafe { core::slice::from_raw_parts(vfs::SHELL_RESULT_BUF as *const u8, n as usize) };
         let s = unsafe { core::str::from_utf8_unchecked(content) };
         print_sanitized(s);
         println("");
@@ -7963,7 +7998,11 @@ fn mount_main() {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
         match msg.tag {
             vfs::VFS_LOOKUP_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 // 回复布局: `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 前缀长度`
                 // (libvfs 按同布局解出, 见 `vfs::mount_lookup`)。
@@ -7997,7 +8036,11 @@ fn mount_main() {
                 sys_reply(mount_auto_vol(req.domain, req.vol));
             }
             vfs::VFS_UMOUNT_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let prefix = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(mount_del(prefix));
             }
@@ -8064,7 +8107,10 @@ struct TmpFd {
     node: u32,
 }
 
-const TMP_FD_EMPTY: TmpFd = TmpFd { used: false, node: 0 };
+const TMP_FD_EMPTY: TmpFd = TmpFd {
+    used: false,
+    node: 0,
+};
 
 static mut TMP_FDS: [TmpFd; TMP_MAX_FD] = [TMP_FD_EMPTY; TMP_MAX_FD];
 
@@ -8294,7 +8340,9 @@ fn tmp_fd_node(fd: u32) -> Option<usize> {
         return None;
     }
     unsafe {
-        let slot = &*core::ptr::addr_of!(TMP_FDS).cast::<TmpFd>().add(fd as usize);
+        let slot = &*core::ptr::addr_of!(TMP_FDS)
+            .cast::<TmpFd>()
+            .add(fd as usize);
         if slot.used {
             Some(slot.node as usize)
         } else {
@@ -8308,7 +8356,9 @@ fn tmp_fd_free(fd: u32) -> u64 {
         return 0;
     }
     unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(TMP_FDS).cast::<TmpFd>().add(fd as usize);
+        let slot = &mut *core::ptr::addr_of_mut!(TMP_FDS)
+            .cast::<TmpFd>()
+            .add(fd as usize);
         if slot.used {
             slot.used = false;
             1
@@ -8338,7 +8388,11 @@ fn tmpfs_main() {
         // 卷编码 (tag 高位) 对本服务无意义 (tmpfs 没有卷概念), 分发前剥掉。
         match vfs::tag_body(msg.tag) {
             vfs::VFS_OPEN_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match tmp_normalize(path, &mut canon) {
                     Some(n) => match tmp_find(&canon[..n]) {
@@ -8492,7 +8546,11 @@ fn tmpfs_main() {
                 sys_reply(tmp_fd_free(fd));
             }
             vfs::VFS_CREAT_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match tmp_normalize(path, &mut canon) {
                     Some(n) => {
@@ -8521,7 +8579,11 @@ fn tmpfs_main() {
                 sys_reply(fd);
             }
             vfs::VFS_MKDIR_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let r = match tmp_normalize(path, &mut canon) {
                     Some(n) if n > 1 && tmp_find(&canon[..n]).is_none() => {
@@ -8542,7 +8604,11 @@ fn tmpfs_main() {
                 sys_reply(r);
             }
             vfs::VFS_UNLINK_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let r = match tmp_normalize(path, &mut canon) {
                     Some(n) => match tmp_find(&canon[..n]) {
@@ -8557,13 +8623,15 @@ fn tmpfs_main() {
                 sys_reply(r);
             }
             vfs::VFS_RMDIR_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let r = match tmp_normalize(path, &mut canon) {
                     Some(n) if n > 1 => match tmp_find(&canon[..n]) {
-                        Some(idx)
-                            if tmp_node_at(idx).is_dir && tmp_dir_empty(&canon[..n]) =>
-                        {
+                        Some(idx) if tmp_node_at(idx).is_dir && tmp_dir_empty(&canon[..n]) => {
                             tmp_node_at_mut(idx).used = false;
                             1
                         }
@@ -9225,7 +9293,9 @@ fn mfs_bmp_touch(b: u32) {
     let c = (b / MFS_BMP_BLOCK_SPAN) as usize;
     if c < MFS_MAX_BMP_DATA_BLOCKS as usize {
         unsafe {
-            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(c >> 3) |= 1u8 << (c & 7);
+            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY)
+                .cast::<u8>()
+                .add(c >> 3) |= 1u8 << (c & 7);
         }
     }
 }
@@ -9689,12 +9759,18 @@ fn mfs_itab_table(k: u32) -> u32 {
     if k as usize >= MFS_ITAB_SLOTS {
         return 0;
     }
-    unsafe { *core::ptr::addr_of!(MFS_ITAB_MEM).cast::<u32>().add(k as usize) }
+    unsafe {
+        *core::ptr::addr_of!(MFS_ITAB_MEM)
+            .cast::<u32>()
+            .add(k as usize)
+    }
 }
 fn mfs_set_itab_table(k: u32, blk: u32) {
     if (k as usize) < MFS_ITAB_SLOTS {
         unsafe {
-            *core::ptr::addr_of_mut!(MFS_ITAB_MEM).cast::<u32>().add(k as usize) = blk;
+            *core::ptr::addr_of_mut!(MFS_ITAB_MEM)
+                .cast::<u32>()
+                .add(k as usize) = blk;
         }
     }
 }
@@ -9864,7 +9940,11 @@ fn mfs_ino_alloc_for(blk: u32) -> Option<u32> {
                 return None;
             }
             unsafe {
-                MFS_INO_HINT = if ino + 1 >= MFS_INO_MAX { MFS_ROOT_INO + 1 } else { ino + 1 };
+                MFS_INO_HINT = if ino + 1 >= MFS_INO_MAX {
+                    MFS_ROOT_INO + 1
+                } else {
+                    ino + 1
+                };
                 MFS_INO_COUNT += 1;
             }
             return Some(ino);
@@ -9911,8 +9991,13 @@ fn mfs_build_super(buf: *mut u8) {
     write_u32(mfs_atm(buf, p + MFS_SB_BLOCK_SIZE), MFS_BLOCK as u32);
     write_u32(mfs_atm(buf, p + MFS_SB_TOTAL), unsafe { MFS_TOTAL_BLOCKS });
     write_u32(mfs_atm(buf, p + MFS_SB_INO_COUNT), unsafe { MFS_INO_COUNT });
-    write_u32(mfs_atm(buf, p + MFS_SB_ALLOC_HINT), unsafe { MFS_ALLOC_NEXT });
-    write_u32(mfs_atm(buf, p + MFS_SB_SNAP_COUNT), unsafe { MFS_SNAP_COUNT } as u32);
+    write_u32(mfs_atm(buf, p + MFS_SB_ALLOC_HINT), unsafe {
+        MFS_ALLOC_NEXT
+    });
+    write_u32(
+        mfs_atm(buf, p + MFS_SB_SNAP_COUNT),
+        unsafe { MFS_SNAP_COUNT } as u32,
+    );
     write_u64(mfs_atm(buf, p + MFS_SB_GEN), unsafe { MFS_GEN });
     write_u32(mfs_atm(buf, p + MFS_SB_ITAB), unsafe { MFS_ITAB });
     write_u32(mfs_atm(buf, p + MFS_SB_INO_HINT), unsafe { MFS_INO_HINT });
@@ -9926,7 +10011,9 @@ fn mfs_build_super(buf: *mut u8) {
     }
     // 主卷序号: 认领 `/mfs` 的依据 (见 `mfs_vol_claim`)。必须每次都写 —— 提交走的是
     // 「重写整块超级块」而不是原地改字段, 漏写就会把标记清掉。
-    write_u64(mfs_atm(buf, p + MFS_SB_PRIMARY), unsafe { MFS_PRIMARY_SERIAL });
+    write_u64(mfs_atm(buf, p + MFS_SB_PRIMARY), unsafe {
+        MFS_PRIMARY_SERIAL
+    });
     // MFS7: 空闲位图不再内联在超级块里, 位图改由 `mfs_bmp_flush` 写入独立的位图
     // 数据块 + 头块。原内联区 (+256 起) 只留 `MFS_SB_PRIMARY` 一项, 其余为保留。
     mfs_seal(buf, MFS_MAGIC_SUPER);
@@ -10286,7 +10373,9 @@ fn mfs_format() -> bool {
     // 位图内容整体重置: 所有数据块都必须落盘 (不能只靠脏位增量)。
     for c in 0..bb {
         unsafe {
-            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(c >> 3) |= 1u8 << (c & 7);
+            *core::ptr::addr_of_mut!(MFS_BMP_DIRTY)
+                .cast::<u8>()
+                .add(c >> 3) |= 1u8 << (c & 7);
         }
     }
     for k in 0..MFS_ITAB_SLOTS {
@@ -10501,7 +10590,11 @@ fn cmos_rtc_snapshot() -> Option<u64> {
         hour = ((hour & 0x7F) + 12) % 24;
     }
     // 两位数年份: 按 70..99 → 19xx, 00..69 → 20xx 归一。
-    let full_year = if year >= 70 { 1900 + year as i64 } else { 2000 + year as i64 };
+    let full_year = if year >= 70 {
+        1900 + year as i64
+    } else {
+        2000 + year as i64
+    };
     if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
@@ -10637,10 +10730,22 @@ fn mfs_dir_slot(buf: *const u8, need: usize) -> Option<(usize, usize, usize)> {
 ///
 /// 若 `used > 0` (切的是某条有效条目的余量), 必须先把该条目的 rec_len 缩回 `used`,
 /// 否则它的 rec_len 会越过新条目, 串联链就跳过了新条目 (插入成功却查不到)。
-fn mfs_ent_place(buf: *mut u8, off: usize, rl: usize, used: usize, comp: &[u8], child: u32, typ: u32) {
+fn mfs_ent_place(
+    buf: *mut u8,
+    off: usize,
+    rl: usize,
+    used: usize,
+    comp: &[u8],
+    child: u32,
+    typ: u32,
+) {
     let need = mfs_ent_need(comp.len());
     let avail = rl - used;
-    let take = if avail - need >= MFS_DIR_ENT_MIN { need } else { avail };
+    let take = if avail - need >= MFS_DIR_ENT_MIN {
+        need
+    } else {
+        avail
+    };
     let eoff = off + used;
     if used > 0 {
         write_u16(mfs_atm(buf, off + 6), used as u16);
@@ -10989,16 +11094,31 @@ struct MfsMapPlan {
 /// 把逻辑块索引算成映射位置; 超出 `MFS_FILE_MAX_BLOCKS` 返回 None。
 fn mfs_map_plan(bi: usize) -> Option<MfsMapPlan> {
     if bi < MFS_FILE_DIRECT {
-        return Some(MfsMapPlan { kind: 0, slot3: 0, slot2: 0, slot1: bi });
+        return Some(MfsMapPlan {
+            kind: 0,
+            slot3: 0,
+            slot2: 0,
+            slot1: bi,
+        });
     }
     let idx = bi - MFS_FILE_DIRECT;
     if idx < MFS_IND_CAP {
-        return Some(MfsMapPlan { kind: 1, slot3: 0, slot2: 0, slot1: idx });
+        return Some(MfsMapPlan {
+            kind: 1,
+            slot3: 0,
+            slot2: 0,
+            slot1: idx,
+        });
     }
     let idx = idx - MFS_IND_CAP;
     if idx < MFS_IND_CAP * MFS_IND_CAP {
         let slot2 = idx / MFS_IND_CAP;
-        return Some(MfsMapPlan { kind: 2, slot3: 0, slot2, slot1: idx % MFS_IND_CAP });
+        return Some(MfsMapPlan {
+            kind: 2,
+            slot3: 0,
+            slot2,
+            slot1: idx % MFS_IND_CAP,
+        });
     }
     // 三级间接: idx3 先按二级块的容量 (CAP²) 切出 slot3, 余下再按一级块容量切。
     let idx3 = idx - MFS_IND_CAP * MFS_IND_CAP;
@@ -11322,7 +11442,11 @@ fn mfs_name_to_fat(name: &[u8], out: &mut [u8; 11]) {
         }
     }
     let base = &seg[..dot];
-    let ext = if dot < len { &seg[dot + 1..len] } else { &seg[len..len] };
+    let ext = if dot < len {
+        &seg[dot + 1..len]
+    } else {
+        &seg[len..len]
+    };
     let bn = base.len().min(8);
     out[..bn].copy_from_slice(&base[..bn]);
     let en = ext.len().min(3);
@@ -11630,7 +11754,11 @@ fn mfs_write_file(ino: u32, offset: u64, count: u32, src: *const u8) -> u64 {
             zero_bytes(c, MFS_BLOCK);
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(src.add(done as usize), mfs_atm(c, MFS_HDR + boff), chunk);
+            core::ptr::copy_nonoverlapping(
+                src.add(done as usize),
+                mfs_atm(c, MFS_HDR + boff),
+                chunk,
+            );
         }
         let new_db = match mfs_commit(c, MFS_MAGIC_DATA) {
             Some(b) => b,
@@ -11950,7 +12078,8 @@ fn mfs_dir_emit(buf: *const u8, out: *mut vfs::DirEntry, count: &mut usize) {
             let typ = mfs_ent_type(buf, off);
             let is_dir = typ == MFS_TYPE_DIR;
             let mut de = vfs::DirEntry::short([0u8; 11], 0, u32::from(is_dir));
-            let name = unsafe { core::slice::from_raw_parts(mfs_at(buf, off + MFS_DIR_ENT_HDR), nl) };
+            let name =
+                unsafe { core::slice::from_raw_parts(mfs_at(buf, off + MFS_DIR_ENT_HDR), nl) };
             mfs_name_to_fat(name, &mut de.name);
             // MFS 名字直接以字节串存储, 原样回传 (截到 IPC 可达长度)。
             let ln = nl.min(vfs::DIR_LONG_MAX);
@@ -12049,7 +12178,9 @@ fn mfs_fd_get(fd: u32) -> Option<MfsFd> {
         return None;
     }
     unsafe {
-        let s = &*core::ptr::addr_of!(MFS_FDS).cast::<MfsFd>().add(fd as usize);
+        let s = &*core::ptr::addr_of!(MFS_FDS)
+            .cast::<MfsFd>()
+            .add(fd as usize);
         if s.used {
             Some(*s)
         } else {
@@ -12062,7 +12193,9 @@ fn mfs_fd_free(fd: u32) -> u64 {
         return 0;
     }
     unsafe {
-        let s = &mut *core::ptr::addr_of_mut!(MFS_FDS).cast::<MfsFd>().add(fd as usize);
+        let s = &mut *core::ptr::addr_of_mut!(MFS_FDS)
+            .cast::<MfsFd>()
+            .add(fd as usize);
         if s.used {
             s.used = false;
             1
@@ -12203,7 +12336,11 @@ fn mfs_main() {
         }
         match tag {
             vfs::VFS_OPEN_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match mfs_normalize(path, &mut canon) {
                     Some(n) => match mfs_resolve(&canon[..n]).and_then(mfs_ino_block) {
@@ -12222,7 +12359,9 @@ fn mfs_main() {
                     Some(fd) if !fd.is_dir => {
                         let p = &fd.path[..fd.path_len as usize];
                         match mfs_resolve(p) {
-                            Some(ino) => mfs_read_file(ino, req.offset, req.count, req.buf as *mut u8),
+                            Some(ino) => {
+                                mfs_read_file(ino, req.offset, req.count, req.buf as *mut u8)
+                            }
                             None => u64::MAX,
                         }
                     }
@@ -12241,7 +12380,9 @@ fn mfs_main() {
                         let plen = fd.path_len as usize;
                         p[..plen].copy_from_slice(&fd.path[..plen]);
                         match mfs_resolve(&p[..plen]) {
-                            Some(ino) => mfs_write_file(ino, req.offset, req.count, req.buf as *const u8),
+                            Some(ino) => {
+                                mfs_write_file(ino, req.offset, req.count, req.buf as *const u8)
+                            }
                             None => u64::MAX,
                         }
                     }
@@ -12273,7 +12414,11 @@ fn mfs_main() {
             }
             vfs::VFS_CREAT_TAG | vfs::VFS_MKDIR_TAG => {
                 let is_dir = tag == vfs::VFS_MKDIR_TAG;
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 // 创建者域 id 作为 owner 记进元数据 (fire-and-forget 显示用)。
                 let fd = mfs_create(path, is_dir, msg.from as u16);
@@ -12281,7 +12426,11 @@ fn mfs_main() {
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
                 let want_dir = tag == vfs::VFS_RMDIR_TAG;
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(mfs_remove(path, want_dir));
             }
@@ -12385,7 +12534,11 @@ fn mfs_main() {
                 unsafe {
                     MFS_SNAP_COUNT = idx + 1;
                 }
-                let r = if mfs_bmp_flush() { idx as u64 } else { u64::MAX };
+                let r = if mfs_bmp_flush() {
+                    idx as u64
+                } else {
+                    u64::MAX
+                };
                 sys_reply(r);
             }
             vfs::MFS_SNAPLIST_TAG => {
@@ -12583,7 +12736,11 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     let c = mfs_c();
     zero_bytes(c, MFS_BLOCK);
     let mode = if is_dir { MFS_MODE_DIR } else { MFS_MODE_FILE };
-    let ftype = if is_dir { MFS_FTYPE_DIR } else { MFS_FTYPE_FILE };
+    let ftype = if is_dir {
+        MFS_FTYPE_DIR
+    } else {
+        MFS_FTYPE_FILE
+    };
     if is_dir {
         mfs_dir_init_empty(c);
     } else {
@@ -12591,7 +12748,11 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
         mfs_file_set_nblocks(c, 0);
     }
     mfs_init_meta(c, is_dir, ftype, owner, mode);
-    let magic = if is_dir { MFS_MAGIC_DIR } else { MFS_MAGIC_FILE };
+    let magic = if is_dir {
+        MFS_MAGIC_DIR
+    } else {
+        MFS_MAGIC_FILE
+    };
     // 先落对象块, 再为它登记一个 ino (登记时把表槽直接指向该块)。顺序反过来会先占
     // 一个空槽却还不知道块号, 需要写两次表。
     let obj = match mfs_commit(c, magic) {
@@ -12939,7 +13100,12 @@ fn ext2_read_block(block_no: u32, dst: *mut u8) -> bool {
     if sectors == 0 {
         return false;
     }
-    block_read_dev(unsafe { EXT2_CUR_VOL }, block_no * sectors as u32, sectors, dst)
+    block_read_dev(
+        unsafe { EXT2_CUR_VOL },
+        block_no * sectors as u32,
+        sectors,
+        dst,
+    )
 }
 
 /// 由 inode 号读 inode: inode 表块读入 `buf`, 需要的字段拷进返回值。
@@ -13422,7 +13588,11 @@ fn exfat_build_set(
     }
     write_u16(
         exfat_atm(out, 4),
-        if is_dir { EXFAT_ATTR_DIR } else { EXFAT_ATTR_ARCHIVE },
+        if is_dir {
+            EXFAT_ATTR_DIR
+        } else {
+            EXFAT_ATTR_ARCHIVE
+        },
     );
     write_u32(exfat_atm(out, 8), ts); // CreateTimestamp
     write_u32(exfat_atm(out, 12), ts); // LastModifiedTimestamp
@@ -13435,8 +13605,7 @@ fn exfat_build_set(
     let stream = exfat_atm(out, EXFAT_DIR_ENTRY);
     unsafe {
         *stream = EXFAT_TYPE_STREAM;
-        *stream.add(1) = EXFAT_SF_ALLOC
-            | if no_fat_chain { EXFAT_SF_NOFATCHAIN } else { 0 };
+        *stream.add(1) = EXFAT_SF_ALLOC | if no_fat_chain { EXFAT_SF_NOFATCHAIN } else { 0 };
         *stream.add(3) = nu as u8; // NameLength (UTF-16 码元数)
     }
     write_u16(exfat_atm(stream, 4), exfat_name_hash(&units, nu));
@@ -13450,7 +13619,10 @@ fn exfat_build_set(
         unsafe {
             *ent = EXFAT_TYPE_NAME;
         }
-        write_u16(exfat_atm(ent, 2 + (k % EXFAT_NAME_UNITS_PER_ENTRY) * 2), units[k]);
+        write_u16(
+            exfat_atm(ent, 2 + (k % EXFAT_NAME_UNITS_PER_ENTRY) * 2),
+            units[k],
+        );
         k += 1;
     }
     let sum = exfat_set_checksum(out, (total * EXFAT_DIR_ENTRY) as u32);
@@ -13997,7 +14169,9 @@ fn ext2_fd_get(fd: u32) -> Option<Ext2Fd> {
         return None;
     }
     unsafe {
-        let s = &*core::ptr::addr_of!(EXT2_FDS).cast::<Ext2Fd>().add(fd as usize);
+        let s = &*core::ptr::addr_of!(EXT2_FDS)
+            .cast::<Ext2Fd>()
+            .add(fd as usize);
         if s.used {
             EXT2_CUR_VOL = s.vol;
             Some(*s)
@@ -14011,7 +14185,9 @@ fn ext2_fd_free(fd: u32) -> u64 {
         return 0;
     }
     unsafe {
-        let s = &mut *core::ptr::addr_of_mut!(EXT2_FDS).cast::<Ext2Fd>().add(fd as usize);
+        let s = &mut *core::ptr::addr_of_mut!(EXT2_FDS)
+            .cast::<Ext2Fd>()
+            .add(fd as usize);
         if s.used {
             s.used = false;
             1
@@ -14092,7 +14268,8 @@ fn ext2_mount() -> bool {
         blk += 1;
     }
     // 根 inode 必须存在且是目录, 否则视为无效卷。
-    let ok = matches!(ext2_read_inode(EXT2_ROOT_INO), Some(i) if i.mode & EXT2_S_IFMT == EXT2_S_IFDIR);
+    let ok =
+        matches!(ext2_read_inode(EXT2_ROOT_INO), Some(i) if i.mode & EXT2_S_IFMT == EXT2_S_IFDIR);
     if ok {
         // 记录「当前几何属于哪个卷」(M1b: 卷切换时据此判断要不要重新解析)。
         unsafe {
@@ -14135,7 +14312,12 @@ fn ext2_main() {
     }
 
     // M1b: 把**额外**的 ext2 卷挂到 `/usb<卷号>` (元数据已解析完, `ext2_a` 可作暂存)。
-    mount_extra_volumes(ext2_a(), VOL_KIND_EXT2, unsafe { EXT2_VOL }, vfs::EXT2_DOMAIN);
+    mount_extra_volumes(
+        ext2_a(),
+        VOL_KIND_EXT2,
+        unsafe { EXT2_VOL },
+        vfs::EXT2_DOMAIN,
+    );
 
     let mut msg = Message {
         from: 0,
@@ -14164,7 +14346,11 @@ fn ext2_main() {
         }
         match tag {
             vfs::VFS_OPEN_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match ext2_resolve(path) {
                     Some((ino, is_dir)) => ext2_fd_alloc(ino, is_dir, vol),
@@ -14664,10 +14850,7 @@ fn exfat_parse_file_set(
     e.first_cluster = read_u32(exfat_at(stream, 20));
     e.valid_size = read_u64(exfat_at(stream, 8));
     e.size = read_u64(exfat_at(stream, 24));
-    e.mtime = exfat_decode_time(
-        read_u32(exfat_at(file, 12)),
-        unsafe { *exfat_at(file, 21) },
-    );
+    e.mtime = exfat_decode_time(read_u32(exfat_at(file, 12)), unsafe { *exfat_at(file, 21) });
     let mut long = [0u8; vfs::DIR_LONG_MAX];
     e.name_len = exfat_read_name(buf, first_index + 2, units, &mut long);
     e.name = long;
@@ -15062,7 +15245,12 @@ fn exfat_chain_nth(first: u32, idx: u32) -> Option<u32> {
 ///
 /// 既有的连续 (`NoFatChain`) 文件会先补齐簇间 FAT 链接转成链式 —— 之后
 /// 只有一种寻簇方式, 读写路径不必再分叉。
-fn exfat_grow_to(first: u32, no_fat_chain: bool, have: u32, needed: u32) -> Option<(u32, bool, u32)> {
+fn exfat_grow_to(
+    first: u32,
+    no_fat_chain: bool,
+    have: u32,
+    needed: u32,
+) -> Option<(u32, bool, u32)> {
     if needed == 0 {
         return Some((0, false, 0));
     }
@@ -15163,7 +15351,9 @@ fn exfat_fd_get(fd: u32) -> Option<ExfatFd> {
         return None;
     }
     unsafe {
-        let s = &*core::ptr::addr_of!(EXFAT_FDS).cast::<ExfatFd>().add(fd as usize);
+        let s = &*core::ptr::addr_of!(EXFAT_FDS)
+            .cast::<ExfatFd>()
+            .add(fd as usize);
         if s.used {
             EXFAT_CUR_VOL = s.vol;
             Some(*s)
@@ -15177,7 +15367,9 @@ fn exfat_fd_free(fd: u32) -> u64 {
         return 0;
     }
     unsafe {
-        let s = &mut *core::ptr::addr_of_mut!(EXFAT_FDS).cast::<ExfatFd>().add(fd as usize);
+        let s = &mut *core::ptr::addr_of_mut!(EXFAT_FDS)
+            .cast::<ExfatFd>()
+            .add(fd as usize);
         if s.used {
             s.used = false;
             1
@@ -15220,9 +15412,7 @@ fn exfat_scan_system_entries() -> bool {
                 match t {
                     EXFAT_TYPE_BITMAP => {
                         // 位图按需读取 (只缓存一个扇区), 故只校验存在性与覆盖面。
-                        if first < 2
-                            || len == 0
-                            || len * 8 < unsafe { EXFAT_CLUSTER_COUNT } as u64
+                        if first < 2 || len == 0 || len * 8 < unsafe { EXFAT_CLUSTER_COUNT } as u64
                         {
                             return false;
                         }
@@ -15396,7 +15586,12 @@ fn exfat_main() {
     println("");
 
     // M1b: 把**额外**的 exFAT 卷挂到 `/usb<卷号>` (元数据已解析完, `exfat_pg` 可作暂存)。
-    mount_extra_volumes(exfat_pg(), VOL_KIND_EXFAT, unsafe { EXFAT_VOL }, vfs::EXFAT_DOMAIN);
+    mount_extra_volumes(
+        exfat_pg(),
+        VOL_KIND_EXFAT,
+        unsafe { EXFAT_VOL },
+        vfs::EXFAT_DOMAIN,
+    );
 
     let mut msg = Message {
         from: 0,
@@ -15428,7 +15623,11 @@ fn exfat_main() {
         }
         match tag {
             vfs::VFS_OPEN_TAG => {
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match exfat_resolve(path) {
                     Some(e) => exfat_fd_alloc(path, e.is_dir, vol),
@@ -15451,10 +15650,13 @@ fn exfat_main() {
                             core::str::from_utf8_unchecked(&fd.path[..fd.path_len as usize])
                         };
                         match exfat_resolve(path) {
-                            Some(e) => {
-                                exfat_read_file(&e, req.offset as u32, req.count, req.buf as *mut u8)
-                                    .unwrap_or(u64::MAX)
-                            }
+                            Some(e) => exfat_read_file(
+                                &e,
+                                req.offset as u32,
+                                req.count,
+                                req.buf as *mut u8,
+                            )
+                            .unwrap_or(u64::MAX),
                             None => u64::MAX,
                         }
                     }
@@ -15472,8 +15674,10 @@ fn exfat_main() {
                             core::str::from_utf8_unchecked(&fd.path[..fd.path_len as usize])
                         };
                         match exfat_resolve(path) {
-                            Some(e) => exfat_readdir(e.first_cluster, req.buf as *mut vfs::DirEntry)
-                                .unwrap_or(u64::MAX),
+                            Some(e) => {
+                                exfat_readdir(e.first_cluster, req.buf as *mut vfs::DirEntry)
+                                    .unwrap_or(u64::MAX)
+                            }
                             None => u64::MAX,
                         }
                     }
@@ -15510,13 +15714,21 @@ fn exfat_main() {
             }
             vfs::VFS_CREAT_TAG | vfs::VFS_MKDIR_TAG => {
                 let is_dir = tag == vfs::VFS_MKDIR_TAG;
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(exfat_create(path, is_dir, vol));
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
                 let want_dir = tag == vfs::VFS_RMDIR_TAG;
-                let len = msg.payload.iter().position(|&b| b == 0).unwrap_or(PAYLOAD_LEN);
+                let len = msg
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(exfat_remove(path, want_dir));
             }
@@ -15575,8 +15787,13 @@ fn exfat_main() {
                                 p[..plen].copy_from_slice(&fd.path[..plen]);
                                 let path = unsafe { core::str::from_utf8_unchecked(&p[..plen]) };
                                 match exfat_resolve(path) {
-                                    Some(e) => exfat_truncate(&e, parent_first, &nm[..nlen], req.size as u32)
-                                        .unwrap_or(u64::MAX),
+                                    Some(e) => exfat_truncate(
+                                        &e,
+                                        parent_first,
+                                        &nm[..nlen],
+                                        req.size as u32,
+                                    )
+                                    .unwrap_or(u64::MAX),
                                     None => u64::MAX,
                                 }
                             }

@@ -61,7 +61,9 @@ static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
 
 /// 更新当前任务的内核栈顶 (调度器调用)。
 pub fn set_current_kernel_stack_top(top: u64) {
-    unsafe { CURRENT_KERNEL_STACK_TOP = top; }
+    unsafe {
+        CURRENT_KERNEL_STACK_TOP = top;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,11 +119,11 @@ global_asm!(
     ".global switch_to_user",
     "switch_to_user:",
     // 选择子须与 gdt.rs 的 USER_DATA_SEL_RPL3 / USER_CODE_SEL_RPL3 一致。
-    "  push 0x1B",  // SS  (user data, RPL3)
-    "  push rsi",   // RSP (user stack top)
-    "  push 0x202", // RFLAGS (bit1 保留位 + IF=1)
-    "  push 0x23",  // CS  (user code, RPL3)
-    "  push rdi",   // RIP (user entry)
+    "  push 0x1B",    // SS  (user data, RPL3)
+    "  push rsi",     // RSP (user stack top)
+    "  push 0x202",   // RFLAGS (bit1 保留位 + IF=1)
+    "  push 0x23",    // CS  (user code, RPL3)
+    "  push rdi",     // RIP (user entry)
     "  mov rdi, rdx", // 把用户参数放入 rdi (SysV 第一个参数), 供 _start 读取
     "  iretq",
 );

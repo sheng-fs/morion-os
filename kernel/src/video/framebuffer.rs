@@ -12,7 +12,12 @@ pub struct Framebuffer {
 impl Framebuffer {
     /// 未初始化的空缓冲 (用于 static 初始值)
     pub const fn empty() -> Self {
-        Self { base: core::ptr::null_mut::<u8>(), width: 0, height: 0, stride: 0 }
+        Self {
+            base: core::ptr::null_mut::<u8>(),
+            width: 0,
+            height: 0,
+            stride: 0,
+        }
     }
 
     /// 是否已初始化
@@ -21,7 +26,12 @@ impl Framebuffer {
     }
 
     pub fn init(base: u64, width: u32, height: u32, stride: u32) -> Self {
-        Self { base: base as *mut u8, width, height, stride }
+        Self {
+            base: base as *mut u8,
+            width,
+            height,
+            stride,
+        }
     }
 
     /// 写入单个像素 (0x00RRGGBB)。

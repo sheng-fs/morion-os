@@ -13,9 +13,7 @@
 //! 句柄 (见 `cap_guard`), `close` 时撤销句柄。句柄被撤销后, 该 fd 上的任何操作
 //! 都会失败 —— 即使 fd 数值被伪造也无法访问服务 (无能力即不可访问)。
 
-use crate::syscall::{
-    sys_call_payload, sys_cap_drop, sys_cap_issue, sys_cap_lookup, PAYLOAD_LEN,
-};
+use crate::syscall::{sys_call_payload, sys_cap_drop, sys_cap_issue, sys_cap_lookup, PAYLOAD_LEN};
 
 /// fat32 文件服务域 id (与内核 `main.rs` 创建顺序一致), 挂载于 `/`。
 pub const FAT32_DOMAIN: u64 = 6;
@@ -146,7 +144,10 @@ pub struct MountReq {
 /// 运行时把文件服务 `domain` 挂到 `prefix`; `prefix` 为空串时由 mount_srv 自动
 /// 分配一个空闲的 `/mnt<N>` 挂载点。成功返回挂载槽位号 (1 起), 失败 `u64::MAX`。
 pub fn mount(prefix: &str, domain: u64) -> u64 {
-    let mut req = MountReq { domain, prefix: [0; MOUNT_PREFIX_MAX] };
+    let mut req = MountReq {
+        domain,
+        prefix: [0; MOUNT_PREFIX_MAX],
+    };
     let n = prefix.len().min(MOUNT_PREFIX_MAX);
     req.prefix[..n].copy_from_slice(&prefix.as_bytes()[..n]);
     let payload = unsafe {
@@ -491,7 +492,13 @@ impl DirEntry {
     }
 
     /// 带长名的条目 (VFAT 长名 / ext2 名字)。
-    pub const fn with_long(name: [u8; 11], long: [u8; DIR_LONG_MAX], long_len: u8, size: u64, is_dir: u32) -> Self {
+    pub const fn with_long(
+        name: [u8; 11],
+        long: [u8; DIR_LONG_MAX],
+        long_len: u8,
+        size: u64,
+        is_dir: u32,
+    ) -> Self {
         Self {
             name,
             long_len,
@@ -760,7 +767,11 @@ pub fn stat(path: &str) -> u64 {
 pub fn stat_into(path: &str, buf: u64) -> u64 {
     match route(path) {
         Some((domain, vol_enc, sub)) => {
-            let req = PathReq { aux: 0, _pad: 0, buf };
+            let req = PathReq {
+                aux: 0,
+                _pad: 0,
+                buf,
+            };
             write_cstr(sub, buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
@@ -795,7 +806,11 @@ pub fn readlink_into(path: &str, buf: u64) -> u64 {
         Some((_, _, n)) => n,
         None => 0,
     };
-    let req = PathReq { aux: 0, _pad: 0, buf };
+    let req = PathReq {
+        aux: 0,
+        _pad: 0,
+        buf,
+    };
     write_cstr(sub, buf);
     let payload = unsafe {
         core::slice::from_raw_parts(
@@ -835,7 +850,11 @@ pub fn lstat(path: &str) -> u64 {
 pub fn lstat_into(path: &str, buf: u64) -> u64 {
     match route(path) {
         Some((domain, vol_enc, sub)) => {
-            let req = PathReq { aux: 0, _pad: 0, buf };
+            let req = PathReq {
+                aux: 0,
+                _pad: 0,
+                buf,
+            };
             write_cstr(sub, buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
@@ -860,7 +879,11 @@ pub fn chmod(path: &str, mode: u32) -> u64 {
 pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
     match route(path) {
         Some((domain, vol_enc, sub)) => {
-            let req = PathReq { aux: mode, _pad: 0, buf };
+            let req = PathReq {
+                aux: mode,
+                _pad: 0,
+                buf,
+            };
             write_cstr(sub, buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
@@ -881,7 +904,11 @@ pub fn truncate(fd: u64, size: u64) -> u64 {
     if !cap_guard(fd) {
         return u64::MAX;
     }
-    let req = TruncateReq { fd: fd_local(fd), _pad: 0, size };
+    let req = TruncateReq {
+        fd: fd_local(fd),
+        _pad: 0,
+        size,
+    };
     let payload = unsafe {
         core::slice::from_raw_parts(
             &req as *const TruncateReq as *const u8,

@@ -157,11 +157,7 @@ impl MenuUI {
     }
 
     /// 渲染菜单
-    pub fn render(
-        &mut self,
-        _renderer: &mut Renderer,
-        _entries: &GenerationManager,
-    ) {
+    pub fn render(&mut self, _renderer: &mut Renderer, _entries: &GenerationManager) {
         // 渲染由 menu::ui 模块处理
         // 这里只是一个钩子点
     }

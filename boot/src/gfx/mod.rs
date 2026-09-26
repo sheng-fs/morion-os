@@ -8,12 +8,12 @@
 //!   - 软件光标渲染
 //!   - 简单的帧动画引擎
 
+pub mod animation;
+pub mod font;
 pub mod framebuffer;
 pub mod renderer;
-pub mod font;
-pub mod animation;
 
+pub use animation::AnimationEngine;
+pub use font::BitmapFont;
 pub use framebuffer::FrameBuffer;
 pub use renderer::Renderer;
-pub use font::BitmapFont;
-pub use animation::AnimationEngine;

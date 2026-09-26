@@ -11,8 +11,8 @@
 
 use crate::config::entries::BootEntry;
 use crate::security::{ImageHasher, SignatureVerifier, TpmMeasurer};
-use uefi::table::boot::BootServices;
 use alloc::string::String;
+use uefi::table::boot::BootServices;
 
 /// ELF64 文件头
 #[repr(C)]

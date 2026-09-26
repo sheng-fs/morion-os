@@ -96,7 +96,11 @@ impl ImageHasher {
         if data.is_empty() {
             return Self::hash(&[]);
         }
-        let cs = if chunk_size == 0 { data.len() } else { chunk_size };
+        let cs = if chunk_size == 0 {
+            data.len()
+        } else {
+            chunk_size
+        };
         let mut level: Vec<Hash256> = data.chunks(cs).map(Self::hash).collect();
 
         while level.len() > 1 {

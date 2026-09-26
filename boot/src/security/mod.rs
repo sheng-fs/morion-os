@@ -8,10 +8,10 @@
 //!
 //! 注: SM3 映像哈希与 SM2 验签已启用 (RustCrypto no_std 纯 Rust)。
 
+pub mod hash;
 pub mod secure_boot;
 pub mod tpm;
-pub mod hash;
 
+pub use hash::ImageHasher;
 pub use secure_boot::SignatureVerifier;
 pub use tpm::TpmMeasurer;
-pub use hash::ImageHasher;

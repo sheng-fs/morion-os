@@ -21,7 +21,10 @@ impl TpmMeasurer {
     }
 
     /// 尝试初始化 TPM 测量 (桩)
-    pub fn initialize(&mut self, _boot_services: &uefi::table::boot::BootServices) -> Result<(), &'static str> {
+    pub fn initialize(
+        &mut self,
+        _boot_services: &uefi::table::boot::BootServices,
+    ) -> Result<(), &'static str> {
         // 桩实现: 始终报告 TPM 未检测到
         Ok(())
     }

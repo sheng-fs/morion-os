@@ -72,10 +72,7 @@ impl KexecBoot {
     /// 调用方必须保证 `entry_point` 指向已校验通过、按目标内核约定映射的可执行入口，
     /// 且 `boot_params_ptr` 指向对目标内核可见、生命周期覆盖跳转的合法参数结构；
     /// 跳转后将直接放弃 UEFI 运行时环境，本函数永不返回。
-    pub unsafe fn jump_to_kernel(
-        entry_point: u64,
-        boot_params_ptr: u64,
-    ) -> ! {
+    pub unsafe fn jump_to_kernel(entry_point: u64, boot_params_ptr: u64) -> ! {
         core::arch::asm!(
             "cli",
             "xor eax, eax",
@@ -92,7 +89,9 @@ impl KexecBoot {
         // 显式永不返回终止点 — asm(options=noreturn) 对 rust-analyzer 在部分 target 下不可见,
         // 追加 loop{} 作为 rust-analyzer 可见的 -> ! 保证 (永远不会被实际执行)
         #[allow(unreachable_code)]
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 

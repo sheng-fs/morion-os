@@ -22,12 +22,42 @@ pub struct Color {
 }
 
 impl Color {
-    pub const TRANSPARENT: Self = Self { blue: 0, green: 0, red: 0, alpha: 0 };
-    pub const BLACK: Self       = Self { blue: 0, green: 0, red: 0, alpha: 255 };
-    pub const WHITE: Self       = Self { blue: 255, green: 255, red: 255, alpha: 255 };
-    pub const RED: Self         = Self { blue: 0, green: 0, red: 255, alpha: 255 };
-    pub const GREEN: Self       = Self { blue: 0, green: 255, red: 0, alpha: 255 };
-    pub const BLUE: Self        = Self { blue: 255, green: 0, red: 0, alpha: 255 };
+    pub const TRANSPARENT: Self = Self {
+        blue: 0,
+        green: 0,
+        red: 0,
+        alpha: 0,
+    };
+    pub const BLACK: Self = Self {
+        blue: 0,
+        green: 0,
+        red: 0,
+        alpha: 255,
+    };
+    pub const WHITE: Self = Self {
+        blue: 255,
+        green: 255,
+        red: 255,
+        alpha: 255,
+    };
+    pub const RED: Self = Self {
+        blue: 0,
+        green: 0,
+        red: 255,
+        alpha: 255,
+    };
+    pub const GREEN: Self = Self {
+        blue: 0,
+        green: 255,
+        red: 0,
+        alpha: 255,
+    };
+    pub const BLUE: Self = Self {
+        blue: 255,
+        green: 0,
+        red: 0,
+        alpha: 255,
+    };
 
     pub fn from_hex(hex: &str) -> Option<Self> {
         let hex = hex.trim_start_matches('#');
@@ -47,16 +77,21 @@ impl Color {
         let r = hex_byte(0)? * 16 + hex_byte(1)?;
         let g = hex_byte(2)? * 16 + hex_byte(3)?;
         let b = hex_byte(4)? * 16 + hex_byte(5)?;
-        Some(Self { red: r, green: g, blue: b, alpha: 255 })
+        Some(Self {
+            red: r,
+            green: g,
+            blue: b,
+            alpha: 255,
+        })
     }
 
     pub fn blend_over(self, bg: Self) -> Self {
         let a = self.alpha as u32;
         let inv_a = 255 - a;
         Self {
-            blue:  ((self.blue as u32 * a + bg.blue as u32 * inv_a) >> 8) as u8,
+            blue: ((self.blue as u32 * a + bg.blue as u32 * inv_a) >> 8) as u8,
             green: ((self.green as u32 * a + bg.green as u32 * inv_a) >> 8) as u8,
-            red:   ((self.red as u32 * a + bg.red as u32 * inv_a) >> 8) as u8,
+            red: ((self.red as u32 * a + bg.red as u32 * inv_a) >> 8) as u8,
             alpha: 255,
         }
     }
@@ -66,11 +101,21 @@ impl Color {
     }
 
     pub const fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { red: r, green: g, blue: b, alpha: 255 }
+        Self {
+            red: r,
+            green: g,
+            blue: b,
+            alpha: 255,
+        }
     }
 
     pub const fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self { red: r, green: g, blue: b, alpha: a }
+        Self {
+            red: r,
+            green: g,
+            blue: b,
+            alpha: a,
+        }
     }
 }
 
@@ -85,12 +130,19 @@ pub struct Rect {
 
 impl Rect {
     pub const fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
-        Self { x, y, width: w, height: h }
+        Self {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     }
 
     pub fn contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x && px < self.x + self.width as i32
-            && py >= self.y && py < self.y + self.height as i32
+        px >= self.x
+            && px < self.x + self.width as i32
+            && py >= self.y
+            && py < self.y + self.height as i32
     }
 }
 
@@ -146,16 +198,16 @@ impl FrameBuffer {
             let mode = gop.current_mode_info();
             let mut fb = gop.frame_buffer();
 
-        Self::from_raw_fb(
-            fb.as_mut_ptr(),
-            fb.size(),
-            ScreenSize {
-                width: mode.resolution().0 as u32,
-                height: mode.resolution().1 as u32,
-            },
-            mode.stride() as u32,
-            mode.pixel_format(),
-        )
+            Self::from_raw_fb(
+                fb.as_mut_ptr(),
+                fb.size(),
+                ScreenSize {
+                    width: mode.resolution().0 as u32,
+                    height: mode.resolution().1 as u32,
+                },
+                mode.stride() as u32,
+                mode.pixel_format(),
+            )
         } // end unsafe
     }
 
@@ -177,15 +229,28 @@ impl FrameBuffer {
             }
         };
         Ok(Self {
-            base, size, resolution, stride, pixel_format,
-            bytes_per_pixel: bpp, owned: false,
+            base,
+            size,
+            resolution,
+            stride,
+            pixel_format,
+            bytes_per_pixel: bpp,
+            owned: false,
         })
     }
 
-    pub fn width(&self) -> u32 { self.resolution.width }
-    pub fn height(&self) -> u32 { self.resolution.height }
-    pub fn resolution(&self) -> ScreenSize { self.resolution }
-    pub fn bpp(&self) -> u8 { self.bytes_per_pixel }
+    pub fn width(&self) -> u32 {
+        self.resolution.width
+    }
+    pub fn height(&self) -> u32 {
+        self.resolution.height
+    }
+    pub fn resolution(&self) -> ScreenSize {
+        self.resolution
+    }
+    pub fn bpp(&self) -> u8 {
+        self.bytes_per_pixel
+    }
 
     pub fn is_bgra(&self) -> bool {
         matches!(self.pixel_format, PixelFormat::Bgr)
@@ -196,8 +261,11 @@ impl FrameBuffer {
         if x >= self.resolution.width || y >= self.resolution.height {
             return;
         }
-        let offset = (y as usize * self.stride as usize + x as usize) * self.bytes_per_pixel as usize;
-        if offset + 4 > self.size { return; }
+        let offset =
+            (y as usize * self.stride as usize + x as usize) * self.bytes_per_pixel as usize;
+        if offset + 4 > self.size {
+            return;
+        }
         unsafe {
             let ptr = self.base.add(offset);
             ptr::write(ptr, color.blue);
@@ -212,8 +280,11 @@ impl FrameBuffer {
         if x >= self.resolution.width || y >= self.resolution.height {
             return None;
         }
-        let offset = (y as usize * self.stride as usize + x as usize) * self.bytes_per_pixel as usize;
-        if offset + 4 > self.size { return None; }
+        let offset =
+            (y as usize * self.stride as usize + x as usize) * self.bytes_per_pixel as usize;
+        if offset + 4 > self.size {
+            return None;
+        }
         unsafe {
             let ptr = self.base.add(offset);
             Some(Color {
@@ -234,8 +305,12 @@ impl FrameBuffer {
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
-        let x_end = (rect.x + rect.width as i32).min(self.resolution.width as i32).max(0) as u32;
-        let y_end = (rect.y + rect.height as i32).min(self.resolution.height as i32).max(0) as u32;
+        let x_end = (rect.x + rect.width as i32)
+            .min(self.resolution.width as i32)
+            .max(0) as u32;
+        let y_end = (rect.y + rect.height as i32)
+            .min(self.resolution.height as i32)
+            .max(0) as u32;
         let x_start = rect.x.max(0) as u32;
         let y_start = rect.y.max(0) as u32;
         for y in y_start..y_end {

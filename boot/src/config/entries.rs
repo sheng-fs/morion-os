@@ -107,17 +107,40 @@ impl BootEntry {
         match self.entry_type {
             EntryType::CurrentGeneration => Color::GREEN,
             EntryType::PreviousGeneration => Color::WHITE,
-            EntryType::Latest => Color { red: 0x3A, green: 0x6A, blue: 0xFF, alpha: 255 },
-            EntryType::Rescue => Color { red: 0xFF, green: 0xA5, blue: 0x00, alpha: 255 },
-            EntryType::OtherOS => Color { red: 0x88, green: 0x88, blue: 0x88, alpha: 255 },
-            EntryType::UefiSettings => Color { red: 0xAA, green: 0xAA, blue: 0xAA, alpha: 255 },
+            EntryType::Latest => Color {
+                red: 0x3A,
+                green: 0x6A,
+                blue: 0xFF,
+                alpha: 255,
+            },
+            EntryType::Rescue => Color {
+                red: 0xFF,
+                green: 0xA5,
+                blue: 0x00,
+                alpha: 255,
+            },
+            EntryType::OtherOS => Color {
+                red: 0x88,
+                green: 0x88,
+                blue: 0x88,
+                alpha: 255,
+            },
+            EntryType::UefiSettings => Color {
+                red: 0xAA,
+                green: 0xAA,
+                blue: 0xAA,
+                alpha: 255,
+            },
         }
     }
 
     /// 是否可被选择启动
     pub fn bootable(&self) -> bool {
         use EntryType::*;
-        matches!(self.entry_type, CurrentGeneration | PreviousGeneration | Latest | Rescue | OtherOS)
+        matches!(
+            self.entry_type,
+            CurrentGeneration | PreviousGeneration | Latest | Rescue | OtherOS
+        )
     }
 }
 
@@ -197,8 +220,7 @@ impl GenerationManager {
 
     /// 获取上次启动的条目
     pub fn last_booted(&self) -> Option<&BootEntry> {
-        self.last_booted_index
-            .and_then(|i| self.get(i))
+        self.last_booted_index.and_then(|i| self.get(i))
     }
 
     /// 标记某条目为已启动

@@ -30,12 +30,16 @@ extern "C" {
 
 #[inline]
 fn bitmap_set(idx: usize) {
-    unsafe { FRAME_BITMAP[idx / 8] |= 1u8 << (idx % 8); }
+    unsafe {
+        FRAME_BITMAP[idx / 8] |= 1u8 << (idx % 8);
+    }
 }
 
 #[inline]
 fn bitmap_clear(idx: usize) {
-    unsafe { FRAME_BITMAP[idx / 8] &= !(1u8 << (idx % 8)); }
+    unsafe {
+        FRAME_BITMAP[idx / 8] &= !(1u8 << (idx % 8));
+    }
 }
 
 #[inline]
@@ -170,7 +174,9 @@ pub fn allocate_frame() -> Option<u64> {
     for idx in 0..MAX_MANAGED_FRAMES {
         if !bitmap_test(idx) {
             bitmap_set(idx);
-            unsafe { FREE_FRAMES -= 1; }
+            unsafe {
+                FREE_FRAMES -= 1;
+            }
             return Some((idx * FRAME_SIZE) as u64);
         }
     }
@@ -197,7 +203,9 @@ pub fn allocate_frames(count: usize) -> Option<u64> {
                 for i in run_start..run_start + count {
                     bitmap_set(i);
                 }
-                unsafe { FREE_FRAMES -= count; }
+                unsafe {
+                    FREE_FRAMES -= count;
+                }
                 return Some((run_start * FRAME_SIZE) as u64);
             }
         } else {
@@ -212,7 +220,9 @@ pub fn free_frame(addr: u64) {
     let idx = (addr / FRAME_SIZE as u64) as usize;
     if idx < MAX_MANAGED_FRAMES && bitmap_test(idx) {
         bitmap_clear(idx);
-        unsafe { FREE_FRAMES += 1; }
+        unsafe {
+            FREE_FRAMES += 1;
+        }
     }
 }
 

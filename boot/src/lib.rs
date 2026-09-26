@@ -38,7 +38,7 @@ extern crate alloc;
 // ============================================================
 // 模块声明
 // ============================================================
-pub mod gfx;
-pub mod config;
-pub mod security;
 pub mod boot;
+pub mod config;
+pub mod gfx;
+pub mod security;

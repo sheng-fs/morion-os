@@ -25,8 +25,10 @@ fn main() {
         // 使用 NASM 编译为 x86_64 UEFI COFF 目标
         let status = std::process::Command::new("nasm")
             .args([
-                "-f", "win64",           // x86_64 Windows/EFI COFF 格式
-                "-o", asm_output.to_str().unwrap(),
+                "-f",
+                "win64", // x86_64 Windows/EFI COFF 格式
+                "-o",
+                asm_output.to_str().unwrap(),
                 asm_path.to_str().unwrap(),
             ])
             .status();
