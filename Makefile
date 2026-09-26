@@ -83,6 +83,11 @@ PARTS_IMG     ?= $(OUT_DIR)/parts.img
 # 路径 (见 FS-22); FS-21 之前的用例不碰它。
 SPARE_IMG     ?= $(OUT_DIR)/spare.img
 SPARE_MIB     ?= 16
+# 分区表测试盘 (namespace 7): 纯零, **不预格式化**, 专供 block_srv 的**写**分区表路径 ——
+# `part.*` 在它上面建/删 GPT 与 MBR 分区 (见 FS-26)。与 parts.img (只读解析) 分开,
+# 免得把「解析既有分区表」的用例与「改写分区表」的用例搅在一块。
+PT_IMG        ?= $(OUT_DIR)/pt.img
+PT_MIB        ?= 64
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -260,9 +265,10 @@ run-nokvm: iso
 #   nsid=4 -> $(PARTS_IMG) (MBR 分区测试盘: FAT32 + ext2, 验证卷层分区解析)
 #   nsid=5 -> $(EXFAT_IMG) (exFAT 读写, 挂载 /usb, 宿主 mkfs.exfat 预格式化)
 #   nsid=6 -> $(SPARE_IMG) (空白盘, 供 `mkfs.mfs` 自测: 格式化后作额外卷挂到 /usb<卷号>)
+#   nsid=7 -> $(PT_IMG)    (空白盘, 供 `part.*` 自测: 建/删 GPT 与 MBR 分区)
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白)..."
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
 	$(QEMU) \
 		-machine q35 \
 		-m $(QEMU_MEM) \
@@ -281,9 +287,18 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device nvme-ns,drive=nvme0n5,bus=nvme0,nsid=5 \
 		-drive file=$(SPARE_IMG),if=none,id=nvme0n6,format=raw \
 		-device nvme-ns,drive=nvme0n6,bus=nvme0,nsid=6 \
+		-drive file=$(PT_IMG),if=none,id=nvme0n7,format=raw \
+		-device nvme-ns,drive=nvme0n7,bus=nvme0,nsid=7 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
+
+# 分区表测试盘: 纯零 raw。**不预格式化** —— FS-26 自己在客户机里建/删分区表。
+$(PT_IMG):
+	@echo "==> 创建分区表测试盘 ($(PT_MIB)MiB, 无分区表, 供 part.* 自测)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(PT_IMG) bs=1M count=$(PT_MIB) status=none
+	@echo "  ✓ 分区表测试盘: $(PT_IMG)"
 
 # 空白测试盘: 纯零 raw。**不预格式化** —— 留给 `mkfs.mfs` 在客户机里格式化。
 $(SPARE_IMG):

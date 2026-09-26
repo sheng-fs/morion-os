@@ -1,6 +1,6 @@
 #!/bin/bash
-# 模拟镜像全量 FS 回归: 6 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘) 上跑
-# app 的 FS-1..FS-24 自测, 由日志判定通过与否。
+# 模拟镜像全量 FS 回归: 7 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘 / 分区表盘)
+# 上跑 app 的 FS-1..FS-26 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
@@ -27,6 +27,9 @@ rm -f "$log"
 # 空白盘 (spare.img) 每轮都重置: FS-22 要验证的正是「格式化一块**没有文件系统**的卷」,
 # 保留上一轮格好的卷会让这条路径根本没被走到。
 dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=none
+# 分区表测试盘同理: FS-26 会建/删分区表, 保留上一轮的 GPT/MBR 会让「在空白盘上建表」
+# 这条路径没被走到 (FS-26 自己也会先 wipe 一次, 但重置镜像让起点更干净)。
+dd if=/dev/zero of="$OUT_DIR/pt.img" bs=1M count="${PT_MIB:-64}" status=none
 if [ "${MFS_KEEP:-0}" = "1" ]; then
   echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
 else
@@ -61,6 +64,7 @@ $QEMU \
   -drive file="$OUT_DIR/parts.img",if=none,id=n4,format=raw -device nvme-ns,drive=n4,bus=nvme0,nsid=4 \
   -drive file="$OUT_DIR/exfat.img",if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
   -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
+  -drive file="$OUT_DIR/pt.img",if=none,id=n7,format=raw -device nvme-ns,drive=n7,bus=nvme0,nsid=7 \
   -display none -monitor none -serial file:"$log" -no-reboot ${accel} ${QEMU_EXTRA:-} \
   >/dev/null 2>&1 &
 pid=$!
@@ -87,7 +91,22 @@ echo "== 额外卷挂载 (mount-dbg) =="
 grep -nE 'mount-dbg' "$log" 2>/dev/null || echo "(无)"
 echo "== 显式格式化 (mkfs) =="
 grep -nE 'mfs: mkfs refused|mfs: mkfs FAILED|mfs: reload state after mkfs' "$log" 2>/dev/null || echo "(无拒绝/无失败)"
+echo "== 分区表写入 (part) =="
+grep -nE 'part-dbg:|block: part .*refused' "$log" 2>/dev/null || echo "(无)"
+# 跨实现校验: FS-26 结束时在 pt.img 上留了一张 GPT, 用宿主工具独立验证它**符合 GPT 规范**
+# —— 客户机里复算 CRC32 只能证明这张表「自洽」, 证不了 GUID 字节序 / 头字段这些规范细节。
+# sgdisk 缺失时跳过 (判定口径不变; 有它时「不是 no problems found」即判失败)。
+host_bad=0
+echo "== 分区表宿主校验 (pt.img) =="
+if command -v sgdisk >/dev/null 2>&1; then
+  sgdisk_out=$(sgdisk -v "$OUT_DIR/pt.img" 2>&1)
+  echo "$sgdisk_out" | sed 's/^/  /'
+  sgdisk -p "$OUT_DIR/pt.img" 2>&1 | sed 's/^/  /'
+  echo "$sgdisk_out" | grep -qi 'no problems found' || host_bad=1
+else
+  echo "  (无 sgdisk, 跳过宿主校验)"
+fi
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ]

@@ -46,6 +46,10 @@ shell: type 'help' for commands
 | `mkfs.mfs` | `mkfs.mfs <vol>` | 在指定卷上创建 MorionFS（**擦除**该卷；只接受空白卷或已有 MFS 卷） |
 | `mfs.primary` | `mfs.primary <vol>` | 把一块已有数据的 MFS 卷换为主卷（**不动数据**；只接受 MFS 卷） |
 | `df` | `df` | 报告 `/mfs`（MorionFS）的空间用量 |
+| `part.create` | `part.create <nsid> <MiB> [mbr]` | 在**整块盘**上建分区（空白盘默认 GPT；`MiB 0` = 用尽剩余空间） |
+| `part.del` | `part.del <nsid> <index>` | 删分区项（**不动数据**；删完最后一个则整张表清空） |
+| `part.wipe` | `part.wipe <nsid>` | 清空分区表，盘回到「无分区表」 |
+| `part.reload` | `part.reload` | 重读分区表（重建并打印卷表） |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
@@ -75,6 +79,10 @@ commands:
   mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)
   mfs.primary <vol>   mark a MorionFS volume primary (keeps data)
   df             show MorionFS space usage (/mfs)
+  part.create <nsid> <MiB> [mbr]  create a partition (disk-wide, blank = GPT)
+  part.del <nsid> <index>  delete a partition entry (keeps data)
+  part.wipe <nsid>   clear the partition table (disk becomes blank)
+  part.reload      re-read all partition tables
   clear          clear screen
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
@@ -265,6 +273,68 @@ commands:
   其中 `U = T - F`、`P` 为整数百分比（`U * 100 / T`，向下取整）。
 - 带参数：`df: usage: df   (only MorionFS reports capacity; other filesystems do not)`。
 - 查询失败（MorionFS 未挂载）：`df: /mfs unavailable (MorionFS not mounted?)`。
+
+### `part.create <nsid> <MiB> [mbr]`
+
+在**整块盘**上建一个分区。这是「新买一块盘」的第一步 —— 建完分区它立刻成为一个卷，可以
+直接 `mkfs.mfs <卷号>`。
+
+- **按 `nsid` 寻址，不是卷号**：分区表属于整块盘，而卷号只是分区表的产物（建之前没有这个卷、
+  删完又没了）。`nsid` 见启动日志的 `vol: <卷号> nsid=<n> …` 行。
+- **`MiB` 是分区大小**，`0` 表示**用尽剩余空间**（对齐后一直到 GPT 的 `last_usable`）。请求
+  超出剩余空间会**被拒**，不会悄悄截断。
+- **表风格按盘自适应**：盘上已有 GPT 就继续 GPT、已有 MBR 就继续 MBR；**空白盘默认建 GPT**
+  （`>2 TiB` 的盘也只能 GPT）。加 `mbr` 参数可强制建 MBR —— **只在盘上还没有分区表时有效**，
+  已有 GPT 时强制转换会毁掉整张表，一律拒绝。
+- 分区起点对齐到 **1 MiB**（2048 扇区）；GPT 类型 GUID 取通用的「Linux 文件系统数据」，
+  MBR 类型字节 `0x83` —— 建分区时还不知道要 format 成什么（MorionFS 是之后 `mkfs.mfs` 建的），
+  卷层探测类型看的是卷首签名，不看这里。
+- GPT 会写**完整的两份**：保护性 MBR（LBA 0）、主头（LBA 1）、主项数组（LBA 2..33）、盘尾的
+  备份项数组与备份头，并算好头 CRC32 与项数组 CRC32 —— 宿主 `sgdisk`/`firmware` 认这张表。
+- 成功后**立刻重读分区表**，新分区作为新卷出现在 `vol:` 表里（块服务打印 `part-dbg: create …`
+  与新表）。
+- 输出：`part.create: nsid <nsid> -> volume <卷号>  (new 'vol:' line above; format it with mkfs.mfs)`；
+  被拒：`part.create: refused nsid <nsid> (no room / no such disk / unsupported conversion)`。
+  服务端诊断：**护栏拒绝**一律是 `block: part create refused (…)`（无剩余空间 / 表已满 / 盘太小 /
+  容量未知 / 已有 GPT 却要 `mbr`），只有**真出错**才打 `block: part create FAILED (write GPT)` 之类。
+- 缺参 / 非数字：`part.create: usage: part.create <nsid> <MiB> [mbr]   (nsid from the 'vol:' lines; MiB 0 = all free space)`。
+
+> 典型用法（真盘上「新买一块盘」）：启动日志里找到目标盘的 `vol:` 行（例如
+> `vol: 7 nsid=7 lba=0 sectors=131072 kind=unknown`），敲 `part.create 7 16`，看新出现的
+> `vol: … nsid=7 lba=2048 sectors=32768 kind=unknown` 拿到卷号，再 `mkfs.mfs <卷号>`。
+
+### `part.del <nsid> <index>`
+
+删掉盘 `<nsid>` 上第 `<index>` 个分区项（`index` 是项下标，从 0 起，不是卷号）。
+
+- **只清条目**：数据区一个字节都不动 —— 要回收空间请重新格式化那个卷（或建新表）。
+- 删完若**一个分区都不剩**，整张表被清空，盘回到「无分区表」的整盘卷状态。这样一块盘能在
+  「GPT → 清空 → MBR」之间来回折腾，不必依赖宿主工具。
+- GPT 删除会**重算**项数组 CRC32 与两个头（主 + 备份）的 CRC32。
+- 输出：`part.del: nsid <nsid> entry <index> removed (data untouched; volume table reparsed)`；
+  失败：`part.del: refused nsid <nsid> entry <index> (no such partition, or no partition table)`。
+
+### `part.wipe <nsid>`
+
+清空盘 `<nsid>` 的分区表，让它回到「无分区表」（整盘一个卷）。
+
+- 与 `part.del` 一样**只动表**：MBR 的磁盘签名与 4 个项、GPT 的头与两份项数组都被清零，
+  数据区不动。
+- 主要用途是把一块盘**复位成空白**（自测每轮都先 `part.wipe` 一次，于是复用镜像也不会被上一轮
+  的残留影响）。
+- 输出：`part.wipe: nsid <nsid> partition table cleared (disk is blank again; volume table reparsed)`；
+  失败：`part.wipe: FAILED on nsid <nsid>`。
+
+### `part.reload`
+
+重新扫描**所有**盘的分区表并重建卷表（然后打印），用来在不重启的前提下确认表改动生效。
+
+- 改动分区表后卷表会被自动重读，所以这条命令主要用于「别人动了盘」或**文件系统被建/删之后**
+  —— 卷的 `kind` 是扫描时按卷首签名探出来的，`mkfs.mfs` 之后要重读一次 `kind` 才会变成 `mfs`。
+- ⚠️ 卷号由扫描顺序决定：**改动靠前的盘**（例如 nsid 更小的盘）会让它后面那些盘的卷号整体后移，
+  而已挂载的文件服务仍记着启动时的旧卷号。安全做法是把分区操作限制在**最后一类**盘上，或者
+  改完就重启。自测只动 nsid 7（最后一块盘），所以卷号 0..6 不受影响。
+- 输出：`part.reload: partition tables re-read (volume table printed above)`。
 
 ### `clear`
 

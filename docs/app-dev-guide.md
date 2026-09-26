@@ -314,7 +314,7 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 | pager (2) | 缺页处理，映射匿名零帧 | 接收缺页消息 → `sys_map_anon` → `sys_page_fault_reply` |
 | echo (3) | 同步 IPC 演示 | `recv` → `reply` |
 | kbd (4) | 键盘驱动 | 注册 IRQ1 → `recv` scancode → 解码 |
-| block_srv (5) | 块设备服务（NVMe / IDE PIO）+ **卷层** | `recv` `BlockReq` → 启动时解析各盘 MBR/GPT 得卷表并探测 FS 类型；`opcode 0/1` 读写（卷号 + 分区偏移）、`opcode 2` 查询卷表 |
+| block_srv (5) | 块设备服务（NVMe / IDE PIO）+ **卷层** | `recv` `BlockReq` → 启动时解析各盘 MBR/GPT 得卷表并探测 FS 类型；`opcode 0/1` 读写（卷号 + 分区偏移）、`opcode 2` 查询卷表、`opcode 3..7` 建/删/清空/重读分区表与裸读一扇区（**按 nsid 寻址**，见 `PartReq`；IDE 回退路径未实现分区写入） |
 | fat32_srv (6) | FAT32 文件服务，挂载于 `/` | `recv` VFS tag → 解析 FAT32 → 经 block_srv 访问磁盘 |
 | mount_srv (9) | 挂载管理（统一目录树） | `recv` `VFS_LOOKUP_TAG` → 最长前缀匹配 → `reply` `(域<<32)|前缀长度`；`MNTA` 运行时挂载（回复槽位号）/ `MNTD` 卸载 |
 | tmpfs_srv (10) | 内存文件系统，挂载于 `/tmp` | `recv` VFS tag → 平铺节点表 + 字节区读写 |

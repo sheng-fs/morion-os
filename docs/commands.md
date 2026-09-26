@@ -55,6 +55,8 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | `EXFAT_IMG` | `build/exfat.img` | exFAT 盘（挂 `/usb`，宿主 `mkfs.exfat`） |
 | `EXFAT_MIB` | `16` | exFAT 盘大小 MiB |
 | `EXFAT_CLU` | *(空)* | exFAT 簇大小（如 `4K`/`32K`/`128K`）；空 = 由 `mkfs.exfat` 按卷大小自选 |
+| `SPARE_IMG` / `SPARE_MIB` | `build/spare.img` / `16` | 空白测试盘（供 `mkfs.mfs` 自测，格式化后挂 `/usb<卷号>`） |
+| `PT_IMG` / `PT_MIB` | `build/pt.img` / `64` | 分区表测试盘（供 `part.*` 自测建/删 GPT 与 MBR，不挂载） |
 | `DISK_IMG` | `build/disk.img` | IDE 回退测试盘 |
 
 ---
@@ -65,12 +67,12 @@ make iso OUT_DIR=build2                      # 自定义输出目录
 | --- | --- |
 | `make run` | 最简运行（`-machine pc`，无磁盘） |
 | `make run-nokvm` | 无硬件虚拟化环境（CI） |
-| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，六 namespace |
+| **`make run-nvme`** | **文件系统验证主用**：q35 + NVMe，七 namespace |
 | `make run-ide` | IDE PIO 回退路径验证（`build/disk.img` 1024 MiB；容量由 ATA IDENTIFY DEVICE 现问，`vol: 0 … sectors=2097152`） |
 
 ### `make run-nvme` 的磁盘布局（重要）
 
-单控制器六 namespace，`dev`（BlockReq 高位）现在是**卷号**，由 block_srv 扫描各盘分区表后分配：
+单控制器七 namespace，`dev`（BlockReq 高位）现在是**卷号**，由 block_srv 扫描各盘分区表后分配：
 block_srv 启动时会把整张卷表打成 `vol: <卷号> nsid=<n> lba=<n> sectors=<n> kind=<名>` 行
 （`mkfs.mfs <卷号>` 的卷号就取自这里；`kind=unknown` = 该卷没有文件系统）。
 
@@ -82,12 +84,17 @@ block_srv 启动时会把整张卷表打成 `vol: <卷号> nsid=<n> lba=<n> sect
 | `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | `/usb3`（FAT32 分区）、`/usb4`（ext2 分区） |
 | `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
 | `nsid=6` | `build/spare.img`（纯空白 raw，16 MiB） | **无**（`kind=unknown`） | 由 `mkfs.mfs` 格式化后挂到 `/usb6` |
+| `nsid=7` | `build/pt.img`（纯空白 raw，64 MiB） | **无**（`kind=unknown`） | 由 `part.*` 自测（FS-26）建/删 GPT 与 MBR 分区，不进挂载表 |
 
 前三个镜像**没有分区表**，各成一个「整盘卷」，卷号恰为 0/1/2 —— 与引入卷层前一致
 （`nsid=5` 的 exFAT 整盘卷号为 5）。
 `build/parts.img` 是额外的一卷测试盘，用于验证 MBR 解析与类型探测。
 `build/spare.img` 是**空白盘**：卷层探测不到文件系统（`kind=unknown`），正是真盘上
 「刚买一块盘」的样子，专供 `mkfs.mfs` 自测（FS-22）走「格式化空白卷 → 挂成额外卷 → 读写」。
+`build/pt.img` 也是空白盘，但专供 **block_srv 写分区表**的自测（FS-26，见下文）：`part.create` /
+`part.del` / `part.wipe` 在它上面建、删 GUID 分区表（GPT）与 MBR 主分区。它与 `parts.img`
+分工明确 —— `parts.img` 验「**解析**既有分区表」，`pt.img` 验「**改写**分区表」。
+`fs-regress.sh` 每轮都会把 `spare.img` 与 `pt.img` 重置成空白。
 
 **额外卷自动挂载（M1b）**：每个文件服务认领**一个**默认卷（fat32 → 卷 0、mfs → 卷 1、
 ext2 → 卷 2、exfat → 卷 5），随后把自己那类的**其余卷**上报给 mount_srv，自动挂到
@@ -256,7 +263,11 @@ sudo chgrp $(id -gn) /dev/sda1 /dev/sda2 && sudo chmod 440 /dev/sda1 /dev/sda2
 
 **判定约定**：正常路径不打日志；只有**失败**才打印一行诊断。因此
 `grep -cE "FAILED|PANIC"` 为 `0` 且能看到 `shell: type 'help' for commands` 即通过。
-app 的 FS 自测（FS-1..FS-25）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
+护栏**拒绝**（是预期行为，不是失败）一律用 `refused` 措辞 —— 如 `mfs: mkfs refused (…)`、
+`block: part create refused (…)`、`mfs: set-primary refused (…)`，故它们不会污染失败统计。
+`scripts/fs-regress.sh` 另有一处**跨实现**校验：FS-26 会在 `build/pt.img` 上留一张 GPT，
+脚本用宿主 `sgdisk -v` 验证它「符合 GPT 规范」（无 `sgdisk` 时跳过，判定口径不变）。
+app 的 FS 自测（FS-1..FS-26）成功时几乎静默（末尾打印一行 `app: SELFTEST DONE` 便于确认跑完），
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
@@ -303,6 +314,17 @@ app 的 FS 自测（FS-1..FS-25）成功时几乎静默（末尾打印一行 `ap
 置成确定状态并记下序号基线；② 在卷上写一个文件；③ `mfs_set_primary` 后序号**严格大于**基线
 （证明与 mkfs **共用**同一个只增计数器）且文件**逐字节一致**（证明数据没被动）；④ 对 FAT 卷 /
 不存在的卷号调 `mfs.primary` 一律被拒（**没有**格式化兜底）。失败打印 `app: FS25 … FAILED`。
+**FS-26（S2 卷管理收口）** 盯 **block_srv 写分区表**（shell 的 `part.*`）：目标盘是 `build/pt.img`
+（nsid 7，64 MiB 纯空白）。① `part.wipe` 后该盘是「无分区表」的整盘卷（容量 64 MiB）；② 空白盘上
+强制 MBR（`mbr`）建 16 MiB 分区 → 卷表出现它，且 **LBA 0 的字节**对得上（`0x55AA` / 类型 `0x83` /
+起点 2048 / 大小 32768），删掉后盘回空白；③ 空白盘默认建 **GPT** → 保护性 MBR（`0xEE`）、头
+`EFI PART`、**头 CRC32** 与**项数组 CRC32**（32 扇区流式复算）全部自洽，项里的起止 LBA 与卷表
+一致；④ 护栏：已有 GPT 时强制 MBR 必须被拒；⑤ 一条龙 `mkfs.mfs` 在这个新分区上建 MorionFS →
+重读后卷 `kind` 变 `mfs`；⑥ 空白盘上「无表可删」「请求超出剩余空间」「不存在的盘」都必须被拒；
+⑦ 最后再留一张 GPT 在盘上，供宿主 `sgdisk -v` **跨实现**校验规范一致性。失败打印
+`app: FS26 … FAILED`。
+⚠️ 自测只动 **nsid 7（最后一块盘）**，所以其余卷号 0..6 不受重读影响（重读会重建整张卷表，
+卷号由扫描顺序决定 —— 动靠前的盘会让后面的卷号整体后移）。
 这些自测都自带**幂等准备**（把持久卷 `/mfs` 上被中断过的残留先清干净），故可反复跑。
 另有一条**启动期**（不属于 FS 自测）的能力自测：域 0/1/3 走通「能力随 IPC 传递」后会打印
 `receiver: capability passing OK (handle moved + SendTo(3) delegated)`。它是**正面证据** ——

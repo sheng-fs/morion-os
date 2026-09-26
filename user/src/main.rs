@@ -1099,6 +1099,43 @@ fn nvme_main() {
                 }
                 sys_reply(n as u64);
             }
+            // 分区表写入 (S2 卷管理收口): 一律按 nsid 寻址, 见 `PartReq`。
+            BLOCK_OP_PART_CREATE | BLOCK_OP_PART_DELETE | BLOCK_OP_PART_WIPE
+            | BLOCK_OP_PART_RELOAD | BLOCK_OP_DISK_READ => {
+                let preq: PartReq =
+                    unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const PartReq) };
+                let mut io = NvmeIo {
+                    cfg: &cfg,
+                    mmio,
+                    isq: isq_doorbell,
+                    icq: icq_doorbell,
+                    tail: &mut io_tail,
+                    head: &mut io_head,
+                    phase: &mut io_phase,
+                };
+                let nsid = preq.nsid as u32;
+                let r = match opcode_low {
+                    BLOCK_OP_PART_CREATE => nvme_part_create(
+                        &mut io,
+                        nsid,
+                        preq.arg0,
+                        (req.op >> 8) & PART_FLAG_FORCE_MBR != 0,
+                        scratch,
+                    ),
+                    BLOCK_OP_PART_DELETE => nvme_part_delete(&mut io, nsid, preq.arg0, scratch),
+                    BLOCK_OP_PART_WIPE => nvme_part_wipe(&mut io, nsid, scratch),
+                    BLOCK_OP_PART_RELOAD => part_reload_volumes(&mut io, scratch),
+                    // 裸读一个扇区: arg0 = 扇区号, arg1 = 目标缓冲页。
+                    _ => {
+                        if io.read(nsid, preq.arg0 as u32, 1, preq.arg1 as *mut u8) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                };
+                sys_reply(r);
+            }
             _ => {
                 sys_reply(0);
             }
@@ -2644,6 +2681,63 @@ const BLOCK_OP_READ: u8 = 0;
 const BLOCK_OP_WRITE: u8 = 1;
 /// 查询卷表: 把 `VolumeDesc` 数组写进 `buf`, 回复卷数。
 const BLOCK_OP_LIST_VOLUMES: u8 = 2;
+/// 建分区 (GPT / MBR): 见 `PartReq`。回复**新分区的卷号**, 失败 `u64::MAX`。
+const BLOCK_OP_PART_CREATE: u8 = 3;
+/// 删分区 (只清条目, **不动数据**): 回复 1/0。删掉最后一个分区后整张表被清空 (盘回到空白)。
+const BLOCK_OP_PART_DELETE: u8 = 4;
+/// 清空分区表 (盘回到「无分区表」): 回复 1/0。
+const BLOCK_OP_PART_WIPE: u8 = 5;
+/// 重读分区表 (重建卷表并打印): 回复重读后的卷数。
+const BLOCK_OP_PART_RELOAD: u8 = 6;
+/// 裸盘读**一个扇区** (按 nsid 寻址, **绕过卷层**): 回复 1/0。
+///
+/// 只给分区诊断/自测用 —— 建完分区后 LBA 0/1 已不属于任何卷 (整盘卷没了、新分区从 2048
+/// 起), 想校验写进去的字节就只能直接按盘读。
+const BLOCK_OP_DISK_READ: u8 = 7;
+
+/// 分区表 / 裸盘请求 (`op & 0xFF` 是 `BLOCK_OP_PART_*` / `BLOCK_OP_DISK_READ` 时按本结构解释)。
+///
+/// 与 `BlockReq` **同为 4 × u64 且字段顺序一一对应** (`op / lba→nsid / count→arg0 / buf→arg1`),
+/// 故发送端复用同一个 payload 布局, 接收端按 opcode 决定读成哪个结构。
+///
+/// 分区表属于**整块盘**, 所以这里一律按 `nsid` 寻址 —— 卷号只是分区表的产物 (建分区前没有
+/// 这个卷、删完分区它又没了), 拿卷号当目标既不稳定也没法表达「在空白盘上建第一张表」。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PartReq {
+    /// `(flags << 8) | opcode`。
+    op: u64,
+    /// 目标盘 (NVMe namespace id)。
+    nsid: u64,
+    /// 主参数: 建分区 = 大小 (扇区, 0 = 用尽剩余空间); 删分区 = 分区序号; 裸读 = 扇区号。
+    arg0: u64,
+    /// 次参数: 建分区 = flags; 裸读 = 目标缓冲页虚拟地址。
+    arg1: u64,
+}
+
+/// 建分区时 `PartReq.op` 高位 (flags) 的含义: bit0 = 强制 MBR。
+const PART_FLAG_FORCE_MBR: u64 = 1;
+
+/// 分区项大小: GPT 规范值为 128 字节 (必须是 128 的倍数)。
+const PART_GPT_ENTRY_SIZE: u32 = 128;
+/// 分区项数量: 取规范最常用的 128 项 (128 × 128 B = 16 KiB = 32 扇区)。
+const PART_GPT_ENTRY_COUNT: u32 = 128;
+/// GPT 项数组占用的扇区数 (128 项 × 128 字节 = 16 KiB = 32 扇区)。
+const PART_GPT_ENTRIES_SECTORS: u64 =
+    (PART_GPT_ENTRY_COUNT as u64 * PART_GPT_ENTRY_SIZE as u64) / 512;
+/// GPT 头部保留的扇区数: 保护性 MBR(1) + 主头(1) + 主项数组(32) = 34。
+///
+/// 盘尾对称留 32 扇区备份项数组 + 1 扇区备份头, 故 `last_usable = 容量 - PART_GPT_RESERVED`。
+const PART_GPT_RESERVED: u64 = 1 + 1 + PART_GPT_ENTRIES_SECTORS;
+/// 分区起点对齐到 1 MiB (2048 扇区) —— 与主流分区工具一致, 避开各家 SSD 的擦除块。
+const PART_ALIGN_SECTORS: u64 = 2048;
+/// MBR 分区项类型字节: 0x83 = Linux 文件系统。
+///
+/// 建分区时还不知道要 format 成什么 (MorionFS 是**之后**由 `mkfs.mfs` 建的), 故取通用类型;
+/// 卷层探测类型靠卷首签名, 不依赖这里。
+const PART_MBR_TYPE_LINUX: u8 = 0x83;
+/// 保护性 MBR 的类型字节 (覆盖整盘的 GPT 占位项)。
+const PART_MBR_TYPE_PROTECTIVE: u8 = 0xEE;
 
 /// 一个卷: 落在某 namespace 上的 [start_lba, start_lba+sectors) 区间。
 /// `sectors == 0` 表示**容量未知** (Identify Namespace 没取到, 例如 IDE PIO 回退路径),
@@ -3022,6 +3116,703 @@ fn vol_scan_namespace(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 分区表**写入** (S2 卷管理收口): 在整块盘上建/删 GPT 与 MBR 分区
+// ---------------------------------------------------------------------------
+// 卷层此前只**读**分区表 (vol_scan_*); 这里补上写路径, 于是「新买一块盘 → 分区 → 格式化 →
+// 挂载」在客户机里能一条龙走完, 不必再去宿主用 fdisk/sgdisk。
+//
+// 三条硬约束:
+//   1. **按 nsid 寻址** —— 分区表属于整块盘, 卷号只是它的产物 (建之前没有、删完就没了);
+//   2. 只动**表**, 不动数据: 删分区只清条目, 数据区一个字节都不碰;
+//   3. 认不出来 / 会毁掉既有表的操作一律拒绝 (例如把已有 GPT 的盘改成 MBR)。
+
+/// 一页能装下的 GPT 项数, 也是流式读写的粒度 —— 由下面两个常量**推出来**, 免得手写数字漂移
+/// (一项 128 字节, 一页 4096 字节 → 32 项)。
+const PART_ENTRIES_PER_CHUNK: u32 = PART_CHUNK_SECTORS as u32 * 512 / PART_GPT_ENTRY_SIZE;
+/// 上面那个粒度对应的扇区数 (4096 / 512 = 8), 必须是 `nvme_rw_sectors` 能一次发完的量。
+const PART_CHUNK_SECTORS: u16 = 8;
+/// GPT 项数组的起始 LBA (规范惯例: 保护性 MBR 在 0, 头在 1, 项数组从 2 起)。
+const PART_GPT_ENTRIES_LBA: u64 = 2;
+
+/// 分区表风格 (见 `part_probe_style`)。
+const PART_STYLE_NONE: u32 = 0;
+const PART_STYLE_MBR: u32 = 1;
+const PART_STYLE_GPT: u32 = 2;
+
+/// GPT 分区类型 GUID: Linux 文件系统数据 (`0FC63DAF-8483-4772-8E79-3D69D8477DE4`)。
+///
+/// 建分区时还不知道要 format 成什么 (MorionFS 是**之后**由 `mkfs.mfs` 建的), 故取通用类型;
+/// 卷层探测类型靠卷首签名, 不看这个 GUID。
+const PART_GPT_TYPE_LINUX: [u8; 16] = [
+    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
+];
+
+/// NVMe I/O 队列上下文: 分区表读写要连发多条命令, 打包传递, 免得每个函数都长十几参数。
+struct NvmeIo<'a> {
+    cfg: &'a NvmeConfig,
+    mmio: u64,
+    isq: u64,
+    icq: u64,
+    tail: &'a mut u32,
+    head: &'a mut u32,
+    phase: &'a mut u32,
+}
+
+impl NvmeIo<'_> {
+    fn rw(&mut self, op: u8, nsid: u32, lba: u32, count: u16, buf: *mut u8) -> bool {
+        nvme_rw_sectors(
+            op, nsid, self.cfg, self.mmio, self.isq, self.icq, lba, count, buf, self.tail,
+            self.head, self.phase,
+        )
+    }
+    fn read(&mut self, nsid: u32, lba: u32, count: u16, buf: *mut u8) -> bool {
+        self.rw(OP_READ, nsid, lba, count, buf)
+    }
+    fn write(&mut self, nsid: u32, lba: u32, count: u16, buf: *mut u8) -> bool {
+        self.rw(OP_WRITE, nsid, lba, count, buf)
+    }
+}
+
+/// 把 `v` 向上对齐到 `align` 的整数倍。
+fn align_up(v: u64, align: u64) -> u64 {
+    if align == 0 {
+        return v;
+    }
+    v.div_ceil(align) * align
+}
+
+/// 探测盘 `nsid` 的分区表风格 (读 LBA 0)。
+///
+/// 判据与卷层解析 (`vol_scan_namespace`) 保持一致: 没有 `0x55AA`, 或**没有一条合法主分区项**,
+/// 都算「无分区表」—— 真实 FAT32 分区的 VBR 里 446..509 是非零引导码, 只看「type != 0」会把
+/// 它误判成 MBR, 于是分区操作会去改一个根本不存在的主分区项。
+fn part_probe_style(io: &mut NvmeIo, nsid: u32, scratch: *mut u8) -> u32 {
+    if !io.read(nsid, 0, 1, scratch) {
+        return PART_STYLE_NONE;
+    }
+    if unsafe { *scratch.add(510) } != 0x55 || unsafe { *scratch.add(511) } != 0xAA {
+        return PART_STYLE_NONE;
+    }
+    let entries = unsafe { scratch.add(446) };
+    if unsafe { *entries.add(4) } == PART_MBR_TYPE_PROTECTIVE {
+        return PART_STYLE_GPT;
+    }
+    let mut i = 0usize;
+    while i < 4 {
+        let e = unsafe { entries.add(i * 16) };
+        let bootflag = unsafe { *e.add(0) };
+        let ptype = unsafe { *e.add(4) };
+        let start = read_u32(unsafe { e.add(8) });
+        let count = read_u32(unsafe { e.add(12) });
+        if ptype != 0 && count != 0 && start != 0 && (bootflag == 0x00 || bootflag == 0x80) {
+            return PART_STYLE_MBR;
+        }
+        i += 1;
+    }
+    PART_STYLE_NONE
+}
+
+/// 混一个 64 位 (splitmix64 变体) —— 只为把 (盘, 角色) 摊成 GUID 的字节。
+fn part_mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// 写一个由 `(seed, role)` **确定性**派生的 16 字节 GUID 到 `out`。
+///
+/// GPT 只要求 GUID 非 0; 用确定性派生而不是随机数, 是为了回归可复现 (同一块盘、同一个分区
+/// 序号每次都得到同一张表, 自测才好断言)。
+fn part_guid(seed: u64, role: u64, out: *mut u8) {
+    let a = part_mix(seed ^ role.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let b = part_mix(a ^ 0xA5A5_A5A5_A5A5_A5A5);
+    write_u64(out, a);
+    write_u64(unsafe { out.add(8) }, b);
+    if a == 0 && b == 0 {
+        // 概率极低, 但全 0 GUID 会被当成「未使用项」, 必须兜住。
+        write_u32(out, 0x4D4F_5249); // "MORI"
+    }
+}
+
+/// GPT 项是否在用 (type GUID 非全 0)。
+fn gpt_entry_used(e: *const u8) -> bool {
+    let mut i = 0usize;
+    while i < 16 {
+        if unsafe { *e.add(i) } != 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// GPT 项数组扫描结果 (一次扫完拿全, 免得建/删分区各扫两遍)。
+struct GptScan {
+    /// 已用项数 (0 = 这张表还没有分区)。
+    used: u32,
+    /// 第一个空项下标 (没有空位时 = `PART_GPT_ENTRY_COUNT`)。
+    first_free: u64,
+    /// 已用项的**最大终点 + 1** (即最后一块被占用的 LBA + 1); 无分区时为 `first_usable`。
+    max_end: u64,
+    /// 本次指定要查的那一项是否已用 (下标越界时为 false)。
+    target_used: bool,
+}
+
+/// 流式扫一遍 GPT 项数组。失败返回 None。
+fn part_scan_gpt(
+    io: &mut NvmeIo,
+    nsid: u32,
+    first_usable: u64,
+    target: u64,
+    scratch: *mut u8,
+) -> Option<GptScan> {
+    let per = PART_ENTRIES_PER_CHUNK as u64;
+    let chunks = (PART_GPT_ENTRY_COUNT as u64).div_ceil(per) as u32;
+    let mut s = GptScan {
+        used: 0,
+        first_free: PART_GPT_ENTRY_COUNT as u64,
+        max_end: first_usable,
+        target_used: false,
+    };
+    let mut c = 0u32;
+    while c < chunks {
+        // ⚠️ 步长是**扇区数**(8), 不是项数(32): 一项 128 字节, 32 项才 4 KiB = 8 扇区。
+        let lba = PART_GPT_ENTRIES_LBA + (c as u64) * PART_CHUNK_SECTORS as u64;
+        if !io.read(nsid, lba as u32, PART_CHUNK_SECTORS, scratch) {
+            return None;
+        }
+        let lo = (c as u64) * per;
+        let mut k = 0u64;
+        while k < per {
+            let e = unsafe { scratch.add((k as usize) * PART_GPT_ENTRY_SIZE as usize) };
+            if gpt_entry_used(e) {
+                s.used += 1;
+                let last = read_u64(unsafe { e.add(0x28) });
+                if last + 1 > s.max_end {
+                    s.max_end = last + 1;
+                }
+                if lo + k == target {
+                    s.target_used = true;
+                }
+            } else if s.first_free == PART_GPT_ENTRY_COUNT as u64 {
+                s.first_free = lo + k;
+            }
+            k += 1;
+        }
+        c += 1;
+    }
+    Some(s)
+}
+
+/// 要在 GPT 项数组里落地的一处改动 (新建一项 = 填字段; 删除 = 清空)。
+#[derive(Clone, Copy)]
+struct GptPatch {
+    index: u64,
+    clear: bool,
+    first_lba: u64,
+    last_lba: u64,
+    type_guid: [u8; 16],
+    uniq_guid: [u8; 16],
+}
+
+/// 把一个 GPT 头写进 `sector` (512 字节): 填字段并算好自校验 CRC32。
+///
+/// CRC 覆盖头的前 92 字节 (`header_size`), 计算时 `header_crc32` 字段本身必须为 0 ——
+/// 所以先清零、填完全部字段、最后才算 CRC 并回填。
+#[allow(clippy::too_many_arguments)] // 头部字段本来就有这么多, 打包成结构反而更难对照规范
+fn gpt_build_header(
+    sector: *mut u8,
+    current_lba: u64,
+    backup_lba: u64,
+    first_usable: u64,
+    last_usable: u64,
+    disk_guid: &[u8; 16],
+    entries_lba: u64,
+    entry_crc: u32,
+) {
+    unsafe { core::ptr::write_bytes(sector, 0, 512) };
+    for (i, &c) in b"EFI PART".iter().enumerate() {
+        unsafe { *sector.add(i) = c };
+    }
+    write_u32(unsafe { sector.add(0x08) }, 0x0001_0000); // revision 1.0
+    write_u32(unsafe { sector.add(0x0C) }, 92); // header_size (规范固定)
+    write_u64(unsafe { sector.add(0x18) }, current_lba);
+    write_u64(unsafe { sector.add(0x20) }, backup_lba);
+    write_u64(unsafe { sector.add(0x28) }, first_usable);
+    write_u64(unsafe { sector.add(0x30) }, last_usable);
+    let mut i = 0usize;
+    while i < 16 {
+        unsafe { *sector.add(0x38 + i) = disk_guid[i] };
+        i += 1;
+    }
+    write_u64(unsafe { sector.add(0x48) }, entries_lba);
+    write_u32(unsafe { sector.add(0x50) }, PART_GPT_ENTRY_COUNT);
+    write_u32(unsafe { sector.add(0x54) }, PART_GPT_ENTRY_SIZE);
+    write_u32(unsafe { sector.add(0x58) }, entry_crc);
+    let crc = mfs_crc32(unsafe { core::slice::from_raw_parts(sector, 92) });
+    write_u32(unsafe { sector.add(0x10) }, crc);
+}
+
+/// 流式重写 GPT 的**两份**项数组与两份头, 顺带把 `patch` 应用到项数组上。
+///
+/// 一次只碰一页 (8 扇区 = 32 项), 所以 16 KiB 的项数组不需要额外缓冲; 项数组 CRC 边读边算
+/// (`crc32_update`)。主副本写完立刻复制到盘尾的备份区 —— 只认主表的工具能跑, 但真实工具链
+/// (sgdisk / 固件) 会校验备份, 缺了它这张表就是半成品。
+fn gpt_flush(
+    io: &mut NvmeIo,
+    nsid: u32,
+    cap: u64,
+    patch: &GptPatch,
+    scratch: *mut u8,
+) -> Option<u32> {
+    let per = PART_ENTRIES_PER_CHUNK as u64;
+    let chunks = (PART_GPT_ENTRY_COUNT as u64).div_ceil(per) as u32;
+    let backup_entries_lba = cap - PART_GPT_ENTRIES_SECTORS - 1;
+    let mut reg: u32 = 0xFFFF_FFFF;
+    let mut c = 0u32;
+    while c < chunks {
+        // 步长用**扇区数**(8): 32 项 × 128 字节 = 4 KiB = 8 扇区 (不是 32)。
+        let lba = PART_GPT_ENTRIES_LBA + (c as u64) * PART_CHUNK_SECTORS as u64;
+        if !io.read(nsid, lba as u32, PART_CHUNK_SECTORS, scratch) {
+            return None;
+        }
+        let lo = (c as u64) * per;
+        if patch.index >= lo && patch.index < lo + per {
+            let e =
+                unsafe { scratch.add((patch.index - lo) as usize * PART_GPT_ENTRY_SIZE as usize) };
+            unsafe { core::ptr::write_bytes(e, 0, PART_GPT_ENTRY_SIZE as usize) };
+            if !patch.clear {
+                let mut i = 0usize;
+                while i < 16 {
+                    unsafe { *e.add(i) = patch.type_guid[i] };
+                    unsafe { *e.add(0x10 + i) = patch.uniq_guid[i] };
+                    i += 1;
+                }
+                write_u64(unsafe { e.add(0x20) }, patch.first_lba);
+                write_u64(unsafe { e.add(0x28) }, patch.last_lba);
+                // 名字 (UTF-16LE): 写个可读标识, 宿主工具里一眼看出是谁建的。
+                for (i, &ch) in b"MorionFS".iter().enumerate() {
+                    unsafe { *e.add(0x38 + i * 2) = ch };
+                }
+            }
+        }
+        reg = crc32_update(reg, unsafe { core::slice::from_raw_parts(scratch, 4096) });
+        if !io.write(nsid, lba as u32, PART_CHUNK_SECTORS, scratch) {
+            return None;
+        }
+        if !io.write(
+            nsid,
+            (backup_entries_lba + (c as u64) * PART_CHUNK_SECTORS as u64) as u32,
+            PART_CHUNK_SECTORS,
+            scratch,
+        ) {
+            return None;
+        }
+        c += 1;
+    }
+    let entry_crc = !reg;
+    let mut disk_guid = [0u8; 16];
+    part_guid(nsid as u64, 0, disk_guid.as_mut_ptr());
+    gpt_build_header(
+        scratch,
+        1,
+        cap - 1,
+        PART_GPT_RESERVED,
+        cap - PART_GPT_RESERVED,
+        &disk_guid,
+        PART_GPT_ENTRIES_LBA,
+        entry_crc,
+    );
+    if !io.write(nsid, 1, 1, scratch) {
+        return None;
+    }
+    gpt_build_header(
+        scratch,
+        cap - 1,
+        1,
+        PART_GPT_RESERVED,
+        cap - PART_GPT_RESERVED,
+        &disk_guid,
+        backup_entries_lba,
+        entry_crc,
+    );
+    if !io.write(nsid, (cap - 1) as u32, 1, scratch) {
+        return None;
+    }
+    Some(entry_crc)
+}
+
+/// 写保护性 MBR (LBA 0): 一条 `0xEE` 项覆盖整盘, 让只认 MBR 的工具看到「这盘被 GPT 占了」。
+fn part_write_protective_mbr(io: &mut NvmeIo, nsid: u32, cap: u64, scratch: *mut u8) -> bool {
+    unsafe { core::ptr::write_bytes(scratch, 0, 512) };
+    write_u32(unsafe { scratch.add(440) }, 0x4D4F_0000 | nsid); // 磁盘签名 (非 0)
+    let e = unsafe { scratch.add(446) };
+    unsafe { *e.add(0) = 0x00 };
+    unsafe { *e.add(4) = PART_MBR_TYPE_PROTECTIVE };
+    write_u32(unsafe { e.add(8) }, 1); // 从 LBA 1 (GPT 头) 起
+    write_u32(unsafe { e.add(12) }, (cap - 1).min(0xFFFF_FFFF) as u32);
+    unsafe { *scratch.add(510) = 0x55 };
+    unsafe { *scratch.add(511) = 0xAA };
+    io.write(nsid, 0, 1, scratch)
+}
+
+/// 在盘上建一个 GPT 分区, 返回 `(起点 LBA, 扇区数)`; 失败 None。
+fn part_create_gpt(
+    io: &mut NvmeIo,
+    nsid: u32,
+    cap: u64,
+    size_sectors: u64,
+    scratch: *mut u8,
+) -> Option<(u64, u64)> {
+    let last_usable = cap - PART_GPT_RESERVED;
+    let scan = part_scan_gpt(io, nsid, PART_GPT_RESERVED, u64::MAX, scratch)?;
+    if scan.first_free >= PART_GPT_ENTRY_COUNT as u64 {
+        println("block: part create refused (GPT full: 128 entries)");
+        return None;
+    }
+    let start = align_up(scan.max_end, PART_ALIGN_SECTORS).max(PART_GPT_RESERVED);
+    if start > last_usable {
+        println("block: part create refused (no room left on disk)");
+        return None;
+    }
+    let room = last_usable - start + 1;
+    let size = if size_sectors == 0 {
+        room
+    } else {
+        size_sectors
+    };
+    if size > room {
+        println("block: part create refused (requested size exceeds free space)");
+        return None;
+    }
+    let mut uniq = [0u8; 16];
+    part_guid(nsid as u64, scan.first_free + 1, uniq.as_mut_ptr());
+    let patch = GptPatch {
+        index: scan.first_free,
+        clear: false,
+        first_lba: start,
+        last_lba: start + size - 1,
+        type_guid: PART_GPT_TYPE_LINUX,
+        uniq_guid: uniq,
+    };
+    if gpt_flush(io, nsid, cap, &patch, scratch).is_none() {
+        println("block: part create FAILED (write GPT)");
+        return None;
+    }
+    Some((start, size))
+}
+
+/// 在盘上建一个 MBR 主分区, 返回 `(起点 LBA, 扇区数)`; 失败 None。
+///
+/// MBR 的 LBA / 大小字段都是 32 位, 故可用空间夹在 `u32::MAX` 扇区 (≈2 TiB) 内 —— 更大的盘
+/// 只能用 GPT, 请求超界直接拒绝而不是悄悄截断。
+fn part_create_mbr(
+    io: &mut NvmeIo,
+    nsid: u32,
+    cap: u64,
+    size_sectors: u64,
+    scratch: *mut u8,
+) -> Option<(u64, u64)> {
+    let cap32 = cap.min(0xFFFF_FFFF);
+    if !io.read(nsid, 0, 1, scratch) {
+        return None;
+    }
+    let mut slot = usize::MAX;
+    let mut floor: u64 = 1; // 分区不可能从 LBA 0 起 (那里是 MBR 自己)
+    let mut i = 0usize;
+    while i < 4 {
+        let e = unsafe { scratch.add(446 + i * 16) };
+        let ptype = unsafe { *e.add(4) };
+        let start = read_u32(unsafe { e.add(8) }) as u64;
+        let count = read_u32(unsafe { e.add(12) }) as u64;
+        if ptype != 0 && count != 0 {
+            if start + count > floor {
+                floor = start + count;
+            }
+        } else if slot == usize::MAX {
+            slot = i;
+        }
+        i += 1;
+    }
+    if slot == usize::MAX {
+        println("block: part create refused (MBR full: 4 primary partitions)");
+        return None;
+    }
+    let start = align_up(floor, PART_ALIGN_SECTORS).max(PART_ALIGN_SECTORS);
+    if start >= cap32 {
+        println("block: part create refused (no room left on disk)");
+        return None;
+    }
+    let room = cap32 - start;
+    let size = if size_sectors == 0 {
+        room
+    } else {
+        size_sectors
+    };
+    if size > room {
+        println("block: part create refused (requested size exceeds free space)");
+        return None;
+    }
+    // 就地改 LBA0: 引导码 (0..440) 原样保留, 只改磁盘签名与分区项 —— 空白盘上引导码本来就是 0。
+    write_u32(unsafe { scratch.add(440) }, 0x4D4F_0000 | nsid);
+    let e = unsafe { scratch.add(446 + slot * 16) };
+    unsafe { core::ptr::write_bytes(e, 0, 16) };
+    unsafe { *e.add(0) = 0x00 }; // 非活动分区
+    unsafe { *e.add(4) = PART_MBR_TYPE_LINUX };
+    write_u32(unsafe { e.add(8) }, start as u32);
+    write_u32(unsafe { e.add(12) }, size as u32);
+    unsafe { *scratch.add(510) = 0x55 };
+    unsafe { *scratch.add(511) = 0xAA };
+    if !io.write(nsid, 0, 1, scratch) {
+        println("block: part create FAILED (write MBR)");
+        return None;
+    }
+    Some((start, size))
+}
+
+/// 把 LBA 0 的分区表区 (偏移 440..512: 磁盘签名 + 4 个项 + `0x55AA`) 清零。
+///
+/// 卷层要求「有 `0x55AA` **且**至少一条合法分区项」才算 MBR, 所以只清这一片就足够让盘回到
+/// 「无分区表」—— 引导码留着无害, 真机上也更愿意保留。
+fn mbr_clear_table(io: &mut NvmeIo, nsid: u32, scratch: *mut u8) -> bool {
+    if !io.read(nsid, 0, 1, scratch) {
+        return false;
+    }
+    unsafe { core::ptr::write_bytes(scratch.add(440), 0, 72) };
+    io.write(nsid, 0, 1, scratch)
+}
+
+/// 清空盘 `nsid` 的分区表 (GPT 连头与两份项数组一起抹掉), 让它回到「无分区表」。
+fn nvme_part_wipe(io: &mut NvmeIo, nsid: u32, scratch: *mut u8) -> u64 {
+    let cap = nvme_ns_sectors_of(nsid) as u64;
+    let style = part_probe_style(io, nsid, scratch);
+    if !mbr_clear_table(io, nsid, scratch) {
+        println("block: part wipe FAILED (write LBA 0)");
+        return 0;
+    }
+    // 只有 GPT 需要额外清理: 主头 + 主项数组 (LBA 1..=33) 与盘尾的备份 (cap-33..cap-1)。
+    // 残留的旧头会让 `sgdisk` 之类看到「有表的残骸」, 也容易被下次建表时的探测误判。
+    if style == PART_STYLE_GPT && cap > 2 * PART_GPT_RESERVED {
+        let mut lba = 1u64;
+        let head_end = PART_GPT_RESERVED - 1; // 33
+        while lba <= head_end {
+            let n = core::cmp::min(PART_CHUNK_SECTORS as u64, head_end - lba + 1) as u16;
+            unsafe { core::ptr::write_bytes(scratch, 0, n as usize * 512) };
+            if !io.write(nsid, lba as u32, n, scratch) {
+                println("block: part wipe FAILED (clear primary header)");
+                return 0;
+            }
+            lba += n as u64;
+        }
+        let tail_start = cap - PART_GPT_ENTRIES_SECTORS - 1;
+        let mut lba = tail_start;
+        while lba < cap {
+            let n = core::cmp::min(PART_CHUNK_SECTORS as u64, cap - lba) as u16;
+            unsafe { core::ptr::write_bytes(scratch, 0, n as usize * 512) };
+            if !io.write(nsid, lba as u32, n, scratch) {
+                println("block: part wipe FAILED (clear backup)");
+                return 0;
+            }
+            lba += n as u64;
+        }
+    }
+    // 表没了 -> 卷表要跟着变 (这块盘回到「一个整盘卷」)。
+    part_reload_volumes(io, scratch);
+    1
+}
+
+/// 删掉盘 `nsid` 上序号为 `index` 的分区 (**只清条目, 数据区一个字节都不动**)。
+///
+/// 删完若一个分区都不剩, 整张表被清空 (盘回到空白) —— 否则盘上会留一张「合法但空」的表,
+/// 下次要在空白盘上建 MBR 就没机会了。
+fn nvme_part_delete(io: &mut NvmeIo, nsid: u32, index: u64, scratch: *mut u8) -> u64 {
+    let cap = nvme_ns_sectors_of(nsid) as u64;
+    match part_probe_style(io, nsid, scratch) {
+        PART_STYLE_GPT => {
+            if cap < 2 * PART_GPT_RESERVED || index >= PART_GPT_ENTRY_COUNT as u64 {
+                println("block: part delete refused (no such partition)");
+                return 0;
+            }
+            let scan = match part_scan_gpt(io, nsid, PART_GPT_RESERVED, index, scratch) {
+                Some(s) => s,
+                None => {
+                    println("block: part delete FAILED (read GPT)");
+                    return 0;
+                }
+            };
+            if !scan.target_used {
+                println("block: part delete refused (no such partition)");
+                return 0;
+            }
+            if scan.used == 1 {
+                return nvme_part_wipe(io, nsid, scratch);
+            }
+            let patch = GptPatch {
+                index,
+                clear: true,
+                first_lba: 0,
+                last_lba: 0,
+                type_guid: [0; 16],
+                uniq_guid: [0; 16],
+            };
+            if gpt_flush(io, nsid, cap, &patch, scratch).is_none() {
+                println("block: part delete FAILED (write GPT)");
+                return 0;
+            }
+            part_reload_volumes(io, scratch);
+            1
+        }
+        PART_STYLE_MBR => {
+            if index >= 4 || !io.read(nsid, 0, 1, scratch) {
+                println("block: part delete refused (no such partition)");
+                return 0;
+            }
+            let e = unsafe { scratch.add(446 + index as usize * 16) };
+            let ptype = unsafe { *e.add(4) };
+            let count = read_u32(unsafe { e.add(12) });
+            if ptype == 0 || count == 0 {
+                println("block: part delete refused (no such partition)");
+                return 0;
+            }
+            unsafe { core::ptr::write_bytes(e, 0, 16) };
+            // 还有别的分区吗? 没有就整张表清掉 (盘回到空白)。
+            let mut rest = 0usize;
+            let mut i = 0usize;
+            while i < 4 {
+                let pe = unsafe { scratch.add(446 + i * 16) };
+                if unsafe { *pe.add(4) } != 0 && read_u32(unsafe { pe.add(12) }) != 0 {
+                    rest += 1;
+                }
+                i += 1;
+            }
+            if rest == 0 {
+                unsafe { core::ptr::write_bytes(scratch.add(440), 0, 72) };
+            }
+            if !io.write(nsid, 0, 1, scratch) {
+                println("block: part delete FAILED (write MBR)");
+                return 0;
+            }
+            part_reload_volumes(io, scratch);
+            1
+        }
+        _ => {
+            println("block: part delete refused (no partition table)");
+            0
+        }
+    }
+}
+
+/// 重扫全部 namespace 重建卷表 (分区表改动后调用) 并打印新表; 返回重读后的卷数。
+fn part_reload_volumes(io: &mut NvmeIo, scratch: *mut u8) -> u64 {
+    vol_reset();
+    let nsn = unsafe { NVME_NS_COUNT };
+    let mut i = 0usize;
+    while i < nsn {
+        let nsid = unsafe { NVME_NSIDS[i] };
+        vol_scan_namespace(
+            nsid,
+            io.cfg,
+            io.mmio,
+            io.isq,
+            io.icq,
+            scratch,
+            &mut *io.tail,
+            &mut *io.head,
+            &mut *io.phase,
+        );
+        i += 1;
+    }
+    vol_print_table();
+    unsafe { VOL_COUNT as u64 }
+}
+
+/// 在卷表里找 `(nsid, start_lba)` 对应的卷号 —— 分区表换过之后用它把「刚建的分区」翻成卷号。
+fn vol_id_of(nsid: u32, start_lba: u32) -> Option<u64> {
+    let n = unsafe { VOL_COUNT };
+    let mut i = 0usize;
+    while i < n {
+        let v = unsafe { VOLUMES[i] };
+        if v.nsid == nsid && v.start_lba == start_lba {
+            return Some(i as u64);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 建分区 (S2 收口): 决定表风格 → 写表 → 重读卷表 → 返回新分区的**卷号**。
+///
+/// 表风格按盘自适应 (已有 MBR 就继续 MBR、已有 GPT 就继续 GPT), **空白盘默认 GPT**;
+/// `force_mbr` 只在盘上还没有分区表时有效 —— 已有 GPT 时强制 MBR 会毁掉整张表, 直接拒绝。
+fn nvme_part_create(
+    io: &mut NvmeIo,
+    nsid: u32,
+    size_sectors: u64,
+    force_mbr: bool,
+    scratch: *mut u8,
+) -> u64 {
+    let cap = nvme_ns_sectors_of(nsid) as u64;
+    if cap == 0 {
+        println("block: part create refused (disk capacity unknown)");
+        return u64::MAX;
+    }
+    if cap < 2 * PART_GPT_RESERVED {
+        println("block: part create refused (disk too small for a partition table)");
+        return u64::MAX;
+    }
+    let style = part_probe_style(io, nsid, scratch);
+    if style == PART_STYLE_GPT && force_mbr {
+        println("block: part create refused (disk already has GPT; --mbr cannot convert)");
+        return u64::MAX;
+    }
+    let use_gpt = match style {
+        PART_STYLE_GPT => true,
+        PART_STYLE_MBR => false,
+        _ => !force_mbr,
+    };
+    let (start, size) = if use_gpt {
+        let r = match part_create_gpt(io, nsid, cap, size_sectors, scratch) {
+            Some(r) => r,
+            None => return u64::MAX,
+        };
+        if style != PART_STYLE_GPT {
+            // 保护性 MBR **最后**写: 万一前面失败, 盘读作「无分区表」而不是「有 GPT 但头不对」。
+            if !part_write_protective_mbr(io, nsid, cap, scratch) {
+                println("block: part create FAILED (write protective MBR)");
+                return u64::MAX;
+            }
+        }
+        r
+    } else {
+        match part_create_mbr(io, nsid, cap, size_sectors, scratch) {
+            Some(r) => r,
+            None => return u64::MAX,
+        }
+    };
+    print("part-dbg: create nsid=");
+    print_u64(nsid as u64);
+    print(if use_gpt {
+        " gpt start="
+    } else {
+        " mbr start="
+    });
+    print_u64(start);
+    print(" sectors=");
+    print_u64(size);
+    println("");
+    // 重读分区表: 新分区立刻成为卷, 于是可以直接 `mkfs.mfs <卷号>`。
+    part_reload_volumes(io, scratch);
+    match vol_id_of(nsid, start as u32) {
+        Some(id) => id,
+        None => {
+            println("block: part create FAILED (new partition not registered)");
+            u64::MAX
+        }
+    }
+}
+
 /// 查询卷表到调用方共享页 `buf`, 返回卷数 (失败 0)。
 fn block_list_volumes(buf: *mut u8, max: u32) -> u64 {
     let req = BlockReq {
@@ -3037,6 +3828,76 @@ fn block_list_volumes(buf: *mut u8, max: u32) -> u64 {
         )
     };
     sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload)
+}
+
+/// 发一个分区 / 裸盘请求给 block_srv, 返回回复值 (`u64::MAX` / 0 都表示失败, 见各调用方)。
+fn block_part_call(req: &PartReq) -> u64 {
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            req as *const PartReq as *const u8,
+            core::mem::size_of::<PartReq>(),
+        )
+    };
+    sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload)
+}
+
+/// 在盘 `nsid` 上建一个 `size_sectors` 扇区的分区 (`0` = 用尽剩余空间)。
+///
+/// 表风格**按盘自适应**: 已有 GPT 就继续 GPT、已有 MBR 就继续 MBR; **空白盘默认建 GPT**
+/// (`force_mbr = true` 时改建 MBR, 只在盘上还没有分区表时可用)。
+/// 成功返回新分区的**卷号** (可直接喂给 `mkfs.mfs`), 失败 `u64::MAX`。
+fn block_part_create(nsid: u64, size_sectors: u64, force_mbr: bool) -> u64 {
+    let req = PartReq {
+        op: BLOCK_OP_PART_CREATE as u64 | ((force_mbr as u64) << 8),
+        nsid,
+        arg0: size_sectors,
+        arg1: 0,
+    };
+    block_part_call(&req)
+}
+
+/// 删掉盘 `nsid` 上序号为 `index` 的分区 (**只清条目, 不动数据**)。成功返回 1。
+fn block_part_delete(nsid: u64, index: u64) -> u64 {
+    let req = PartReq {
+        op: BLOCK_OP_PART_DELETE as u64,
+        nsid,
+        arg0: index,
+        arg1: 0,
+    };
+    block_part_call(&req)
+}
+
+/// 清空盘 `nsid` 的分区表, 让它回到「无分区表」状态。成功返回 1。
+fn block_part_wipe(nsid: u64) -> u64 {
+    let req = PartReq {
+        op: BLOCK_OP_PART_WIPE as u64,
+        nsid,
+        arg0: 0,
+        arg1: 0,
+    };
+    block_part_call(&req)
+}
+
+/// 重读全部分区表并重建卷表 (分区表改动后调用)。返回重读后的卷数, 失败 0。
+fn block_part_reload() -> u64 {
+    let req = PartReq {
+        op: BLOCK_OP_PART_RELOAD as u64,
+        nsid: 0,
+        arg0: 0,
+        arg1: 0,
+    };
+    block_part_call(&req)
+}
+
+/// 裸读盘 `nsid` 的**一个扇区** `lba` 到 `buf` (绕过卷层; 分区诊断与自测校验表字节用)。
+fn block_disk_read(nsid: u64, lba: u64, buf: *mut u8) -> bool {
+    let req = PartReq {
+        op: BLOCK_OP_DISK_READ as u64,
+        nsid,
+        arg0: lba,
+        arg1: buf as u64,
+    };
+    block_part_call(&req) == 1
 }
 
 /// 在卷描述符数组中查找第一个 `kind` 匹配的卷号。
@@ -3058,6 +3919,19 @@ fn vol_find_kind(list: *const u8, count: u64, kind: u32) -> Option<u32> {
 fn vol_desc(list: *const u8, i: usize) -> VolumeDesc {
     let esize = core::mem::size_of::<VolumeDesc>();
     unsafe { core::ptr::read_unaligned(list.add(i * esize) as *const VolumeDesc) }
+}
+
+/// 在卷描述符数组里找 `(nsid, start_lba)` 对应的那一项 (自测断言分区/整盘卷在用)。
+fn vol_desc_find(list: *const u8, count: u64, nsid: u32, start_lba: u32) -> Option<VolumeDesc> {
+    let mut i = 0u64;
+    while i < count {
+        let d = vol_desc(list, i as usize);
+        if d.nsid == nsid && d.start_lba == start_lba {
+            return Some(d);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 文件服务启动时「认领」自己要用的卷号。
@@ -3265,6 +4139,9 @@ fn ide_block_main() {
                 sys_reply(n as u64);
             }
             _ => {
+                // 分区表写入 (`BLOCK_OP_PART_*`) 与裸盘读目前**只实现了 NVMe 路径**:
+                // IDE 回退路径只登记一块整盘、也没有 nsid 概念, 拿卷号去分区会与 NVMe 的
+                // 语义分叉。真要在 IDE 盘上分区时再补 (回归走 NVMe, 见 FS-26)。
                 sys_reply(0);
             }
         }
@@ -6956,6 +7833,237 @@ fn app_main() {
             return;
         }
     }
+    // 31. FS-26 自测 (S2 卷管理收口): block_srv **写**分区表 (`part.*`) —— 建/删 GPT 与 MBR。
+    //     目标盘是 Makefile 里挂的第 7 个 namespace (`build/pt.img`, 64 MiB 纯空白, 见
+    //     `run-nvme` / `fs-regress.sh`)。分四段:
+    //       (a) 起点干净: `part.wipe` 后该盘回到「无分区表」的**整盘卷** (容量 64 MiB);
+    //       (b) 强制 MBR: 建 16 MiB 分区 -> 卷表出现它, 且 LBA 0 的**字节**对得上
+    //           (0x55AA / 类型 0x83 / 起点 2048 / 大小 32768); 删掉 -> 盘回空白;
+    //       (c) GPT (空白盘默认): 建 16 MiB 分区 -> 保护性 MBR(0xEE) + 头("EFI PART") +
+    //           头 CRC32 + 项数组 CRC32 全部自洽, 项里的起点/大小与卷表一致; 再验「已有
+    //           GPT 时强制 MBR 必须被拒」, 然后在这个分区上 `mkfs.mfs` -> 卷类型变 mfs
+    //           (一条龙: 建分区 -> 格式化), 最后删掉它;
+    //       (d) 空白盘上的护栏: 无表时删分区、请求超出剩余空间都必须被拒。
+    //     为什么能读裸字节: 建完分区后 LBA 0/1 已不属于任何卷 (整盘卷没了、新分区从 2048 起),
+    //     只能按 nsid 直读 (`block_disk_read`) —— 这也正是本自测**独立**校验写盘结果
+    //     (而不是只信卷表) 的关键: 卷表是同一份代码扫出来的, 光看它可能「自证成功」。
+    {
+        const PT_NSID: u64 = 7;
+        // 分区大小: 16 MiB。
+        const PT_PART_SECTORS: u64 = 32768;
+        // 起点: 1 MiB 对齐。
+        const PT_PART_START: u32 = 2048;
+        // `build/pt.img` 容量: 64 MiB。
+        const PT_DISK_SECTORS: u32 = 131072;
+
+        let raw = vfs::RESULT_BUF as *mut u8;
+
+        // (a) 起点干净 (幂等: 复用镜像时上一轮留下的 GPT/MBR 也在这里被清掉)。
+        if block_part_wipe(PT_NSID) != 1 {
+            println("app: FS26 wipe FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        match vol_desc_find(raw as *const u8, n, PT_NSID as u32, 0) {
+            Some(d) if d.sectors == PT_DISK_SECTORS => {}
+            Some(_) => {
+                println("app: FS26 blank disk capacity wrong FAILED");
+                return;
+            }
+            None => {
+                println("app: FS26 blank disk volume missing FAILED");
+                return;
+            }
+        }
+
+        // (b) 强制 MBR (空白盘上才允许):
+        let vol_mbr = block_part_create(PT_NSID, PT_PART_SECTORS, true);
+        if vol_mbr == u64::MAX {
+            println("app: FS26 create MBR partition FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        match vol_desc_find(raw as *const u8, n, PT_NSID as u32, PT_PART_START) {
+            Some(d) if d.sectors == PT_PART_SECTORS as u32 && d.id as u64 == vol_mbr => {}
+            Some(_) => {
+                println("app: FS26 MBR volume geometry mismatch FAILED");
+                return;
+            }
+            None => {
+                println("app: FS26 MBR partition not registered FAILED");
+                return;
+            }
+        }
+        // LBA 0 的字节必须真的是刚写的那张 MBR。
+        if !block_disk_read(PT_NSID, 0, raw) {
+            println("app: FS26 MBR raw read FAILED");
+            return;
+        }
+        if unsafe { *raw.add(510) } != 0x55 || unsafe { *raw.add(511) } != 0xAA {
+            println("app: FS26 MBR signature wrong FAILED");
+            return;
+        }
+        if unsafe { *raw.add(446 + 4) } != PART_MBR_TYPE_LINUX
+            || read_u32(unsafe { raw.add(446 + 8) }) != PT_PART_START
+            || read_u32(unsafe { raw.add(446 + 12) }) != PT_PART_SECTORS as u32
+        {
+            println("app: FS26 MBR entry wrong FAILED");
+            return;
+        }
+        if block_part_delete(PT_NSID, 0) != 1 {
+            println("app: FS26 delete MBR partition FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        if vol_desc_find(raw as *const u8, n, PT_NSID as u32, PT_PART_START).is_some()
+            || vol_desc_find(raw as *const u8, n, PT_NSID as u32, 0).is_none()
+        {
+            println("app: FS26 MBR delete did not restore blank disk FAILED");
+            return;
+        }
+
+        // (c) GPT (空白盘默认风格):
+        let vol_gpt = block_part_create(PT_NSID, PT_PART_SECTORS, false);
+        if vol_gpt == u64::MAX {
+            println("app: FS26 create GPT partition FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        match vol_desc_find(raw as *const u8, n, PT_NSID as u32, PT_PART_START) {
+            Some(d) if d.sectors == PT_PART_SECTORS as u32 && d.id as u64 == vol_gpt => {}
+            Some(_) => {
+                println("app: FS26 GPT volume geometry mismatch FAILED");
+                return;
+            }
+            None => {
+                println("app: FS26 GPT partition not registered FAILED");
+                return;
+            }
+        }
+        // 保护性 MBR: LBA0 第一条项类型必须是 0xEE。
+        if !block_disk_read(PT_NSID, 0, raw) || unsafe { *raw.add(446 + 4) } != 0xEE {
+            println("app: FS26 GPT protective MBR wrong FAILED");
+            return;
+        }
+        // GPT 头: 签名 / header_size / 自校验 CRC32 (算之前把 CRC 字段清零, 算完还原)。
+        if !block_disk_read(PT_NSID, 1, raw) {
+            println("app: FS26 GPT header read FAILED");
+            return;
+        }
+        if unsafe { core::slice::from_raw_parts(raw as *const u8, 8) } != b"EFI PART"
+            || read_u32(unsafe { raw.add(0x0C) }) != 92
+        {
+            println("app: FS26 GPT header layout wrong FAILED");
+            return;
+        }
+        let hdr_crc = read_u32(unsafe { raw.add(0x10) });
+        let entry_crc = read_u32(unsafe { raw.add(0x58) });
+        write_u32(unsafe { raw.add(0x10) }, 0);
+        let hdr_calc = mfs_crc32(unsafe { core::slice::from_raw_parts(raw as *const u8, 92) });
+        write_u32(unsafe { raw.add(0x10) }, hdr_crc);
+        if hdr_calc != hdr_crc {
+            println("app: FS26 GPT header CRC32 mismatch FAILED");
+            return;
+        }
+        // 项数组 CRC32: 128 项 × 128 B = 32 扇区, 一扇区一读地流式累加。
+        let mut reg: u32 = 0xFFFF_FFFF;
+        let mut i = 0u64;
+        while i < 32 {
+            if !block_disk_read(PT_NSID, 2 + i, raw) {
+                println("app: FS26 GPT entries read FAILED");
+                return;
+            }
+            reg = crc32_update(reg, unsafe {
+                core::slice::from_raw_parts(raw as *const u8, 512)
+            });
+            i += 1;
+        }
+        if !reg != entry_crc {
+            println("app: FS26 GPT entry array CRC32 mismatch FAILED");
+            return;
+        }
+        // 第 0 项的字段: 类型 GUID 与起止 LBA 必须与卷表看到的一致。
+        if !block_disk_read(PT_NSID, 2, raw) {
+            println("app: FS26 GPT entry read FAILED");
+            return;
+        }
+        if read_u64(unsafe { raw.add(0x20) }) != PT_PART_START as u64
+            || read_u64(unsafe { raw.add(0x28) }) != PT_PART_START as u64 + PT_PART_SECTORS - 1
+        {
+            println("app: FS26 GPT entry geometry wrong FAILED");
+            return;
+        }
+        let mut k = 0usize;
+        while k < 16 {
+            if unsafe { *raw.add(k) } != PART_GPT_TYPE_LINUX[k] {
+                println("app: FS26 GPT entry type GUID wrong FAILED");
+                return;
+            }
+            k += 1;
+        }
+        // 护栏: 盘上已是 GPT 时, 强制 MBR 必须被拒 (那会毁掉整张表)。
+        if block_part_create(PT_NSID, PT_PART_SECTORS, true) != u64::MAX {
+            println("app: FS26 force-MBR on GPT disk NOT refused FAILED");
+            return;
+        }
+        // 一条龙: 在这个新分区上建 MorionFS, 卷类型必须变成 mfs。
+        if vfs::mfs_mkfs(vol_gpt) == u64::MAX {
+            println("app: FS26 mkfs on new partition FAILED");
+            return;
+        }
+        // 卷表的 kind 是**扫描时**探出来的, 所以格式化后要重读一次才会更新。
+        if block_part_reload() == 0 {
+            println("app: FS26 reload after mkfs FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        match vol_desc_find(raw as *const u8, n, PT_NSID as u32, PT_PART_START) {
+            Some(d) if d.kind == VOL_KIND_MFS => {}
+            Some(_) => {
+                println("app: FS26 new partition not detected as MFS FAILED");
+                return;
+            }
+            None => {
+                println("app: FS26 partition lost after mkfs FAILED");
+                return;
+            }
+        }
+        // 删掉它 (GPT 表的项数组与两个头都会被重算 CRC), 盘回到空白。
+        if block_part_delete(PT_NSID, 0) != 1 {
+            println("app: FS26 delete GPT partition FAILED");
+            return;
+        }
+        let n = block_list_volumes(raw, 16);
+        if vol_desc_find(raw as *const u8, n, PT_NSID as u32, PT_PART_START).is_some()
+            || vol_desc_find(raw as *const u8, n, PT_NSID as u32, 0).is_none()
+        {
+            println("app: FS26 GPT delete did not restore blank disk FAILED");
+            return;
+        }
+
+        // (d) 空白盘上的护栏: 无表可删 / 请求超出剩余空间都必须被拒 (且一个字都不写)。
+        if block_part_delete(PT_NSID, 0) != 0 {
+            println("app: FS26 delete without a partition table NOT refused FAILED");
+            return;
+        }
+        if block_part_create(PT_NSID, 1 << 40, false) != u64::MAX {
+            println("app: FS26 oversized create NOT refused FAILED");
+            return;
+        }
+        if block_part_create(4242, PT_PART_SECTORS, false) != u64::MAX {
+            println("app: FS26 create on nonexistent disk NOT refused FAILED");
+            return;
+        }
+
+        // (e) 收尾: 再建一个 GPT 分区并**留在盘上**。自测里复算 CRC32 只能证明这张表「自洽」,
+        //     证明不了 GUID 字节序 / 头字段这些**规范细节**; 留在盘上是为了让宿主工具
+        //     (`sgdisk -v` / `parted -l`, 见 `fs-regress.sh`) 能跨实现地校验它。
+        //     下一轮开头那句 `part.wipe` 会清掉它, 所以反复跑仍然确定。
+        if block_part_create(PT_NSID, PT_PART_SECTORS, false) == u64::MAX {
+            println("app: FS26 final GPT create FAILED");
+            return;
+        }
+    }
     println("app: SELFTEST DONE");
 }
 
@@ -7155,6 +8263,12 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)");
             println("  mfs.primary <vol>   mark a MorionFS volume primary (keeps data)");
             println("  df             show MorionFS space usage (/mfs)");
+            println(
+                "  part.create <nsid> <MiB> [mbr]  create a partition (disk-wide, blank = GPT)",
+            );
+            println("  part.del <nsid> <index>  delete a partition entry (keeps data)");
+            println("  part.wipe <nsid>   clear the partition table (disk becomes blank)");
+            println("  part.reload      re-read all partition tables");
             println("  clear          clear screen");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
             println(
@@ -7179,6 +8293,17 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "mkfs.mfs" => shell_mkfs(arg),
         "mfs.primary" => shell_mfs_primary(arg),
         "df" => shell_df(arg),
+        "part.create" => shell_part_create(arg),
+        "part.del" => shell_part_delete(arg),
+        "part.wipe" => shell_part_wipe(arg),
+        "part.reload" => {
+            let n = block_part_reload();
+            if n > 0 {
+                println("part.reload: partition tables re-read (volume table printed above)");
+            } else {
+                println("part.reload: FAILED");
+            }
+        }
         "clear" => {
             sys_clear();
         }
@@ -7607,6 +8732,100 @@ fn shell_df(arg: &str) {
     print(" (");
     print_u64(pct);
     println("% used; 1 block = 4 KiB)");
+}
+
+/// `part.create <nsid> <MiB> [mbr]` — 在盘 `<nsid>` 上建一个 `<MiB>` 的分区 (`0` = 用尽剩余空间)。
+///
+/// 表风格**按盘自适应**: 盘上已有分区表就沿用它的风格; **空白盘默认建 GPT**, 参数加 `mbr`
+/// 改建 MBR (只在空白盘上有效 —— 把已有 GPT 的盘改成 MBR 会毁掉那张表, 一律拒绝)。
+/// 起点对齐到 1 MiB。成功后块服务会**立刻重读分区表**, 新分区作为新卷出现在 `vol:` 表里。
+fn shell_part_create(arg: &str) {
+    const USAGE: &str = "part.create: usage: part.create <nsid> <MiB> [mbr]   (nsid from the 'vol:' lines; MiB 0 = all free space)";
+    let mut it = arg.split_whitespace();
+    let (nsid, mib) = match (it.next().and_then(parse_dec), it.next().and_then(parse_dec)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            println(USAGE);
+            return;
+        }
+    };
+    let force_mbr = match it.next() {
+        None => false,
+        Some("mbr") => true,
+        Some(_) => {
+            println(USAGE);
+            return;
+        }
+    };
+    if it.next().is_some() {
+        println(USAGE);
+        return;
+    }
+    // 1 MiB = 2048 个 512 字节扇区。
+    let vol = block_part_create(nsid, mib * 2048, force_mbr);
+    if vol != u64::MAX {
+        print("part.create: nsid ");
+        print_u64(nsid);
+        print(" -> volume ");
+        print_u64(vol);
+        println("  (new 'vol:' line above; format it with mkfs.mfs)");
+    } else {
+        print("part.create: refused nsid ");
+        print_u64(nsid);
+        println(" (no room / no such disk / unsupported conversion)");
+    }
+}
+
+/// `part.del <nsid> <index>` — 删掉盘 `<nsid>` 上序号为 `<index>` 的分区。
+///
+/// **只清条目**: 数据区一个字节都不动 (要回收空间请重新格式化那个卷)。删完若一个分区都不剩,
+/// 整张表被清空, 盘回到「无分区表」。
+fn shell_part_delete(arg: &str) {
+    const USAGE: &str = "part.del: usage: part.del <nsid> <index>   (index = 项下标, 从 0 起)";
+    let mut it = arg.split_whitespace();
+    let (nsid, index) = match (it.next().and_then(parse_dec), it.next().and_then(parse_dec)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            println(USAGE);
+            return;
+        }
+    };
+    if block_part_delete(nsid, index) == 1 {
+        print("part.del: nsid ");
+        print_u64(nsid);
+        print(" entry ");
+        print_u64(index);
+        println(" removed (data untouched; volume table reparsed)");
+    } else {
+        print("part.del: refused nsid ");
+        print_u64(nsid);
+        print(" entry ");
+        print_u64(index);
+        println(" (no such partition, or no partition table)");
+    }
+}
+
+/// `part.wipe <nsid>` — 清空盘 `<nsid>` 的分区表, 让它回到「无分区表」(整盘卷)。
+///
+/// 与 `part.del` 一样**只动表**: GPT 的头与两份项数组、MBR 的签名与 4 个项都被清零, 数据区
+/// 不动。用来把一块测试盘复位成空白, 好从头再建另一种风格的表。
+fn shell_part_wipe(arg: &str) {
+    let nsid = match parse_dec(arg) {
+        Some(v) => v,
+        None => {
+            println("part.wipe: usage: part.wipe <nsid>");
+            return;
+        }
+    };
+    if block_part_wipe(nsid) == 1 {
+        print("part.wipe: nsid ");
+        print_u64(nsid);
+        println(" partition table cleared (disk is blank again; volume table reparsed)");
+    } else {
+        print("part.wipe: FAILED on nsid ");
+        print_u64(nsid);
+        println("");
+    }
 }
 
 /// 按 8 / 10 进制解析无符号整数 (不带前缀, 空串/非法字符返回 None)。
@@ -9391,9 +10610,10 @@ fn write_u64(ptr: *mut u8, v: u64) {
     write_u32(unsafe { ptr.add(4) }, (v >> 32) as u32);
 }
 
-/// CRC-32 (IEEE 802.3, 多项式 0xEDB88320, 反射)。
-fn mfs_crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
+/// CRC-32 的**增量**形式: 传入上一段的寄存器 (初值 `0xFFFF_FFFF`), 返回更新后的寄存器;
+/// 全部分段喂完后取反才是最终 CRC。用于**流式**校验大于一页的数据 (如 GPT 项数组: 128 项
+/// × 128 字节 = 16 KiB, 超过一个共享页, 只能分块读)。
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
@@ -9404,7 +10624,12 @@ fn mfs_crc32(data: &[u8]) -> u32 {
             }
         }
     }
-    !crc
+    crc
+}
+
+/// CRC-32 (IEEE 802.3, 多项式 0xEDB88320, 反射)。
+fn mfs_crc32(data: &[u8]) -> u32 {
+    !crc32_update(0xFFFF_FFFF, data)
 }
 
 /// 计算并写入块头 CRC (payload 已填好)。
