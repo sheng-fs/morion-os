@@ -39,7 +39,6 @@ uefi = "0.26"
 # --- 内核 ---
 # 极简 no_std 依赖
 bitflags = { version = "2", default-features = false }
-log = { version = "0.4", default-features = false }
 
 # --- 配置解析 ---
 toml = { version = "0.8", default-features = false }
@@ -50,7 +49,6 @@ sm2 = { version = "0.13", default-features = false, features = ["alloc", "dsa"] 
 
 # --- x86_64 底层 ---
 x86_64 = "0.15"
-volatile = "0.5"
 spin = "0.9"
 
 # --- 序列化 (用户态服务) ---

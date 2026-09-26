@@ -188,10 +188,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "linked_list_allocator",
- "log",
- "raw-cpuid",
  "spin",
- "volatile 0.5.4",
  "x86_64",
 ]
 
@@ -265,15 +262,6 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-
-[[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags",
-]
 
 [[package]]
 name = "rfc6979"
@@ -475,12 +463,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
 
 [[package]]
-name = "volatile"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05a5337d258c4ef40d920ffcc5a729278951d57e6596f8b62ca7d4827613e77"
-
-[[package]]
 name = "x86_64"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -490,7 +472,7 @@ dependencies = [
  "bitflags",
  "const_fn",
  "rustversion",
- "volatile 0.4.6",
+ "volatile",
 ]
 
 [[package]]

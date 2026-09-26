@@ -36,11 +36,9 @@ enclave = []
 [dependencies]
 # --- 工作区共享依赖 ---
 bitflags.workspace = true
-log.workspace = true
 
 # --- x86_64 底层操作 ---
 x86_64 = { workspace = true, optional = true, features = ["abi_x86_interrupt"] }
-volatile.workspace = true
 spin.workspace = true
 
 # --- 极简内存分配 ---
@@ -48,7 +46,3 @@ linked_list_allocator = "0.10"
 
 # --- 能力模型 (内核内部) ---
 # 能力表、端点等使用自定义实现
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-# x86_64 特化
-raw-cpuid = "11"
