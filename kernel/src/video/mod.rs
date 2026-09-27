@@ -3,11 +3,17 @@
 //! 屏幕布局 (自顶向下):
 //!   - 顶部 `MARGIN` 起为「历史区」, 显示已提交的行, 可通过 ↑/↓ 回滚查看。
 //!   - 底部固定一行「输入行」, 用于当前正在编辑/打印的行, 带可见光标。
+//!
+//! 字体: ASCII 用 `font.rs` 的 8x16 位图; 其余字符 (汉字 / 全角标点 / 杂项符号) 用
+//! `unicode.rs` 查 `cjk.bin` 的 8x16 / 16x16 点阵。行缓冲存的是 **UTF-8 字节**,
+//! 排版按**显示列**算 (汉字 16x16 占 2 列), 故 `CUR_POS` / `CUR_COL` 是字节下标,
+//! 显示位置一律经 `unicode::str_width` 折算。
 
 pub mod bg;
 pub mod font;
 pub mod framebuffer;
 pub mod logo;
+pub mod unicode;
 
 use crate::bootinfo::BootInfo;
 use framebuffer::Framebuffer;
@@ -385,15 +391,26 @@ fn redraw() {
             let idx = (HISTORY_START + i) % HISTORY_LINES;
             let len = HISTORY_LEN[idx];
             let mut x = MARGIN;
-            for &ch in HISTORY[idx][..len].iter() {
-                if ch == 0 {
+            // 逐**字符**（而非逐字节）绘制: 汉字是 3 字节的 UTF-8、占 2 个字符格,
+            // 逐字节只会把 3 个字节当 3 个孤立字符画 (结果是空白/乱码)。
+            let bytes = &HISTORY[idx][..len];
+            let mut bi = 0;
+            while bi < bytes.len() {
+                let (cp, n) = unicode::decode(bytes, bi);
+                let w = unicode::width(cp);
+                if cp == 0 {
                     break;
                 }
-                font::draw_char(&mut FB, x, y, ch, FG);
-                x += font::CHAR_WIDTH;
-                if x + font::CHAR_WIDTH > FB.width() {
+                if w == 0 {
+                    bi += n;
+                    continue;
+                }
+                if x + w * font::CHAR_WIDTH > FB.width() {
                     break;
                 }
+                unicode::draw(&mut FB, x, y, cp, FG);
+                x += w * font::CHAR_WIDTH;
+                bi += n;
             }
             y += LINE_HEIGHT;
         }
@@ -417,29 +434,66 @@ fn draw_input_line() {
     let iy = input_y();
     unsafe {
         let mut x = MARGIN;
-        for &ch in CUR_LINE[..CUR_LEN].iter() {
-            font::draw_char(&mut FB, x, iy, ch, FG);
-            x += font::CHAR_WIDTH;
-            if x + font::CHAR_WIDTH > FB.width() {
+        let bytes = &CUR_LINE[..CUR_LEN];
+        let mut bi = 0;
+        while bi < bytes.len() {
+            let (cp, n) = unicode::decode(bytes, bi);
+            let w = unicode::width(cp);
+            if w == 0 {
+                bi += n;
+                continue;
+            }
+            if x + w * font::CHAR_WIDTH > FB.width() {
                 break;
             }
+            unicode::draw(&mut FB, x, iy, cp, FG);
+            x += w * font::CHAR_WIDTH;
+            bi += n;
         }
 
-        // 光标位置: CUR_ROW = 0 在输入行 (列 = CUR_POS), >0 在历史区 (列 = CUR_COL)
-        let (mut cx, cy) = if CUR_ROW == 0 {
-            let cx = MARGIN + (CUR_POS as u32) * font::CHAR_WIDTH;
-            (cx, iy + font::CHAR_HEIGHT)
+        // 光标位置: CUR_ROW = 0 在输入行 (列 = CUR_POS), >0 在历史区 (列 = CUR_COL)。
+        // 两者都是**字节**下标, 故下划线前的横向位置要按显示的列数折算; 下划线宽度
+        // 取光标所在字符的宽度 —— 汉字是双格, 画 8px 会只盖住左半边。
+        let (col_x, cy, cur_w) = if CUR_ROW == 0 {
+            let px =
+                MARGIN + unicode::str_width(&bytes[..CUR_POS.min(bytes.len())]) * font::CHAR_WIDTH;
+            (px, iy + font::CHAR_HEIGHT, char_cells(bytes, CUR_POS))
         } else {
+            let (px, cw) = match cur_hist_ridx() {
+                Some(ridx) => {
+                    let hbytes = &HISTORY[ridx][..HISTORY_LEN[ridx]];
+                    (
+                        MARGIN
+                            + unicode::str_width(&hbytes[..CUR_COL.min(hbytes.len())])
+                                * font::CHAR_WIDTH,
+                        char_cells(hbytes, CUR_COL),
+                    )
+                }
+                None => (MARGIN, 1),
+            };
             let cy = iy - (CUR_ROW as u32) * LINE_HEIGHT + font::CHAR_HEIGHT;
-            (MARGIN + (CUR_COL as u32) * font::CHAR_WIDTH, cy)
+            (px, cy, cw)
         };
+        let mut cx = col_x;
         if cx + font::CHAR_WIDTH > FB.width() {
             cx = FB.width() - font::CHAR_WIDTH;
         }
-        for dx in 0..font::CHAR_WIDTH {
+        for dx in 0..(cur_w * font::CHAR_WIDTH) {
             FB.pixel(cx + dx, cy, FG);
             FB.pixel(cx + dx, cy + 1, FG);
         }
+    }
+}
+
+/// 光标位于 `pos` 时, 它左边那个字符占的字符格数 (行尾 = 1 格)。
+fn char_cells(bytes: &[u8], pos: usize) -> u32 {
+    if pos >= bytes.len() {
+        return 1;
+    }
+    let (cp, _) = unicode::decode(bytes, pos);
+    match unicode::width(cp) {
+        0 | 1 => 1,
+        w => w,
     }
 }
 
@@ -489,34 +543,53 @@ pub fn scroll_view_down() {
 static PRINT_LOCK: Mutex<()> = Mutex::new(());
 
 /// 把一个字符追加到当前输入行 (行满则先换行提交); 返回是否发生了提交。
-fn append_char(ch: u8) -> bool {
+///
+/// 「行满」按**显示列数**判断 (汉字占 2 列), 并额外受 `LINE_BYTES` 字节容量限制
+/// —— 汉字 3 字节/个, 光看字节数会让一行提早或过晚换行。
+fn append_cp(cp: u32) -> bool {
+    let w = unicode::width(cp);
+    if w == 0 {
+        return false; // 控制字符 / 组合符: 终端不显示, 丢弃
+    }
+    let mut buf = [0u8; 4];
+    let n = match char::from_u32(cp) {
+        Some(c) => c.encode_utf8(&mut buf).len(),
+        None => return false,
+    };
     unsafe {
-        if CUR_LEN >= max_cols() {
+        let cols = unicode::str_width(&CUR_LINE[..CUR_LEN]) as usize;
+        if CUR_LEN + n > LINE_BYTES || cols + w as usize > max_cols() {
             commit_line();
-            if CUR_LEN < LINE_BYTES {
-                CUR_LINE[CUR_LEN] = ch;
-                CUR_LEN += 1;
-                CUR_POS = CUR_LEN;
+            if CUR_LEN + n <= LINE_BYTES {
+                CUR_LINE[..n].copy_from_slice(&buf[..n]);
+                CUR_LEN = n;
+                CUR_POS = n;
             }
             return true;
         }
-        if CUR_LEN < LINE_BYTES {
-            CUR_LINE[CUR_LEN] = ch;
-            CUR_LEN += 1;
-            CUR_POS = CUR_LEN;
-        }
+        CUR_LINE[CUR_LEN..CUR_LEN + n].copy_from_slice(&buf[..n]);
+        CUR_LEN += n;
+        CUR_POS = CUR_LEN;
         false
     }
 }
 
+/// 追加一个 ASCII 字节 (LOG0/提示符等纯 ASCII 路径的便捷入口)。
+fn append_char(ch: u8) -> bool {
+    append_cp(ch as u32)
+}
+
 /// 追加一段文本 (`\n` 提交当前行); 返回是否发生过换行提交。
+///
+/// 按 `&str` 的**字符**迭代 (而非字节): `SYS_PUTS` 传进来的就是 UTF-8 字符串,
+/// 汉字因此以一整个字符为单位落到行缓冲里。
 fn append_text(s: &str) -> bool {
     let mut committed = false;
-    for ch in s.bytes() {
-        if ch == b'\n' {
+    for ch in s.chars() {
+        if ch == '\n' {
             commit_line();
             committed = true;
-        } else if append_char(ch) {
+        } else if append_cp(ch as u32) {
             committed = true;
         }
     }
@@ -628,7 +701,9 @@ pub fn term_put(c: u8) {
                         INPUT_BASE = CUR_LEN;
                         INPUT_ACTIVE = true;
                     }
-                    if CUR_LEN >= max_cols() {
+                    if unicode::str_width(&CUR_LINE[..CUR_LEN]) as usize + 1 > max_cols()
+                        || CUR_LEN + 1 > LINE_BYTES
+                    {
                         // 输入行满: 换行续写, 新行完全属于用户输入。
                         commit_line();
                         INPUT_BASE = 0;
@@ -636,6 +711,12 @@ pub fn term_put(c: u8) {
                         needs_full = true;
                     }
                     if CUR_LEN < LINE_BYTES {
+                        // 插入位置必须落在字符边界上 (行里可能有汉字: 光标左右移动
+                        // 都是按字符走的, 正常不会停在中间; 这里再挡一次, 免得把
+                        // 一个汉字的 UTF-8 字节切开)。
+                        if CUR_POS < CUR_LEN && CUR_LINE[CUR_POS] & 0xC0 == 0x80 {
+                            CUR_POS = unicode::prev_index(&CUR_LINE[..CUR_LEN], CUR_POS);
+                        }
                         for i in (CUR_POS..CUR_LEN).rev() {
                             CUR_LINE[i + 1] = CUR_LINE[i];
                         }
@@ -671,9 +752,10 @@ fn insert_hist_char(c: u8) {
     };
     unsafe {
         let len = HISTORY_LEN[ridx];
-        let mut col = CUR_COL;
-        if col > len {
-            col = len;
+        // 插入点必须是字符边界: 行里可能有汉字, 光标正常停在边界上, 这里再挡一次。
+        let mut col = CUR_COL.min(len);
+        if col < len && HISTORY[ridx][col] & 0xC0 == 0x80 {
+            col = unicode::prev_index(&HISTORY[ridx][..len], col);
         }
         if len < LINE_BYTES {
             for i in (col..len).rev() {
@@ -701,11 +783,21 @@ pub fn term_backspace() {
         } else if CUR_POS > 0 {
             // 不删到输入起点之前 (即不破坏提示符)。
             if !(INPUT_ACTIVE && CUR_POS <= INPUT_BASE) {
-                for i in CUR_POS..CUR_LEN {
-                    CUR_LINE[i - 1] = CUR_LINE[i];
+                // 按**字符**删: 汉字 3 字节, 删 1 字节只会剩下残字节。
+                let start = unicode::prev_index(&CUR_LINE[..CUR_LEN], CUR_POS);
+                let start = if INPUT_ACTIVE {
+                    start.max(INPUT_BASE)
+                } else {
+                    start
+                };
+                if start < CUR_POS {
+                    let removed = CUR_POS - start;
+                    for i in CUR_POS..CUR_LEN {
+                        CUR_LINE[i - removed] = CUR_LINE[i];
+                    }
+                    CUR_LEN -= removed;
+                    CUR_POS = start;
                 }
-                CUR_LEN -= 1;
-                CUR_POS -= 1;
             }
         }
     }
@@ -728,17 +820,17 @@ fn backspace_hist_char() {
     };
     unsafe {
         let len = HISTORY_LEN[ridx];
-        let mut col = CUR_COL;
-        if col > len {
-            col = len;
-        }
+        let mut col = CUR_COL.min(len);
         if col > 0 {
+            let start = unicode::prev_index(&HISTORY[ridx][..len], col);
+            let removed = col - start;
             for i in col..len {
-                HISTORY[ridx][i - 1] = HISTORY[ridx][i];
+                HISTORY[ridx][i - removed] = HISTORY[ridx][i];
             }
-            HISTORY_LEN[ridx] = len - 1;
-            CUR_COL = col - 1;
+            HISTORY_LEN[ridx] = len - removed;
+            col = start;
         }
+        CUR_COL = col;
     }
 }
 
@@ -750,12 +842,19 @@ pub fn term_left() {
     let mut needs_full = false;
     unsafe {
         if CUR_ROW == 0 {
-            // 不左移到输入起点之前 (即不进入提示符)。
+            // 不左移到输入起点之前 (即不进入提示符); 按**字符**移动 (汉字 3 字节)。
             if CUR_POS > 0 && !(INPUT_ACTIVE && CUR_POS <= INPUT_BASE) {
-                CUR_POS -= 1;
+                let start = unicode::prev_index(&CUR_LINE[..CUR_LEN], CUR_POS);
+                if !(INPUT_ACTIVE && start < INPUT_BASE) {
+                    CUR_POS = start;
+                }
             }
         } else {
-            CUR_COL = CUR_COL.saturating_sub(1);
+            if let Some(ridx) = cur_hist_ridx() {
+                let len = HISTORY_LEN[ridx];
+                let pos = CUR_COL.min(len);
+                CUR_COL = unicode::prev_index(&HISTORY[ridx][..len], pos);
+            }
             needs_full = true;
         }
     }
@@ -779,11 +878,15 @@ pub fn term_right() {
     unsafe {
         if CUR_ROW == 0 {
             if CUR_POS < CUR_LEN {
-                CUR_POS += 1;
+                CUR_POS = unicode::next_index(&CUR_LINE[..CUR_LEN], CUR_POS).min(CUR_LEN);
             }
         } else {
-            if CUR_COL < cur_hist_len() {
-                CUR_COL += 1;
+            if let Some(ridx) = cur_hist_ridx() {
+                let len = HISTORY_LEN[ridx];
+                let pos = CUR_COL.min(len);
+                if pos < len {
+                    CUR_COL = unicode::next_index(&HISTORY[ridx][..len], pos);
+                }
             }
             needs_full = true;
         }

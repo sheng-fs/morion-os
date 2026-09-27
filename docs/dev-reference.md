@@ -165,7 +165,26 @@ UEFI 固件
 - `unsafe input_read(out: *mut u8, max: usize) -> Option<usize>`（`SYS_READLINE` 用：从输入行队列取走一行，键盘回车时由 `term_put('\n')` 入队并唤醒等待者）
 - `term_put` 记录本轮**用户输入起点** `INPUT_BASE`（首个按键时锁定为当时行尾），回车只提交该起点之后的内容，
   由此支持「行内提示符」：提示符可先 `print` 到输入行，`SYS_READLINE` 只回传用户键入部分；退格/左移不会越过该起点。
-- `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII，因内核字体仅含 0x20..=0x7E）
+- `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII）
+- **中文 / 非 ASCII 点阵渲染**（[kernel/src/video/unicode.rs](../../kernel/src/video/unicode.rs)）：
+  - 字体分两套：ASCII（0x20..=0x7E）用 `font.rs` 的 **8x16**；其余字符查 `video/cjk.bin` 的
+    **8x16（窄）/ 16x16（宽）** 点阵。汉字笔画密度要求 16x16，故占 **2 个字符格**（16 px = 2×8）。
+  - `cjk.bin` 由 [scripts/gen-cjk-font.py](../../scripts/gen-cjk-font.py) 从 **GNU Unifont**
+    （OFL-1.1 / GPLv2+ with font embedding exception）生成：字符集 = **GB2312 全集**（Python 内建
+    `gb2312` 编解码表枚举，7445 字）**∪ 仓库源码/文档里出现过的所有非 ASCII 字符**（保证本项目
+    自己打印的东西一个不缺）；共约 7500 字 / 276 KB，定长 37 字节记录按码点升序，
+    内核二分查找（`unicode::glyph`）。产物**随仓库提交**，构建不依赖网络与 Python。
+  - `unicode::decode(bytes, i) -> (码点, 字节数)`（非法序列按 U+FFFD 且只前进 1 字节，
+    不能让一个坏字节卡住整行）/ `next_index` / `prev_index`（按字符移动光标与退格，
+    绝不切进多字节字符中间）/ `width(cp)` / `str_width(bytes)` / `draw(fb, x, y, cp, color)`。
+  - **宽度随字形一起存**（`cjk.bin` 记录里那位 `width`：1 = 8x16，2 = 16x16），故排版列数
+    不必再维护一张 East Asian Width 表 —— GB2312 里的 `·` 是窄的、全角 `，` 是宽的，各自都对；
+    只有「字库缺字形」时才退回 `east_asian_wide()` 粗判豆腐块宽度。
+  - 撞不上的字画**空心豆腐块**（不是空白）：明确区分「有这个字符但字库没有」与「真的没内容」。
+- **终端行模型（显示列而非字节）**：行缓冲存的是 **UTF-8 字节**，`CUR_POS` / `CUR_COL` 是字节下标，
+  但排版与换行按 `unicode::str_width` 折算的**显示列**（`append_cp` 用列数判满行、渲染时逐字符推进
+  `8/16 px`、光标下划线宽度取该字符宽度）。退格 / ←/→ 都走 `prev_index` / `next_index`，
+  所以行里有汉字时编辑不会把它的 UTF-8 字节切开。
 - 背景：清屏/重绘不再填纯色，而是调用 `bg_fill_rect` / `bg_fill_all`，按 `bg::color_for_row` 的**竖直渐变**
   逐行取色填充。颜色表 `bg.rs` 由 `resources/system/terminal/终端背景_1024x768.raw` 采样得到（64 级 ≈ 256 字节），
   已压暗偏蓝以保证白色文字可读；分辨率无关，重绘开销与原先纯色填充同量级。
@@ -380,3 +399,4 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 39 | **NVMe 中断化（MSI/MSI-X）**：内核新增 LAPIC 最小支撑（`arch/apic.rs`：`IA32_APIC_BASE`/`SVR`/`TPR`/`LVT0`-ExtINT 透传/`EOI`）、PCI 能力链表遍历与 MSI-X 定位（`pci::find_msix`/`disable_intx`/`enable_msix`）、MSI 向量段 `0x50..0x5F` 的 IDT 处理器（`eoi` + 置待处理位）、向量注册与 `SYS_IRQ_POLL`/`SYS_MSIX_ENABLE`；分工 = 内核管中断配置（LAPIC + PCI 配置空间 + 向量段），驱动写 MSI-X 表（该 BAR 由固件分配在 4 GiB 以上，内核到不了，且本就非缓存映射给驱动）。`nvme::setup` 在内核侧准备向量 + 授权 `Irq`，驱动写表项 0 → 请内核开 MSI-X → 注册向量 → `submit_wait` 改「先等中断再查 CQE」（`create_iocq` 补 **IEN=1**，否则 I/O CQ 根本不投中断），等不到则**粘性回退轮询**；启动打 `MSI-X prepared/enabled` 与 `after volume scan cmds=/irq_cmds=/poll_cmds=/irqs=` 两路证据，运行期每 4096 条命令再打一行 | ✅ |
 | 40 | **阻塞等中断（等待原语）**：调度器加带超时阻塞（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒 `Sleeping` 与带超时 `Blocked` 两态）与伪等待键 `irq_wait_token`（当时按向量取键，**S5 起改为按域取键**，见第 41 行）；`irq::set_pending` 置位后 `wake_one` 唤醒等待该向量的域（取完锁再进调度器，不形成锁嵌套）；新 syscall `SYS_IRQ_WAIT(36)`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，让被中断唤醒的域立刻接手而不必等一个时钟 tick。驱动 `submit_wait` 的中断路径改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**彻底去掉前一轮的每轮踢宿主自旋**，等不到中断仍是轮数 × 超时的看门狗后粘性回退。实测：中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 **314 s**（旧「每轮踢」实现 342 s，同轮轮询对照 174 s —— 这套 QEMU/KVM 下中断等待每条命令仍多约半个 tick） | ✅ |
 | 41 | **多向量 + `wait_any`（中断/等待原语做深）**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— 调度器 `irq_wait_token(domain) = u64::MAX-0x300-domain`（落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`，与真实域 id / `INPUT_WAIT` 不重叠），`irq` 侧加 `ANY_MASK: [u64; 64]` 记「每个域正在等的向量掩码」。`SYS_IRQ_POLL(34)` / `SYS_IRQ_WAIT(36)` 的入参 `rdi` 从「向量号」改为**掩码**（位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`），返回**命中的向量号**（0 = 无 / 超时 / 非法）；掩码里每个位都须持有 `Capability::Irq` 且是该向量的注册者，一个不满足即整体非法。`take_pending_any(mask, domain)` 只取自己注册的位，`set_pending` 置位后算出「掩码含该向量」的域、放锁后逐个 `wake_one(irq_wait_token(domain))`。NVMe 侧：`NVME_MSIX_VECTORS = 3`、`NVME_DMA_PAGES = 5 → 7`，建 **admin + 2 条 I/O 队列**，每条 CQ 用**自己的**向量（0x50/0x51/0x52），驱动按段**轮转选队列**、I/O 完成等 `1<<IO_QUEUES` 掩码（`wait_any`）。⚠️ 踩到的坑:`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**（admin CQ 恒 0），写成「队列序号」会让 qid 1 与 admin 抢向量 0 —— 症状是 I/O 完成投的是 0x50 而驱动在等掩码位 1/2，永远等不到、13 条命令后即回退轮询（`vecs=0x1`）。实测三条向量都真实投递：`after volume scan cmds=29 irq_cmds=29 poll_cmds=0 irqs=29 vecs=0x7 mode=irq`、运行期 `cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq` | ✅ |
+| 42 | **终端中文 / 非 ASCII 点阵渲染**：内核终端原只有 8x16 ASCII 位图，`SYS_PUTS` 拿到的是 UTF-8，汉字（3 字节）被逐字节喂进 `draw_char` 后落在「不可打印」分支被丢掉 —— 中文直接不显示。新增 `video/unicode.rs`（UTF-8 解码 + 二分查字形 + 绘制 + 豆腐块）与生成的字库 `video/cjk.bin`（**GNU Unifont**，OFL-1.1：GB2312 全集 ∪ 仓库非 ASCII 字符 ≈ 7500 字 / 276 KB，定长 37 字节记录、**宽度随字形存**，故内核不必维护 East Asian Width 表）。终端行模型从「字节 = 一列」改为**按显示列**：`append_cp` 按列数判满行、渲染逐字符推进 8/16 px、光标按字节下标折算显示位置且下划线宽度取字符宽度、退格/←/→ 走 `prev_index`/`next_index` 不切开多字节字符。验证：`screendump` 截图确认内核启动行与 Ring 3 shell 行都正确显示汉字与全角标点、宽窄混排对齐 | ✅ |

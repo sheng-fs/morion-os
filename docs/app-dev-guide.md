@@ -176,7 +176,7 @@ sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直�
 
 | 编号 | 封装 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
-| 4 | `sys_puts(s)` | `rdi=ptr, rsi=len` | — | 打印字符串 |
+| 4 | `sys_puts(s)` | `rdi=ptr, rsi=len` | — | 打印字符串。传的是 **UTF-8 字节**：ASCII 按 8x16 单格、汉字/全角标点按 16x16 双格渲染（字库 `video/cjk.bin`，缺字形画空心豆腐块） |
 | 15 | `sys_scroll_up()` | — | 1 | 光标上移 / 到顶滚动历史 |
 | 16 | `sys_scroll_down()` | — | 1 | 光标下移 / 到底滚动历史 |
 | 17 | `sys_backspace()` | — | 1 | 删除输入行光标前一个字符 |

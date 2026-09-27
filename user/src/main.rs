@@ -8520,6 +8520,9 @@ fn shell_main() {
         return;
     }
     println("shell: type 'help' for commands");
+    // 用户态打印中文: 经 `SYS_PUTS` 把 UTF-8 原样交给内核终端 —— Ring 3 一路到
+    // 16x16 点阵字形 (全角标点也是双宽度), 这条是端到端的渲染验证。
+    println("你好，世界！MorionOS 终端支持中文、全角标点与宽窄混排。");
 
     // 初始工作目录为根。
     let mut st = ShellState {

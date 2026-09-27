@@ -410,6 +410,10 @@ pub extern "C" fn kernel_main() -> ! {
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();
     video::println("");
+    // 中文渲染自检: 汉字是 16x16 点阵、占 2 个字符格 (字库见 video/cjk.bin),
+    // 与 8x16 的 ASCII 混排 —— 这一行同时验证「三字节 UTF-8 解码 + 双宽度排版」。
+    video::println("MorionOS 微内核 · 中文渲染就绪：汉字、全角标点、双宽度混排。");
+    video::println("");
 
     // 交给调度器。首次切换在中断关闭下进行, 避免 enable 与首次调度之间
     // 的竞态 (否则定时器中断会在 run 完成前触发 schedule 抢走主执行流)。

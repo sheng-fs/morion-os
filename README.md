@@ -49,7 +49,7 @@
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
-| 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
+| 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**（8x16 ASCII + 16x16 汉字点阵，支持中文/全角标点与宽窄混排）；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
 
@@ -203,7 +203,7 @@
 │       ├── arch/             #   x86_64 架构 (gdt/idt/pic/pit/keyboard/pci)
 │       ├── memory/           #   内存管理 (paging/frame_allocator)
 │       ├── scheduler/        #   调度器 (context 上下文切换)
-│       ├── video/            #   帧缓冲文本控制台 (framebuffer/font/logo/bg)
+│       ├── video/            #   帧缓冲文本控制台 (framebuffer/font/logo/bg/unicode) + 汉字点阵 cjk.bin
 │       ├── bootinfo.rs       #   引导信息 (内存图 + GOP 帧缓冲)
 │       ├── cap.rs            #   能力系统 (能力槽 + 能力句柄表)
 │       ├── domain.rs         #   保护域 (进程)
@@ -321,6 +321,7 @@
 - [x] **NVMe 中断化（MSI/MSI-X）**（**S3**：内核补 LAPIC 最小支撑（`IA32_APIC_BASE` / `SVR` / `TPR` / `LVT0`-ExtINT 透传 / `EOI`）+ PCI 能力链表遍历与 MSI-X 定位，IDT 装 MSI 向量段 `0x50..0x5F`；**内核管中断配置**（LAPIC + PCI 配置空间 + 向量段），**驱动写 MSI-X 表**（表在那个 4 GiB 以上、内核到不了的 BAR 里）；中断不投 IPC 而只置「待处理位」（与块请求邮箱混用会打乱 `reply` 路由），驱动用新 syscall `SYS_IRQ_POLL` 取位、`SYS_MSIX_ENABLE` 请内核开 MSI-X；`submit_wait` 改「先等中断再查 CQE」，等不到就**自动回退轮询**。修掉一个隐蔽 bug：`Create I/O CQ` 漏了 **IEN=1**，该队列根本不投中断 —— 轮询看不出来，中断路径会一直等。运行期证据：`nvme: stats … irq_cmds=N poll_cmds=0 irqs=N mode=irq`）
 - [x] **阻塞等中断（等待原语）**（**S4**：调度器补**带超时阻塞**（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒），伪等待键 `irq_wait_token(vector)`（**S5 起改为按域取键 + 掩码**）让 `irq::set_pending` 直接**唤醒**等待该向量的驱动域（与 IPC 的域 id 键不重叠，不会误唤醒）；新 syscall `SYS_IRQ_WAIT`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，被中断唤醒的域立刻接手。驱动 `submit_wait` 因此改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**去掉上一轮「每轮踢一次宿主」的自旋**，等不到中断仍是「轮数 × 超时」看门狗后粘性回退。实测中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 314 s（旧实现 342 s））
 - [x] **多向量 + `wait_any`（中断/等待原语做深）**（**S5**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— `irq_wait_token(domain)` + `irq::ANY_MASK[域]`；`SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 入参由向量号改为**掩码**，返回**命中的向量号**，一次等多条队列。NVMe 建成 **admin + 2 条 I/O 队列**、每条 CQ 用**自己的向量**（0x50/0x51/0x52），驱动按段轮转选队列、I/O 完成等 `1<<IO_QUEUES` 掩码。修掉一个踩坑：`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**，写成队列序号会让 qid 1 与 admin 抢向量 0，I/O 完成永远等不到（13 条命令后即回退）。运行期证据：`nvme: stats cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq`，三条向量都真实投递）
+- [x] **终端中文渲染（汉字 / 全角 / 宽窄混排）**（内核终端原本只有 8x16 ASCII 位图，而 `SYS_PUTS` 传的是 UTF-8 —— 汉字被逐字节喂进 `draw_char` 后落进「不可打印」分支，中文因此完全不显示。新增 `video/unicode.rs` + 生成的字库 `video/cjk.bin`：字源 **GNU Unifont**（OFL-1.1），字符集 = **GB2312 全集** ∪ 仓库里出现过的非 ASCII 字符 ≈ 7500 字 / 276 KB，16x16 汉字占 **2 个字符格**；记录里**自带宽度**，内核无需维护 East Asian Width 表，缺字形画空心豆腐块。终端行模型由「字节 = 一列」改为**按显示列**：满行判定、渲染步进、光标折算与下划线宽度都按列，退格/←/→ 按字符走不切开多字节。字库由 `scripts/gen-cjk-font.py` 生成并随仓库提交，构建不依赖网络）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 可执行文件加载（当前所有服务共用一份扁平二进制，按域 id 分流）
 - [ ] 帧缓冲对用户态开放 / GUI 服务
