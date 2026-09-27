@@ -19,6 +19,11 @@ pub enum Capability {
     Irq(u8),
     /// 把指定物理基址 (页对齐) 的 MMIO 区域映射进本域的能力。
     Mmio(u64),
+    /// 加载可执行文件并启动的能力 (`SYS_SPAWN_ELF`): 允许建新域 + 载入镜像 + 起任务。
+    ///
+    /// 无参数 —— 该能力本身就是"可以造进程"这张凭证。与其它能力一样默认不授予,
+    /// 由信任方显式给（引导期给 shell / 自测域）。
+    Spawn,
 }
 
 /// 每域能力槽数量。
@@ -30,6 +35,8 @@ pub const CAP_KIND_SEND_TO: u64 = 0;
 pub const CAP_KIND_MAP_INTO: u64 = 1;
 pub const CAP_KIND_IRQ: u64 = 2;
 pub const CAP_KIND_MMIO: u64 = 3;
+/// `Spawn` 无参数, 故 `arg` 被忽略（但保留两段式编码, 委派路径才不必特判）。
+pub const CAP_KIND_SPAWN: u64 = 4;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -43,6 +50,7 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         CAP_KIND_MAP_INTO => Some(Capability::MapInto(arg)),
         CAP_KIND_IRQ if arg <= u8::MAX as u64 => Some(Capability::Irq(arg as u8)),
         CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
+        CAP_KIND_SPAWN => Some(Capability::Spawn),
         _ => None,
     }
 }
@@ -75,6 +83,18 @@ pub fn init(domain_count: usize) {
     for _ in 0..domain_count {
         handles.push([None; HANDLE_SLOTS]);
     }
+}
+
+/// 运行时新增一个域 (ELF 加载建新域时调用): 补两行空槽, 新域默认**零能力**。
+///
+/// 与 `init` 一样按域 id 索引, 故必须在 `domain::create()` 之后、任何对该域的能力
+/// 查询之前调用, 否则下标错位。
+pub fn add_domain() {
+    let mut table = CAP_TABLE.lock();
+    table.push([None; CAP_SLOTS]);
+    drop(table);
+    let mut handles = HANDLE_TABLE.lock();
+    handles.push([None; HANDLE_SLOTS]);
 }
 
 /// 为域 `domain` 的不透明对象 `obj` 签发句柄, 返回句柄索引 (0 起);

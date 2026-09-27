@@ -23,12 +23,23 @@ pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 /// 用户空间基址 (P4[1], 512 GiB), 与内核的恒等/offset 映射分离。
 pub const USER_SPACE_BASE: u64 = 0x0000_0080_0000_0000;
 
+/// 用户空间结束地址 (**开区间**), 即 P4[1] 的上界 —— 越界就等于跳到内核/未映射区域。
+pub const USER_SPACE_END: u64 = USER_SPACE_BASE + 0x0000_0080_0000_0000;
+
+/// 用户栈顶虚拟地址。所有用户程序共用同一套链接地址与固定布局 (见 `user/linker.ld`),
+/// 故栈位置也是全局常量 —— 引导期加载 (`load_user_program`) 与运行时 ELF 加载
+/// (`exec::spawn_elf`) 必须一致, 因此放在这里作为唯一来源。
+pub const USER_STACK_TOP: u64 = USER_SPACE_BASE + 0x40_1000;
+
+/// 用户栈页数 (自 `USER_STACK_TOP` 向下增长)。
+pub const USER_STACK_PAGES: u64 = 8;
+
 /// 内核堆起始虚拟地址 (未使用的上半区地址)
 const HEAP_START: u64 = 0x4444_4444_0000;
 /// 内核堆大小 (至少容纳 7 个 32 KiB 内核栈 + 调度器/IPC/Cap/分页器/分配器元数据)
-///   7 × 32 KiB = 224 KiB 仅栈; 加上分配器头 + 容器扩容 + 域/任务结构, 256 KiB 不够,
-///   放 1 MiB 给将来扩展 (VFS / 更多域) 留余量。
-const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+///   7 × 32 KiB = 224 KiB 仅栈; 加上分配器头 + 容器扩容 + 域/任务结构, 含运行时创建的
+///   域/任务后每任务仍要 32 KiB 内核栈 (任务表上限 32 → 约 1 MiB 仅栈), 故留 4 MiB。
+const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// 可管理的物理内存上限 (前 4 GiB, 覆盖 QEMU 2 GiB 内存)
 const MANAGED_MEMORY: u64 = 4 * 1024 * 1024 * 1024;

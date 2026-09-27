@@ -13,6 +13,8 @@ members = [
     "kernel",
     "kernel_test",
     "user",
+    # 可执行文件加载的演示程序 (E1): 独立 crate → 独立 ELF, 由 SYS_SPAWN_ELF 运行时载入。
+    "user/hello",
 ]
 
 # 未来添加:

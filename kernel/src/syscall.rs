@@ -62,6 +62,17 @@ pub const SYS_MSIX_ENABLE: u64 = 35;
 /// 阻塞等待**向量掩码**里任意一个向量的中断, 最多 `rsi` 毫秒 (返回命中的向量号;
 /// 超时返回 0 —— 调用方据此回退轮询)。
 pub const SYS_IRQ_WAIT: u64 = 36;
+/// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动: `rdi = 镜像首地址, rsi = 长度`,
+/// 成功返回**新域 id**, 失败返回 `u64::MAX`。需 `Capability::Spawn`。
+///
+/// 镜像是用户态给的, 故内核侧做全部校验 (`elf::parse`); 新域零能力, 其分页器登记为调用者。
+pub const SYS_SPAWN_ELF: u64 = 37;
+
+/// `SYS_SPAWN_ELF` 接受的最大镜像长度 (1 MiB)。
+///
+/// 镜像要先整段放进调用方的地址空间, 这个上限既挡恶意的"巨大长度", 也避免内核
+/// 为一个请求遍历过多页; 真正的页数上限在 `exec::MAX_IMAGE_PAGES`。
+const MAX_ELF_LEN: u64 = 1024 * 1024;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -510,6 +521,37 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             let s = unsafe { core::str::from_utf8_unchecked(slice) };
             crate::video::print(s);
             0
+        }
+        SYS_SPAWN_ELF => {
+            // 加载可执行文件并启动 (rdi = 镜像首地址, rsi = 长度) → 新域 id / u64::MAX。
+            //
+            // 信任边界: 镜像是用户态给的, 解析与映射全部在核内做 (elf::parse 先全量校验),
+            // 因此加载器即使有 bug 也映射不出任意物理帧。用户缓冲按页确认**已映射** ——
+            // 内核以调用方的 CR3 直接读它, 未映射会在内核态缺页。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::Spawn) {
+                return u64::MAX;
+            }
+            let (ptr, len) = (a1, a2);
+            if !crate::memory::paging::is_user_address(ptr) || !(64..=MAX_ELF_LEN).contains(&len) {
+                return u64::MAX;
+            }
+            let end = match ptr.checked_add(len) {
+                Some(e) => e,
+                None => return u64::MAX,
+            };
+            if !crate::memory::paging::is_user_address(end - 1) {
+                return u64::MAX;
+            }
+            let mut page = ptr & !0xFFF;
+            while page < end {
+                if crate::memory::paging::resolve_user_page(from, page).is_none() {
+                    return u64::MAX;
+                }
+                page += 4096;
+            }
+            let image = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+            crate::exec::spawn_elf(image, from).unwrap_or(u64::MAX)
         }
         SYS_EXIT => crate::scheduler::exit_current(),
         _ => 0,

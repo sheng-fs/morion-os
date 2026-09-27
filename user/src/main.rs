@@ -17,8 +17,8 @@ use syscall::{
     sys_irq_poll, sys_irq_wait, sys_map_anon, sys_msix_enable, sys_page_fault_reply, sys_port_in16,
     sys_port_in8, sys_port_out16, sys_port_out8, sys_readline, sys_recv, sys_recv_msg,
     sys_register_irq, sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page,
-    sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys, CAP_KIND_IRQ,
-    CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
+    sys_spawn_elf, sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys,
+    CAP_KIND_IRQ, CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
 };
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
@@ -5257,6 +5257,22 @@ fn fs20_lstat(path: &str) -> Option<vfs::Stat> {
     Some(unsafe { core::ptr::read_unaligned(vfs::RESULT_BUF as *const vfs::Stat) })
 }
 
+/// E1 自测用的「可执行程序」镜像: 独立 crate `user/hello` 编译出的**真 ELF**。
+///
+/// 内嵌只是**测试运输方式**（产物本身是独立 cargo 构建、独立链接、独立地址空间）：
+/// 自测先把它写进 tmpfs，再从**文件**读回来交给内核加载 —— 走的就是"可执行文件加载"
+/// 那条路。等 E2 把服务拆成独立程序后，程序就从安装树/磁盘上读，内嵌这一段自然去掉。
+const HELLO_ELF: &[u8] = include_bytes!("../../build/user/hello.elf");
+
+/// ELF 暂存区虚拟地址（app 域），读回镜像用。
+///
+/// 须避开程序镜像（随代码增长）、文件服务缓冲页（`+0x10_0000..+0x16_2000`）与用户栈
+/// （`+0x3F_9000` 起），故取 `+0x17_0000`；这些页会被共享给 tmpfs_srv。
+const ELF_STAGE: u64 = 0x0000_0080_0017_0000;
+
+/// 暂存区页数上限（16 页 = 64 KiB，与内核 `MAX_ELF_LEN` 同量级）。
+const ELF_STAGE_PAGES: u64 = 16;
+
 /// 域 7 — 测试应用: 经 libvfs 走通 read/write/readdir + FS-2/FS-3 全链路自测。
 /// 成功路径完全静默 (只保留失败信息), 避免刷屏打断 shell 提示符。
 fn app_main() {
@@ -8381,6 +8397,84 @@ fn app_main() {
             return;
         }
     }
+    // 32. FS-27 自测 (E1 可执行文件加载): 把一份**独立编译的程序**写进文件系统, 再从**文件**
+    //     读回镜像交给内核 `SYS_SPAWN_ELF` —— 内核校验后建**新域**、按 ELF 段映射、起任务。
+    //     子程序 (`user/hello`) 会自己打印 `exec:` 开头的标记行; 这里断言的是"镜像能存能读、
+    //     逐字节一致、加载成功", 子程序是否真的跑起来由那行标记 + 回归脚本判定。
+    {
+        let image: &[u8] = HELLO_ELF;
+        if image.is_empty() || (image.len() as u64) > ELF_STAGE_PAGES * 4096 {
+            println("app: FS27 embedded image size FAILED");
+            return;
+        }
+
+        // (a) 暂存区: 逐页分配 + 共享给 tmpfs_srv —— 读文件时是**服务**往这些页里写,
+        //     没有共享映射它就没有合法的写入地址。
+        let pages = (image.len() as u64).div_ceil(4096);
+        for i in 0..pages {
+            let va = ELF_STAGE + i * 4096;
+            if sys_alloc_page(va) != 1 || sys_share_page(va, vfs::TMPFS_DOMAIN) != 1 {
+                println("app: FS27 staging alloc/share FAILED");
+                return;
+            }
+        }
+
+        // (b) 写进文件系统: 客户端只有一页写缓冲, 故按 4096 字节分块。
+        let wfd = vfs::creat("/tmp/HELLO.ELF");
+        if wfd == u64::MAX {
+            println("app: FS27 creat \"/tmp/HELLO.ELF\" FAILED");
+            return;
+        }
+        let mut off = 0usize;
+        while off < image.len() {
+            let n = (image.len() - off).min(4096);
+            if vfs::write(wfd, off as u64, &image[off..off + n]) != n as u64 {
+                println("app: FS27 write FAILED");
+                vfs::close(wfd);
+                return;
+            }
+            off += n;
+        }
+        vfs::close(wfd);
+
+        // (c) 再**从文件**读回来（不再是内嵌那份）, 逐字节比对: 证明交给内核的确实是
+        //     文件系统里的内容。
+        let rfd = vfs::open("/tmp/HELLO.ELF");
+        if rfd == u64::MAX {
+            println("app: FS27 open \"/tmp/HELLO.ELF\" FAILED");
+            return;
+        }
+        let mut got = 0usize;
+        while got < image.len() {
+            let n = (image.len() - got).min(4096);
+            if vfs::read_into(rfd, got as u64, n as u32, ELF_STAGE + got as u64) != n as u64 {
+                println("app: FS27 read back FAILED");
+                vfs::close(rfd);
+                return;
+            }
+            got += n;
+        }
+        vfs::close(rfd);
+        let staged = unsafe { core::slice::from_raw_parts(ELF_STAGE as *const u8, image.len()) };
+        if staged != image {
+            println("app: FS27 round-trip mismatch FAILED");
+            return;
+        }
+        vfs::unlink("/tmp/HELLO.ELF");
+
+        // (d) 加载并启动: 内核全量校验镜像 → 建新域 → 映射段与栈 → 起任务。
+        let domain = sys_spawn_elf(staged);
+        if domain == u64::MAX {
+            println("app: FS27 SYS_SPAWN_ELF FAILED");
+            return;
+        }
+        print("app: FS27 exec loaded ");
+        print_u64(image.len() as u64);
+        print(" bytes -> domain ");
+        print_u64(domain);
+        println(" (child prints its own line next)");
+    }
+
     println("app: SELFTEST DONE");
 }
 

@@ -1358,6 +1358,88 @@ vector=0x50 …`；驱动打 `MSI-X table[0] programmed` 与内核的 `MSI-X ena
   正确性就悄悄没了。另：`set_any_mask` 对 `domain >= 64` 返回 false，`SYS_IRQ_WAIT` 会把它当
   超时返回 0（当前只有 14 个域，不可达，但这不是显式校验而是尺寸上限的副产品）。
 
+### E1 可执行文件加载（ELF + 运行时 spawn）已完成 ✅
+
+**为什么要做**：现在 14 个域跑的是**同一份扁平二进制、映射在同一基址** —— 内核
+`load_user_program(domain_id)` 把编译期嵌入的 `user.bin` 拷到 `USER_BASE`，用户态
+`_start(domain_id)` 再按域 id 分流（`user/src/main.rs`）。于是「加一个程序 = 给 17673 行的
+main.rs 追加代码 + 加一个域 + 加一个分支」，且所有固定地址（缓冲页、共享页、栈）都是全局
+约定的同一份布局。后果：**跑不了用户编出来的程序**，也谈不上"每程序独立地址空间"。
+这一步是后面所有事情的前置：运行库要「多程序」才有意义、包管理要「从路径加载 + exec」、
+飞地要「一个独立镜像 + 直通设备」。
+
+**已有的地基（复用了这些）**：
+- 每个域**已经有独立的 PML4**（`domain::create()` 运行时就能建域，`DOMAINS: Vec`）。
+- 能力表 / 邮箱表 / 分页器表都是 `Vec`，可运行时增行（`cap::init`/`ipc::init`/`pager::init`）。
+- `scheduler::spawn_user(entry, stack, domain)` 已能建 Ring 3 任务，`switch_to_user` 把
+  `arg` 放进 RDI 当作 `_start` 的第一个参数。
+- 用户目标是 **非 PIE / 静态**（`user/x86_64-morion-user.json` 里 `position-independent-executables: false`），
+  产物是固定基址 `0x8000_0000_0000` 的 `ET_EXEC` —— 加载器不需要重定位。
+
+**设计要点**：
+- **加载在核里做，verification 只有一处**：新 syscall `SYS_SPAWN_ELF(37)`，
+  `rdi = 镜像首地址, rsi = 长度`。内核直接以调用方的 CR3 读用户缓冲（与 `SYS_PUTS` 同一信任模型），
+  逐段校验后再映射 —— 这样"ELF 能不能信"只由内核裁决，用户态加载器即使有 bug 也映射不出任意帧。
+- **校验清单**（用户可传任意字节，必须不 panic）：magic/`ELFCLASS64`/`ELFDATA2LSB`/
+  `ET_EXEC`/`EM_X86_64`；`e_phnum ≤ 32`；每个 `PT_LOAD` 须 `p_filesz ≤ p_memsz`、
+  `p_vaddr ≥ USER_SPACE_BASE`、段范围不越过用户空间上界；总页数 ≤ 上限。
+- **映射**：按页分配物理帧 → 清零（`.bss` 天然为零，不依赖分配器清零）→ 拷入文件内容 →
+  `map_user_page(new_domain, vaddr, paddr)`；同一物理页被相邻段覆盖时复用（末尾 `memsz`
+  与下一段共享页很常见，重复映射会触发 `PageAlreadyMapped` panic）。
+- **栈与任务**：按现有布局给新域映射 `USER_STACK_PAGES` 页（基址与老程序一致，因为所有程序
+  都是同一套链接地址）、`spawn_user(entry, USER_STACK_TOP, new_domain)`；新域的分页器登记为
+  **调用者**（它就是这个程序的 loader）。
+- **新能力 `Capability::Spawn`**：只有持它的域能造新域 + 加载执行 —— 与其它能力一样，
+  默认零能力，逐个显式授予（本轮先给 app 用于自测）。
+- **容量与回收**：`MAX_TASKS` 16 → 32（现有 15 个已占满 15），内核堆 `HEAP_SIZE` 1 → 4 MiB
+  （每任务 32 KiB 内核栈，任务表扩容必须同步扩堆）；`spawn` 满表时**返回失败而不是 panic**
+  （运行时触发，属于用户可触发的路径）。⚠️ **未做**：域销毁/帧回收（程序退出后域与页不回收）、
+  W^X（所有段都映射为可写，`map_user_page` 没有权限参数）、动态链接。
+
+**执行顺序**：
+1. **E1（本轮）**：内核 ELF64 加载器 + `SYS_SPAWN_ELF` + 运行时域/任务 + 独立小程序
+   `user/hello`（真实 cargo 产物、独立链接、独立地址空间）。自测路径：
+   把内嵌的 ELF 写进 `/tmp`（tmpfs）→ **从文件读回** → `SYS_SPAWN_ELF` → 子程序打印自己的行。
+   （内嵌只是**测试运输方式**：程序产物是真 ELF，等 E2 拆分服务后自然改成磁盘上的程序。）
+2. **E2（下一步）**：把 14 个服务从巨型扁平二进制拆成独立程序 + 抽取 `libmorion`（运行库），
+   shell 加 `run <path>`，程序开始从文件系统/安装树加载。
+
+**实测（全量回归 `scripts/fs-regress.sh`，从零重置盘）**：
+
+| 项 | 结果 |
+|---|---|
+| 总耗时 | **314 s**（与 S5 持平；加载/建域/映射的开销在整套自测里看不出来） |
+| 自测结论 | `SELFTEST DONE` 1 次，`FAILED` / `PANIC` 0 次，宿主 `sgdisk -v` 无问题 |
+| 中断路径 | `nvme: stats cmds=28672 irq_cmds=28672 poll_cmds=0 irqs=28672 vecs=0x7 mode=irq` 零回退 |
+| 加载证据 | 自测 FS-27：`app: FS27 exec loaded 5568 bytes -> domain 14`，紧接着子程序自己打印 `exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 14, 入口 = 0x8000000000` |
+
+**「入口 = 0x8000000000」这一条值得注意**：子程序报出的入口**正是它链接时的虚拟地址**
+（`user/linker.ld` 的 `USER_SPACE_BASE`）—— 镜像确实被按 `p_vaddr` 映到了它期望的地方，
+而不是"随便找块内存跑起来"。
+
+**过程里踩到/修掉的两个地基问题**（都属"只有真做运行时加载才会暴露"）：
+
+1. **`Domain::new` 会继承调用者的用户空间页表**。它复制的是**当前 CR3** 的非空 PML4 条目：
+   引导期建域时 P4[1] 还是空的，所以一直没暴露；但 `SYS_SPAWN_ELF` 是在**调用者的 syscall**
+   里建域的（CR3 = 调用者的 PML4），照抄过去新域就与调用者共用同一棵用户空间页表 ——
+   既没有地址空间隔离，映射新程序还会直接撞上调用者自己的镜像（`PageAlreadyMapped` panic）。
+   改为**显式跳过 P4[1]**，新域的用户空间从零建立。
+2. **任务表上限与内核堆是绑在一起的**。`MAX_TASKS` 16 → 32，而每任务要 32 KiB 内核栈来自
+   内核堆（1 MiB 只够 32 个任务裸栈），堆同步 1 → 4 MiB；同时把 `spawn` 的"满表即 panic"
+   改成 `try_spawn_user` 返回 `false` —— 运行时由用户触发的路径不该 panic。
+
+**E1 未完成**（都明确留着，不是遗漏）：
+
+- **域销毁 / 帧回收**：程序退出后域与它的页都不回收（`SYS_EXIT` 只结束任务）。所以加载器
+  **不登记共享帧引用计数**（与引导期 `load_user_program` 一致），否则会把 64 槽的
+  `SHARED_FRAMES` 表挤爆。等有 domain destroy 时一并处理。
+- **W^X**：`map_user_page` 没有权限参数，所有段（含 `.text`）都映射为可写，也没有置 NX。
+  真要做需要给页表加标志 + `EFER.NXE`，属独立一环。
+- **动态链接 / 重定位**：只接受 `ET_EXEC`（非 PIE）。目标文件本身也是 `position-independent-executables: false`，
+  所以本轮够用；共享库要等 runtime linker。
+- **`SYS_SPAWN_ELF` 只给 app 开了权限**（自测用）。shell 的 `run <path>` 归 E2。
+- 14 个服务仍共用那份扁平二进制 —— E1 只是把"能加载任意程序"这条路打通。
+
 ### 阶段 4 — 远期
 
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。

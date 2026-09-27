@@ -13,6 +13,9 @@ use x86_64::structures::paging::PageTable;
 
 use crate::memory::frame_allocator;
 
+/// 用户空间在 PML4 里的下标 (P4[1], 见 `paging::USER_SPACE_BASE`)。
+const USER_SPACE_P4_INDEX: usize = 1;
+
 /// 保护域。
 pub struct Domain {
     pub id: u64,
@@ -42,7 +45,13 @@ impl Domain {
         let pml4 = frame_allocator::allocate_frame().expect("allocate domain PML4");
         unsafe { core::ptr::write_bytes(pml4 as *mut u8, 0, 4096) };
 
-        // 复制当前内核 PML4 的非空条目, 共享内核空间映射。
+        // 复制当前内核 PML4 的**内核空间**条目, 共享内核映射 (代码 / 恒等 / offset / 内核堆)。
+        //
+        // ⚠️ 必须跳过 P4[1] (= 用户空间, 见 `paging::is_user_address`): 引导期建域时它还是空的,
+        // 但**运行时**(`SYS_SPAWN_ELF` 在新域的创建发生在调用者的 syscall 里, CR3 = 调用者的 PML4)
+        // 若照抄过去, 新域就会与调用者**共用同一棵用户空间页表** —— 既没有地址空间隔离,
+        // 映射新程序时还会与调用者自己的镜像撞车 (`PageAlreadyMapped` panic)。
+        // 新域的用户空间必须从零开始, 由加载器 (exec::spawn_elf) 一页页建立。
         let (kernel_frame, _) = Cr3::read();
         let src = kernel_frame.start_address().as_u64() as *const PageTable;
         let dst = pml4 as *mut PageTable;
@@ -50,6 +59,9 @@ impl Domain {
             let src_ref = &*src;
             let dst_ref = &mut *dst;
             for i in 0..512 {
+                if i == USER_SPACE_P4_INDEX {
+                    continue;
+                }
                 if !src_ref[i].is_unused() {
                     dst_ref[i] = src_ref[i].clone();
                 }

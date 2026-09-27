@@ -106,6 +106,10 @@ if command -v sgdisk >/dev/null 2>&1; then
 else
   echo "  (无 sgdisk, 跳过宿主校验)"
 fi
+echo "== 可执行文件加载 (E1: FS-27 / SYS_SPAWN_ELF) =="
+# app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
+# 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
+grep -nE 'FS27|exec: ' "$log" 2>/dev/null || echo "(无)"
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 

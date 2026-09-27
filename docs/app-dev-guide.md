@@ -148,6 +148,7 @@ ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态
 | 34 | `sys_irq_poll(mask)` | `rdi=mask` | 命中的向量号 | 掩码里每个位的 `Irq(vector)` | 非阻塞取走**掩码覆盖的向量**中任意一个的「待处理」标志，命中返回该向量号（0 = 无 / 非法）。位 `i` ↔ 向量 `0x50 + i`；MSI 中断不投 IPC，故驱动用它走「中断已到」的快路径 |
 | 35 | `sys_msix_enable()` | — | 1/0 | 该控制器的驱动域 | 打开 NVMe 的 MSI-X（**须先写好 MSI-X 表项**）；只成功一次，PCI 配置空间写留在内核 |
 | 36 | `sys_irq_wait(mask, timeout_ms)` | `rdi=mask, rsi=timeout_ms` | 命中的向量号 | 掩码里每个位的 `Irq(vector)` | **阻塞**等掩码里任意一条向量的中断（`wait_any`）：命中返回该向量号，0 = 超时 / 非法。阻塞期间本域让出 CPU 不空转，由中断处理器唤醒；调用方据此回退轮询 |
+| 37 | `sys_spawn_elf(image)` | `rdi=ptr, rsi=len` | 新域 id | `Spawn` | **加载可执行文件并启动**：把本域内存里的 ELF64 `ET_EXEC` 镜像交给内核，内核全量校验后建**新域**、按段映射、起 Ring 3 任务；失败 `u64::MAX`。新域**零能力**（要给它什么得自己再授权），其分页器是本域 |
 
 **能力随 IPC 传递的两条路径**（[kernel/src/cap.rs](../kernel/src/cap.rs)）：
 

@@ -45,6 +45,13 @@ pub fn init(domain_count: usize) {
     }
 }
 
+/// 运行时新增一个域 (ELF 加载建新域时调用): 补一个空邮箱。
+///
+/// 按域 id 索引, 故须在 `domain::create()` 之后调用。
+pub fn add_domain() {
+    MAILBOXES.lock().push(VecDeque::new());
+}
+
 /// 发送消息到目标域 (非阻塞)。
 /// 返回是否成功 (无能力或邮箱满则失败)。
 pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {

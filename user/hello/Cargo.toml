@@ -1,0 +1,11 @@
+[package]
+name = "morion-hello"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Morion OS 可执行文件加载演示程序 (独立 ELF, 由 SYS_SPAWN_ELF 运行时载入)"
+
+[[bin]]
+name = "morion-hello"
+path = "src/main.rs"

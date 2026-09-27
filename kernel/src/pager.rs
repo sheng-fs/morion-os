@@ -37,6 +37,13 @@ pub fn init(domain_count: usize, pager_domain: u64) {
     }
 }
 
+/// 运行时新增一个域 (ELF 加载建新域时调用): 登记它的分页器。
+///
+/// 新域的分页器 = **加载它的那个域**（loader 自然就是该程序的缺页后端）。
+pub fn add_domain(pager_domain: u64) {
+    PAGERS.lock().push(pager_domain);
+}
+
 /// 查询指定域的分页器域 id。
 pub fn of(domain: u64) -> u64 {
     PAGERS.lock()[domain as usize]

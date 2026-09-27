@@ -34,20 +34,18 @@ core::arch::global_asm!(
 // ---------------------------------------------------------------------------
 /// 用户程序基址 (P4[1] 用户空间基址), 与 user/linker.ld 的链接地址一致。
 const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
-/// 用户栈顶虚拟地址 (栈向下增长)。
+/// 用户栈顶与页数取自 `memory::paging`(唯一来源): 引导期加载与运行时 ELF 加载
+/// (`exec::spawn_elf`) 必须给出完全一致的栈布局 —— 所有程序共用同一套链接地址。
 ///
 /// 布置在程序镜像 (自 `USER_BASE` 起, 随代码增长) 之上、固定数据区之下。固定数据区
 /// (`USER_BASE + 8 MiB` 起: sender/receiver 共享页、NVMe 配置/MMIO/DMA) 与文件服务
 /// 缓冲页 (`USER_BASE + 1 MiB` 起, 最高到 `+0x16_2000`) 均在其上, 互不重叠。
-/// 故取 4 MiB 处留足余量。
-const USER_STACK_TOP: u64 = USER_BASE + 0x40_1000;
-/// 用户栈页数 (栈自 `USER_STACK_TOP` 向下增长)。
-///
-/// 单页 (4 KiB) 不够: VFS 请求/回复在栈上构造 `Message` (96 字节 payload) 并层层
-/// 调用, app 域在最早的几次 VFS 调用就会越过一页栈底; 过去靠按需分页把缺的页
+/// 栈取 8 页 (32 KiB): 单页不够 —— VFS 请求/回复在栈上构造 `Message` (96 字节 payload)
+/// 并层层调用, app 域在最早的几次 VFS 调用就会越过一页栈底; 过去靠按需分页把缺的页
 /// 静默补上, 但那是「碰巧能用」而非可靠 —— 栈布局随代码/时序变化, 一旦在补页的
-/// 间隙踩到未映射页就会表现成随机卡死。这里直接给足 8 页 (32 KiB)。
-const USER_STACK_PAGES: u64 = 8;
+/// 间隙踩到未映射页就会表现成随机卡死。
+const USER_STACK_TOP: u64 = memory::paging::USER_STACK_TOP;
+const USER_STACK_PAGES: u64 = memory::paging::USER_STACK_PAGES;
 /// 用户栈区域最低页虚拟地址 (由栈顶与页数推出, 不再写死单页)。
 const USER_STACK_ADDR: u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
 /// 页大小。
@@ -343,6 +341,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 授权: app 可直接查询 block_srv 的卷表 (自测卷层/分区解析); 只需读 + 共享结果页。
     cap::grant(app_domain, cap::Capability::SendTo(block_domain));
     cap::grant(app_domain, cap::Capability::MapInto(block_domain));
+    // 授权: app 可加载可执行文件并启动 (E1 自测: 从 /tmp 读回 ELF → SYS_SPAWN_ELF)。
+    // 新域默认零能力 —— 「能造进程」这张凭证只给需要它的域。
+    cap::grant(app_domain, cap::Capability::Spawn);
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
     // 服务自己的暂存页, 不需要共享缓冲, 故只给 SendTo。
     cap::grant(shell_domain, cap::Capability::SendTo(block_domain));

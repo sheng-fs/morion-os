@@ -45,6 +45,8 @@ pub const SYS_CAP_SEND: u64 = 33;
 pub const SYS_IRQ_POLL: u64 = 34;
 pub const SYS_MSIX_ENABLE: u64 = 35;
 pub const SYS_IRQ_WAIT: u64 = 36;
+/// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回新域 id (失败 `u64::MAX`)。
+pub const SYS_SPAWN_ELF: u64 = 37;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -151,6 +153,14 @@ pub fn sys_irq_wait(mask: u64, timeout_ms: u64) -> u64 {
 /// 只有该设备的驱动域能调用, 且只成功一次; 配置空间写留在内核。
 pub fn sys_msix_enable() -> u64 {
     unsafe { syscall(SYS_MSIX_ENABLE, 0, 0, 0) }
+}
+
+/// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回**新域 id** (失败 `u64::MAX`)。
+///
+/// `image` 是完整的 ELF 镜像字节 (须在本域已映射的内存里)。内核会全量校验再映射;
+/// 新域零能力, 其分页器登记为本域。需持有 `Capability::Spawn`。
+pub fn sys_spawn_elf(image: &[u8]) -> u64 {
+    unsafe { syscall(SYS_SPAWN_ELF, image.as_ptr() as u64, image.len() as u64, 0) }
 }
 
 pub fn sys_scroll_up() -> u64 {

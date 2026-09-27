@@ -45,6 +45,9 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态测试程序 (kernel/src/main.rs 用 include_bytes! 嵌入)
 USER_ELF      := $(OUT_DIR)/user/morion-user
 USER_BIN      := $(OUT_DIR)/user/user.bin
+# 可执行文件加载 (E1) 的演示程序: 独立 crate → 独立 ELF, 由 `SYS_SPAWN_ELF` 运行时载入。
+# 主程序用 include_bytes! 把它带进镜像当"运输方式", 自测再写进文件系统读回来跑 (见 roadmap E1)。
+HELLO_ELF     := $(OUT_DIR)/user/hello.elf
 EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 
@@ -136,7 +139,22 @@ $(KERNEL_EMBED): $(KERNEL_ELF)
 .PHONY: user
 user: $(USER_BIN)
 
-$(USER_ELF): $(USER_SRC)
+# 演示程序 (E1 可执行文件加载): 与主程序同 target/同链接脚本, 但**独立 crate、独立 ELF**。
+# 必须早于 $(USER_ELF) 构建 —— 主程序 include_bytes! 它。
+$(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) user/linker.ld
+	@echo "==> 构建演示程序 (独立 ELF, 供 SYS_SPAWN_ELF 加载)..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-hello \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-hello $@
+	@echo "  ✓ 演示程序: $@"
+
+$(USER_ELF): $(USER_SRC) $(HELLO_ELF)
 	@echo "==> 构建用户态测试程序..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -481,18 +499,26 @@ check: $(KERNEL_EMBED)
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-hello \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
 	$(CARGO) check --package morion-boot --target $(BOOT_TARGET)
 
 .PHONY: fmt
 fmt:
 	$(CARGO) fmt --all -- --check
 
-# clippy 是**门禁**: `-D warnings`, 三个 crate 任一有告警即失败。
+# clippy 是**门禁**: `-D warnings`, 四个 crate 任一有告警即失败。
 # 同样依赖 $(KERNEL_EMBED): clippy 也会展开 kernel / boot 的 include_bytes! (见上)。
 .PHONY: clippy
 clippy: $(KERNEL_EMBED)
 	$(CARGO) clippy --package morion-kernel --target $(KERNEL_TARGET) -- -D warnings
 	$(CARGO) clippy --package morion-user \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem -- -D warnings
+	$(CARGO) clippy --package morion-hello \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem -- -D warnings

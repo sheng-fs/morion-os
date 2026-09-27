@@ -23,8 +23,9 @@ use x86_64::PhysAddr;
 
 use context::{switch, TaskContext};
 
-/// 最大任务数 (固定大小任务表)。
-const MAX_TASKS: usize = 16;
+/// 最大任务数 (固定大小任务表)。含运行时经 `SYS_SPAWN_ELF` 创建的域, 故留足余量;
+/// 每任务占 32 KiB 内核栈, 提到 32 时须同步扩内核堆 (见 `paging::HEAP_SIZE`)。
+const MAX_TASKS: usize = 32;
 /// 每任务内核栈大小 (32 KiB, 足以容纳中断帧 + 若干层函数调用)。
 const STACK_SIZE: usize = 4096 * 8;
 
@@ -118,29 +119,29 @@ impl Scheduler {
     /// 创建一个新内核任务 (归属指定域), 返回其任务表索引。
     fn spawn(&mut self, entry: extern "C" fn(), domain: u64) -> usize {
         self.spawn_inner(entry, domain, 0, 0)
+            .expect("scheduler: no free task slot")
     }
 
     /// 创建一个新用户态任务 (Ring 3), 返回其任务表索引。
     ///
     /// `entry` / `user_stack` 为用户空间虚拟地址; 首次调度时经 `switch_to_user`
     /// 构造中断返回帧切入 Ring 3。内核栈仍由调度器分配, 供中断 / syscall 使用。
-    fn spawn_user(&mut self, entry: u64, user_stack: u64, domain: u64) -> usize {
+    fn spawn_user(&mut self, entry: u64, user_stack: u64, domain: u64) -> Option<usize> {
         self.spawn_inner(user_trampoline, domain, entry, user_stack)
     }
 
     /// 任务创建的公共实现: 分配内核栈, 构造初始上下文。
+    ///
+    /// 任务表满时返回 `None` —— 运行时创建的域可能把它撞满, 那是用户可触发的路径,
+    /// 不能 panic (引导期的 `spawn` 反过来断言它必须成功)。
     fn spawn_inner(
         &mut self,
         entry: extern "C" fn(),
         domain: u64,
         user_entry: u64,
         user_stack: u64,
-    ) -> usize {
-        let slot = self
-            .tasks
-            .iter()
-            .position(|t| t.is_none())
-            .expect("scheduler: no free task slot");
+    ) -> Option<usize> {
+        let slot = self.tasks.iter().position(|t| t.is_none())?;
 
         let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
         let ctx = unsafe { TaskContext::from_entry(entry, &mut stack) };
@@ -163,7 +164,7 @@ impl Scheduler {
             reply_target: u64::MAX,
             _stack: stack,
         });
-        slot
+        Some(slot)
     }
 
     /// 从 `after` 之后 (环绕) 寻找下一个就绪任务。
@@ -197,7 +198,7 @@ pub fn spawn(entry: extern "C" fn(), domain: u64) {
         .spawn(entry, domain);
 }
 
-/// 创建一个用户态任务 (Ring 3, 归属指定域)。
+/// 创建一个用户态任务 (Ring 3, 归属指定域), 引导期调用 —— 失败即 panic。
 ///
 /// `entry` / `user_stack` 为用户空间虚拟地址, 其所在页须已由
 /// `memory::paging::map_user_page` 映射到该域 (USER 权限)。
@@ -206,7 +207,18 @@ pub fn spawn_user(entry: u64, user_stack: u64, domain: u64) {
         .lock()
         .as_mut()
         .expect("scheduler not initialized")
-        .spawn_user(entry, user_stack, domain);
+        .spawn_user(entry, user_stack, domain)
+        .expect("scheduler: no free task slot (boot)");
+}
+
+/// 运行时创建一个用户态任务 (供 `SYS_SPAWN_ELF`), **任务表满时返回 false**。
+pub fn try_spawn_user(entry: u64, user_stack: u64, domain: u64) -> bool {
+    SCHEDULER
+        .lock()
+        .as_mut()
+        .expect("scheduler not initialized")
+        .spawn_user(entry, user_stack, domain)
+        .is_some()
 }
 
 /// 用户态任务的内核入口蹦床: 首次调度时被 `ret` 跳入, 读取当前任务的

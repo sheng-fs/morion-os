@@ -206,7 +206,9 @@
 │       ├── video/            #   帧缓冲文本控制台 (framebuffer/font/logo/bg/unicode) + 汉字点阵 cjk.bin
 │       ├── bootinfo.rs       #   引导信息 (内存图 + GOP 帧缓冲)
 │       ├── cap.rs            #   能力系统 (能力槽 + 能力句柄表)
-│       ├── domain.rs         #   保护域 (进程)
+│       ├── domain.rs         #   保护域 (进程, 每域独立页表)
+│       ├── elf.rs            #   ELF64 解析与校验 (可执行文件加载的信任边界)
+│       ├── exec.rs           #   运行时加载 ELF → 建新域 → 映射 → 起任务
 │       ├── ipc.rs            #   进程间通信
 │       ├── irq.rs            #   中断路由 (中断即 IPC)
 │       ├── nvme.rs           #   NVMe 控制器初始化 (队列 / DMA)
@@ -214,7 +216,8 @@
 │       ├── syscall.rs        #   系统调用入口与编号表
 │       ├── lib.rs
 │       └── main.rs
-├── user/                     # 用户态程序与系统服务 (morion-user, 扁平二进制)
+├── user/                     # 用户态: 服务与 shell (morion-user)
+│   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
 │   └── src/
 │       ├── syscall.rs        #   系统调用封装 + 打印辅助 (libuser)
 │       ├── vfs.rs            #   libvfs: fd / 挂载路由 / 能力句柄守卫
@@ -322,8 +325,9 @@
 - [x] **阻塞等中断（等待原语）**（**S4**：调度器补**带超时阻塞**（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒），伪等待键 `irq_wait_token(vector)`（**S5 起改为按域取键 + 掩码**）让 `irq::set_pending` 直接**唤醒**等待该向量的驱动域（与 IPC 的域 id 键不重叠，不会误唤醒）；新 syscall `SYS_IRQ_WAIT`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，被中断唤醒的域立刻接手。驱动 `submit_wait` 因此改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**去掉上一轮「每轮踢一次宿主」的自旋**，等不到中断仍是「轮数 × 超时」看门狗后粘性回退。实测中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 314 s（旧实现 342 s））
 - [x] **多向量 + `wait_any`（中断/等待原语做深）**（**S5**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— `irq_wait_token(domain)` + `irq::ANY_MASK[域]`；`SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 入参由向量号改为**掩码**，返回**命中的向量号**，一次等多条队列。NVMe 建成 **admin + 2 条 I/O 队列**、每条 CQ 用**自己的向量**（0x50/0x51/0x52），驱动按段轮转选队列、I/O 完成等 `1<<IO_QUEUES` 掩码。修掉一个踩坑：`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**，写成队列序号会让 qid 1 与 admin 抢向量 0，I/O 完成永远等不到（13 条命令后即回退）。运行期证据：`nvme: stats cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq`，三条向量都真实投递）
 - [x] **终端中文渲染（汉字 / 全角 / 宽窄混排）**（内核终端原本只有 8x16 ASCII 位图，而 `SYS_PUTS` 传的是 UTF-8 —— 汉字被逐字节喂进 `draw_char` 后落进「不可打印」分支，中文因此完全不显示。新增 `video/unicode.rs` + 生成的字库 `video/cjk.bin`：字源 **GNU Unifont**（OFL-1.1），字符集 = **GB2312 全集** ∪ 仓库里出现过的非 ASCII 字符 ≈ 7500 字 / 276 KB，16x16 汉字占 **2 个字符格**；记录里**自带宽度**，内核无需维护 East Asian Width 表，缺字形画空心豆腐块。终端行模型由「字节 = 一列」改为**按显示列**：满行判定、渲染步进、光标折算与下划线宽度都按列，退格/←/→ 按字符走不切开多字节。字库由 `scripts/gen-cjk-font.py` 生成并随仓库提交，构建不依赖网络）
+- [x] **可执行文件加载（ELF + 运行时 spawn）**（**E1**：内核新增 **ELF64 加载器**（`elf.rs` 全量校验 + `exec.rs` 映射）与新 syscall `SYS_SPAWN_ELF`（`Capability::Spawn` 门禁）：解析 `ET_EXEC` 镜像 → 建**新域**（`domain::create()` + 能力/邮箱/分页器表补行）→ 按段映射（一页只映射一次、新页清零、`.bss` 补零）→ 映射用户栈 → 起 Ring 3 任务，返回新域 id；新域**零能力**、分页器登记为加载者。配套：`MAX_TASKS` 16 → 32 + 内核堆 1 → 4 MiB（每任务 32 KiB 栈）、任务表满时**返回失败而不再 panic**、`Domain::new` **显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 —— 既无隔离又会撞车）。演示程序 `user/hello` 是**独立 crate / 独立 ELF**：自测把它写进 `/tmp` 再从**文件**读回来加载运行，子程序自己打印 `exec:` 行。自测 **FS-27**）
+- [ ] 把 14 个服务从扁平二进制拆成独立程序（**E2**：抽 `libmorion` 运行库 + shell `run <path>`）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
-- [ ] 可执行文件加载（当前所有服务共用一份扁平二进制，按域 id 分流）
 - [ ] 帧缓冲对用户态开放 / GUI 服务
 - [ ] 网络协议栈
 

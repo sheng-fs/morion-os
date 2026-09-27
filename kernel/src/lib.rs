@@ -18,6 +18,8 @@ pub mod arch;
 pub mod bootinfo;
 pub mod cap;
 pub mod domain;
+pub mod elf;
+pub mod exec;
 pub mod ipc;
 pub mod irq;
 pub mod memory;
