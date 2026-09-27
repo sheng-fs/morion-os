@@ -410,6 +410,24 @@ pub fn wake_one(domain: u64) {
     }
 }
 
+/// 是否有任务正阻塞在等待键 `key` 上。
+///
+/// 终端用它判断"输入行是否正被用户使用": shell 是先打印提示符、再 `SYS_READLINE`
+/// (阻塞在 `INPUT_WAIT`) 的, 所以有等待者 = 当前行是 shell 的输入行, 即使一个字符
+/// 都还没敲。这样异步日志就不会把提示符那一行推进历史。
+/// 调度器初始化前返回 `false` (引导期还没有任务)。
+pub fn is_waiting_on(key: u64) -> bool {
+    let guard = SCHEDULER.lock();
+    match guard.as_ref() {
+        Some(sched) => sched
+            .tasks
+            .iter()
+            .flatten()
+            .any(|t| t.state == TaskState::Blocked && t.wait_on == key),
+        None => false,
+    }
+}
+
 /// 启动调度器: 从当前 (main) 执行流切换到首个任务, 永不返回。
 pub fn run() -> ! {
     let mut guard = SCHEDULER.lock();

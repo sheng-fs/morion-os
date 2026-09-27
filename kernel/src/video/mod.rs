@@ -62,11 +62,16 @@ static mut INPUT_ACTIVE: bool = false;
 // 之后回车提交的只剩后半截。这里把「提示符 + 已输入」在输出期间**整体摘下暂存**,
 // 输出打完再接回来: 异步日志因此永远碰不到用户正在敲的那一行。
 //
-// 触发条件: `INPUT_ACTIVE`(已开始输入) 且当前行非空 —— 也就是"确实有半截输入"时。
+// 触发条件: 当前行非空, 且 (用户已开始输入 `INPUT_ACTIVE` **或** 有任务阻塞在
+// `SYS_READLINE` 上)。后者不可少 —— 提示符是 shell 在**等你输入之前**就打印好的,
+// 那时还没有任何按键, 若只保护"已输入的半截", 异步日志就会把**整行提示符**推进历史,
+// 屏幕上看就像"这一行被回车执行掉了"。
 static mut IN_SAVE: [u8; LINE_BYTES] = [0; LINE_BYTES];
 static mut IN_SAVE_LEN: usize = 0;
 static mut IN_SAVE_POS: usize = 0;
 static mut IN_SAVE_BASE: usize = 0;
+/// 摘下时的 `INPUT_ACTIVE`: 接回时必须**原样**恢复 (见 `input_reattach`)。
+static mut IN_SAVE_ACTIVE: bool = false;
 static mut IN_SAVED: bool = false;
 
 /// 跨行输入的累积区。
@@ -352,7 +357,7 @@ fn input_detach() -> bool {
         if IN_SAVED {
             return true;
         }
-        if !INPUT_ACTIVE || CUR_LEN == 0 {
+        if !(INPUT_ACTIVE || reader_waiting()) || CUR_LEN == 0 {
             return false;
         }
         let n = CUR_LEN.min(IN_SAVE.len());
@@ -360,6 +365,7 @@ fn input_detach() -> bool {
         IN_SAVE_LEN = n;
         IN_SAVE_POS = CUR_POS.min(n);
         IN_SAVE_BASE = INPUT_BASE.min(n);
+        IN_SAVE_ACTIVE = INPUT_ACTIVE;
         IN_SAVED = true;
         // 只清空, **不 commit**: 提示符要留着, 接回时重新画在同一位置。
         CUR_LEN = 0;
@@ -388,10 +394,21 @@ fn input_reattach() -> bool {
         CUR_LEN = n;
         CUR_POS = IN_SAVE_POS.min(n);
         INPUT_BASE = IN_SAVE_BASE.min(n);
-        INPUT_ACTIVE = true;
+        // 恢复**原样**的输入态: 若摘下时只是"提示符被保护、用户还没敲第一个键",
+        // 就不能凭空把 INPUT_ACTIVE 置真 —— 否则 INPUT_BASE 会停在 0, 首次按键
+        // 不再锁定提示符末尾, 提交时会把提示符一起送给 shell。
+        INPUT_ACTIVE = IN_SAVE_ACTIVE;
         IN_SAVE_LEN = 0;
         committed
     }
+}
+
+/// 是否有任务正阻塞在 `SYS_READLINE` 上 (即"输入行正被用户使用")。
+///
+/// shell 是先打印提示符、再 `SYS_READLINE` 阻塞的, 所以"有等待者"就等价于
+/// "当前行是 shell 的输入行", 即使一个字符都还没敲。
+fn reader_waiting() -> bool {
+    crate::scheduler::is_waiting_on(crate::scheduler::INPUT_WAIT)
 }
 
 /// 从输入行队列取走一行, 拷入 `out` (最多 `max` 字节, 不含换行)。

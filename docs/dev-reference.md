@@ -174,6 +174,12 @@ UEFI 固件
   把半截命令推进历史并清空 —— 看起来像"命令自己回车执行了"。`print` 现在会先 `input_detach()`
   把「提示符 + 已输入」整体摘下、打完再 `input_reattach()` 原样接回（幂等；无输入时走原路径），
   故**只有回车才提交**。跨行（超列宽）输入由 `IN_ACCUM` 累积、回车时用 `input_queue_push_pair` 拼接提交，不再腰斩。
+- **保护范围含"还没开打的提示符行"**：摘下条件是 `INPUT_ACTIVE || scheduler::is_waiting_on(INPUT_WAIT)`
+  且当前行非空。shell 是"先打印提示符、再 `SYS_READLINE` 阻塞"的，所以只要**有任务在等输入**，
+  这一行就是 shell 的输入行 —— 只保护"已敲入的半截"不够：用户还没按第一个键时 `INPUT_ACTIVE`
+  仍为 false，异步日志会把**整行提示符**推进历史，屏幕上看就像"这一行被回车执行掉了"。
+  接回时 `INPUT_ACTIVE` 按摘下时的原值恢复（`IN_SAVE_ACTIVE`），不能在用户尚未敲键时凭空置真，
+  否则 `INPUT_BASE` 停在 0、不再锁定提示符末尾，提交会把提示符一起送给 shell。
 - `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII）
 - **中文 / 非 ASCII 点阵渲染**（[kernel/src/video/unicode.rs](../../kernel/src/video/unicode.rs)）：
   - 字体分两套：ASCII（0x20..=0x7E）用 `font.rs` 的 **8x16**；其余字符查 `video/cjk.bin` 的
@@ -260,6 +266,7 @@ UEFI 固件
 - `deliver(from: u64, to: u64, tag: u64, payload: &[u8]) -> bool`（内核内部投递，绕过能力检查，用于缺页等异常转发）
 - `receive() -> Message`（阻塞，记录回复目标供 `reply` 使用）
 - `call(to: u64, tag: u64, payload: &[u8]) -> Message`（同步调用：发送请求 + 阻塞等回复）
+- `is_waiting_on(key: u64) -> bool`（是否有任务阻塞在该等待键上；终端用它判断「输入行是否正被用户占用」，见 `video::reader_waiting`）
 - `reply(tag: u64, payload: &[u8]) -> bool`（回复最近一次 `receive` 到的调用者）
 - `PAYLOAD_LEN = 96`（VFS 请求要把绝对路径整条装进 payload），邮箱容量 `MAILBOX_CAP = 16`
 - `Message { from, to, tag, payload }`（`#[repr(C)]`，与用户态同布局）
