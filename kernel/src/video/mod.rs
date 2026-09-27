@@ -54,6 +54,29 @@ static mut INPUT_BASE: usize = 0;
 /// 本轮是否已有用户按键 (决定 INPUT_BASE 何时锁定, 以及回车提交哪一段)。
 static mut INPUT_ACTIVE: bool = false;
 
+// ---- 输入行与输出隔离 ----
+//
+// 输出 (`SYS_PUTS` → `print`) 和键盘输入 (`SYS_TERM_PUT`) 原本共用同一条 CUR_LINE:
+// 别的域在你打字时打印一行日志, 就会把你**敲到一半的那一行**推进历史并清空
+// (`commit_line`) —— 看起来像"命令自己回车执行了", 而且光标/起点也随之复位,
+// 之后回车提交的只剩后半截。这里把「提示符 + 已输入」在输出期间**整体摘下暂存**,
+// 输出打完再接回来: 异步日志因此永远碰不到用户正在敲的那一行。
+//
+// 触发条件: `INPUT_ACTIVE`(已开始输入) 且当前行非空 —— 也就是"确实有半截输入"时。
+static mut IN_SAVE: [u8; LINE_BYTES] = [0; LINE_BYTES];
+static mut IN_SAVE_LEN: usize = 0;
+static mut IN_SAVE_POS: usize = 0;
+static mut IN_SAVE_BASE: usize = 0;
+static mut IN_SAVED: bool = false;
+
+/// 跨行输入的累积区。
+///
+/// 输入行显示宽度用满时, 已敲入的段会作为"历史行"落到屏幕上 (视觉换行), 行缓冲随之清空。
+/// 若提交时只看最后一段, 命令就会被**腰斩**成最后一行 —— 故把换行前的段累积在这里,
+/// 回车时拼接提交。上限 `LINE_BYTES` (队列单行容量, 也是 shell 缓冲区量级)。
+static mut IN_ACCUM: [u8; LINE_BYTES] = [0; LINE_BYTES];
+static mut IN_ACCUM_LEN: usize = 0;
+
 /// 回滚偏移: 0 = 跟随底部(live), N > 0 = 向上回滚了 N 行
 static mut SCROLL_OFFSET: usize = 0;
 
@@ -191,6 +214,9 @@ pub fn clear_screen() {
         CUR_COL = 0;
         INPUT_BASE = 0;
         INPUT_ACTIVE = false;
+        IN_SAVED = false;
+        IN_SAVE_LEN = 0;
+        IN_ACCUM_LEN = 0;
     }
     bg_fill_all();
     if was_enabled {
@@ -282,6 +308,89 @@ fn input_queue_push(bytes: &[u8]) {
         } else {
             INPUT_HEAD = (INPUT_HEAD + 1) % INPUT_QUEUE_LINES;
         }
+    }
+}
+
+/// 把两段拼接后压入输入行队列 (跨行命令 = 累积的前段 + 当前段)。
+///
+/// 只拼接、不重复定义队列逻辑: 容量仍受 `LINE_BYTES` 约束 (超出部分丢弃, 与单段路径一致)。
+fn input_queue_push_pair(a: &[u8], b: &[u8]) {
+    let mut buf = [0u8; LINE_BYTES];
+    let mut n = 0usize;
+    for src in [a, b] {
+        for &byte in src {
+            if n >= LINE_BYTES {
+                break;
+            }
+            buf[n] = byte;
+            n += 1;
+        }
+    }
+    input_queue_push(&buf[..n]);
+}
+
+/// 把一段已敲入的字节追加到跨行累积区 (超容量则丢弃多余部分)。
+fn accum_push(bytes: &[u8]) {
+    unsafe {
+        for &byte in bytes {
+            if IN_ACCUM_LEN >= LINE_BYTES {
+                return;
+            }
+            IN_ACCUM[IN_ACCUM_LEN] = byte;
+            IN_ACCUM_LEN += 1;
+        }
+    }
+}
+
+/// 有半截输入时把它整体摘下暂存, 供输出独占当前行。
+///
+/// 摘下的内容含**提示符** (即 `CUR_LINE[..CUR_LEN]` 全段): 输出结束后要原样接回来,
+/// 用户看到的行与敲之前完全一致。已在摘下状态时幂等返回 `true`。
+/// 返回 `false` = 当前没有待保护的输入 (输出走原路径)。
+fn input_detach() -> bool {
+    unsafe {
+        if IN_SAVED {
+            return true;
+        }
+        if !INPUT_ACTIVE || CUR_LEN == 0 {
+            return false;
+        }
+        let n = CUR_LEN.min(IN_SAVE.len());
+        IN_SAVE[..n].copy_from_slice(&CUR_LINE[..n]);
+        IN_SAVE_LEN = n;
+        IN_SAVE_POS = CUR_POS.min(n);
+        IN_SAVE_BASE = INPUT_BASE.min(n);
+        IN_SAVED = true;
+        // 只清空, **不 commit**: 提示符要留着, 接回时重新画在同一位置。
+        CUR_LEN = 0;
+        CUR_POS = 0;
+        INPUT_BASE = 0;
+        INPUT_ACTIVE = false;
+        true
+    }
+}
+
+/// 把摘下的输入接回来 (输出打完); 返回是否因"输出停在半行"而提交了一次。
+fn input_reattach() -> bool {
+    unsafe {
+        if !IN_SAVED {
+            return false;
+        }
+        IN_SAVED = false;
+        // 输出若没以换行结尾, 先把那半行收进历史, 免得提示符接在日志尾巴后面。
+        let mut committed = false;
+        if CUR_LEN > 0 {
+            commit_line();
+            committed = true;
+        }
+        let n = IN_SAVE_LEN;
+        CUR_LINE[..n].copy_from_slice(&IN_SAVE[..n]);
+        CUR_LEN = n;
+        CUR_POS = IN_SAVE_POS.min(n);
+        INPUT_BASE = IN_SAVE_BASE.min(n);
+        INPUT_ACTIVE = true;
+        IN_SAVE_LEN = 0;
+        committed
     }
 }
 
@@ -596,7 +705,10 @@ fn append_text(s: &str) -> bool {
     committed
 }
 
-/// 打印字符串 (支持 '\n' 换行; 日志追加到输入行末尾)
+/// 打印字符串 (支持 '\n' 换行)。
+///
+/// 若用户此刻正在敲一行命令, 会先把「提示符 + 已输入」摘下, 打完再原样接回 ——
+/// 异步日志因此不会清空/弄脏输入行, 也不会改变"只有回车才提交"的语义。
 pub fn print(s: &str) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
@@ -605,9 +717,13 @@ pub fn print(s: &str) {
     // 镜像到 COM1 串口, 供 headless 调试捕获。
     serial_write(s);
 
-    let committed = append_text(s);
+    let detached = input_detach();
+    // 两个调用都要执行 (不能短路: 输出提交与输入接回是两件独立的事)。
+    let out_committed = append_text(s);
+    let reattached = input_reattach();
+    let committed = out_committed || reattached;
     // 历史区变化或光标不在输入行时才需要整屏重绘, 否则只重画输入行。
-    if committed || unsafe { CUR_ROW } != 0 {
+    if committed || detached || unsafe { CUR_ROW } != 0 {
         redraw();
     } else {
         redraw_input_line();
@@ -685,7 +801,13 @@ pub fn term_put(c: u8) {
                 } else {
                     CUR_LEN
                 };
-                input_queue_push(&CUR_LINE[base..CUR_LEN]);
+                if IN_ACCUM_LEN > 0 {
+                    // 跨行命令: 累积的前段 + 当前段一起提交, 否则命令只剩最后一行 (腰斩)。
+                    input_queue_push_pair(&IN_ACCUM[..IN_ACCUM_LEN], &CUR_LINE[base..CUR_LEN]);
+                    IN_ACCUM_LEN = 0;
+                } else {
+                    input_queue_push(&CUR_LINE[base..CUR_LEN]);
+                }
                 return_to_input();
                 commit_line();
                 entered = true;
@@ -704,7 +826,14 @@ pub fn term_put(c: u8) {
                     if unicode::str_width(&CUR_LINE[..CUR_LEN]) as usize + 1 > max_cols()
                         || CUR_LEN + 1 > LINE_BYTES
                     {
-                        // 输入行满: 换行续写, 新行完全属于用户输入。
+                        // 输入行满: 先把已敲入段累积起来, 再换行续写 (新行完全属于用户输入)。
+                        // 不累积的话回车只会提交最后一段, 长命令被腰斩。
+                        let ubase = if INPUT_ACTIVE {
+                            INPUT_BASE.min(CUR_LEN)
+                        } else {
+                            0
+                        };
+                        accum_push(&CUR_LINE[ubase..CUR_LEN]);
                         commit_line();
                         INPUT_BASE = 0;
                         INPUT_ACTIVE = true;

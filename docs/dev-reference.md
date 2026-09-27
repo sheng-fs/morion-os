@@ -170,6 +170,10 @@ UEFI 固件
 - `unsafe input_read(out: *mut u8, max: usize) -> Option<usize>`（`SYS_READLINE` 用：从输入行队列取走一行，键盘回车时由 `term_put('\n')` 入队并唤醒等待者）
 - `term_put` 记录本轮**用户输入起点** `INPUT_BASE`（首个按键时锁定为当时行尾），回车只提交该起点之后的内容，
   由此支持「行内提示符」：提示符可先 `print` 到输入行，`SYS_READLINE` 只回传用户键入部分；退格/左移不会越过该起点。
+- **输出与输入互不干扰**：输入输出原本共用同一条 `CUR_LINE`，别的域在你打字时打印一行日志就会
+  把半截命令推进历史并清空 —— 看起来像"命令自己回车执行了"。`print` 现在会先 `input_detach()`
+  把「提示符 + 已输入」整体摘下、打完再 `input_reattach()` 原样接回（幂等；无输入时走原路径），
+  故**只有回车才提交**。跨行（超列宽）输入由 `IN_ACCUM` 累积、回车时用 `input_queue_push_pair` 拼接提交，不再腰斩。
 - `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII）
 - **中文 / 非 ASCII 点阵渲染**（[kernel/src/video/unicode.rs](../../kernel/src/video/unicode.rs)）：
   - 字体分两套：ASCII（0x20..=0x7E）用 `font.rs` 的 **8x16**；其余字符查 `video/cjk.bin` 的
