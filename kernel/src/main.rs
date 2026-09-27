@@ -341,9 +341,12 @@ pub extern "C" fn kernel_main() -> ! {
     // 授权: app 可直接查询 block_srv 的卷表 (自测卷层/分区解析); 只需读 + 共享结果页。
     cap::grant(app_domain, cap::Capability::SendTo(block_domain));
     cap::grant(app_domain, cap::Capability::MapInto(block_domain));
-    // 授权: app 可加载可执行文件并启动 (E1 自测: 从 /tmp 读回 ELF → SYS_SPAWN_ELF)。
+    // 授权: app / shell 可加载可执行文件并启动 (`SYS_SPAWN_ELF`)。
+    //   - app: E1 自测用 (从文件读回镜像 → 载入新域);
+    //   - shell: `run <path>` 命令 —— 让"可执行文件加载"成为用户可见的功能。
     // 新域默认零能力 —— 「能造进程」这张凭证只给需要它的域。
     cap::grant(app_domain, cap::Capability::Spawn);
+    cap::grant(shell_domain, cap::Capability::Spawn);
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
     // 服务自己的暂存页, 不需要共享缓冲, 故只给 SendTo。
     cap::grant(shell_domain, cap::Capability::SendTo(block_domain));

@@ -1442,6 +1442,62 @@ main.rs 追加代码 + 加一个域 + 加一个分支」，且所有固定地址
 - **`SYS_SPAWN_ELF` 只给 app 开了权限**（自测用）。shell 的 `run <path>` 归 E2。
 - 14 个服务仍共用那份扁平二进制 —— E1 只是把"能加载任意程序"这条路打通。
 
+### E2a 运行库 libmorion + shell `run` 已完成 ✅
+
+**目标**：把「可执行文件加载」从自测里的证据变成**用户可见的功能**，同时把入口/crt0/syscall
+样板从「每个程序各带一套」收敛成一份运行库。E1 打通了机制，这一步让它可用、可复用。
+
+**做了什么**：
+
+- **`user/libmorion`**（crate 名 `morion`）—— 所有用户程序的运行时：
+  - `syscall`（syscall 封装 + `print`/`println`/`print_u64`/`print_hex`/`flush` + `domain_id()`）
+    与 `vfs`（libvfs）从 `morion-user` 里**移入**（`git mv`，路径之外的改动为零）；
+  - 入口样板：`_start(domain_id)`（放 `.text._start`，链接脚本 `ENTRY(_start)` 保证它在镜像最前端）
+    调程序定义的 `morion_main(domain_id)`，返回即退出；`#[panic_handler]` 打印一行后退出。
+    程序**只写 `morion_main`**，不再各写一份 crt0/panic/syscall 桩。
+  - 链接参数仍由**程序自己**的 `build.rs` 声明（`-T user/linker.ld` + `-nostdlib`）——
+    链接布局是程序的事，库不替它决定。
+- **`exec::spawn_file(path)`**：`vfs::open` → 分块读进本域内存 → `SYS_SPAWN_ELF`。
+  两个实现细节（都是"第二次 `run` 才暴露"的坑）：
+  - **只经一页中转**，不把每个暂存页都共享给文件服务 —— 否则几百 KB 的程序要占几十个
+    内核共享帧槽位（`frame_allocator` 只有 64 个）。
+  - 对同一 (页, 域) 只能 `share_page` **一次**、`alloc_page` 前必须先用 `sys_virt_to_phys`
+    判"已映射" —— 两处任一处漏了，第二次 `run` 就会撞内核的 `PageAlreadyMapped` panic。
+- **shell 新增 `run <file>`**（并补 `Capability::Spawn`）—— 这是本轮最直观的产出：一条 shell
+  命令就能从磁盘加载程序到新域里跑。
+- **FS-27 自测改成"真·从磁盘"**：不再内嵌 ELF、不再经 tmpfs 运输，直接 `spawn_file("/HELLO.MEX")`
+  —— 与 shell `run` 走**同一条代码路径**（所以回归覆盖的就是用户实际用的加载链）。
+- **构建**：新增 `make hello`；`$(NVME_IMG)` 依赖 `$(HELLO_ELF)` 并 `mcopy` 成 `::/HELLO.MEX`；
+  回归脚本也**就地注入** `/HELLO.MEX`，免去"跑回归前必须先 make 一遍镜像"的隐含前提。
+- 门禁扩到五个 crate（新 libmorion 也走 `-D warnings` 的 clippy）。
+
+**实测（交互验证 —— 这是本轮的重点）**：
+
+```text
+[morion@morion /]$ run /HELLO.MEX
+run: loaded /HELLO.MEX -> new domain 14
+exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 14, 入口 = 0x8000000000
+[morion@morion /]$
+```
+
+**实测（全量回归 `scripts/fs-regress.sh`，从零重置盘）**：
+
+| 项 | 结果 |
+|---|---|
+| 总耗时 | **315 s**（与 E1 的 314 s 持平） |
+| 自测结论 | `SELFTEST DONE` 1 次，`FAILED` / `PANIC` 0 次，宿主 `sgdisk -v` "No problems found" |
+| 中断路径 | `nvme: stats cmds=28672 irq_cmds=28672 poll_cmds=0 irqs=28672 vecs=0x7 mode=irq` 零回退 |
+| 加载证据 | `app: FS27 exec /HELLO.MEX -> domain 14` + 子程序 `exec: … 我的域 = 14, 入口 = 0x8000000000` |
+
+**E2a 未完成**（都留给 E2b）：
+
+- 14 个服务仍是**同一份扁平二进制**按域 id 分流（`morion_main` 里的 match）—— 这一步只把
+  "运行库"和"从文件加载"理顺了，没有拆程序。
+- 仍然**没有域销毁 / 帧回收**（`spawn_file` 每次加载都永久占用新域与它的页）—— 拆成可重启的
+  独立服务后这条会立刻变成真问题。
+- `spawn_file` 的暂存区假设调用方是**客户端程序**（shell / app），文件服务自己在该地址有
+  整簇缓冲（fat32 的 `+0x20_0000`），故调用方不能是文件服务。
+
 ### 阶段 4 — 远期
 
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。

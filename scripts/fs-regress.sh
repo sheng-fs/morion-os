@@ -1,6 +1,6 @@
 #!/bin/bash
 # 模拟镜像全量 FS 回归: 7 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘 / 分区表盘)
-# 上跑 app 的 FS-1..FS-26 自测, 由日志判定通过与否。
+# 上跑 app 的 FS-1..FS-27 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
@@ -30,6 +30,18 @@ dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=no
 # 分区表测试盘同理: FS-26 会建/删分区表, 保留上一轮的 GPT/MBR 会让「在空白盘上建表」
 # 这条路径没被走到 (FS-26 自己也会先 wipe 一次, 但重置镜像让起点更干净)。
 dd if=/dev/zero of="$OUT_DIR/pt.img" bs=1M count="${PT_MIB:-64}" status=none
+
+# FAT32 卷 (nvme.img) 是**持久卷**, 脚本一直沿用既有的那份 (它同时被交互式验证用)。
+# 但可执行文件加载 (FS-27 / shell `run`) 需要卷根目录里有 HELLO.MEX —— 就地补进去,
+# 免去"跑回归前必须先 make 一遍镜像"的隐含前提。mtools 是既有依赖 (Makefile 也在用)。
+if [ -f "$OUT_DIR/nvme.img" ]; then
+  if [ -f "$OUT_DIR/user/hello.elf" ]; then
+    mcopy -o -i "$OUT_DIR/nvme.img" "$OUT_DIR/user/hello.elf" ::/HELLO.MEX 2>/dev/null \
+      && echo "== 已注入可执行文件: /HELLO.MEX"
+  else
+    echo "== 警告: $OUT_DIR/user/hello.elf 不存在, FS-27 (可执行文件加载) 会失败"
+  fi
+fi
 if [ "${MFS_KEEP:-0}" = "1" ]; then
   echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
 else

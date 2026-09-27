@@ -9,3 +9,7 @@ description = "Morion OS 可执行文件加载演示程序 (独立 ELF, 由 SYS_
 [[bin]]
 name = "morion-hello"
 path = "src/main.rs"
+
+[dependencies]
+# 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印。程序本身不再自带 syscall 桩。
+morion = { path = "../libmorion" }

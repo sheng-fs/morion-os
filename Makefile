@@ -139,9 +139,14 @@ $(KERNEL_EMBED): $(KERNEL_ELF)
 .PHONY: user
 user: $(USER_BIN)
 
-# 演示程序 (E1 可执行文件加载): 与主程序同 target/同链接脚本, 但**独立 crate、独立 ELF**。
-# 必须早于 $(USER_ELF) 构建 —— 主程序 include_bytes! 它。
-$(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) user/linker.ld
+# 只构建演示程序 (独立 ELF): 便于单独改动/检查一个"运行时加载"的程序。
+.PHONY: hello
+hello: $(HELLO_ELF)
+
+# 演示程序 (E1/E2 可执行文件加载): 与主程序同 target/同链接脚本, 但**独立 crate、独立 ELF**,
+# 依赖运行库 libmorion。它不进主程序镜像, 而是经 `make` 放进 FAT32 卷 (见 $(NVME_IMG) 规则),
+# 由 shell 的 `run /HELLO.MEX` 或 app 的 FS-27 自测**从文件**加载。
+$(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/libmorion -type f 2>/dev/null) user/linker.ld
 	@echo "==> 构建演示程序 (独立 ELF, 供 SYS_SPAWN_ELF 加载)..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -154,7 +159,7 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) user/linker.ld
 	$(CP) target/x86_64-morion-user/release/morion-hello $@
 	@echo "  ✓ 演示程序: $@"
 
-$(USER_ELF): $(USER_SRC) $(HELLO_ELF)
+$(USER_ELF): $(USER_SRC)
 	@echo "==> 构建用户态测试程序..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -396,7 +401,9 @@ run-ide: iso $(DISK_IMG)
 # 创建 NVMe 磁盘镜像并格式化为 FAT32, 写入与 IDE 镜像一致的测试文件
 # 另含一个 VFAT 长名文件 (Long File Name.txt, 短名派生为 LONGFI~1.TXT),
 # 供 VFAT 长名读取 / 按长名打开的自测与交互验证使用。
-$(NVME_IMG):
+# 还放入 HELLO.MEX —— 可执行文件加载 (E1/E2) 的演示程序: `run /HELLO.MEX` 从这张盘上
+# 加载它。它是**独立编译的 ELF**, 故镜像依赖 $(HELLO_ELF) (hello 变了就重建镜像)。
+$(NVME_IMG): $(HELLO_ELF)
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
@@ -408,6 +415,7 @@ $(NVME_IMG):
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
 	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
+	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/HELLO.MEX
 	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
 
 # 创建 IDE 磁盘镜像并格式化为 FAT32
@@ -499,6 +507,10 @@ check: $(KERNEL_EMBED)
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
 	$(CARGO) check --package morion-hello \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
@@ -509,12 +521,16 @@ check: $(KERNEL_EMBED)
 fmt:
 	$(CARGO) fmt --all -- --check
 
-# clippy 是**门禁**: `-D warnings`, 四个 crate 任一有告警即失败。
+# clippy 是**门禁**: `-D warnings`, 五个 crate 任一有告警即失败。
 # 同样依赖 $(KERNEL_EMBED): clippy 也会展开 kernel / boot 的 include_bytes! (见上)。
 .PHONY: clippy
 clippy: $(KERNEL_EMBED)
 	$(CARGO) clippy --package morion-kernel --target $(KERNEL_TARGET) -- -D warnings
 	$(CARGO) clippy --package morion-user \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem -- -D warnings
+	$(CARGO) clippy --package morion \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem -- -D warnings

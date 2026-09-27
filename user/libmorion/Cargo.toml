@@ -1,0 +1,11 @@
+[package]
+name = "morion"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 用户态运行库 (libmorion): syscall 封装 / 打印 / libvfs / 程序入口样板"
+
+[lib]
+name = "morion"
+path = "src/lib.rs"

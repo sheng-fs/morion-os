@@ -9,6 +9,22 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 
+/// 本程序所在域的 id, 由 `lib.rs` 的 `_start` 在进入 `morion_main` 前写入。
+///
+/// 内核把域 id 放进 RDI 交给 `_start` —— 程序自己拿不到这个参数（入口在库里），
+/// 故由库代记, 需要时问 [`domain_id`]。
+static mut DOMAIN_ID: u64 = u64::MAX;
+
+/// 记录本域 id（只应由 libmorion 的 `_start` 调用）。
+pub fn set_domain_id(id: u64) {
+    unsafe { DOMAIN_ID = id };
+}
+
+/// 本程序所在的域 id（未初始化时为 `u64::MAX`）。
+pub fn domain_id() -> u64 {
+    unsafe { DOMAIN_ID }
+}
+
 pub const SYS_YIELD: u64 = 0;
 pub const SYS_SLEEP: u64 = 1;
 pub const SYS_SEND: u64 = 2;

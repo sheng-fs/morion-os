@@ -15,3 +15,7 @@ description = "Morion OS 用户态测试程序 (Ring 3)"
 [[bin]]
 name = "morion-user"
 path = "src/main.rs"
+
+[dependencies]
+# 用户态运行库: syscall 封装 / 打印 / libvfs / `_start` + panic 样板。
+morion = { path = "libmorion" }

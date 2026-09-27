@@ -31,6 +31,7 @@ shell: type 'help' for commands
 | `pwd` | `pwd` | 打印当前工作目录 |
 | `ls` | `ls [path]` | 列目录，默认当前目录 |
 | `cat` | `cat <file>` | 打印文件内容（最多 4096 字节） |
+| `run` | `run <file>` | **从文件加载并运行一个程序**（E1/E2）：`morion::exec::spawn_file` 读入镜像 → 内核 `SYS_SPAWN_ELF` 载入**新域**；不等待它结束 |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -64,6 +65,7 @@ commands:
   pwd            print working directory
   ls [-l] [path] list directory (-l: long form)
   cat <file>     print file content
+  run <file>     load a .mex program from a file and run it (new domain)
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file
@@ -114,6 +116,26 @@ commands:
 - 打开失败：`cat: cannot open <path>`
 - 读取失败（例如目标是目录）：`cat: read failed (is it a directory?)`
 - 内容中不可打印字节显示为 `.`。
+
+### `run <file>`
+
+从文件系统加载一个可执行文件并启动它（E1/E2 可执行文件加载）。**看内容不看后缀**：
+镜像必须是 ELF64 `ET_EXEC`（`.mex`），由内核全量校验。
+
+- 无参数：`run: usage: run <file>   (e.g. run /HELLO.MEX)`
+- 路径过长：`run: path too long`
+- 成功：`run: loaded <path> -> new domain <n>`；紧接着子程序会打印它自己的输出
+  （不等待它结束，shell 立即回到提示符）。
+- 失败：`run: cannot load <path> (missing file, or not a valid ELF64 program)`
+
+需要 shell 持有 `Capability::Spawn`（内核引导期授予）。当前镜像里可直接试：
+
+```text
+[morion@morion /]$ run /HELLO.MEX
+run: loaded /HELLO.MEX -> new domain 14
+exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 14, 入口 = 0x8000000000
+[morion@morion /]$
+```
 
 ### `cd [path]`
 

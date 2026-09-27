@@ -29,52 +29,68 @@ Morion OS 是微内核 + 能力系统架构：
 
 ## 2. 用户程序结构
 
-用户程序在 `user/` crate 内，编译为**扁平二进制**，由内核在启动时按页加载到用户空间基址。
+程序样板由运行库 **libmorion**（`user/libmorion`）统一提供 —— 入口 `_start`（crt0）、
+`#[panic_handler]`、syscall 封装、打印辅助、libvfs 都在库里；**程序只写 `morion_main`**。
 
 ```rust
 #![no_std]
 #![no_main]
 
-mod syscall;
-use syscall::*;
+use morion::syscall::println;
 
-/// 入口: 内核经 rdi 传入本程序所属的域 id。
-/// 须置于镜像最前端 (offset 0)。
-#[link_section = ".text._start"]
+/// 程序主逻辑。`domain_id` = 本域 id（内核经 RDI 交给 crt0，库再转交）。
 #[no_mangle]
-pub extern "C" fn _start(domain_id: u64) -> ! {
-    match domain_id {
-        0 => app_a_main(),
-        1 => app_b_main(),
-        _ => {}
-    }
-    sys_exit();
-}
-
-fn app_a_main() { /* ... */ }
-
-#[cfg(target_os = "none")]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    sys_exit();
+pub extern "C" fn morion_main(_domain_id: u64) {
+    println("hello");
 }
 ```
 
 要点：
 
-- 入口函数固定名为 `_start(domain_id: u64) -> !`，通过 `domain_id` 分流到不同角色。
-- `panic_handler` 只能 `sys_exit()`（用户态无法恢复）。
-- 链接地址为 `USER_SPACE_BASE = 0x0000_0080_0000_0000`，常简写为 10 位 hex `0x8000_0000_00`（见 [user/linker.ld](../user/linker.ld)）。
+- **不要自己定义 `_start` 或 `panic_handler`** —— libmorion 各提供一份（重复定义会链接冲突）。
+- `Cargo.toml`：`morion = { path = "../libmorion" }`；`build.rs` 传 `-T user/linker.ld`
+  与 `-nostdlib`（链接布局由程序自己声明，库不替它决定）。
+- 链接地址为 `USER_SPACE_BASE = 0x0000_0080_0000_0000`（见 [user/linker.ld](../user/linker.ld)）；
+  所有程序共用同一套布局。
 - 用户态虚拟地址必须落在 P4[1] 的 canonical 区间：约 `0x8000_0000_00 ~ 0xFF_FFFF_FF_FF`（**10 位 hex**）。
   若误写成 12 位 hex（如 `0x9000_0000_0000`）会让 bit47=1，成为非 canonical 地址，访问时触发 #GP 而非 #PF，
   进而 double fault。分配内存 / 未来 mmap 帧缓冲时务必注意。
+- 库提供的常用项：`syscall::*`（`sys_*` 与 `print` / `println` / `print_u64` / `print_hex`）、
+  `vfs::*`（`open` / `read_into` / `readdir_into` / `write` …）、`exec::spawn_file(path)`、
+  `syscall::domain_id()`（本域 id）。
 
-### 构建命令
+### 两种程序、两种载体
+
+| | 载体 | 载入时机 | 现状 |
+|---|---|---|---|
+| **系统程序**（`user/`，14 个域共用） | 内核按页载入扁平二进制 `user.bin` | 引导期 | 过渡态（E2b 会拆成独立程序） |
+| **独立程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
+
+独立程序的产物后缀约定见 [architecture.md 的命名约定](architecture.md#可执行文件与包的命名约定)
+（`.mex`）。加载**只看文件头**，不看后缀 —— 后缀是给人的提示。
+
+### 构建与运行
 
 ```bash
-make user      # 仅构建用户程序 → build/user/user.bin
-make kernel    # 内核编译期 include_bytes! 嵌入 user.bin
+make user      # 系统程序 → build/user/user.bin (内核编译期嵌入)
+make hello     # 演示程序 → build/user/hello.elf (独立 ELF)
 make iso       # 完整镜像
+make build/nvme.img   # FAT32 卷(含 /HELLO.MEX, 供 run 命令用)
+```
+
+在系统里运行独立程序（shell 命令，见 §7）：
+
+```
+run /HELLO.MEX
+```
+
+或从代码里加载（需 `Capability::Spawn`，见 §6）：
+
+```rust
+match morion::exec::spawn_file("/HELLO.MEX") {
+    Some(new_domain) => { /* 程序已在域 new_domain 里跑起来 */ }
+    None => { /* 文件不存在或不是合法的 ELF64 ET_EXEC */ }
+}
 ```
 
 ### 当前域角色分配（[kernel/src/main.rs](../kernel/src/main.rs)）

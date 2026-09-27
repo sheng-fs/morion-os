@@ -43,7 +43,7 @@
 | 方向 | 状态 | 说明 |
 |------|------|------|
 | 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度（含**带超时阻塞**）、地址空间与按需分页、中断路由（PIC + **LAPIC/MSI-X**，含**阻塞等中断**与**多向量 `wait_any`**）、能力系统（含**能力随 IPC 传递**） |
-| 系统调用接口 | ✅ 约 36 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
+| 系统调用接口 | ✅ 约 37 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
@@ -216,12 +216,11 @@
 │       ├── syscall.rs        #   系统调用入口与编号表
 │       ├── lib.rs
 │       └── main.rs
-├── user/                     # 用户态: 服务与 shell (morion-user)
+├── user/                     # 用户态: 运行库 + 服务与 shell
+│   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / 入口样板
 │   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
 │   └── src/
-│       ├── syscall.rs        #   系统调用封装 + 打印辅助 (libuser)
-│       ├── vfs.rs            #   libvfs: fd / 挂载路由 / 能力句柄守卫
-│       └── main.rs           #   _start 按域 id 分流: 各服务与 shell 实现
+│       └── main.rs           #   morion_main 按域 id 分流: 各服务与 shell 实现
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -326,7 +325,8 @@
 - [x] **多向量 + `wait_any`（中断/等待原语做深）**（**S5**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— `irq_wait_token(domain)` + `irq::ANY_MASK[域]`；`SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 入参由向量号改为**掩码**，返回**命中的向量号**，一次等多条队列。NVMe 建成 **admin + 2 条 I/O 队列**、每条 CQ 用**自己的向量**（0x50/0x51/0x52），驱动按段轮转选队列、I/O 完成等 `1<<IO_QUEUES` 掩码。修掉一个踩坑：`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**，写成队列序号会让 qid 1 与 admin 抢向量 0，I/O 完成永远等不到（13 条命令后即回退）。运行期证据：`nvme: stats cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq`，三条向量都真实投递）
 - [x] **终端中文渲染（汉字 / 全角 / 宽窄混排）**（内核终端原本只有 8x16 ASCII 位图，而 `SYS_PUTS` 传的是 UTF-8 —— 汉字被逐字节喂进 `draw_char` 后落进「不可打印」分支，中文因此完全不显示。新增 `video/unicode.rs` + 生成的字库 `video/cjk.bin`：字源 **GNU Unifont**（OFL-1.1），字符集 = **GB2312 全集** ∪ 仓库里出现过的非 ASCII 字符 ≈ 7500 字 / 276 KB，16x16 汉字占 **2 个字符格**；记录里**自带宽度**，内核无需维护 East Asian Width 表，缺字形画空心豆腐块。终端行模型由「字节 = 一列」改为**按显示列**：满行判定、渲染步进、光标折算与下划线宽度都按列，退格/←/→ 按字符走不切开多字节。字库由 `scripts/gen-cjk-font.py` 生成并随仓库提交，构建不依赖网络）
 - [x] **可执行文件加载（ELF + 运行时 spawn）**（**E1**：内核新增 **ELF64 加载器**（`elf.rs` 全量校验 + `exec.rs` 映射）与新 syscall `SYS_SPAWN_ELF`（`Capability::Spawn` 门禁）：解析 `ET_EXEC` 镜像 → 建**新域**（`domain::create()` + 能力/邮箱/分页器表补行）→ 按段映射（一页只映射一次、新页清零、`.bss` 补零）→ 映射用户栈 → 起 Ring 3 任务，返回新域 id；新域**零能力**、分页器登记为加载者。配套：`MAX_TASKS` 16 → 32 + 内核堆 1 → 4 MiB（每任务 32 KiB 栈）、任务表满时**返回失败而不再 panic**、`Domain::new` **显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 —— 既无隔离又会撞车）。演示程序 `user/hello` 是**独立 crate / 独立 ELF**：自测把它写进 `/tmp` 再从**文件**读回来加载运行，子程序自己打印 `exec:` 行。自测 **FS-27**）
-- [ ] 把 14 个服务从扁平二进制拆成独立程序（**E2**：抽 `libmorion` 运行库 + shell `run <path>`）
+- [x] **用户态运行库 libmorion + `run` 命令**（**E2a**：抽 `user/libmorion`（crate `morion`）= syscall 封装 + 打印 + `domain_id()` + libvfs + 入口样板（`_start`/`morion_main`/panic），`morion-user` 与 `morion-hello` 共用，`hello` 瘦成 20 行；新增 `exec::spawn_file(path)`；shell 加 **`run <file>`**（+ `Capability::Spawn`），把可执行文件加载变成**用户可见的功能**；FS-27 改为从**磁盘文件** `/HELLO.MEX` 加载。交互实测 `run /HELLO.MEX` → 新域 14 跑起来）
+- [ ] 把 14 个服务从扁平二进制拆成独立程序（**E2b**：每个服务一个程序 + 域销毁/帧回收）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 帧缓冲对用户态开放 / GUI 服务
 - [ ] 网络协议栈

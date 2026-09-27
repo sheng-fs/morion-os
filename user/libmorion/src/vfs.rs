@@ -341,9 +341,9 @@ fn fd_handle(fd: u64) -> u64 {
     fd >> 48
 }
 
-/// 从对外 fd 解出目标服务域。
+/// 从 fd 编码里取出服务域（libmorion 内部使用：如 `exec` 要知道该把中转页共享给谁）。
 #[inline]
-fn fd_domain(fd: u64) -> u64 {
+pub(crate) fn fd_domain(fd: u64) -> u64 {
     (fd >> 32) & 0xFFFF
 }
 

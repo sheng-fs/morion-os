@@ -1,25 +1,21 @@
-//! Morion OS 用户态测试程序 (Ring 3)
+//! Morion OS 用户态系统程序 (Ring 3)
 //!
-//! 由内核在运行时加载到用户空间基址 USER_SPACE_BASE, 经 `switch_to_user`
-//! 首次切入 Ring 3。入口 `_start` 必须位于镜像最前端 (offset 0)。
+//! 由内核在引导期加载到用户空间基址 USER_SPACE_BASE, 经 `switch_to_user` 首次切入 Ring 3。
+//! 入口 `_start`（crt0）与 panic 处理由运行库 **libmorion** 提供, 这里只实现 `morion_main`:
+//! 按域 id 分流到各服务/shell（14 个域共用这一份镜像）。
+//!
+//! ⚠️ 这份"一个二进制装 14 个服务、按域 id 分流"的形态是过渡态: 下一步 (E2b) 会把服务拆成
+//! 各自独立的程序, 由文件系统加载 —— 届时每个程序只实现自己的 `morion_main`。
 
 #![no_std]
 #![no_main]
 // 部分预留 syscall 与演示代码暂未使用, 故允许 dead_code。
 #![allow(dead_code)]
 
-mod syscall;
-mod vfs;
-
-use syscall::{
-    print, print_hex, print_u64, println, sys_alloc_page, sys_backspace, sys_call,
-    sys_call_payload, sys_cap_issue, sys_cap_lookup, sys_cap_send, sys_clear, sys_handle_send,
-    sys_irq_poll, sys_irq_wait, sys_map_anon, sys_msix_enable, sys_page_fault_reply, sys_port_in16,
-    sys_port_in8, sys_port_out16, sys_port_out8, sys_readline, sys_recv, sys_recv_msg,
-    sys_register_irq, sys_reply, sys_scroll_down, sys_scroll_up, sys_send, sys_share_page,
-    sys_spawn_elf, sys_term_left, sys_term_put, sys_term_right, sys_unmap, sys_virt_to_phys,
-    CAP_KIND_IRQ, CAP_KIND_MAP_INTO, CAP_KIND_SEND_TO, PAYLOAD_LEN,
-};
+// 运行库既给出模块路径 (`syscall::sys_exit()`, `vfs::open()`), 也把 syscall 项直接引入
+// 作用域 (`sys_exit()` 等), 与原 `mod syscall; use syscall::{...}` 的写法等价。
+use morion::syscall::*;
+use morion::{syscall, vfs};
 
 /// 各服务域 id (与内核 `main.rs` 创建顺序一致)。
 ///   0 sender / 1 receiver / 2 pager / 3 echo / 4 kbd
@@ -36,11 +32,10 @@ const USER_DATA_BASE: u64 = 0x0000_0080_0080_0000;
 /// sender/receiver 共享页虚拟地址 (双方约定同一地址)。
 const SHARED_PAGE: u64 = USER_DATA_BASE;
 
-/// 用户程序入口 — 内核已设好用户栈 (rsp) 与用户参数 (rdi=域 id),
-/// 此处按所属域 id 分流到不同角色后退出。
-#[link_section = ".text._start"]
+/// 程序主函数（libmorion 的 `_start` 调用）—— 内核已设好用户栈，`domain_id` = 本域 id。
+/// 按所属域分流到不同角色；返回即结束。
 #[no_mangle]
-pub extern "C" fn _start(domain_id: u64) -> ! {
+pub extern "C" fn morion_main(domain_id: u64) {
     match domain_id {
         0 => sender_main(),
         1 => receiver_main(),
@@ -58,7 +53,6 @@ pub extern "C" fn _start(domain_id: u64) -> ! {
         13 => exfat_main(),
         _ => {}
     }
-    syscall::sys_exit();
 }
 
 /// 「能力随 IPC 传递」自测: 句柄指向的**不透明**对象标识 —— 内核不解释它的含义,
@@ -5257,21 +5251,11 @@ fn fs20_lstat(path: &str) -> Option<vfs::Stat> {
     Some(unsafe { core::ptr::read_unaligned(vfs::RESULT_BUF as *const vfs::Stat) })
 }
 
-/// E1 自测用的「可执行程序」镜像: 独立 crate `user/hello` 编译出的**真 ELF**。
+/// E1/E2 自测用的可执行文件：在 FAT32 卷 (`/`) 根目录里的 `HELLO.MEX`。
 ///
-/// 内嵌只是**测试运输方式**（产物本身是独立 cargo 构建、独立链接、独立地址空间）：
-/// 自测先把它写进 tmpfs，再从**文件**读回来交给内核加载 —— 走的就是"可执行文件加载"
-/// 那条路。等 E2 把服务拆成独立程序后，程序就从安装树/磁盘上读，内嵌这一段自然去掉。
-const HELLO_ELF: &[u8] = include_bytes!("../../build/user/hello.elf");
-
-/// ELF 暂存区虚拟地址（app 域），读回镜像用。
-///
-/// 须避开程序镜像（随代码增长）、文件服务缓冲页（`+0x10_0000..+0x16_2000`）与用户栈
-/// （`+0x3F_9000` 起），故取 `+0x17_0000`；这些页会被共享给 tmpfs_srv。
-const ELF_STAGE: u64 = 0x0000_0080_0017_0000;
-
-/// 暂存区页数上限（16 页 = 64 KiB，与内核 `MAX_ELF_LEN` 同量级）。
-const ELF_STAGE_PAGES: u64 = 16;
+/// 由 `make` 从独立 crate `user/hello` 编译出的 ELF 拷进去（见 Makefile 的 `$(NVME_IMG)` 规则），
+/// 是**真正的磁盘文件** —— 自测与 shell 的 `run` 走的是同一条 `morion::exec::spawn_file` 路径。
+const HELLO_MEX: &str = "/HELLO.MEX";
 
 /// 域 7 — 测试应用: 经 libvfs 走通 read/write/readdir + FS-2/FS-3 全链路自测。
 /// 成功路径完全静默 (只保留失败信息), 避免刷屏打断 shell 提示符。
@@ -8397,82 +8381,23 @@ fn app_main() {
             return;
         }
     }
-    // 32. FS-27 自测 (E1 可执行文件加载): 把一份**独立编译的程序**写进文件系统, 再从**文件**
-    //     读回镜像交给内核 `SYS_SPAWN_ELF` —— 内核校验后建**新域**、按 ELF 段映射、起任务。
-    //     子程序 (`user/hello`) 会自己打印 `exec:` 开头的标记行; 这里断言的是"镜像能存能读、
-    //     逐字节一致、加载成功", 子程序是否真的跑起来由那行标记 + 回归脚本判定。
+    // 32. FS-27 自测 (E1/E2 可执行文件加载): 从**磁盘上的文件**加载一个独立编译的程序 ——
+    //     `morion::exec::spawn_file` 打开路径、分块读进本域内存、交给内核 `SYS_SPAWN_ELF`,
+    //     内核校验后建**新域**、按 ELF 段映射、起任务。走的是与 shell `run` 命令**同一条**
+    //     代码路径, 所以这条自测覆盖的就是用户实际用的加载链。
+    //     子程序 (`user/hello`) 会自己打印 `exec:` 开头的标记行 —— 它真的跑起来了, 由那行
+    //     标记 + 回归脚本判定; 这里只断言加载调用本身成功。
     {
-        let image: &[u8] = HELLO_ELF;
-        if image.is_empty() || (image.len() as u64) > ELF_STAGE_PAGES * 4096 {
-            println("app: FS27 embedded image size FAILED");
-            return;
-        }
-
-        // (a) 暂存区: 逐页分配 + 共享给 tmpfs_srv —— 读文件时是**服务**往这些页里写,
-        //     没有共享映射它就没有合法的写入地址。
-        let pages = (image.len() as u64).div_ceil(4096);
-        for i in 0..pages {
-            let va = ELF_STAGE + i * 4096;
-            if sys_alloc_page(va) != 1 || sys_share_page(va, vfs::TMPFS_DOMAIN) != 1 {
-                println("app: FS27 staging alloc/share FAILED");
-                return;
+        match morion::exec::spawn_file(HELLO_MEX) {
+            Some(domain) => {
+                print("app: FS27 exec ");
+                print(HELLO_MEX);
+                print(" -> domain ");
+                print_u64(domain);
+                println(" (child prints its own line next)");
             }
+            None => println("app: FS27 spawn_file(\"/HELLO.MEX\") FAILED"),
         }
-
-        // (b) 写进文件系统: 客户端只有一页写缓冲, 故按 4096 字节分块。
-        let wfd = vfs::creat("/tmp/HELLO.ELF");
-        if wfd == u64::MAX {
-            println("app: FS27 creat \"/tmp/HELLO.ELF\" FAILED");
-            return;
-        }
-        let mut off = 0usize;
-        while off < image.len() {
-            let n = (image.len() - off).min(4096);
-            if vfs::write(wfd, off as u64, &image[off..off + n]) != n as u64 {
-                println("app: FS27 write FAILED");
-                vfs::close(wfd);
-                return;
-            }
-            off += n;
-        }
-        vfs::close(wfd);
-
-        // (c) 再**从文件**读回来（不再是内嵌那份）, 逐字节比对: 证明交给内核的确实是
-        //     文件系统里的内容。
-        let rfd = vfs::open("/tmp/HELLO.ELF");
-        if rfd == u64::MAX {
-            println("app: FS27 open \"/tmp/HELLO.ELF\" FAILED");
-            return;
-        }
-        let mut got = 0usize;
-        while got < image.len() {
-            let n = (image.len() - got).min(4096);
-            if vfs::read_into(rfd, got as u64, n as u32, ELF_STAGE + got as u64) != n as u64 {
-                println("app: FS27 read back FAILED");
-                vfs::close(rfd);
-                return;
-            }
-            got += n;
-        }
-        vfs::close(rfd);
-        let staged = unsafe { core::slice::from_raw_parts(ELF_STAGE as *const u8, image.len()) };
-        if staged != image {
-            println("app: FS27 round-trip mismatch FAILED");
-            return;
-        }
-        vfs::unlink("/tmp/HELLO.ELF");
-
-        // (d) 加载并启动: 内核全量校验镜像 → 建新域 → 映射段与栈 → 起任务。
-        let domain = sys_spawn_elf(staged);
-        if domain == u64::MAX {
-            println("app: FS27 SYS_SPAWN_ELF FAILED");
-            return;
-        }
-        print("app: FS27 exec loaded ");
-        print_u64(image.len() as u64);
-        print(" bytes -> domain ");
-        print_u64(domain);
-        println(" (child prints its own line next)");
     }
 
     println("app: SELFTEST DONE");
@@ -8662,6 +8587,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  pwd            print working directory");
             println("  ls [-l] [path] list directory (-l: long form)");
             println("  cat <file>     print file content");
+            println("  run <file>     load a .mex program from a file and run it (new domain)");
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -8693,6 +8619,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "pwd" => println(st.cwd_str()),
         "ls" => shell_ls(st, if arg.is_empty() { "." } else { arg }),
         "cat" => shell_cat(st, arg),
+        "run" => shell_run(st, arg),
         "cd" => shell_cd(st, if arg.is_empty() { "/" } else { arg }),
         "mkdir" => shell_mkdir(st, arg),
         "touch" => shell_touch(st, arg),
@@ -8724,6 +8651,38 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         _ => {
             print("shell: unknown command: ");
             println(cmd);
+        }
+    }
+}
+
+/// `run <path>` — 从文件系统加载一个可执行文件并启动它（E1/E2）。
+///
+/// 路径由内容决定能不能跑：加载器只认文件头（ELF64 `ET_EXEC`），后缀/名字只是给人的提示。
+/// 加载到的是一个**新域**（新进程），子程序自己打印它的输出；shell 不等待它结束。
+fn shell_run(st: &ShellState, arg: &str) {
+    if arg.is_empty() {
+        println("run: usage: run <file>   (e.g. run /HELLO.MEX)");
+        return;
+    }
+    let path = match resolve_in_cwd(st.cwd_str(), arg) {
+        Some(p) => p,
+        None => {
+            println("run: path too long");
+            return;
+        }
+    };
+    match morion::exec::spawn_file(path) {
+        Some(domain) => {
+            print("run: loaded ");
+            print(path);
+            print(" -> new domain ");
+            print_u64(domain);
+            println("");
+        }
+        None => {
+            print("run: cannot load ");
+            print(path);
+            println(" (missing file, or not a valid ELF64 program)");
         }
     }
 }
@@ -17757,11 +17716,4 @@ fn exfat_main() {
             }
         }
     }
-}
-
-#[cfg(target_os = "none")]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // 用户态 panic: 无法恢复, 直接终止本任务。
-    syscall::sys_exit();
 }
