@@ -27,7 +27,7 @@ pub const USER_SPACE_BASE: u64 = 0x0000_0080_0000_0000;
 pub const USER_SPACE_END: u64 = USER_SPACE_BASE + 0x0000_0080_0000_0000;
 
 /// 用户栈顶虚拟地址。所有用户程序共用同一套链接地址与固定布局 (见 `user/linker.ld`),
-/// 故栈位置也是全局常量 —— 引导期加载 (`load_user_program`) 与运行时 ELF 加载
+/// 故栈位置也是全局常量 —— 引导期加载 (`exec::spawn_elf_at`) 与运行时 ELF 加载
 /// (`exec::spawn_elf`) 必须一致, 因此放在这里作为唯一来源。
 pub const USER_STACK_TOP: u64 = USER_SPACE_BASE + 0x40_1000;
 
@@ -314,6 +314,64 @@ pub fn unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64> {
     let paddr = frame.start_address().as_u64();
     flush.flush();
     Some(paddr)
+}
+
+/// 释放一个域**全部用户空间**: 逐页归还物理帧, 再回收各级页表帧与 PML4 自身。
+///
+/// 只遍历 P4[1] (用户空间) —— 其余 PML4 条目是内核映射 (恒等 / offset / 内核堆),
+/// 为所有域共享, 不能动 (见 `domain::Domain::new` 里对 P4[1] 的跳过)。
+///
+/// 逐页归还走 `frame_allocator::release_user_frame` (记账规则见那里): 登记过引用计数的
+/// 帧按计数递减、归零才释放, 未登记的 (镜像页 / 栈帧 / 页表帧) 视为本域独占直接释放。
+/// 不回收的话, 每 `run` 一次就漏掉一整个地址空间 —— 这正是 E2b 要补上的那一条。
+///
+/// 调用者须是**别的域** (不能拆自己正在用的页表), 门禁在 `domain::destroy` 的调用方。
+pub fn free_user_space(pml4_phys: u64) {
+    let p4_index = ((USER_SPACE_BASE >> 39) & 0x1FF) as usize;
+    let frame_size = frame_allocator::FRAME_SIZE as u64;
+    let pml4 = unsafe { &mut *((PHYS_OFFSET + pml4_phys) as *mut PageTable) };
+    if pml4[p4_index].is_unused() {
+        return;
+    }
+    let pdpt_phys = pml4[p4_index].addr().as_u64();
+
+    for p3 in 0..512 {
+        let pdpt = unsafe { &mut *((PHYS_OFFSET + pdpt_phys) as *mut PageTable) };
+        if pdpt[p3].is_unused() {
+            continue;
+        }
+        let pd_phys = pdpt[p3].addr().as_u64();
+        for p2 in 0..512 {
+            let pd = unsafe { &mut *((PHYS_OFFSET + pd_phys) as *mut PageTable) };
+            if pd[p2].is_unused() {
+                continue;
+            }
+            if pd[p2].flags().contains(PageTableFlags::HUGE_PAGE) {
+                // 2 MiB 大页: 没有下一级页表, 直接归还它覆盖的 512 个 4 KiB 帧。
+                let base = pd[p2].addr().as_u64();
+                for i in 0..512u64 {
+                    frame_allocator::release_user_frame(base + i * frame_size);
+                }
+                pd[p2].set_unused();
+                continue;
+            }
+            let pt_phys = pd[p2].addr().as_u64();
+            for p1 in 0..512 {
+                let pt = unsafe { &mut *((PHYS_OFFSET + pt_phys) as *mut PageTable) };
+                if pt[p1].is_unused() {
+                    continue;
+                }
+                frame_allocator::release_user_frame(pt[p1].addr().as_u64());
+                pt[p1].set_unused();
+            }
+            frame_allocator::free_frame(pt_phys);
+            pd[p2].set_unused();
+        }
+        frame_allocator::free_frame(pd_phys);
+        pdpt[p3].set_unused();
+    }
+    frame_allocator::free_frame(pdpt_phys);
+    pml4[p4_index].set_unused();
 }
 
 #[cfg(test)]

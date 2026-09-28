@@ -11,7 +11,8 @@
 | --- | --- | --- |
 | `make` | 默认目标，等价 `make iso` | `build/morion-os.iso` |
 | `make kernel` | 仅构建微内核 | `build/kernel/morion-kernel` |
-| `make user` | 仅构建用户态程序 | `build/user/user.bin` |
+| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（14 份独立 ELF） |
+| `make hello` | 仅构建可执行文件加载演示程序 | `build/user/hello.elf` |
 | `make boot` | 仅构建 UEFI 引导器 | `build/boot/morion-boot.efi` |
 | `make iso` | 构建完整可启动 ISO | `build/morion-os.iso` |
 | `make clean` | 清理 `target/` 与 `build/` | — |
@@ -21,9 +22,9 @@
 | `make setup` | 检查/安装工具链与依赖 | — |
 | `make debug` | QEMU + GDB（`-s -S`，监听 1234） | — |
 
-依赖关系：`iso → kernel → user`（内核用 `include_bytes!` 嵌入 `build/user/user.bin`），
+依赖关系：`iso → kernel → user`（内核用 `include_bytes!` 逐个嵌入 `build/user/srv/*.elf`），
 且 `boot` 需要先 `make kernel` 产出 `boot/loader/morion-kernel.elf`。
-**只改了用户态代码也必须走 `make iso`**，否则内核里嵌的还是旧的 `user.bin`。
+**只改了用户态代码也必须走 `make iso`**，否则内核里嵌的还是旧的服务 ELF。
 
 `check` / `clippy` 不能写成 `cargo check --workspace`：三个 crate 的 target 各不相同
 （kernel `x86_64-unknown-none`、user 自定义 `user/x86_64-morion-user.json`、boot
@@ -159,7 +160,7 @@ rm -f build/mfs.img && make build/mfs.img    # 重新生成空白盘
 ```
 
 `build/ext2.img` 由宿主 `mke2fs` 预格式化，并用 `debugfs` 预置测试文件
-（`HELLO.TXT`、`SUBDIR/NESTED.TXT`）；`ext2_srv` **只读、不自动格式化**，
+（`hello.txt`、`subdir/nested.txt`）；`ext2_srv` **只读、不自动格式化**，
 删掉后重新生成即可回到干净镜像：
 
 ```bash
@@ -271,7 +272,7 @@ app 的 FS 自测（FS-1..FS-26）成功时几乎静默（末尾打印一行 `ap
 故「无 FAILED」即代表挂载与读写自测全通
 （ext2 挂载失败会打印 `ext2: mount FAILED ...`，exFAT 打印 `exfat: mount FAILED ...`）。
 **FS-17（M1b）** 是唯一验证**额外卷**的用例：它从卷表里取出 `parts.img` 两个分区的卷号，
-拼出 `/usb3` / `/usb4`，读回宿主预置的 `PART1.TXT` / `PART2.TXT`（校验前 10 字节 == `partition `），
+拼出 `/usb3` / `/usb4`，读回宿主预置的 `part1.txt` / `part2.txt`（校验前 10 字节 == `partition `），
 **全程只读**；失败会打印 `app: FS17 … FAILED`。
 **FS-18** 是 fat32 的**大文件写路径**用例：写 100000 字节跨簇、逐簇读回校验、UNLINK 释放簇链
 （4 KiB 簇跨 25 簇、32 KiB 簇跨 4 簇），补上之前只有小文件 mkdir/creat/write 的缺口。
@@ -399,5 +400,5 @@ s.sendall(b'screendump build/screen.ppm\n')
 2. **同一条命令里清理与启动要分开**：残留的 QEMU 会持有 `build/nvme.img` / `build/mfs.img`
    的写锁，导致新 QEMU 报 `Failed to get "write" lock`。先确认无残留再启动。
 3. **后台启动 QEMU 必须显式给 monitor**：不加 `-monitor` 时 QEMU 会尝试占用 stdio 而退出。
-4. **改用户态代码后必须 `make iso`**（内核嵌入 `user.bin`）。
+4. **改用户态代码后必须 `make iso`**（内核逐个嵌入 `build/user/srv/*.elf`）。
 5. 验证只能用**自动可判定**的方式（`grep` 关键字 / 截图），不要依赖人工肉眼看屏。

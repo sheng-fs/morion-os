@@ -63,6 +63,15 @@ pub const SYS_MSIX_ENABLE: u64 = 35;
 pub const SYS_IRQ_WAIT: u64 = 36;
 /// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回新域 id (失败 `u64::MAX`)。
 pub const SYS_SPAWN_ELF: u64 = 37;
+/// 销毁一个域并回收它的全部资源 (`rdi = 域 id`), 成功返回 1, 失败 0。
+///
+/// 门禁: 需 `Capability::Spawn`, 且调用者必须是该域的**分页器** (= 加载它的那个域) ——
+/// 也就是"谁加载谁负责"。所以自我销毁不可达。
+pub const SYS_DOMAIN_DESTROY: u64 = 38;
+/// 存活域数 (自测取证: 销毁之后应回到基线)。
+pub const SYS_DOMAIN_COUNT: u64 = 39;
+/// 当前空闲物理帧数 (自测取证: 反复加载/销毁后不应下降)。
+pub const SYS_FRAME_FREE: u64 = 40;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -177,6 +186,23 @@ pub fn sys_msix_enable() -> u64 {
 /// 新域零能力, 其分页器登记为本域。需持有 `Capability::Spawn`。
 pub fn sys_spawn_elf(image: &[u8]) -> u64 {
     unsafe { syscall(SYS_SPAWN_ELF, image.as_ptr() as u64, image.len() as u64, 0) }
+}
+
+/// 销毁域 `domain` 并回收它的地址空间与内核状态, 成功返回 1。
+///
+/// 调用者必须是它的分页器 (加载它的域), 且持有 `Capability::Spawn`。
+pub fn sys_domain_destroy(domain: u64) -> u64 {
+    unsafe { syscall(SYS_DOMAIN_DESTROY, domain, 0, 0) }
+}
+
+/// 当前存活域数。
+pub fn sys_domain_count() -> u64 {
+    unsafe { syscall(SYS_DOMAIN_COUNT, 0, 0, 0) }
+}
+
+/// 当前空闲物理帧数。
+pub fn sys_frame_free() -> u64 {
+    unsafe { syscall(SYS_FRAME_FREE, 0, 0, 0) }
 }
 
 pub fn sys_scroll_up() -> u64 {

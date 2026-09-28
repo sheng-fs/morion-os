@@ -29,7 +29,19 @@ pub const ELF_STAGE: u64 = 0x0000_0080_0020_0000;
 pub const ELF_STAGE_PAGES: u64 = 256;
 
 /// 读文件用的中转页（紧邻暂存区下方一页）。
-const BOUNCE: u64 = ELF_STAGE - 4096;
+const BOUNCE_BASE: u64 = ELF_STAGE - 4096;
+
+/// 本域的读文件中转页虚拟地址。
+///
+/// **每个客户端域一页**：中转页要共享给持有该 fd 的文件服务域，而 `SYS_SHARE_PAGE` 是把
+/// 调用方的页映射进目标域的**同一虚拟地址**。若所有客户端都用同一个地址，第一个客户端
+/// 共享之后，第二个客户端再共享就会在服务域里撞上已映射页（`map_user_page`
+/// `PageAlreadyMapped` panic）—— app 自测的 FS-27 先共享给 fat32_srv，shell 再 `run`
+/// 同一张盘就会崩。按域 id 错开即可，做法与 `RESULT_BUF` / `SHELL_RESULT_BUF` 一致
+/// （各客户端用各自的地址）。基址往下到 `+0x16_2000` 之间是空闲区，够约 157 个域。
+fn bounce_va() -> u64 {
+    BOUNCE_BASE - crate::syscall::domain_id() * 4096
+}
 
 /// 已经从本域共享过中转页的文件服务域（按域 id 置位的位图）。
 ///
@@ -47,7 +59,8 @@ pub fn spawn_file(path: &str) -> Option<u64> {
     }
 
     // 中转页：分配一次 + 共享给**持有该 fd 的那个**文件服务（只共享它，不多要能力）。
-    if !ensure_page(BOUNCE) || !share_bounce(vfs::fd_domain(fd)) {
+    let bounce = bounce_va();
+    if !ensure_page(bounce) || !share_bounce(bounce, vfs::fd_domain(fd)) {
         vfs::close(fd);
         return None;
     }
@@ -57,7 +70,7 @@ pub fn spawn_file(path: &str) -> Option<u64> {
     loop {
         if len >= cap {
             // 到达上限：再探一个字节，还有内容就说明镜像超限（宁可明确失败，不做静默截断）。
-            if vfs::read_into(fd, len, 1, BOUNCE) > 0 {
+            if vfs::read_into(fd, len, 1, bounce) > 0 {
                 vfs::close(fd);
                 return None;
             }
@@ -67,7 +80,7 @@ pub fn spawn_file(path: &str) -> Option<u64> {
             vfs::close(fd);
             return None;
         }
-        let n = vfs::read_into(fd, len, 4096, BOUNCE);
+        let n = vfs::read_into(fd, len, 4096, bounce);
         if n == u64::MAX {
             vfs::close(fd);
             return None;
@@ -77,7 +90,7 @@ pub fn spawn_file(path: &str) -> Option<u64> {
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
-                BOUNCE as *const u8,
+                bounce as *const u8,
                 (ELF_STAGE + len) as *mut u8,
                 n as usize,
             );
@@ -105,8 +118,8 @@ fn ensure_page(va: u64) -> bool {
     sys_alloc_page(va) == 1
 }
 
-/// 把中转页共享给 `domain`（同一进程里对同一域只做一次）。
-fn share_bounce(domain: u64) -> bool {
+/// 把本域的中转页 `va` 共享给 `domain`（同一进程里对同一域只做一次）。
+fn share_bounce(va: u64, domain: u64) -> bool {
     // 域 id 超出位图宽度就不记（当前域数远小于 64；真到那天这里要换成位数组）。
     let tracked = domain < 64;
     unsafe {
@@ -114,7 +127,7 @@ fn share_bounce(domain: u64) -> bool {
             return true;
         }
     }
-    if sys_share_page(BOUNCE, domain) != 1 {
+    if sys_share_page(va, domain) != 1 {
         return false;
     }
     if tracked {

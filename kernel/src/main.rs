@@ -6,7 +6,7 @@
 #![no_main]
 
 use morion_kernel::{
-    arch, bootinfo, cap, domain, ipc, memory, nvme, pager, scheduler, syscall, video,
+    arch, bootinfo, cap, domain, exec, ipc, memory, nvme, pager, scheduler, syscall, video,
 };
 
 extern crate alloc;
@@ -30,59 +30,33 @@ core::arch::global_asm!(
 );
 
 // ---------------------------------------------------------------------------
-// 阶段十: 用户程序加载 (编译产物, 替代阶段九的手写机器码)
+// 阶段十 / E2b: 引导期加载服务程序 (每个服务一份独立 ELF, 见 user/srv)
 // ---------------------------------------------------------------------------
-/// 用户程序基址 (P4[1] 用户空间基址), 与 user/linker.ld 的链接地址一致。
-const USER_BASE: u64 = memory::paging::USER_SPACE_BASE;
-/// 用户栈顶与页数取自 `memory::paging`(唯一来源): 引导期加载与运行时 ELF 加载
-/// (`exec::spawn_elf`) 必须给出完全一致的栈布局 —— 所有程序共用同一套链接地址。
+/// 引导期服务程序表: `(固定域号, 编译期嵌入的 ELF 镜像)`。
 ///
-/// 布置在程序镜像 (自 `USER_BASE` 起, 随代码增长) 之上、固定数据区之下。固定数据区
-/// (`USER_BASE + 8 MiB` 起: sender/receiver 共享页、NVMe 配置/MMIO/DMA) 与文件服务
-/// 缓冲页 (`USER_BASE + 1 MiB` 起, 最高到 `+0x16_2000`) 均在其上, 互不重叠。
-/// 栈取 8 页 (32 KiB): 单页不够 —— VFS 请求/回复在栈上构造 `Message` (96 字节 payload)
-/// 并层层调用, app 域在最早的几次 VFS 调用就会越过一页栈底; 过去靠按需分页把缺的页
-/// 静默补上, 但那是「碰巧能用」而非可靠 —— 栈布局随代码/时序变化, 一旦在补页的
-/// 间隙踩到未映射页就会表现成随机卡死。
-const USER_STACK_TOP: u64 = memory::paging::USER_STACK_TOP;
-const USER_STACK_PAGES: u64 = memory::paging::USER_STACK_PAGES;
-/// 用户栈区域最低页虚拟地址 (由栈顶与页数推出, 不再写死单页)。
-const USER_STACK_ADDR: u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
-/// 页大小。
-const PAGE_SIZE: u64 = 4096;
-
-/// 编译期嵌入的用户程序扁平二进制 (由 Makefile 先构建 user, 再 objcopy 产出)。
-const USER_PROGRAM: &[u8] = include_bytes!("../../build/user/user.bin");
-
-/// 把用户程序加载到指定域: 分配连续物理帧, 映射到 `USER_BASE` 起, 拷贝镜像,
-/// 并映射一页用户栈。
-fn load_user_program(domain_id: u64) {
-    let bytes = USER_PROGRAM;
-    let pages = (bytes.len() as u64).div_ceil(PAGE_SIZE);
-
-    for i in 0..pages {
-        let frame = memory::frame_allocator::allocate_frame().expect("allocate user program frame");
-        let vaddr = USER_BASE + i * PAGE_SIZE;
-        memory::paging::map_user_page(domain_id, vaddr, frame);
-
-        let start = (i * PAGE_SIZE) as usize;
-        let end = core::cmp::min(start + PAGE_SIZE as usize, bytes.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(start),
-                frame as *mut u8,
-                end - start,
-            );
-        }
-    }
-
-    // 用户栈: 连续映射 USER_STACK_PAGES 页 (栈向下增长, 最高页紧邻栈顶)。
-    for i in 0..USER_STACK_PAGES {
-        let stack_frame =
-            memory::frame_allocator::allocate_frame().expect("allocate user stack frame");
-        memory::paging::map_user_page(domain_id, USER_STACK_ADDR + i * PAGE_SIZE, stack_frame);
-    }
-}
+/// E2b 起每个服务是**独立程序** (独立 crate / 独立 ELF, 见 `user/srv`), 由内核在引导期
+/// 经 `exec::spawn_elf_at` 载入到**各自的固定域**。域号是 ABI: libvfs 写死
+/// `FAT32_DOMAIN=6` 等, shell 直接 `SendTo(5)`, 所以"域号 ↔ 程序"的对应必须稳定。
+///
+/// ELF 由 Makefile 构建到 `build/user/srv/<name>.elf` (`make` 先构建 `morion-srv` 的 14 个
+/// bin 再逐个拷贝)。此前 14 个域共用一份扁平二进制 (`build/user/user.bin`) 按域 id 分流 ——
+/// 那是过渡态, 现已删除; 现在每个域跑的是它自己那份 ELF, 各自独立地址空间。
+const SERVICE_ELFS: [(u64, &[u8]); 14] = [
+    (0, include_bytes!("../../build/user/srv/sender.elf")),
+    (1, include_bytes!("../../build/user/srv/receiver.elf")),
+    (2, include_bytes!("../../build/user/srv/pager.elf")),
+    (3, include_bytes!("../../build/user/srv/echo.elf")),
+    (4, include_bytes!("../../build/user/srv/kbd.elf")),
+    (5, include_bytes!("../../build/user/srv/block_srv.elf")),
+    (6, include_bytes!("../../build/user/srv/fat32_srv.elf")),
+    (7, include_bytes!("../../build/user/srv/app.elf")),
+    (8, include_bytes!("../../build/user/srv/shell.elf")),
+    (9, include_bytes!("../../build/user/srv/mount_srv.elf")),
+    (10, include_bytes!("../../build/user/srv/tmpfs_srv.elf")),
+    (11, include_bytes!("../../build/user/srv/mfs_srv.elf")),
+    (12, include_bytes!("../../build/user/srv/ext2_srv.elf")),
+    (13, include_bytes!("../../build/user/srv/exfat_srv.elf")),
+];
 
 /// 空闲任务: 当用户任务退出后兜底运行, 停机等待中断。
 ///
@@ -375,41 +349,18 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // 加载用户程序到十四个域 (同一镜像, 经 domain_id 参数区分角色)。
-    load_user_program(sender_domain);
-    load_user_program(receiver_domain);
-    load_user_program(pager_domain);
-    load_user_program(echo_domain);
-    load_user_program(kbd_domain);
-    load_user_program(block_domain);
-    load_user_program(fat32_domain);
-    load_user_program(app_domain);
-    load_user_program(shell_domain);
-    load_user_program(mount_domain);
-    load_user_program(tmpfs_domain);
-    load_user_program(mfs_domain);
-    load_user_program(ext2_domain);
-    load_user_program(exfat_domain);
-    video::println("[OK] user program loaded into domains 0..13");
+    // 逐个加载服务 ELF 并起任务: 域号已按 `SERVICE_ELFS` 的顺序 (0..13) 建好, 故直接
+    // 按表内域号载入 —— 每个服务跑自己的 ELF、进自己的地址空间 (E2b)。
+    for (dom, image) in SERVICE_ELFS {
+        if !exec::spawn_elf_at(dom, image) {
+            video::println("[FAILED] service ELF load (embedded)");
+        }
+    }
+    video::println("[OK] 14 service ELFs loaded (embedded)");
 
-    // 域 0..13 各起一个用户任务。
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, sender_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, receiver_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, pager_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, echo_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, kbd_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, block_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, fat32_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, app_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, shell_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mount_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, tmpfs_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, mfs_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, ext2_domain);
-    scheduler::spawn_user(USER_BASE, USER_STACK_TOP, exfat_domain);
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] sender + receiver + pager + echo + kbd + block + fat32 + app + shell + mount + tmpfs + mfs + ext2 + exfat + idle tasks spawned");
+    video::println("[OK] 14 service tasks + idle task spawned");
     video::println("");
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();

@@ -67,6 +67,17 @@ pub const SYS_IRQ_WAIT: u64 = 36;
 ///
 /// 镜像是用户态给的, 故内核侧做全部校验 (`elf::parse`); 新域零能力, 其分页器登记为调用者。
 pub const SYS_SPAWN_ELF: u64 = 37;
+/// 销毁一个域并回收它的全部资源: `rdi = 域 id`, 成功返回 1, 失败 0。
+///
+/// 门禁是**两条一起**: `Capability::Spawn` **且** 目标是自己的分页器
+/// (`pager::of(target) == 调用者`) —— 即"谁加载谁负责"。`exec::spawn_elf` 把加载者
+/// 登记为分页器, 于是"自我销毁"天然不可达 (拆自己的页表/内核栈会当场崩)。
+/// 回收内容见 `domain::destroy`: 地址空间、页表、能力/句柄、邮箱、分页器、中断注册、任务。
+pub const SYS_DOMAIN_DESTROY: u64 = 38;
+/// 存活域数 (`domain::alive_count`) —— 自测取证用: 销毁之后应回到基线。
+pub const SYS_DOMAIN_COUNT: u64 = 39;
+/// 当前空闲物理帧数 (`frame_allocator::free_frames`) —— 自测取证用: 反复加载/销毁不应下降。
+pub const SYS_FRAME_FREE: u64 = 40;
 
 /// `SYS_SPAWN_ELF` 接受的最大镜像长度 (1 MiB)。
 ///
@@ -554,6 +565,19 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::exec::spawn_elf(image, from).unwrap_or(u64::MAX)
         }
         SYS_EXIT => crate::scheduler::exit_current(),
+        SYS_DOMAIN_DESTROY => {
+            // 「谁加载谁负责」: 既要能造进程 (Spawn), 又要是它的分页器 (= 加载它的域)。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::Spawn) {
+                return 0;
+            }
+            if crate::pager::of(a1) != Some(from) {
+                return 0;
+            }
+            crate::domain::destroy(a1) as u64
+        }
+        SYS_DOMAIN_COUNT => crate::domain::alive_count() as u64,
+        SYS_FRAME_FREE => crate::memory::frame_allocator::free_frames() as u64,
         _ => 0,
     }
 }

@@ -281,6 +281,9 @@ fn schedule_next(current_state: TaskState) {
 /// 两类到期唤醒: `Sleeping` 的睡眠到期, 以及**带超时 `Blocked`** (SYS_IRQ_WAIT)
 /// 的阻塞到期 —— 后者是「等不到中断就回退轮询」的兜底。
 pub fn tick() {
+    // 退出即回收: 在本任务 (被打断者) 的上下文里销毁挂起的域。挂起域已无可运行任务,
+    // 故必不是当前域 —— 释放它的页表 / 栈 / 帧不会动到正在用的东西。
+    crate::domain::reclaim_pending();
     {
         let mut guard = SCHEDULER.lock();
         let sched = guard.as_mut().expect("scheduler not initialized");
@@ -428,6 +431,36 @@ pub fn is_waiting_on(key: u64) -> bool {
     }
 }
 
+/// 域销毁时调用: 摘除该域的全部任务, 并唤醒正在等它的任务。
+///
+/// - 任务从任务表移除后 `Task` 被 drop, 它的内核栈 (32 KiB `Box<[u8]>`) 归还内核堆,
+///   任务槽位可被后续 `spawn` 复用 (否则反复 `run` 会先耗尽 `MAX_TASKS`);
+/// - `wait_on == domain` 的阻塞任务**必须**唤醒 —— 它们等的是一个已经不存在的域,
+///   不唤醒就是永久挂死;
+/// - 分页器已在 `domain::destroy` 里摘过, 但 `deliver_fault` 可能已有一条消息在途,
+///   所以这里只做任务侧清理。
+///
+/// **不要在目标域自己的任务里调用**: 那会把自己正在使用的内核栈一起释放掉。
+/// 门禁见 `domain::destroy` 的调用方 (`SYS_DOMAIN_DESTROY` 要求目标的分页器 == 调用者,
+/// 而分页器是"加载它的域", 故自我销毁天然不可达)。调度器未初始化时 (宿主单测) 直接返回。
+pub fn remove_domain(domain: u64) {
+    let mut guard = SCHEDULER.lock();
+    let Some(sched) = guard.as_mut() else {
+        return;
+    };
+    for slot in sched.tasks.iter_mut() {
+        if slot.as_ref().is_some_and(|t| t.domain == domain) {
+            *slot = None;
+        }
+    }
+    for task in sched.tasks.iter_mut().flatten() {
+        if task.state == TaskState::Blocked && task.wait_on == domain {
+            task.state = TaskState::Ready;
+            task.wake_deadline = 0;
+        }
+    }
+}
+
 /// 启动调度器: 从当前 (main) 执行流切换到首个任务, 永不返回。
 pub fn run() -> ! {
     let mut guard = SCHEDULER.lock();
@@ -463,7 +496,31 @@ pub fn run() -> ! {
 ///
 /// 由 `SYS_EXIT` 系统调用调用 (syscall 已清 IF)。当前任务被标记为
 /// `Terminated`, 之后不再被调度。
+///
+/// **退出即回收**: 若当前任务是所属域的最后一个任务 (自己即将终止), 就
+/// [`domain::request_destroy`] 登记该域 —— 但**不在这里销毁**: 此刻仍跑在本域的
+/// 内核栈与页表 (CR3) 上, 会拆掉正在用的东西。登记后由时钟 `tick` 在别的任务
+/// 上下文里真正回收 (引导期服务域是白名单, 登记会被忽略)。
 pub fn exit_current() -> ! {
+    let (domain, last_in_domain) = {
+        let guard = SCHEDULER.lock();
+        let sched = guard.as_ref().expect("scheduler not initialized");
+        let domain = sched.tasks[sched.current]
+            .as_ref()
+            .expect("scheduler: no current task")
+            .domain;
+        // 数一数本域还有几个"未终止"任务 —— 只可能是自己 (退出中的那个)。
+        let live = sched
+            .tasks
+            .iter()
+            .flatten()
+            .filter(|t| t.domain == domain && t.state != TaskState::Terminated)
+            .count();
+        (domain, live <= 1)
+    };
+    if last_in_domain {
+        crate::domain::request_destroy(domain);
+    }
     schedule_next(TaskState::Terminated);
     unreachable!("scheduler::exit_current: schedule_next returned");
 }

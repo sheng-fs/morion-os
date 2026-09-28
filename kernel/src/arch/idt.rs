@@ -128,7 +128,12 @@ extern "x86-interrupt" fn page_fault_handler(
     // 分页器映射页面并 reply 后, 本任务被重新调度, iretq 恢复现场并
     // 重新执行那条缺页指令。
     let fault_domain = crate::scheduler::current_domain();
-    let pager = crate::pager::of(fault_domain);
+    let Some(pager) = crate::pager::of(fault_domain) else {
+        // 该域没有分页器 (已销毁 / 从未登记): 没人能补这一页。继续 iretq 会立刻再缺页,
+        // 变成无限重试, 所以只能停下并留下证据。
+        crate::video::println("KERNEL PANIC: page fault in a domain with no pager");
+        crate::halt();
+    };
 
     crate::pager::deliver_fault(
         pager,

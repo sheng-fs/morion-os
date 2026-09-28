@@ -208,7 +208,7 @@ name = "morion-kernel-test"
 version = "0.1.0"
 
 [[package]]
-name = "morion-user"
+name = "morion-srv"
 version = "0.1.0"
 dependencies = [
  "morion",

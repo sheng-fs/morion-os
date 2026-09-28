@@ -85,16 +85,28 @@ pub fn init(domain_count: usize) {
     }
 }
 
-/// 运行时新增一个域 (ELF 加载建新域时调用): 补两行空槽, 新域默认**零能力**。
+/// 运行时确保域 `id` 的槽位存在且**为空** (ELF 加载建新域时调用)。
 ///
-/// 与 `init` 一样按域 id 索引, 故必须在 `domain::create()` 之后、任何对该域的能力
-/// 查询之前调用, 否则下标错位。
-pub fn add_domain() {
-    let mut table = CAP_TABLE.lock();
-    table.push([None; CAP_SLOTS]);
-    drop(table);
-    let mut handles = HANDLE_TABLE.lock();
-    handles.push([None; HANDLE_SLOTS]);
+/// 新域默认**零能力**; 且域表槽位会被复用 (见 `domain::slot_for`), 所以这里不只是
+/// 补行, 还必须把复用到的旧行清零。按域 id 索引, 须在 `domain::create()` 之后调用。
+pub fn add_domain(id: u64) {
+    set_row(&mut CAP_TABLE.lock(), id, [None; CAP_SLOTS]);
+    set_row(&mut HANDLE_TABLE.lock(), id, [None; HANDLE_SLOTS]);
+}
+
+/// 域销毁时调用: 丢掉该域遗留的能力槽与句柄槽 (行保留, 供槽位复用)。
+pub fn remove_domain(id: u64) {
+    set_row(&mut CAP_TABLE.lock(), id, [None; CAP_SLOTS]);
+    set_row(&mut HANDLE_TABLE.lock(), id, [None; HANDLE_SLOTS]);
+}
+
+/// 把 `table` 的第 `id` 行设为 `row` —— 不够长就在表尾补齐 (中间的空缺一并补成 `row`)。
+fn set_row<T: Copy>(table: &mut Vec<T>, id: u64, row: T) {
+    let idx = id as usize;
+    while table.len() <= idx {
+        table.push(row);
+    }
+    table[idx] = row;
 }
 
 /// 为域 `domain` 的不透明对象 `obj` 签发句柄, 返回句柄索引 (0 起);
@@ -291,4 +303,34 @@ pub fn delegate(from: u64, to: u64, cap: Capability) -> bool {
         x86_64::instructions::interrupts::enable();
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 域销毁必须把能力槽与句柄槽一起丢掉, 且**槽位复用**时不能捡到上一个域的遗留。
+    ///
+    /// 直接摆放表格现场而不经 `grant` / `handle_issue` / `handle_lookup`: 那几个会
+    /// `cli`/`sti` 关开中断, 是特权指令, 在宿主单测里执行会 SIGSEGV (单测跑在用户态)。
+    /// 这里校验的正是它们读的那两张表。
+    #[test]
+    fn destroy_and_reuse_domain_clears_caps_and_handles() {
+        init(3);
+        CAP_TABLE.lock()[1][0] = Some(Capability::SendTo(2));
+        HANDLE_TABLE.lock()[1][0] = Some(0xDEAD_BEEF);
+        assert!(has(1, Capability::SendTo(2)));
+
+        // 销毁域 1: 能力与句柄都不再可用。
+        remove_domain(1);
+        assert!(!has(1, Capability::SendTo(2)));
+        assert!(HANDLE_TABLE.lock()[1].iter().all(|slot| slot.is_none()));
+
+        // 槽位复用 (同一个 id 再建域): 又摆一份旧值, `add_domain` 必须把它清零。
+        CAP_TABLE.lock()[1][0] = Some(Capability::Spawn);
+        HANDLE_TABLE.lock()[1][0] = Some(0xDEAD_BEEF);
+        add_domain(1);
+        assert!(!has(1, Capability::Spawn));
+        assert!(HANDLE_TABLE.lock()[1].iter().all(|slot| slot.is_none()));
+    }
 }

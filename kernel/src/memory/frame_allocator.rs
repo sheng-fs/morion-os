@@ -231,7 +231,8 @@ pub fn free_frame(addr: u64) {
 // ---------------------------------------------------------------------------
 // 记录「用户显式申请 / 共享」的帧及其被映射的域数, 用于在解除映射时判断
 // 何时真正释放。仅覆盖 SYS_ALLOC_PAGE / SYS_SHARE_PAGE / SYS_UNMAP 这条路径;
-// 镜像页与栈帧 (load_user_program) 不纳入, 其生命周期随任务。
+// 镜像页与栈帧 (加载器直接分配) 不登记 —— 域销毁时按 `release_user_frame`
+// 的规则处理: 登记过的按计数递减, 未登记的视为该域独占直接释放。
 const MAX_SHARED_FRAMES: usize = 64;
 
 static mut SHARED_FRAMES: [(u64, u8); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
@@ -272,6 +273,36 @@ pub fn dec_ref(addr: u64) -> bool {
     false
 }
 
+/// 该物理帧是否**登记过**引用计数 (即经 `SYS_ALLOC_PAGE` / `SYS_SHARE_PAGE` 而来)。
+pub fn is_tracked(addr: u64) -> bool {
+    unsafe {
+        SHARED_FRAMES
+            .iter()
+            .any(|slot| slot.0 == addr && slot.1 > 0)
+    }
+}
+
+/// 归还一个「由某个域的用户空间持有」的物理帧 —— 域销毁 / 摘除映射时逐页调用。
+///
+/// 记账规则 (就这一条, 与 `SYS_ALLOC_PAGE`/`SYS_SHARE_PAGE` 的分工配套):
+///
+/// - **登记过引用计数**的帧 (用户显式申请或共享出去的): 按计数递减, **归零**才真正
+///   `free_frame` —— 还有别的域把它映射在自己的地址空间里时不能释放;
+/// - **未登记**的帧 (镜像页 / 用户栈帧: 由加载器直接 `allocate_frame` + 映射, 从不经
+///   syscall): 归该域独占, 直接释放。
+///
+/// 半个前提: 同一物理帧在**同一个域**里只会被映射到一个虚拟地址 (`SYS_ALLOC_PAGE`
+/// 对已映射地址返回 0, `SYS_SHARE_PAGE` 的目标域不是本域), 所以"一页一扫"不会重复计数。
+pub fn release_user_frame(addr: u64) {
+    if is_tracked(addr) {
+        if dec_ref(addr) {
+            free_frame(addr);
+        }
+    } else {
+        free_frame(addr);
+    }
+}
+
 /// 已管理 (空闲 + 已分配) 的帧总数。
 pub fn total_frames() -> usize {
     unsafe { TOTAL_FRAMES }
@@ -304,4 +335,38 @@ pub fn print_stats() {
     crate::video::print("  Total memory:   ");
     crate::video::print_u64(total_memory_bytes());
     crate::video::println(" bytes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 域销毁逐页归还时遵守「谁拥有谁释放」的记账规则。
+    ///
+    /// 单测跑在宿主上 (位图未初始化), 故不依赖真实内存: 用 `reserve_frame` 把待测帧
+    /// 标记为"已占用", 以位图是否翻转判定"有没有被真正释放"。
+    /// 断言全放在一个测试里 —— 它们共享全局位图与引用计数表, 拆开会被并行执行互相干扰。
+    #[test]
+    fn release_user_frame_follows_ownership_rule() {
+        // (1) 未登记的帧 (镜像页 / 用户栈帧): 本域独占 → 直接释放。
+        let fresh: u64 = 7 * FRAME_SIZE as u64;
+        reserve_frame(fresh as usize);
+        assert!(bitmap_test(7));
+        assert!(!is_tracked(fresh));
+        release_user_frame(fresh);
+        assert!(!bitmap_test(7), "未登记的帧应被释放");
+
+        // (2) 登记过的帧 (alloc_page / share_page): 计数递减, 归零才释放。
+        let shared: u64 = 11 * FRAME_SIZE as u64;
+        reserve_frame(shared as usize);
+        inc_ref(shared); // 本域 alloc_page
+        inc_ref(shared); // 又共享给了另一个域
+        assert!(is_tracked(shared));
+        release_user_frame(shared);
+        assert!(bitmap_test(11), "还有别的域映射着它, 不能释放");
+        assert!(is_tracked(shared));
+        release_user_frame(shared);
+        assert!(!bitmap_test(11), "计数归零后应释放");
+        assert!(!is_tracked(shared));
+    }
 }

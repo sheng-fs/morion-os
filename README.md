@@ -164,9 +164,10 @@
 
 ### 当前实际结构
 
-> 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`user`、`kernel_test` **四个 crate**。
-> 其中 `user` 是一个**扁平二进制**，内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
-> 都在其中按**域 id** 分流实现，由内核在启动时加载。
+> 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`user/srv`、`user/libmorion`、
+> `user/hello`、`kernel_test` 等 crate。内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
+> 都是**各自独立的用户态程序**（`user/srv` 里一个服务一个 `[[bin]]` → 一份独立 ELF），由内核在启动期
+> **逐个载入各自固定域**（E2b：不再是"一份扁平二进制按域 id 分流"）。
 > UI 素材统一按用途归档：引导期资源在 `boot/loader/resources/`，系统全局资源在 `resources/system/`。
 
 ```
@@ -216,11 +217,23 @@
 │       ├── syscall.rs        #   系统调用入口与编号表
 │       ├── lib.rs
 │       └── main.rs
-├── user/                     # 用户态: 运行库 + 服务与 shell
+├── user/                     # 用户态: 运行库 + 服务程序
 │   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / 入口样板
 │   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
-│   └── src/
-│       └── main.rs           #   morion_main 按域 id 分流: 各服务与 shell 实现
+│   └── srv/                  #   系统服务 (crate `morion-srv`): 每个服务一个 [[bin]] → 一份独立 ELF
+│       └── src/
+│           ├── common.rs     #     各服务共用的线协议 / 块客户端 / 名字工具
+│           ├── block_srv.rs  #     域 5  块设备驱动服务
+│           ├── fat32_srv.rs  #     域 6  FAT32 文件服务
+│           ├── app.rs        #     域 7  自测程序
+│           ├── shell.rs      #     域 8  命令行
+│           ├── mount_srv.rs  #     域 9  挂载服务
+│           ├── tmpfs_srv.rs  #     域 10 内存文件系统
+│           ├── mfs_srv.rs    #     域 11 MorionFS
+│           ├── ext2_srv.rs   #     域 12 ext2 只读
+│           ├── exfat_srv.rs  #     域 13 exFAT 读写
+│           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
+│           └── bin/          #     14 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -325,8 +338,8 @@
 - [x] **多向量 + `wait_any`（中断/等待原语做深）**（**S5**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— `irq_wait_token(domain)` + `irq::ANY_MASK[域]`；`SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 入参由向量号改为**掩码**，返回**命中的向量号**，一次等多条队列。NVMe 建成 **admin + 2 条 I/O 队列**、每条 CQ 用**自己的向量**（0x50/0x51/0x52），驱动按段轮转选队列、I/O 完成等 `1<<IO_QUEUES` 掩码。修掉一个踩坑：`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**，写成队列序号会让 qid 1 与 admin 抢向量 0，I/O 完成永远等不到（13 条命令后即回退）。运行期证据：`nvme: stats cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq`，三条向量都真实投递）
 - [x] **终端中文渲染（汉字 / 全角 / 宽窄混排）**（内核终端原本只有 8x16 ASCII 位图，而 `SYS_PUTS` 传的是 UTF-8 —— 汉字被逐字节喂进 `draw_char` 后落进「不可打印」分支，中文因此完全不显示。新增 `video/unicode.rs` + 生成的字库 `video/cjk.bin`：字源 **GNU Unifont**（OFL-1.1），字符集 = **GB2312 全集** ∪ 仓库里出现过的非 ASCII 字符 ≈ 7500 字 / 276 KB，16x16 汉字占 **2 个字符格**；记录里**自带宽度**，内核无需维护 East Asian Width 表，缺字形画空心豆腐块。终端行模型由「字节 = 一列」改为**按显示列**：满行判定、渲染步进、光标折算与下划线宽度都按列，退格/←/→ 按字符走不切开多字节。字库由 `scripts/gen-cjk-font.py` 生成并随仓库提交，构建不依赖网络）
 - [x] **可执行文件加载（ELF + 运行时 spawn）**（**E1**：内核新增 **ELF64 加载器**（`elf.rs` 全量校验 + `exec.rs` 映射）与新 syscall `SYS_SPAWN_ELF`（`Capability::Spawn` 门禁）：解析 `ET_EXEC` 镜像 → 建**新域**（`domain::create()` + 能力/邮箱/分页器表补行）→ 按段映射（一页只映射一次、新页清零、`.bss` 补零）→ 映射用户栈 → 起 Ring 3 任务，返回新域 id；新域**零能力**、分页器登记为加载者。配套：`MAX_TASKS` 16 → 32 + 内核堆 1 → 4 MiB（每任务 32 KiB 栈）、任务表满时**返回失败而不再 panic**、`Domain::new` **显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 —— 既无隔离又会撞车）。演示程序 `user/hello` 是**独立 crate / 独立 ELF**：自测把它写进 `/tmp` 再从**文件**读回来加载运行，子程序自己打印 `exec:` 行。自测 **FS-27**）
-- [x] **用户态运行库 libmorion + `run` 命令**（**E2a**：抽 `user/libmorion`（crate `morion`）= syscall 封装 + 打印 + `domain_id()` + libvfs + 入口样板（`_start`/`morion_main`/panic），`morion-user` 与 `morion-hello` 共用，`hello` 瘦成 20 行；新增 `exec::spawn_file(path)`；shell 加 **`run <file>`**（+ `Capability::Spawn`），把可执行文件加载变成**用户可见的功能**；FS-27 改为从**磁盘文件** `/HELLO.MEX` 加载。交互实测 `run /HELLO.MEX` → 新域 14 跑起来）
-- [ ] 把 14 个服务从扁平二进制拆成独立程序（**E2b**：每个服务一个程序 + 域销毁/帧回收）
+- [x] **用户态运行库 libmorion + `run` 命令**（**E2a**：抽 `user/libmorion`（crate `morion`）= syscall 封装 + 打印 + `domain_id()` + libvfs + 入口样板（`_start`/`morion_main`/panic），`morion-user` 与 `morion-hello` 共用，`hello` 瘦成 20 行；新增 `exec::spawn_file(path)`；shell 加 **`run <file>`**（+ `Capability::Spawn`），把可执行文件加载变成**用户可见的功能**；FS-27 改为从**磁盘文件** `/hello.mex` 加载。交互实测 `run /hello.mex` → 新域 14 跑起来）
+- [x] **服务拆成独立程序 + 域销毁/帧回收**（**E2b**：① 域销毁——`domain::destroy` 摘域表槽位 + 释放用户地址空间（逐页按帧引用计数归还、回收页表帧）+ 清各子系统按域状态（能力/句柄、邮箱、分页器、中断）+ 摘除并终止其任务；域 id **复用空槽**（`slot_for`），配 `SYS_DOMAIN_DESTROY/COUNT/FRAME_FREE`。② **退出即回收**——任务退出时若为本域最后一个任务，登记该域、由时钟 `tick` 在别的上下文销毁（不可就地拆自己的栈/页表），引导域白名单永不销毁。③ **服务拆成独立程序**——新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → 各一份**独立 ELF**（`cfg` 门控，一个 bin 只编自己的服务 + `common`），删掉 17814 行的单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at` 逐个载入固定域，删 `load_user_program`；每个程序启动打印 `[up] <name> (domain N)`。自测新增 **FS-28**，交互 `run` 域号复用）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 帧缓冲对用户态开放 / GUI 服务
 - [ ] 网络协议栈

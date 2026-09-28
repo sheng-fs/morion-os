@@ -25,28 +25,47 @@ pub struct PageFaultInfo {
     pub error_code: u64,
 }
 
-/// 每域的分页器域 id。
-static PAGERS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// 每域的分页器域 id (`None` = 该域没有分页器, 或已被销毁)。
+static PAGERS: Mutex<Vec<Option<u64>>> = Mutex::new(Vec::new());
 
 /// 初始化分页器映射 (创建 `domain_count` 个域, 统一指向 `pager_domain`)。
 pub fn init(domain_count: usize, pager_domain: u64) {
     let mut pagers = PAGERS.lock();
     pagers.clear();
     for _ in 0..domain_count {
-        pagers.push(pager_domain);
+        pagers.push(Some(pager_domain));
     }
 }
 
-/// 运行时新增一个域 (ELF 加载建新域时调用): 登记它的分页器。
+/// 运行时登记域 `id` 的分页器 (ELF 加载建新域时调用)。
 ///
 /// 新域的分页器 = **加载它的那个域**（loader 自然就是该程序的缺页后端）。
-pub fn add_domain(pager_domain: u64) {
-    PAGERS.lock().push(pager_domain);
+/// 按域 id 索引, 须在 `domain::create()` 之后调用; 域表槽位会被复用
+/// (见 `domain::slot_for`), 所以这里也是"覆盖上一轮遗留值"。
+pub fn add_domain(id: u64, pager_domain: u64) {
+    set_pager(id, Some(pager_domain));
 }
 
-/// 查询指定域的分页器域 id。
-pub fn of(domain: u64) -> u64 {
-    PAGERS.lock()[domain as usize]
+/// 域销毁时调用: 摘掉它的分页器登记。
+pub fn remove_domain(id: u64) {
+    set_pager(id, None);
+}
+
+/// 把 `id` 的分页器设为 `pager` —— 不够长就在表尾补齐 (`None`)。
+fn set_pager(id: u64, pager: Option<u64>) {
+    let mut pagers = PAGERS.lock();
+    let idx = id as usize;
+    while pagers.len() <= idx {
+        pagers.push(None);
+    }
+    pagers[idx] = pager;
+}
+
+/// 查询指定域的分页器域 id; 该域不存在 / 已销毁 / 无分页器时返回 `None`。
+///
+/// 返回 `None` 时缺页无人能补 —— 调用方 (缺页处理器) 必须停下来而不能无限重试。
+pub fn of(domain: u64) -> Option<u64> {
+    PAGERS.lock().get(domain as usize).copied().flatten()
 }
 
 /// 投递一条缺页消息给分页器并唤醒它。
@@ -62,4 +81,30 @@ pub fn deliver_fault(pager: u64, info: PageFaultInfo) {
         )
     };
     crate::ipc::deliver(info.fault_domain, pager, FAULT_TAG, payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 分页器登记的建/销/复用: 销毁后查不到, 槽位复用能被覆盖, 表不增长。
+    #[test]
+    fn destroy_and_reuse_domain_resets_pager() {
+        init(2, 7);
+        assert_eq!(of(0), Some(7));
+        assert_eq!(of(1), Some(7));
+        assert_eq!(of(2), None, "表外的域没有分页器");
+
+        // 运行时建新域 (域表槽位 2) → 分页器 = 加载者。
+        add_domain(2, 9);
+        assert_eq!(of(2), Some(9));
+        assert_eq!(PAGERS.lock().len(), 3);
+
+        // 销毁域 1 → 摘掉登记; 槽位复用 (同一个 id) 能被新值覆盖。
+        remove_domain(1);
+        assert_eq!(of(1), None);
+        add_domain(1, 4);
+        assert_eq!(of(1), Some(4));
+        assert_eq!(PAGERS.lock().len(), 3, "复用槽位不应新增行");
+    }
 }

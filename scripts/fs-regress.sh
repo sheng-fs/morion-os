@@ -32,12 +32,12 @@ dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=no
 dd if=/dev/zero of="$OUT_DIR/pt.img" bs=1M count="${PT_MIB:-64}" status=none
 
 # FAT32 卷 (nvme.img) 是**持久卷**, 脚本一直沿用既有的那份 (它同时被交互式验证用)。
-# 但可执行文件加载 (FS-27 / shell `run`) 需要卷根目录里有 HELLO.MEX —— 就地补进去,
+# 但可执行文件加载 (FS-27 / shell `run`) 需要卷根目录里有 hello.mex —— 就地补进去,
 # 免去"跑回归前必须先 make 一遍镜像"的隐含前提。mtools 是既有依赖 (Makefile 也在用)。
 if [ -f "$OUT_DIR/nvme.img" ]; then
   if [ -f "$OUT_DIR/user/hello.elf" ]; then
-    mcopy -o -i "$OUT_DIR/nvme.img" "$OUT_DIR/user/hello.elf" ::/HELLO.MEX 2>/dev/null \
-      && echo "== 已注入可执行文件: /HELLO.MEX"
+    mcopy -o -i "$OUT_DIR/nvme.img" "$OUT_DIR/user/hello.elf" ::/hello.mex 2>/dev/null \
+      && echo "== 已注入可执行文件: /hello.mex"
   else
     echo "== 警告: $OUT_DIR/user/hello.elf 不存在, FS-27 (可执行文件加载) 会失败"
   fi
@@ -118,10 +118,11 @@ if command -v sgdisk >/dev/null 2>&1; then
 else
   echo "  (无 sgdisk, 跳过宿主校验)"
 fi
-echo "== 可执行文件加载 (E1: FS-27 / SYS_SPAWN_ELF) =="
+echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
-grep -nE 'FS27|exec: ' "$log" 2>/dev/null || echo "(无)"
+# FS-28 进一步验证子程序退出后内核**自动回收**该域 (域号复用、空闲帧回到稳态)。
+grep -nE 'FS27|FS28|exec: ' "$log" 2>/dev/null || echo "(无)"
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 

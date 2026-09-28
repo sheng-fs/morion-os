@@ -1,6 +1,6 @@
 # Morion OS — Shell 命令规范
 
-Shell 是域 8 的用户态进程（[user/src/main.rs](../../user/src/main.rs)），通过 libvfs
+Shell 是域 8 的用户态进程（[user/srv/src/shell.rs](../../user/srv/src/shell.rs)），通过 libvfs
 经 `mount_srv` 路由到各文件服务。本文件是 shell 命令的**行为契约**：新增/修改命令时先改这里。
 
 ---
@@ -122,7 +122,7 @@ commands:
 从文件系统加载一个可执行文件并启动它（E1/E2 可执行文件加载）。**看内容不看后缀**：
 镜像必须是 ELF64 `ET_EXEC`（`.mex`），由内核全量校验。
 
-- 无参数：`run: usage: run <file>   (e.g. run /HELLO.MEX)`
+- 无参数：`run: usage: run <file>   (e.g. run /hello.mex)`
 - 路径过长：`run: path too long`
 - 成功：`run: loaded <path> -> new domain <n>`；紧接着子程序会打印它自己的输出
   （不等待它结束，shell 立即回到提示符）。
@@ -131,8 +131,8 @@ commands:
 需要 shell 持有 `Capability::Spawn`（内核引导期授予）。当前镜像里可直接试：
 
 ```text
-[morion@morion /]$ run /HELLO.MEX
-run: loaded /HELLO.MEX -> new domain 14
+[morion@morion /]$ run /hello.mex
+run: loaded /hello.mex -> new domain 14
 exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 14, 入口 = 0x8000000000
 [morion@morion /]$
 ```
@@ -422,9 +422,9 @@ rm: removed /mfs/D/F.TXT
 [morion@morion /mfs]$ cd /ext2
 [morion@morion /ext2]$ ls
 [DIR]  lost+found
-[FILE] HELLO.TXT  size=48
-[DIR]  SUBDIR
-[morion@morion /ext2]$ cat HELLO.TXT
+[FILE] hello.txt  size=48
+[DIR]  subdir
+[morion@morion /ext2]$ cat hello.txt
 Hello from ext2!
 This is a read-only test file.
 [morion@morion /ext2]$ cd /usb

@@ -1,0 +1,130 @@
+# Morion OS 用户态系统服务 (E2b: 每个服务一份独立 ELF)
+#
+# 过渡态 (`user/src/main.rs`: 一份镜像按 domain_id 分流 14 个服务) 的拆分产物:
+# 本 crate 每个 `[[bin]]` = 一个独立程序, 只实现自己的 `morion_main` (入口/panic
+# 样板由 libmorion 提供), 由内核按名字嵌入并加载。
+#
+# cfg 门控: 每个 bin 只启用自己那份服务代码的 feature, 于是它只编译 "自己的模块 +
+# common", 不会把其它 13 个服务的代码也编进来。
+
+[package]
+name = "morion-srv"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Morion OS 用户态系统服务 (每个服务一份独立 ELF)"
+
+[lib]
+name = "morion_srv"
+path = "src/lib.rs"
+
+# 每个服务的代码门控 feature。`default` 把它们**全部**打开 —— 这样仓库根那条统一
+# 构建命令 (不带 --features) 才能一次编出 14 个 bin (Cargo 的一次调用只能有一组
+# feature, 无法按 bin 分别开关)。要真正「只编某一份服务 + common」, 用:
+#   cargo build ... --no-default-features --features svc-<name> --bin <name>
+[features]
+default = [
+    "svc-sender",
+    "svc-receiver",
+    "svc-pager",
+    "svc-echo",
+    "svc-kbd",
+    "svc-block_srv",
+    "svc-fat32_srv",
+    "svc-app",
+    "svc-shell",
+    "svc-mount_srv",
+    "svc-tmpfs_srv",
+    "svc-mfs_srv",
+    "svc-ext2_srv",
+    "svc-exfat_srv",
+]
+svc-sender = []
+svc-receiver = []
+svc-pager = []
+svc-echo = []
+svc-kbd = []
+svc-block_srv = []
+svc-fat32_srv = []
+svc-app = []
+svc-shell = []
+svc-mount_srv = []
+svc-tmpfs_srv = []
+svc-mfs_srv = []
+svc-ext2_srv = []
+svc-exfat_srv = []
+
+[[bin]]
+name = "sender"
+path = "src/bin/sender.rs"
+required-features = ["svc-sender"]
+
+[[bin]]
+name = "receiver"
+path = "src/bin/receiver.rs"
+required-features = ["svc-receiver"]
+
+[[bin]]
+name = "pager"
+path = "src/bin/pager.rs"
+required-features = ["svc-pager"]
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+required-features = ["svc-echo"]
+
+[[bin]]
+name = "kbd"
+path = "src/bin/kbd.rs"
+required-features = ["svc-kbd"]
+
+[[bin]]
+name = "block_srv"
+path = "src/bin/block_srv.rs"
+required-features = ["svc-block_srv"]
+
+[[bin]]
+name = "fat32_srv"
+path = "src/bin/fat32_srv.rs"
+required-features = ["svc-fat32_srv"]
+
+[[bin]]
+name = "app"
+path = "src/bin/app.rs"
+required-features = ["svc-app"]
+
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+required-features = ["svc-shell"]
+
+[[bin]]
+name = "mount_srv"
+path = "src/bin/mount_srv.rs"
+required-features = ["svc-mount_srv"]
+
+[[bin]]
+name = "tmpfs_srv"
+path = "src/bin/tmpfs_srv.rs"
+required-features = ["svc-tmpfs_srv"]
+
+[[bin]]
+name = "mfs_srv"
+path = "src/bin/mfs_srv.rs"
+required-features = ["svc-mfs_srv"]
+
+[[bin]]
+name = "ext2_srv"
+path = "src/bin/ext2_srv.rs"
+required-features = ["svc-ext2_srv"]
+
+[[bin]]
+name = "exfat_srv"
+path = "src/bin/exfat_srv.rs"
+required-features = ["svc-exfat_srv"]
+
+[dependencies]
+# 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。
+morion = { path = "../libmorion" }

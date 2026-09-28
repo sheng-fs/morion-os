@@ -142,3 +142,53 @@ pub fn set_pending(vector: u8) {
         }
     }
 }
+
+/// 域销毁时调用: 清掉它在中断子系统里的全部痕迹。
+///
+/// 三处都可能留着它: 等向量的掩码 (`ANY_MASK`, 按域 id 索引)、它注册的 MSI/MSI-X
+/// 向量 (`VECTORS`)、它注册的 PIC IRQ (`HANDLERS`)。不清的话, 槽位复用后新域会
+/// 顶着一个不存在的旧注册; 而且 `SYS_IRQ_WAIT` 的掩码校验也会拿旧值放行。
+///
+/// `PENDING` 位是**按向量**的全局标志, 注册者被摘掉后 `take_pending_any` 会拒绝它,
+/// 故无需按域清。
+pub fn remove_domain(domain: u64) {
+    if (domain as usize) < ANY_MAX_DOMAINS {
+        ANY_MASK.lock()[domain as usize] = 0;
+    }
+    for slot in VECTORS.lock().iter_mut() {
+        if *slot == Some(domain) {
+            *slot = None;
+        }
+    }
+    for slot in HANDLERS.lock().iter_mut() {
+        if *slot == Some(domain) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 域销毁要把「等待掩码 + 向量注册 + PIC IRQ 注册」三处一起摘干净,
+    /// 且槽位复用后新域不会顶着旧注册。
+    #[test]
+    fn remove_domain_clears_mask_and_registrations() {
+        let victim = 3u64;
+        let other = 5u64;
+
+        set_any_mask(victim, 0b111);
+        set_any_mask(other, 0b001);
+        register_vector(0x50, victim);
+        register_vector(0x51, other);
+        register(1, victim);
+
+        remove_domain(victim);
+
+        assert!(!is_registered_by(0x50, victim), "向量注册应被摘掉");
+        assert!(is_registered_by(0x51, other), "别的域的注册不受影响");
+        assert_eq!(ANY_MASK.lock()[victim as usize], 0, "等待掩码应清零");
+        assert_eq!(HANDLERS.lock()[1], None, "PIC IRQ 注册应被摘掉");
+    }
+}

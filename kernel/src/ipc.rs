@@ -45,11 +45,30 @@ pub fn init(domain_count: usize) {
     }
 }
 
-/// 运行时新增一个域 (ELF 加载建新域时调用): 补一个空邮箱。
+/// 运行时确保域 `id` 有一个**空**邮箱 (ELF 加载建新域时调用)。
 ///
-/// 按域 id 索引, 故须在 `domain::create()` 之后调用。
-pub fn add_domain() {
-    MAILBOXES.lock().push(VecDeque::new());
+/// 按域 id 索引, 故须在 `domain::create()` 之后调用; 域表槽位会被复用
+/// (见 `domain::slot_for`), 所以这里同时起到"清掉上一个域遗留消息"的作用。
+pub fn add_domain(id: u64) {
+    set_mailbox(id, VecDeque::new());
+}
+
+/// 域销毁时调用: 丢掉该域邮箱里未读的消息。
+///
+/// 未读消息不会有人再取 (该域已无任务), 留着只会白占内存 —— 且槽位复用后
+/// 新域会捡到旧消息。
+pub fn remove_domain(id: u64) {
+    set_mailbox(id, VecDeque::new());
+}
+
+/// 把 `id` 的邮箱整体替换成 `box_` —— 不够长就在表尾补齐空邮箱。
+fn set_mailbox(id: u64, box_: VecDeque<Message>) {
+    let mut boxes = MAILBOXES.lock();
+    let idx = id as usize;
+    while boxes.len() <= idx {
+        boxes.push(VecDeque::new());
+    }
+    boxes[idx] = box_;
 }
 
 /// 发送消息到目标域 (非阻塞)。
@@ -233,4 +252,31 @@ pub fn reply(tag: u64, payload: &[u8]) -> bool {
     crate::scheduler::wake_one(target);
     x86_64::instructions::interrupts::enable();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 域销毁要丢掉邮箱里未读的消息, 且**槽位复用**后新域看不到旧消息。
+    #[test]
+    fn destroy_and_reuse_domain_drops_mailbox() {
+        init(3);
+        // 直接往域 1 邮箱塞一条 —— 不经 `deliver`, 那条路会唤醒调度器, 而单测里没有调度器。
+        MAILBOXES.lock()[1].push_back(Message {
+            from: 0,
+            to: 1,
+            tag: 0xAA,
+            payload: [0; PAYLOAD_LEN],
+        });
+        assert_eq!(MAILBOXES.lock()[1].len(), 1);
+
+        remove_domain(1);
+        assert!(MAILBOXES.lock()[1].is_empty());
+
+        // 槽位复用: 同一个 id 再建域, 邮箱干净, 且**不新增行** (表按域 id 定长)。
+        add_domain(1);
+        assert!(MAILBOXES.lock()[1].is_empty());
+        assert_eq!(MAILBOXES.lock().len(), 3);
+    }
 }

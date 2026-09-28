@@ -9,7 +9,9 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/` | 用户态测试程序 (crate: `morion-user`)，编译为扁平二进制由内核加载 |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：14 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b) |
+| `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
+| `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
 | `docs/dev-reference.md` | 本速查手册 |
@@ -51,7 +53,7 @@ UEFI 固件
 | `PHYS_OFFSET` | `0xFFFF_8000_0000_0000` | 物理内存 offset 映射（P4[256]） |
 | `USER_SPACE_BASE` | `0x0000_0080_0000_0000` | 用户空间基址（P4[1]） |
 | `USER_SPACE_END` | `USER_SPACE_BASE + 512 GiB` | 用户空间上界（**开区间**，P4[1] 之外就是内核/未映射；ELF 段与入口都要落在里面） |
-| `USER_STACK_TOP` / `USER_STACK_PAGES` | `USER_BASE + 0x40_1000` / 8 | 用户栈顶与页数（32 KiB）。**唯一来源**：引导期 `load_user_program` 与运行时 `exec::spawn_elf` 必须给出同一布局 —— 所有程序共用一套链接地址 |
+| `USER_STACK_TOP` / `USER_STACK_PAGES` | `USER_BASE + 0x40_1000` / 8 | 用户栈顶与页数（32 KiB）。**唯一来源**：引导期 `exec::spawn_elf_at` 与运行时 `exec::spawn_elf` 必须给出同一布局 —— 所有程序共用一套链接地址 |
 | `HEAP_START` | `0x4444_4444_0000` | 内核堆起始虚拟地址 |
 | `HEAP_SIZE` | `4 MiB` | 内核堆大小（每任务 32 KiB 内核栈 × `MAX_TASKS = 32` ≈ 1 MiB，故留 4 MiB） |
 | `MANAGED_MEMORY` | `4 GiB` | 管理的物理内存上限 |
@@ -66,11 +68,11 @@ UEFI 固件
 > 到 `[_stack_end, _stack_end + frame_size)` —— 恰好落在镜像之外、帧分配器最先交出的帧（内核堆第 0 页）
 > 上，随机破坏堆的链表元数据，表现为 `alloc` 失败或 `Bad free`（且随代码体积变化时有时无）。
 
-### 用户空间固定布局（内核与用户程序约定，见 [kernel/src/main.rs](../../kernel/src/main.rs) / [user/src/main.rs](../../user/src/main.rs)）
+### 用户空间固定布局（内核与用户程序约定，见 [kernel/src/main.rs](../../kernel/src/main.rs) / [user/srv/src/common.rs](../../user/srv/src/common.rs)）
 
 | 区域 | 地址 | 说明 |
 | --- | --- | --- |
-| 程序镜像 | `USER_BASE` 起 | 扁平二进制，**随代码增长**（E1 后带完字库/自测约 68 页 / 271 KiB；硬上限是 `+0x10_0000` 之前那段 = 1 MiB） |
+| 程序镜像 | `USER_BASE` 起 | 每个程序自己的 ELF 镜像，**随代码增长**；硬上限是 `+0x10_0000` 之前那段 = 1 MiB |
 | 文件服务缓冲页 | `USER_BASE + 0x10_0000` 起 | fat32 的 BPB/目录/FAT/文件缓冲（`..+0x10_4000`）、app 的 `RESULT_BUF`/`WRITE_BUF` 与 shell 的 `SHELL_RESULT_BUF`/`SHELL_WRITE_BUF`（`..+0x10_8000`）、mfs 的 4 个块缓冲（`..+0x10_C000`）、ext2 块缓冲（`..+0x10_10000`） |
 | mfs 元数据缓冲 | `USER_BASE + 0x11_0000` 起 | GC 遍历 / inode 表块缓存 / 索引块 scratch / GC 表块（`..+0x11_4000`，M5b 新增后三页） |
 | exFAT 缓冲 | `USER_BASE + 0x11_4000` 起 | 集群缓冲（按簇大小最多 64 页，`..+0x15_4000`）+ 位图窗口 `+0x15_4000` + upcase 窗口 `+0x15_5000` + 单页暂存 `+0x15_6000`（M6c 起集群缓冲动态分配） |
@@ -81,8 +83,8 @@ UEFI 固件
 | 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 NVMe 配置、+0x2_0000 MMIO、+0x3_0000 DMA（7 页：admin 的 ASQ/ACQ + 两条 I/O 队列的 SQ/CQ + data 页，**S5 起**每条 I/O 队列各一套；与内核 `nvme::NVME_DMA_PAGES` 同值） |
 | 按需分页测试地址 | `USER_BASE + 0x1_0000_0000` | sender 触发的缺页演示 |
 
-> ⚠️ 程序镜像是**全部域共用**的同一镜像，新增代码会使其变大。所有固定映射地址必须留在
-> 镜像增长范围之上（当前 ≥ 1 MiB），否则会在 `load_user_program` / `sys_alloc_page` 触发
+> ⚠️ 每个程序自己的镜像都会随代码增长。所有固定映射地址必须留在**所有**镜像的增长范围
+> 之上（当前 ≥ 1 MiB），否则会在 `exec::spawn_elf_at` / `sys_alloc_page` 触发
 > `map_user_page: PageAlreadyMapped` 内核 panic。
 
 ## 4. GDT 选择子（[kernel/src/arch/gdt.rs](../../kernel/src/arch/gdt.rs)）
@@ -108,7 +110,7 @@ UEFI 固件
 | 2 | `SYS_SEND` | `rdi=to, rsi=tag` | 发送 IPC 消息；需 `Capability::SendTo(to)`，返回 1 成功 / 0 失败 |
 | 3 | `SYS_RECV` | `rdi=ptr`（可空） | 接收 IPC 消息（阻塞）；`ptr` 非空时把完整 `Message` 写回用户缓冲区，返回 `tag` |
 | 4 | `SYS_PUTS` | `rdi=ptr, rsi=len` | 打印用户字符串 |
-| 5 | `SYS_EXIT` | — | 终止当前用户任务（标记 `Terminated`） |
+| 5 | `SYS_EXIT` | — | 终止当前用户任务（标记 `Terminated`）；若它是所属域的**最后一个**任务且该域非引导域，则登记该域由内核**退出即回收**（见域小节 `request_destroy`） |
 | 6 | `SYS_ALLOC_PAGE` | `rdi=vaddr` | 分配一物理帧映射到本域 `vaddr`，返回 1 成功 / 0 失败 |
 | 7 | `SYS_SHARE_PAGE` | `rdi=vaddr, rsi=to` | 把本域 `vaddr` 的页映射进 `to` 域同地址；需 `Capability::MapInto(to)`，返回 1/0 |
 | 8 | `SYS_UNMAP` | `rdi=vaddr` | 解除本域 `vaddr` 映射并递减引用计数，归零时释放物理帧，返回 1/0 |
@@ -139,7 +141,10 @@ UEFI 固件
 | 34 | `SYS_IRQ_POLL` | `rdi=mask` | 非阻塞取走**掩码 `mask` 覆盖的 MSI/MSI-X 向量**中任意一个的「待处理」标志，命中返回**该向量号**，无 / 非法返回 0。位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`；掩码里每个位都须满足 `Capability::Irq(vector)` 且是该向量的注册者，否则整体非法。中断不投 IPC（见「IRQ 转发」），驱动用它走「中断已到」的快路径，未命中再 `SYS_IRQ_WAIT` 阻塞 |
 | 35 | `SYS_MSIX_ENABLE` | — | 打开 NVMe 控制器的 MSI-X（置 Enable、清 Function Mask）；只有该控制器的驱动域能调用且只成功一次，**PCI 配置空间写因此留在内核**。返回 1/0 |
 | 36 | `SYS_IRQ_WAIT` | `rdi=mask, rsi=timeout_ms` | **阻塞等待掩码里任意一条向量**的中断（`wait_any`）：命中返回该向量号，超时返回 0（调用方据此回退轮询）。阻塞期间本域让出 CPU（不空转），由中断处理器唤醒；超时由 `tick()` 兜底。校验同 `SYS_IRQ_POLL`。syscall 入口已用 SFMASK 清 IF，故「查标志 → 登记掩码 → 阻塞」之间不会插进中断处理，不丢唤醒 |
-| 37 | `SYS_SPAWN_ELF` | `rdi=ptr, rsi=len` | **加载可执行文件并启动**（E1）：把本域内存里的 ELF64 `ET_EXEC` 镜像校验后载入**新域**并起一个 Ring 3 任务，成功返回**新域 id**，失败 `u64::MAX`。需 `Capability::Spawn`。解析与映射全在核内（`elf::parse` 全量校验 + `exec::spawn_elf`），新域**零能力**、其分页器登记为调用者 |
+| 37 | `SYS_SPAWN_ELF` | `rdi=ptr, rsi=len` | **加载可执行文件并启动**（E1）：把本域内存里的 ELF64 `ET_EXEC` 镜像校验后载入**新域**并起一个 Ring 3 任务，成功返回**新域 id**，失败 `u64::MAX`。需 `Capability::Spawn`。解析与映射全在核内（`elf::parse` 全量校验 + `exec::spawn_elf`），新域**零能力**、其分页器登记为调用者。**失败时会把半成品域销毁掉**（地址空间与各全局表行都不留） |
+| 38 | `SYS_DOMAIN_DESTROY` | `rdi=domain` | **销毁一个域并回收它的全部资源**（E2b 地基）：地址空间（逐页按引用计数归还 + 页表帧 + PML4）、能力与句柄、邮箱、分页器登记、中断注册、任务与内核栈；域 id 槽位归还以便复用。返回 1/0。门禁是**两条一起**：`Capability::Spawn` **且** `pager::of(domain) == 调用者`（"谁加载谁负责"）—— 因此**自我销毁不可达**（拆自己正在用的页表/内核栈会当场崩） |
+| 39 | `SYS_DOMAIN_COUNT` | — | 当前**存活域数**（`domain::alive_count`），自测取证用：销毁之后应回到基线 |
+| 40 | `SYS_FRAME_FREE` | — | 当前**空闲物理帧数**（`frame_allocator::free_frames`），自测取证用：反复加载/销毁后不应下降 |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -211,6 +216,7 @@ UEFI 固件
 - `allocate_frame() -> Option<u64>`（返回物理地址）
 - `free_frame(addr: u64)`
 - `inc_ref(addr: u64)` / `dec_ref(addr: u64) -> bool`（共享帧引用计数；`dec_ref` 归零返回 `true`）
+- `is_tracked(addr: u64) -> bool` / `release_user_frame(addr: u64)`（**域销毁时的逐页归还规则**：登记过引用计数的帧按计数递减、归零才 `free_frame`；**未登记**的帧 —— 镜像页 / 用户栈帧 / 页表帧 —— 视为该域独占，直接 `free_frame`。引用计数表只有 64 槽，故只有「用户显式申请/共享」的帧登记在内）
 - `total_frames() / free_frames() / total_memory_bytes() / free_memory_bytes()`
 - `FRAME_SIZE = 4096`
 - 初始化末尾调用 `reserve_active_page_tables()`：把当前 `CR3` 页表层级引用的物理帧标记为占用。
@@ -225,20 +231,28 @@ UEFI 固件
 - `map_user_page(domain_id: u64, vaddr: u64, paddr: u64)`（USER 权限映射）
 - `resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（遍历页表把 vaddr 反查为物理地址）
 - `unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（解除映射并返回原物理地址）
+- `free_user_space(pml4_phys: u64)`（**域销毁时调用**：只遍历 P4[1]——其余 PML4 条目是所有域共享的内核映射，不能动——逐页 `release_user_frame` 归还物理帧，再回收 PT/PD/PDPT 页表帧，最后清掉 P4[1] 条目。兼容 2 MiB 大页。调用者必须是**别的域**，不能拆自己正在用的页表）
 - `heap_start() / heap_size()`
 
 ### 域（[kernel/src/domain.rs](../../kernel/src/domain.rs)）
 
-- `create() -> u64`（返回域 id；域表是 `Vec`，**运行时也能建**）
+- `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
+- `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
+- `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
+- `is_boot(id)` / `BOOT_DOMAINS = 14`（**白名单**：引导期服务域 `0..13` 退出时不自动销毁；它们的槽位始终被占用，故「id < 14 即引导域」是稳定不变量）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
+- `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
+- **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
 - 建域时复制当前 PML4 的**内核空间**条目（代码 / 恒等 / offset / 内核堆），**显式跳过 P4[1]（用户空间）**：引导期它是空的所以看不出来，但 `SYS_SPAWN_ELF` 是在调用者的 syscall 里建域（CR3 = 调用者的 PML4），照抄过去会让新域与调用者**共用同一棵用户空间页表** —— 既没有隔离，映射新程序还会撞上调用者自己的镜像（`PageAlreadyMapped`）。新域的用户空间必须从零由加载器建立。
 
 ### 可执行文件加载（[kernel/src/elf.rs](../../kernel/src/elf.rs) + [kernel/src/exec.rs](../../kernel/src/exec.rs)）
 
 - `elf::parse(bytes) -> Option<Image>`（**信任边界**：镜像字节完全由用户态提供，故每个字段先校验再用 —— magic / `ELFCLASS64` / `ELFDATA2LSB` / `ET_EXEC` / `EM_X86_64` / `e_phentsize == 56` / `e_phnum ≤ 32`；每段 `p_filesz ≤ p_memsz`、文件内容不越界、段整体落在 `[USER_SPACE_BASE, USER_SPACE_END)`；**入口必须落在某个已载入段内**。全程不分配资源、不 panic，非法即 `None`）
-- `exec::spawn_elf(image, loader) -> Option<u64>`（解析 → `domain::create()` + `cap/ipc/pager::add_domain()` → 逐段映射 → 映射用户栈 → `try_spawn_user`；返回新域 id）
+- `exec::spawn_elf(image, loader) -> Option<u64>`（**运行时**：解析 → `domain::create()` + `cap/ipc/pager::add_domain(domain[, loader])` → 逐段映射 → 映射用户栈 → `try_spawn_user`；返回新域 id）
+- `exec::spawn_elf_at(domain, image) -> bool`（**引导期**：不建域、不登记全局表 —— 14 个服务域由内核按固定域号先建好并授权，这里只"解析 → 映射镜像与栈 → 起任务"。内核经 `SERVICE_ELFS` 表把 14 份编译期嵌入（`include_bytes!`）的服务 ELF 逐个载入各自固定域，见 [kernel/src/main.rs](../../kernel/src/main.rs)）
+- 失败清理（E2b 地基）：`spawn_elf` 映射或起任务任一步失败 → `domain::destroy(domain)` 把半成品域拆干净（地址空间 + 各全局表行）后返回 `None`，不再漏域漏页。
 - 映射要点：**一页只映射一次**（相邻段常共享边界页，重复 `map_user_page` 会 panic）——已映射的页复用其物理帧；新页先**清零**再拷入文件内容（分配器不保证零，`.bss` 与段尾填充都依赖这一点）；物理地址 < 4 GiB 在恒等映射内，故可直接当指针写。
-- 不做的事（见 roadmap「E1 未完成」）：**不登记共享帧引用计数**（与引导期 `load_user_program` 一致，域销毁未实现）、**W^X**（`map_user_page` 无权限参数，所有段都可写）、**动态链接 / 重定位**（只吃 `ET_EXEC`）、程序退出后**不回收域与帧**。
+- 不做的事（见 roadmap「E1 未完成」）：**不登记共享帧引用计数**（镜像页/栈帧都是该域独占，销毁时按「未登记即独占」直接归还，见物理帧分配小节）、**W^X**（`map_user_page` 无权限参数，所有段都可写）、**动态链接 / 重定位**（只吃 `ET_EXEC`）。域与帧的回收已在 E2b 地基落地（`SYS_DOMAIN_DESTROY` / 退出即回收）。
 
 ### 调度器（[kernel/src/scheduler/mod.rs](../../kernel/src/scheduler/mod.rs)）
 
@@ -247,12 +261,13 @@ UEFI 固件
 - `spawn_user(entry: u64, user_stack: u64, domain: u64)`（Ring 3 用户任务；引导期用，吃满任务表即 panic）
 - `try_spawn_user(entry: u64, user_stack: u64, domain: u64) -> bool`（**运行时**用，供 `SYS_SPAWN_ELF`；任务表满返回 false 而**不 panic** —— 那是用户可触发的路径）
 - `run() -> !`
-- `tick()` / `yield_now()` / `sleep(ms: u64)`
+- `tick()` / `yield_now()` / `sleep(ms: u64)`（`tick` 开头还会 `domain::reclaim_pending()` 执行**退出即回收**的挂起销毁 —— 此刻跑在被中断任务的上下文里，与挂起域必不相同）
 - `block_current(on_domain: u64)` / `wake_one(domain: u64)`
 - `block_current_timeout_ms(on: u64, ms: u64)`（**带超时的阻塞**：TCB 记 `wake_deadline`，由 `tick()` 在到期时置回 `Ready`；`SYS_IRQ_WAIT` 用它等设备中断，超时即返回让调用方回退。`tick()` 的到期唤醒因此覆盖 `Sleeping` 与**带超时 `Blocked`** 两态）
 - `current_domain() -> u64`
 - `set_current_reply_target(target: u64)` / `current_reply_target() -> u64`（`reply` 回复目标追踪；`u64::MAX` 表示无）
-- `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口）
+- `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口；若这是所属域的**最后一个**任务，会 `domain::request_destroy` 登记该域 —— **延迟**到 `tick` 真正销毁，因为此刻仍跑在本域的栈与页表上，见域小节）
+- `remove_domain(domain: u64)`（**域销毁时调用**：把该域的任务槽位置 `None`（drop 归还内核栈），并唤醒所有 `wait_on == domain` 的阻塞任务 —— 否则等它的域会永远睡下去。`SCHEDULER` 尚未初始化时直接返回）
 - `INPUT_WAIT`（伪域 id `u64::MAX-1`：表示等待控制台输入行；`SYS_READLINE` 用 `block_current(INPUT_WAIT)`，`video::term_put` 回车时 `wake_one(INPUT_WAIT)`）
 - `IRQ_WAIT_MARK` / `irq_wait_token(domain: u64)`（伪等待键 `u64::MAX-0x300-domain`，落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`：`SYS_IRQ_WAIT` 以它阻塞、`irq::set_pending` 按掩码命中后以它唤醒。**按域取键**而非按向量 —— 一个域同时只可能有一个任务在等中断，掩码等待天然属于「域」；与真实域 id、`INPUT_WAIT` 都不重叠，故中断唤醒不会误撞 IPC 的唤醒）
 - **空闲任务** `task_idle`（[kernel/src/main.rs](../../kernel/src/main.rs)）循环 `hlt(); yield_now();` —— `hlt` 交出 CPU（KVM 里 vCPU 因此退出客户机，宿主设备模型才有机会 post 完成并投中断），返回后立即让出，使**刚被中断唤醒的域马上接手**而不必再等一个时钟 tick。
@@ -261,7 +276,7 @@ UEFI 固件
 
 ### IPC（[kernel/src/ipc.rs](../../kernel/src/ipc.rs)）
 
-- `init(domain_count: usize)` / `add_domain()`（运行时建新域时补一个空邮箱）
+- `init(domain_count: usize)` / `add_domain(id: u64)`（运行时建新域时按 id 补一个空邮箱）/ `remove_domain(id: u64)`（域销毁时清掉它的邮箱行，槽位随域 id 复用）
 - `send(to: u64, tag: u64, payload: &[u8]) -> bool`（非阻塞）
 - `deliver(from: u64, to: u64, tag: u64, payload: &[u8]) -> bool`（内核内部投递，绕过能力检查，用于缺页等异常转发）
 - `receive() -> Message`（阻塞，记录回复目标供 `reply` 使用）
@@ -280,7 +295,7 @@ UEFI 固件
 - `grant` / `revoke` 保存并恢复中断使能状态，避免 boot 期（IF=0）被提前开中断。
 - `Capability::SendTo(u64)` / `Capability::MapInto(u64)` / `Capability::Irq(u8)` / `Capability::Mmio(u64)` / `Capability::Spawn`，每域 `CAP_SLOTS = 16`
 - `Spawn`（E1）无参数 —— 它就是「可以造进程」这张凭证：`SYS_SPAWN_ELF` 建新域 + 载入镜像 + 起任务全靠它。默认不授予，引导期只给自测域（将来给 shell / init）。`SYS_CAP_SEND` 的 `kind` 相应加 `4=CAP_KIND_SPAWN`（`arg` 忽略）。
-- `init(domain_count)` / **`add_domain()`**（运行时经 `SYS_SPAWN_ELF` 建新域时补一行空槽；新域**零能力**，与 `init` 同理按域 id 索引，故必须在 `domain::create()` 之后调用）
+- `init(domain_count)` / **`add_domain(id: u64)`**（运行时经 `SYS_SPAWN_ELF` 建新域时按 id 补一行空槽；新域**零能力**，与 `init` 同理按域 id 索引，故必须在 `domain::create()` 之后调用）/ **`remove_domain(id: u64)`**（域销毁时清掉该域的能力行与句柄行，槽位随域 id 复用）
 - **「能力即句柄」句柄表**：`handle_issue(domain, obj) -> u64` / `handle_lookup(domain, handle) -> Option<u64>` / `handle_drop(domain, handle) -> bool`，每域 `HANDLE_SLOTS = 32`。槽内存放**不透明**对象标识（微内核不解释其含义，libvfs 传 `(服务域 << 32) | 服务内 fd`），由 `SYS_CAP_ISSUE`/`SYS_CAP_LOOKUP`/`SYS_CAP_DROP` 暴露给用户态。
 - **能力随 IPC 传递**（`SYS_HANDLE_SEND`/`SYS_CAP_SEND`）两条路径，语义刻意不同：
   - `handle_move(from, to, handle) -> u64`：**移动**。先取出源槽对象、再在目标域找空槽；目标槽满则**回滚**（对象放回原槽），故失败时不会出现「两边都没有」。移走后源域该句柄立即失效 —— 「能力是唯一凭证」，同一份能力同一时刻只属于一个域。这是 fd 传递要的语义（交出 fd 后自己不再持有）。
@@ -290,8 +305,9 @@ UEFI 固件
 
 ### 分页器（[kernel/src/pager.rs](../../kernel/src/pager.rs)）
 
-- `init(domain_count: usize, pager_domain: u64)`（每域统一登记 `pager_domain` 为其分页器；**运行时**建的新域用 `add_domain(pager_domain)` 补一行 —— 新域的分页器 = 加载它的那个域，loader 自然是该程序的缺页后端）
-- `of(domain: u64) -> u64`（查询某域的分页器域 id）
+- `init(domain_count: usize, pager_domain: u64)`（每域统一登记 `pager_domain` 为其分页器；**运行时**建的新域用 `add_domain(id, pager_domain)` 按 id 补一行 —— 新域的分页器 = 加载它的那个域，loader 自然是该程序的缺页后端）
+- `add_domain(id, pager_domain)` / `remove_domain(id)`（域销毁时摘掉登记，`PAGERS` 表项置 `None`）
+- `of(domain: u64) -> Option<u64>`（查询某域的分页器域 id；该域不存在 / 已销毁 / 无分页器时为 `None` —— 缺页处理器据此**停下来**而不能无限重试）
 - `deliver_fault(pager: u64, info: PageFaultInfo)`（把缺页信息序列化进 IPC 消息 payload，经 `ipc::deliver` 投递并 `wake_one` 分页器）
 - `PageFaultInfo { fault_domain, fault_addr, error_code }`（`#[repr(C)]`，24 字节，与用户态同布局）
 - `FAULT_TAG`（缺页消息 tag 标记，区分普通 IPC）
@@ -303,6 +319,7 @@ UEFI 固件
 - `register(irq: u8, domain: u64)`（登记某域为 PIC `irq` 的驱动域；调用者须先通过 `SYS_REGISTER_IRQ` 校验 `Capability::Irq(irq)`）
 - `dispatch(irq: u8, data: u64)`（把中断数据作为 IPC 消息 tag 转发给注册域；从 IRQ 处理器 IF=0 调用，非阻塞、不改变中断位）
 - 最多支持 16 个 PIC IRQ（master 8 + slave 8）；`HANDLERS` 为 `[Option<u64>; 16]`。
+- `remove_domain(domain)`（**域销毁时调用**：把「PIC IRQ 注册 + MSI 向量注册 + 等待掩码」三处一起摘干净，槽位随域 id 复用，新域不会顶着旧注册）
 - **MSI/MSI-X 向量**（阶段 39/40/41）走另一条路：`register_vector(vector, domain)` / `is_registered_by(vector, domain)` / `set_pending(vector)` / `set_any_mask(domain, mask)` / `clear_any_mask(domain)` / `take_pending_any(mask, domain) -> Option<u8>`。
   - 向量处理器置一个「待处理位」并**唤醒**等在**掩码**上的域，**不投 IPC**：那个邮箱同时也是驱动收请求的邮箱，拉取即消费，还会改写内核记录的回复目标，`reply` 会投错域。驱动改用 `SYS_IRQ_POLL` 取位 / `SYS_IRQ_WAIT` 阻塞等。
   - `VECTORS`/`PENDING` 均为 `[…; 256]`，以向量号为下标；`take_pending_any` 遍历掩码里的位、**只取自己注册的那个**并同时校验注册者，别的域读不到别人的中断。`ANY_MASK` 是 `[u64; ANY_MAX_DOMAINS]`（`ANY_MAX_DOMAINS = 64`），按**域**存「正在等的向量掩码」—— 一个域同时只有一个等待者，故域即等待身份。
@@ -376,7 +393,8 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 命令 | 说明 |
 | --- | --- |
 | `make kernel` | 仅构建微内核 |
-| `make user` | 仅构建用户态程序 → `build/user/user.bin` |
+| `make user` | 仅构建用户态服务 → `build/user/srv/*.elf`（14 份） |
+| `make hello` | 仅构建可执行文件加载演示程序 → `build/user/hello.elf` |
 | `make boot` | 仅构建引导器 |
 | `make iso` | 构建完整 ISO（`build/morion-os.iso`） |
 | `make run` | QEMU 运行（KVM） |
@@ -392,9 +410,9 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 - 自定义 target：`user/x86_64-morion-user.json`（`code-model=large` + `rustc-abi=softfloat` + `relocation-model=static`），解决用户基址 `0x8000_0000_0000` 超出 32 位重定位范围的问题。
 - 链接脚本：`user/linker.ld`，`ENTRY(_start)`，链接到 `0x8000000000`，`_start` 置于镜像最前端。
-- 入口 `_start(domain_id: u64)` 接收内核经 `rdi` 传入的域 id，据此分流角色：0=sender、1=receiver、2=pager、3=echo、4=kbd（键盘驱动）。
-- 构建链：`cargo build --target user/x86_64-morion-user.json ... -Z json-target-spec` → `objcopy -O binary` → `build/user/user.bin`。
-- 内核经 `include_bytes!("../../build/user/user.bin")` 在编译期嵌入，运行期按页映射到 `USER_SPACE_BASE` 加载。
+- **E2b 起每个服务是独立程序**：`user/srv`（crate `morion-srv`）里一个服务一个 `[[bin]]`，各模块用 `#[cfg(feature = "svc-<name>")]` 门控 —— 一个 bin 只编自己的服务模块 + `common`。入口 `_start(domain_id)`（libmorion 提供）调各 bin 的 `morion_main`，后者打印 `[up] <name> (domain N)` 后进 `morion_srv::<mod>::run()`。
+- 构建链：`cargo build --target user/x86_64-morion-user.json --package morion-srv --release -Z json-target-spec` → `build/user/srv/<name>.elf`（14 份，各自一份 ELF）。
+- 内核经 `include_bytes!("../../build/user/srv/<name>.elf")` 在编译期逐份嵌入（`SERVICE_ELFS` 表），引导期由 `exec::spawn_elf_at` 载入到各自固定域。
 
 ## 8. 工程约定
 
@@ -451,4 +469,5 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 41 | **多向量 + `wait_any`（中断/等待原语做深）**：等待原语从「按向量取键」改为「**按域取键 + 向量掩码**」—— 调度器 `irq_wait_token(domain) = u64::MAX-0x300-domain`（落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`，与真实域 id / `INPUT_WAIT` 不重叠），`irq` 侧加 `ANY_MASK: [u64; 64]` 记「每个域正在等的向量掩码」。`SYS_IRQ_POLL(34)` / `SYS_IRQ_WAIT(36)` 的入参 `rdi` 从「向量号」改为**掩码**（位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`），返回**命中的向量号**（0 = 无 / 超时 / 非法）；掩码里每个位都须持有 `Capability::Irq` 且是该向量的注册者，一个不满足即整体非法。`take_pending_any(mask, domain)` 只取自己注册的位，`set_pending` 置位后算出「掩码含该向量」的域、放锁后逐个 `wake_one(irq_wait_token(domain))`。NVMe 侧：`NVME_MSIX_VECTORS = 3`、`NVME_DMA_PAGES = 5 → 7`，建 **admin + 2 条 I/O 队列**，每条 CQ 用**自己的**向量（0x50/0x51/0x52），驱动按段**轮转选队列**、I/O 完成等 `1<<IO_QUEUES` 掩码（`wait_any`）。⚠️ 踩到的坑:`Create I/O CQ` 的 `CDW11` 里 **IV 必须等于完成队列下标**（admin CQ 恒 0），写成「队列序号」会让 qid 1 与 admin 抢向量 0 —— 症状是 I/O 完成投的是 0x50 而驱动在等掩码位 1/2，永远等不到、13 条命令后即回退轮询（`vecs=0x1`）。实测三条向量都真实投递：`after volume scan cmds=29 irq_cmds=29 poll_cmds=0 irqs=29 vecs=0x7 mode=irq`、运行期 `cmds=8192 irq_cmds=8192 poll_cmds=0 irqs=8192 vecs=0x7 mode=irq` | ✅ |
 | 42 | **终端中文 / 非 ASCII 点阵渲染**：内核终端原只有 8x16 ASCII 位图，`SYS_PUTS` 拿到的是 UTF-8，汉字（3 字节）被逐字节喂进 `draw_char` 后落在「不可打印」分支被丢掉 —— 中文直接不显示。新增 `video/unicode.rs`（UTF-8 解码 + 二分查字形 + 绘制 + 豆腐块）与生成的字库 `video/cjk.bin`（**GNU Unifont**，OFL-1.1：GB2312 全集 ∪ 仓库非 ASCII 字符 ≈ 7500 字 / 276 KB，定长 37 字节记录、**宽度随字形存**，故内核不必维护 East Asian Width 表）。终端行模型从「字节 = 一列」改为**按显示列**：`append_cp` 按列数判满行、渲染逐字符推进 8/16 px、光标按字节下标折算显示位置且下划线宽度取字符宽度、退格/←/→ 走 `prev_index`/`next_index` 不切开多字节字符。验证：`screendump` 截图确认内核启动行与 Ring 3 shell 行都正确显示汉字与全角标点、宽窄混排对齐 | ✅ |
 | 43 | **可执行文件加载（ELF + 运行时 spawn）**（**E1**）：此前所有域跑的是同一份编译期嵌入的扁平二进制（`load_user_program` 拷到 `USER_BASE`，用户态 `_start(domain_id)` 按域分流），既跑不了用户编的程序，也没有"每程序独立地址空间"。新增内核 **ELF64 加载器**（`elf.rs`：magic/`ELFCLASS64`/`ET_EXEC`/`EM_X86_64`/`phentsize=56`/`phnum≤32`、每段 `filesz≤memsz`+文件不越界+段落在 `[USER_SPACE_BASE, USER_SPACE_END)`、**入口必须落在已载入段内**；不分配资源、不 panic）与 `exec.rs`（建域 + 逐段映射 + 栈 + 起任务），新 syscall `SYS_SPAWN_ELF(37)`（`Capability::Spawn` 门禁，返回新域 id；镜像字节来自用户态故校验全在核内，并按页确认缓冲**已映射**）。配套地基修正：`MAX_TASKS` 16→32 + `HEAP_SIZE` 1→4 MiB（每任务 32 KiB 内核栈来自内核堆）、`spawn` 满表改 `try_spawn_user` 返回 false（运行时用户可触发路径不 panic）、**`Domain::new` 显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 → 无隔离且 `PageAlreadyMapped`）、`USER_STACK_TOP/PAGES` 提到 `paging` 作唯一来源。演示程序 `user/hello` 是**独立 crate/独立 ELF**，自测 FS-27 把它写进 `/tmp` 再从**文件**读回加载。实测：314 s、零失败，`FS27 exec loaded 5568 bytes -> domain 14` + 子程序 `exec: … 我的域 = 14, 入口 = 0x8000000000`（入口正是其链接地址）；内核新增 4 个 ELF 解析单测（`cargo test --lib -p morion-kernel` 全过） | ✅ |
-| 44 | **用户态运行库 libmorion + `run` 命令**（**E2a**）：抽出 **libmorion**（`user/libmorion`，crate 名 `morion`）—— `syscall`（syscall 封装 + 打印 + `domain_id()`）与 `vfs`（libvfs）从 `morion-user` 移入库，库另提供入口样板 `_start(domain_id)`（放 `.text._start`，`ENTRY(_start)`）+ `#[panic_handler]`，程序只实现 `morion_main(domain_id)`（crt0 把域 id 交给它，返回即退出）—— `morion-user` 与 `morion-hello` 都依赖它，`hello` 从"自带 syscall 桩"瘦成 20 行主逻辑。新增 `exec::spawn_file(path)`：`vfs::open` → 分块读进本域内存 → `SYS_SPAWN_ELF`；**经一页中转**而不是把每个暂存页都共享出去（否则几百 KB 的程序要占几十个共享帧槽位，内核只有 64 个），且对同一 (页, 域) 只 `share_page` 一次、`alloc_page` 前先用 `sys_virt_to_phys` 判已映射 —— 两处漏了都会在**第二次** `run` 时撞 `PageAlreadyMapped` panic。shell 新增 **`run <file>`** 命令（并补 `Capability::Spawn`），把"可执行文件加载"从自测里的证据变成**用户可见的功能**；FS-27 自测改为从**磁盘文件** `/HELLO.MEX` 走同一条 `spawn_file` 路径（不再内嵌镜像、不再经 tmpfs 运输）。构建：`make hello`；`$(NVME_IMG)` 依赖 `$(HELLO_ELF)` 并 `mcopy` 成 `::/HELLO.MEX`（回归脚本也会就地注入，免去"先 make 一遍镜像"的隐含前提）。实测：交互 `run /HELLO.MEX` → `run: loaded /HELLO.MEX -> new domain 14` 且子程序打印 `exec: … 我的域 = 14, 入口 = 0x8000000000`；全量回归零失败 | ✅ |
+| 44 | **用户态运行库 libmorion + `run` 命令**（**E2a**）：抽出 **libmorion**（`user/libmorion`，crate 名 `morion`）—— `syscall`（syscall 封装 + 打印 + `domain_id()`）与 `vfs`（libvfs）从 `morion-user` 移入库，库另提供入口样板 `_start(domain_id)`（放 `.text._start`，`ENTRY(_start)`）+ `#[panic_handler]`，程序只实现 `morion_main(domain_id)`（crt0 把域 id 交给它，返回即退出）—— `morion-user` 与 `morion-hello` 都依赖它，`hello` 从"自带 syscall 桩"瘦成 20 行主逻辑。新增 `exec::spawn_file(path)`：`vfs::open` → 分块读进本域内存 → `SYS_SPAWN_ELF`；**经一页中转**而不是把每个暂存页都共享出去（否则几百 KB 的程序要占几十个共享帧槽位，内核只有 64 个），且对同一 (页, 域) 只 `share_page` 一次、`alloc_page` 前先用 `sys_virt_to_phys` 判已映射 —— 两处漏了都会在**第二次** `run` 时撞 `PageAlreadyMapped` panic。**跨进程那处也漏过**：中转页地址原先所有客户端共用一个固定 vaddr，而 `SYS_SHARE_PAGE` 是映射进目标服务域的**同一地址** —— app 自测的 FS-27 共享给 fat32_srv 之后，shell 再 `run` 同一张盘就在服务域同址撞 `PageAlreadyMapped`（表现为跑完 `SELFTEST DONE` 后 `run` 必崩）。现按**调用方域 id 错开**中转页地址（与 `RESULT_BUF`/`SHELL_RESULT_BUF` 同一做法）。shell 新增 **`run <file>`** 命令（并补 `Capability::Spawn`），把"可执行文件加载"从自测里的证据变成**用户可见的功能**；FS-27 自测改为从**磁盘文件** `/hello.mex` 走同一条 `spawn_file` 路径（不再内嵌镜像、不再经 tmpfs 运输）。构建：`make hello`；`$(NVME_IMG)` 依赖 `$(HELLO_ELF)` 并 `mcopy` 成 `::/hello.mex`（回归脚本也会就地注入，免去"先 make 一遍镜像"的隐含前提）。实测：交互 `run /hello.mex` → `run: loaded /hello.mex -> new domain 14` 且子程序打印 `exec: … 我的域 = 14, 入口 = 0x8000000000`；全量回归零失败 | ✅ |
+| 45 | **域销毁 / 退出即回收 + 服务拆成独立程序**（**E2b**，三步）：**① 域销毁（地基）** —— 域表改 `Vec<Option<Domain>>` + `slot_for` **复用空槽**（域 id 是各全局表下标，单调增长会越界 `irq::ANY_MASK`），`domain::destroy` 顺序 = 摘域表槽位 → `paging::free_user_space`（遍历 P4[1] 逐页归还 + 回收页表帧）→ 清 `cap/ipc/pager/irq` 按域行 → `scheduler::remove_domain`（摘任务 + 唤醒等它的域）；帧记账规则 = `frame_allocator::release_user_frame`（登记过引用计数的按计数递减、**未登记**的镜像页/栈帧/页表帧视为独占直接归还）；新 syscall `SYS_DOMAIN_DESTROY(38)`（门禁 `Spawn` 且 `pager::of(target)==调用者`）/`SYS_DOMAIN_COUNT(39)`/`SYS_FRAME_FREE(40)`。**② 退出即回收** —— `exit_current` 若为本域最后一个任务则 `domain::request_destroy` **只登记**（不能就地拆自己正在用的栈/页表），由时钟 `tick` 开头 `reclaim_pending` 在别的任务上下文销毁；引导期服务域走白名单（`is_boot`/`BOOT_DOMAINS=14`）永不自动销毁。**③ 服务拆成独立程序** —— 新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → **各一份独立 ELF**，各模块 `#[cfg(feature="svc-<name>")]` 门控（一个 bin 只编自己的服务 + `common`），删掉 17814 行单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at(domain, image)`（不建域/不登记全局表）逐个载入**各自固定域**，删 `load_user_program`/`USER_PROGRAM`；每个程序入口打印 `[up] <name> (domain N)`。验证：内核单测 12 项全过；FS-28 `exit-reclaim OK (domain 14 reused 8x, frames stable)`；启动 `[OK] 14 service ELFs loaded (embedded)` + 14 行 `[up]`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |

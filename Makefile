@@ -42,9 +42,12 @@ KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
 KERNEL_EMBED  := boot/loader/morion-kernel.elf
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
-# 用户态测试程序 (kernel/src/main.rs 用 include_bytes! 嵌入)
-USER_ELF      := $(OUT_DIR)/user/morion-user
-USER_BIN      := $(OUT_DIR)/user/user.bin
+# 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF),
+# kernel/src/main.rs 用 include_bytes! 逐个嵌入 (见 SERVICE_ELFS)。
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv
+SRV_DIR       := $(OUT_DIR)/user/srv
+SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
+SRV_STAMP     := $(SRV_DIR)/.built
 # 可执行文件加载 (E1) 的演示程序: 独立 crate → 独立 ELF, 由 `SYS_SPAWN_ELF` 运行时载入。
 # 主程序用 include_bytes! 把它带进镜像当"运输方式", 自测再写进文件系统读回来跑 (见 roadmap E1)。
 HELLO_ELF     := $(OUT_DIR)/user/hello.elf
@@ -114,7 +117,7 @@ USER_SRC   := $(shell find user -type f 2>/dev/null)
 .PHONY: kernel
 kernel: $(KERNEL_ELF)
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(USER_BIN)
+$(KERNEL_ELF): $(KERNEL_SRC) $(SRV_STAMP)
 	@echo "==> 构建微内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -134,18 +137,18 @@ $(KERNEL_EMBED): $(KERNEL_ELF)
 	@echo "  ✓ 已更新: $@"
 
 # ============================================================
-# 用户态测试程序构建 (内核运行时加载)
+# 用户态系统服务构建 (E2b: 每个服务一份独立 ELF, 内核引导期加载)
 # ============================================================
 .PHONY: user
-user: $(USER_BIN)
+user: $(SRV_STAMP)
 
 # 只构建演示程序 (独立 ELF): 便于单独改动/检查一个"运行时加载"的程序。
 .PHONY: hello
 hello: $(HELLO_ELF)
 
-# 演示程序 (E1/E2 可执行文件加载): 与主程序同 target/同链接脚本, 但**独立 crate、独立 ELF**,
-# 依赖运行库 libmorion。它不进主程序镜像, 而是经 `make` 放进 FAT32 卷 (见 $(NVME_IMG) 规则),
-# 由 shell 的 `run /HELLO.MEX` 或 app 的 FS-27 自测**从文件**加载。
+# 演示程序 (E1/E2 可执行文件加载): 独立 crate、独立 ELF, 依赖运行库 libmorion。
+# 它不进引导期服务表, 而是经 `make` 放进 FAT32 卷 (见 $(NVME_IMG) 规则),
+# 由 shell 的 `run /hello.mex` 或 app 的 FS-27 自测**从文件**加载。
 $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/libmorion -type f 2>/dev/null) user/linker.ld
 	@echo "==> 构建演示程序 (独立 ELF, 供 SYS_SPAWN_ELF 加载)..."
 	$(MKDIR) $(dir $@)
@@ -159,28 +162,24 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/lib
 	$(CP) target/x86_64-morion-user/release/morion-hello $@
 	@echo "  ✓ 演示程序: $@"
 
-$(USER_ELF): $(USER_SRC)
-	@echo "==> 构建用户态测试程序..."
-	$(MKDIR) $(dir $@)
+# 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
+# (内核 `SERVICE_ELFS` 按名 include_bytes!)。用 stamp 让"多产物一次构建"只跑一遍。
+SRV_SRC := $(shell find user/srv user/libmorion -type f 2>/dev/null) user/linker.ld
+$(SRV_STAMP): $(SRV_SRC)
+	@echo "==> 构建用户态服务 (E2b: 14 个独立 ELF)..."
+	$(MKDIR) $(SRV_DIR)
 	$(CARGO) build \
 		--target user/x86_64-morion-user.json \
-		--package morion-user \
+		--package morion-srv \
 		--release \
 		-Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
-	$(CP) target/x86_64-morion-user/release/morion-user $@
-	@echo "  ✓ 用户程序构建完成: $@"
-
-$(USER_BIN): $(USER_ELF)
-	@echo "==> 生成用户程序扁平二进制..."
-	$(MKDIR) $(dir $@)
-	# 默认 objcopy -O binary 不含 NOBITS 的 .bss 段, 导致镜像长度只覆盖 text+data,
-	# 而 .bss 可能落入下一未映射页 (随程序增长反复触发缺页, 破坏控制台/滚动)。
-	# 用 --set-section-flags 把 .bss 标记为有内容, 使其零填充并入扁平二进制,
-	# 令内核按「完整内存占用」映射足够页表。
-	objcopy -O binary --set-section-flags .bss=alloc,load,contents,data $(USER_ELF) $(USER_BIN)
-	@echo "  ✓ 用户程序二进制: $@"
+	@for n in $(SRV_NAMES); do \
+		$(CP) target/x86_64-morion-user/release/$$n $(SRV_DIR)/$$n.elf; \
+	done
+	@touch $(SRV_STAMP)
+	@echo "  ✓ 14 个服务 ELF: $(SRV_DIR)/*.elf"
 
 # ============================================================
 # UEFI 引导器构建
@@ -339,16 +338,16 @@ $(MFS_IMG):
 
 # ext2 磁盘镜像: 宿主 mke2fs 预格式化 (只读兼容, 首挂载不自动格式化),
 # 并用 debugfs 预置测试文件与子目录, 保证启动后无需写盘即可验证。
-$(EXT2_IMG):
+$(EXT2_IMG): Makefile
 	@echo "==> 创建 ext2 磁盘镜像 (mke2fs + debugfs 预置测试文件)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(EXT2_IMG) bs=1M count=$(EXT2_MIB) status=none
 	mke2fs -q -t ext2 -F -b 1024 $(EXT2_IMG)
 	@printf 'Hello from ext2!\nThis is a read-only test file.\n' > $(OUT_DIR)/ext2hello.txt
-	debugfs -w -R "write $(OUT_DIR)/ext2hello.txt HELLO.TXT" $(EXT2_IMG) >/dev/null 2>&1
-	debugfs -w -R "mkdir /SUBDIR" $(EXT2_IMG) >/dev/null 2>&1
+	debugfs -w -R "write $(OUT_DIR)/ext2hello.txt hello.txt" $(EXT2_IMG) >/dev/null 2>&1
+	debugfs -w -R "mkdir /subdir" $(EXT2_IMG) >/dev/null 2>&1
 	@printf 'nested file in ext2 subdir!\n' > $(OUT_DIR)/ext2nested.txt
-	debugfs -w -R "write $(OUT_DIR)/ext2nested.txt SUBDIR/NESTED.TXT" $(EXT2_IMG) >/dev/null 2>&1
+	debugfs -w -R "write $(OUT_DIR)/ext2nested.txt subdir/nested.txt" $(EXT2_IMG) >/dev/null 2>&1
 	@echo "  ✓ ext2 镜像: $(EXT2_IMG)"
 
 # 分区测试盘: 32 MiB, MBR 两个主分区 —— 分区 1 FAT32 (16 MiB, 起点 2048),
@@ -357,7 +356,7 @@ $(EXT2_IMG):
 #   - 能解析 MBR 分区表并登记分区为独立卷;
 #   - 能按卷首签名探测出 FAT32 / ext2 类型。
 # 注意: 这是**额外**的一卷测试盘, 不影响现有三张整盘镜像的卷号 (0/1/2)。
-$(PARTS_IMG):
+$(PARTS_IMG): Makefile
 	@echo "==> 创建分区测试盘 (MBR: FAT32 + ext2)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(PARTS_IMG) bs=1M count=32 status=none
@@ -365,12 +364,12 @@ $(PARTS_IMG):
 	dd if=/dev/zero of=$(OUT_DIR)/part1.fat bs=512 count=32768 status=none
 	mkfs.fat -F 32 $(OUT_DIR)/part1.fat >/dev/null 2>&1
 	@printf 'partition 1 (FAT32) test file\n' > $(OUT_DIR)/part1.txt
-	mcopy -i $(OUT_DIR)/part1.fat $(OUT_DIR)/part1.txt ::/PART1.TXT
+	mcopy -i $(OUT_DIR)/part1.fat $(OUT_DIR)/part1.txt ::/part1.txt
 	dd if=$(OUT_DIR)/part1.fat of=$(PARTS_IMG) bs=512 seek=2048 conv=notrunc status=none
 	dd if=/dev/zero of=$(OUT_DIR)/part2.ext2 bs=1M count=4 status=none
 	mke2fs -q -t ext2 -F -b 1024 $(OUT_DIR)/part2.ext2
 	@printf 'partition 2 (ext2) test file\n' > $(OUT_DIR)/part2.txt
-	debugfs -w -R "write $(OUT_DIR)/part2.txt PART2.TXT" $(OUT_DIR)/part2.ext2 >/dev/null 2>&1
+	debugfs -w -R "write $(OUT_DIR)/part2.txt part2.txt" $(OUT_DIR)/part2.ext2 >/dev/null 2>&1
 	dd if=$(OUT_DIR)/part2.ext2 of=$(PARTS_IMG) bs=512 seek=34816 conv=notrunc status=none
 	@echo "  ✓ 分区测试盘: $(PARTS_IMG)"
 
@@ -401,34 +400,34 @@ run-ide: iso $(DISK_IMG)
 # 创建 NVMe 磁盘镜像并格式化为 FAT32, 写入与 IDE 镜像一致的测试文件
 # 另含一个 VFAT 长名文件 (Long File Name.txt, 短名派生为 LONGFI~1.TXT),
 # 供 VFAT 长名读取 / 按长名打开的自测与交互验证使用。
-# 还放入 HELLO.MEX —— 可执行文件加载 (E1/E2) 的演示程序: `run /HELLO.MEX` 从这张盘上
+# 还放入 hello.mex —— 可执行文件加载 (E1/E2) 的演示程序: `run /hello.mex` 从这张盘上
 # 加载它。它是**独立编译的 ELF**, 故镜像依赖 $(HELLO_ELF) (hello 变了就重建镜像)。
-$(NVME_IMG): $(HELLO_ELF)
+$(NVME_IMG): $(HELLO_ELF) Makefile
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
 	mkfs.fat -F 32 $(if $(NVME_CLU),-s $(NVME_CLU),) $(NVME_IMG) >/dev/null 2>&1
 	@printf 'Hello from FAT32!\nThis is a test file.\n' > $(OUT_DIR)/hello.txt
-	mcopy -i $(NVME_IMG) $(OUT_DIR)/hello.txt ::/HELLO.TXT
-	mmd -i $(NVME_IMG) ::/DIR1
+	mcopy -i $(NVME_IMG) $(OUT_DIR)/hello.txt ::/hello.txt
+	mmd -i $(NVME_IMG) ::/dir1
 	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
-	mcopy -i $(NVME_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
+	mcopy -i $(NVME_IMG) $(OUT_DIR)/nested.txt ::/dir1/nested.txt
 	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
-	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/HELLO.MEX
+	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/hello.mex
 	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
 
 # 创建 IDE 磁盘镜像并格式化为 FAT32
-$(DISK_IMG):
+$(DISK_IMG): Makefile
 	@echo "==> 创建 IDE 磁盘镜像 (FAT32)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=1024 status=none
 	mkfs.fat -F 32 $(DISK_IMG) >/dev/null 2>&1
 	@printf 'Hello from FAT32!\nThis is a test file.\n' > $(OUT_DIR)/hello.txt
-	mcopy -i $(DISK_IMG) $(OUT_DIR)/hello.txt ::/HELLO.TXT
-	mmd -i $(DISK_IMG) ::/DIR1
+	mcopy -i $(DISK_IMG) $(OUT_DIR)/hello.txt ::/hello.txt
+	mmd -i $(DISK_IMG) ::/dir1
 	@printf 'nested file via path!\n' > $(OUT_DIR)/nested.txt
-	mcopy -i $(DISK_IMG) $(OUT_DIR)/nested.txt ::/DIR1/NESTED.TXT
+	mcopy -i $(DISK_IMG) $(OUT_DIR)/nested.txt ::/dir1/nested.txt
 	@echo "  ✓ IDE 镜像: $(DISK_IMG)"
 
 # GDB 调试
@@ -494,16 +493,16 @@ clean:
 # `#[panic_handler] required` 而失败。
 #
 # 依赖 $(KERNEL_EMBED) —— 两个 crate 都靠 include_bytes! 嵌生成物, 干净树上必须先生成:
-#   kernel/src/main.rs   → build/user/user.bin   (USER_BIN)
+#   kernel/src/main.rs   → build/user/srv/*.elf   (SRV_ELFS)
 #   boot/src/main.rs     → boot/loader/morion-kernel.elf (KERNEL_EMBED, 见 .gitignore)
-# $(KERNEL_EMBED) 的依赖链已经把 USER_BIN 带上 (KERNEL_EMBED ← KERNEL_ELF ← USER_BIN),
+# $(KERNEL_EMBED) 的依赖链已经把 SRV_ELFS 带上 (KERNEL_EMBED ← KERNEL_ELF ← SRV_STAMP),
 # 所以写这一个就够。缺了它, 干净克隆上第一个包就报
-# `error: couldn't read .../user.bin: No such file or directory`。
+# `error: couldn't read .../sender.elf: No such file or directory`。
 # 本地不易发现: build/ 早被前面的 `make` 填好了 —— CI 是干净树, 才暴露。
 .PHONY: check
 check: $(KERNEL_EMBED)
 	$(CARGO) check --package morion-kernel --target $(KERNEL_TARGET)
-	$(CARGO) check --package morion-user \
+	$(CARGO) check --package morion-srv \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
@@ -526,7 +525,7 @@ fmt:
 .PHONY: clippy
 clippy: $(KERNEL_EMBED)
 	$(CARGO) clippy --package morion-kernel --target $(KERNEL_TARGET) -- -D warnings
-	$(CARGO) clippy --package morion-user \
+	$(CARGO) clippy --package morion-srv \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem -- -D warnings

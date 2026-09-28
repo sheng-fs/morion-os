@@ -1498,6 +1498,110 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - `spawn_file` 的暂存区假设调用方是**客户端程序**（shell / app），文件服务自己在该地址有
   整簇缓冲（fat32 的 `+0x20_0000`），故调用方不能是文件服务。
 
+### E2b 规划：服务拆成独立程序 + 域销毁/帧回收（下一个）
+
+**目标（两条，缺一不可）**
+
+1. **每个服务一个独立程序**：不再是"同一份扁平二进制按域 id 分流"，而是各自一个 crate/bin、
+   各自一个 `.mex`（独立 ELF）、各自一个域与独立地址空间；引导期逐个经 `exec::spawn_elf`
+   加载 —— 与 shell `run` 走**同一条加载链**。
+2. **域销毁 / 帧回收**：程序退出后，域、地址空间（镜像页 + 栈帧 + 页表帧）、任务槽与内核栈、
+   能力/句柄/邮箱/分页器/中断注册一律回收。没有这条就谈不上"服务可重启"，
+   而且 `run` 每跑一次永久漏一个域与一批页。
+
+**关键决策（已定）**
+
+| # | 问题 | 决定 |
+|---|---|---|
+| D1 | 服务 ELF 从哪来 | **(a) 内核 `include_bytes!` 内嵌**，引导期 `exec::spawn_elf` 加载 —— `block_srv` 必须先于任何文件系统可用（鸡生蛋），且与 `run` 复用同一加载链；引导器/init 从盘加载留给后面的"安装树"阶段。代价是内核镜像变大 |
+| D2 | 域号是否仍固定 | **(a) 保留 `0..13` 固定 spawn 表**（域号是 ABI：libvfs 写死 `FAT32_DOMAIN=6` 等，shell 直接 `SendTo(5)`） |
+| D3 | 拆分到什么程度 | **(a) 真拆分**：`user/src/main.rs` 按服务切成模块，每个 bin 经 `cfg` 只编自己那份代码 + 公共原语 —— 每个程序只背自己的代码，工作量集中在分文件 |
+| D4 | 回收时机 | **(a) 退出即回收**：域内最后一个任务终止 → 内核直接销毁该域（引导期服务域在白名单里永不销毁）。`run` 的程序退出即回收，shell 不必写 wait，也没有僵尸堆积 |
+
+**设计要点**
+
+*一、服务拆程序*
+
+- crate 布局：`user/srv`（一个 crate、`[[bin]]` × 14，`cfg` 分服务）+ `user/app` + `user/shell`；
+  服务间共享的"块请求 / 协议常量 / 名字工具"抽到 `user/srv/src/common.rs`，
+  跨程序的（syscall / libvfs / `_start`）仍在 libmorion。
+- 内核引导改成一张 **spawn 表**：`(域号, ELF, 能力列表, pager)`，按表 `create` → 加载。
+  因此 `exec` 要提供一个"**指定域号**加载"的入口 —— `domain::create()` 目前自己发号。
+- 删除 `load_user_program` / `USER_PROGRAM` / `morion_main` 的 14 路 `match`。
+- 构建：每个服务一个 ELF 产物 + 内核 `include_bytes!`；`$(KERNEL_ELF)` 的依赖从
+  `USER_BIN`（单份）改为各服务 ELF（内核体积会变大，见风险）。
+- 能力与资源仍**按域号**授予（现有 `cap::grant` 表基本原样保留）；`nvme::setup(block_domain)`
+  不变。
+
+*二、域销毁（内核）*
+
+- **域号必须复用**（这是隐藏硬约束）：`domain::create()` 现在是 `id = domains.len()`，而
+  `irq::ANY_MASK` 是 `[u64; 64]`、`cap`/`ipc`/`pager` 各表都是 `Vec` 按域 id 下标 ——
+  反复 `run` 会让域号单调涨到 64 以上并越界 panic。改成"找空闲槽"，所有按域索引的表
+  同步支持"槽位释放"。
+- `paging::free_user_space(domain)`：遍历 P4[1]（PDPT→PD→PT），逐页 `dec_ref` → 归零才
+  `free_frame`；释放 PDPT/PD/PT 帧；最后释放 PML4 帧。兼容 2 MiB 大页
+  （`resolve_user_page` 已认 `HUGE_PAGE`）。
+- 各子系统 `remove_domain(id)`：`cap`（能力行 + 句柄行）、`ipc`（丢弃未读消息）、
+  `pager`、`irq`（`ANY_MASK` 位 + `VECTORS`/`HANDLERS` 中属于它的项）、`domain` 槽位。
+- `scheduler::remove_domain(id)`：该域任务全部终止并移出任务表（`Task` drop → `_stack`
+  归还内核堆）、释放槽位；并 `wake_one` 掉所有 `wait_on == id` 的阻塞任务
+  （否则对端永久挂死）。
+- **帧记账必须一起改**：`SHARED_FRAMES` 只有 64 槽，且**镜像页/栈帧根本不登记**。
+  两条路：(i) 计数表改成**按帧号索引**并让 `exec` 映射时也登记；(ii) 保留"仅共享帧登记"，
+  销毁时"登记过 → `dec_ref`；没登记 → 视为独占，直接 `free_frame`"。选 (ii) 改动小，
+  但规则要写死在注释里。
+- 新 syscall：`SYS_DOMAIN_DESTROY(38)`（`rdi = 域 id`，门禁 = `Capability::Spawn` **且**
+  该域的分页器 == 调用者 —— "谁加载谁负责"），外加取证用的
+  `SYS_DOMAIN_COUNT` / `SYS_FRAME_FREE`（自测要断言"回到基线"）。
+  D4 选 (a) 时，`SYS_EXIT` 内部直接走销毁，`SYS_DOMAIN_DESTROY` 只作显式兜底。
+
+*三、`run` 的语义变化*
+
+- D4(a) 下：`run /hello.mex` → 子程序 `morion_main` 返回 → `SYS_EXIT` → 域与页回收 →
+  **域号可复用**。shell 不需要 wait，可连续 `run`。
+
+**执行顺序（4 步，每步都能独立回归）**
+
+1. ✅ **已完成（地基，内核）**：域表槽位化（`domain::create` 经 `slot_for` 复用空闲槽 + `destroy`；
+   `cap`/`ipc`/`pager`/`irq`/`scheduler` 各加 `remove_domain`）→ 帧记账规则（`frame_allocator::is_tracked`
+   + `release_user_frame`：登记过按计数递减、未登记视为独占直接归还）→ `paging::free_user_space`（遍历 P4[1]
+   逐页归还 + 回收页表帧）→ 新 syscall `SYS_DOMAIN_DESTROY(38)`/`SYS_DOMAIN_COUNT(39)`/`SYS_FRAME_FREE(40)`
+   （门禁 = `Capability::Spawn` 且 `pager::of(target) == 调用者`）→ 内核单测 11 项全过。
+   端到端取证 **FS-28**：`spawn` 会退出的程序 8 轮，实测 `domain 14 reused 8x, frames stable`；
+   全量回归 `SELFTEST DONE` ×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v`
+   "No problems found"。
+2. ✅ **已完成（退出即回收）**：`scheduler::exit_current` 在终止前判断「是否本域最后一个任务」，
+   是则 `domain::request_destroy(domain)` **登记**（不就地销毁 —— 仍跑在本域的栈/页表上）；
+   由时钟 `tick` 开头 `domain::reclaim_pending()` 在**别的任务**上下文真正销毁。引导期服务域
+   走白名单（`domain::is_boot` / `BOOT_DOMAINS = 14`）永不自动销毁。端到端 **FS-28** 改为
+   稳态口径：子程序退出后存活域数回基线、空闲帧数每轮回到同一稳态值（实测
+   `exit-reclaim OK (domain 14 reused 8x, frames stable at 505939 free)`）；交互连续两次
+   `run /hello.mex` 均 `new domain 14`（复用）。全量回归 `SELFTEST DONE` ×1、`FAILED`/`PANIC` 0、
+   `irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found"。
+3. ✅ **已完成（服务拆程序）**：新建 `user/srv`（crate `morion-srv`）—— 14 个服务各一个 `[[bin]]`、各一份**独立 ELF**，各模块用 `#[cfg(feature = "svc-<name>")]` 门控（一个 bin 只编自己的服务 + `common`），共享的线协议/块客户端/名字工具抽到 `src/common.rs`。原生单文件 `user/src/main.rs`（17814 行、按域 id 分流）与 `morion-user` crate 已删除。内核改为 `SERVICE_ELFS` 表 + `exec::spawn_elf_at(domain, image)`（不建域/不登记全局表，只映射+起任务），删掉 `load_user_program`/`USER_PROGRAM`；14 份 ELF 经 `include_bytes!` 嵌入，引导期逐个载入各自固定域。每个程序入口打印 `[up] <name> (domain N)`。Makefile：`make user` 构建 `morion-srv` 的 14 个 bin → `build/user/srv/*.elf`，内核依赖该 stamp；`check`/`clippy` 改查 `morion-srv`。
+4. **收口（文档已完成，仅剩提交）**：文档已同步 —— dev-reference 第 45 行（E2b 三步全记）、build/exec/域小节、app-dev-guide（"两种程序"表 + 新增服务步骤 + syscall 路径）、shell-reference、commands.md、README（架构树 + 路线勾选）；全量回归已过（见第 3 步与第 1/2 步证据）。**仅剩 git 提交未做（待授权）**。
+
+**验收（沿用现有口径）**
+
+| 项 | 判据 |
+|---|---|
+| 服务真是独立程序 | 启动日志里每个服务打印自己的名字（各自域、各自地址空间）；新增 `[OK] 14 service ELFs loaded (embedded)` |
+| 域/帧不泄漏 | 新增 **FS-28**：`spawn` 一个会退出的程序 N 次，打印 `alive domains` / `free frames`，断言回到基线且**域号被复用** |
+| `run` 可反复 | 交互连续 `run /hello.mex` ≥ 3 次：每次都 `run: loaded … -> new domain <复用号>` + 子程序 `exec:` 行，**0 panic** |
+| 不退化 | `SELFTEST DONE` 1 次、`FAILED`/`PANIC` 0 次、`irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found"、耗时与 318 s 同量级 |
+| 门禁 | `make fmt` / `check` / `clippy` 全 0（crate/bin 变化后同步 Makefile） |
+
+**风险 / 必须一起做的地基项**
+
+- **域号复用**（`ANY_MAX_DOMAINS = 64` + 各表按域 id 索引）—— 不做必越界 panic。
+- **销毁顺序**：先摘任务、再唤醒等待者、最后释放页表与帧，避免"销毁到一半被打断"。
+- **对端存活假设**：销毁某域后，仍持有它 fd/handle 的域必须"请求失败"而不是 panic
+  （本轮服务域不销毁，但规则要先立起来）。
+- **内核体积**：14 个 ELF 内嵌进内核（`include_bytes!`），镜像会明显变大；升级路径是
+  引导器/init 从盘加载（同 D1 的 (b)/(c)）。
+- **拆分工作量**集中在把 `user/src/main.rs`（19k 行）按服务分文件 —— 这是 D3 定 (a) 后本轮的主要成本。
+
 ### 阶段 4 — 远期
 
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。

@@ -3,7 +3,7 @@
 > 面向**用户态应用 / GUI 开发者**的接口规范与开发手册。
 > 本文档只讲「应用怎么用系统」，不涉及内核内部实现；内核内部速查见 [dev-reference.md](dev-reference.md)。
 >
-> 系统当前处于早期阶段，接口会持续演进。本文档与 [user/src/syscall.rs](../user/src/syscall.rs) 同步维护，
+> 系统当前处于早期阶段，接口会持续演进。本文档与 [user/libmorion/src/syscall.rs](../user/libmorion/src/syscall.rs) 同步维护，
 > 新增/修改系统调用时请同步更新本文档，避免后续开发 GUI 时到处翻 API。
 
 ---
@@ -22,7 +22,7 @@ Morion OS 是微内核 + 能力系统架构：
    └── IPC(需 SendTo) ──────┴──► 服务域(文件服务/驱动服务/...)
 ```
 
-应用编写者看到的是 libuser（当前为 [user/src/syscall.rs](../user/src/syscall.rs)）提供的一组封装函数，
+应用编写者看到的是 libmorion（[user/libmorion/src/syscall.rs](../user/libmorion/src/syscall.rs)）提供的一组封装函数，
 未来会由 libc/libvfs 进一步封装成 POSIX 风格接口。
 
 ---
@@ -63,8 +63,11 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 
 | | 载体 | 载入时机 | 现状 |
 |---|---|---|---|
-| **系统程序**（`user/`，14 个域共用） | 内核按页载入扁平二进制 `user.bin` | 引导期 | 过渡态（E2b 会拆成独立程序） |
-| **独立程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
+| **系统服务程序**（`user/srv/`，14 个服务各自一个 `[[bin]]`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：内核按 `SERVICE_ELFS` 表逐个载入**各自固定域** | E2b 起 |
+| **运行时程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
+
+两者都是**独立 ELF**，走同一条加载链（`elf::parse` + `exec`）—— 差别只在"什么时候、载入哪个域"：
+系统服务在引导期载入预先建好的固定域，运行时程序由某个域调用 `SYS_SPAWN_ELF` 新建域。
 
 独立程序的产物后缀约定见 [architecture.md 的命名约定](architecture.md#可执行文件与包的命名约定)
 （`.mex`）。加载**只看文件头**，不看后缀 —— 后缀是给人的提示。
@@ -72,22 +75,22 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 ### 构建与运行
 
 ```bash
-make user      # 系统程序 → build/user/user.bin (内核编译期嵌入)
+make user      # 系统服务 → build/user/srv/*.elf (14 份独立 ELF, 内核编译期嵌入)
 make hello     # 演示程序 → build/user/hello.elf (独立 ELF)
 make iso       # 完整镜像
-make build/nvme.img   # FAT32 卷(含 /HELLO.MEX, 供 run 命令用)
+make build/nvme.img   # FAT32 卷(含 /hello.mex, 供 run 命令用)
 ```
 
 在系统里运行独立程序（shell 命令，见 §7）：
 
 ```
-run /HELLO.MEX
+run /hello.mex
 ```
 
 或从代码里加载（需 `Capability::Spawn`，见 §6）：
 
 ```rust
-match morion::exec::spawn_file("/HELLO.MEX") {
+match morion::exec::spawn_file("/hello.mex") {
     Some(new_domain) => { /* 程序已在域 new_domain 里跑起来 */ }
     None => { /* 文件不存在或不是合法的 ELF64 ET_EXEC */ }
 }
@@ -112,15 +115,17 @@ match morion::exec::spawn_file("/HELLO.MEX") {
 | 12 | ext2_srv | ext2 只读兼容（挂载于 `/ext2`；解析超级块 / 块组描述符 / inode / 目录，不写盘） |
 | 13 | exfat_srv | exFAT（**读 + 写**，挂载于 `/usb`；引导区 / FAT 链 / entry set / 分配位图 / upcase 表，支持 `CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`） |
 
-> 新增一个应用/域：需在 `kernel/src/main.rs` 里 `domain::create()` → `cap::grant(..)` 授权 →
-> `load_user_program(..)` → `scheduler::spawn_user(..)`，并在 `user/src/main.rs` 的 `_start` 里加对应分支。
-> 目前是手工接线，后续会由「进程管理器」服务统一创建。
+> 新增一个服务/程序（E2b 起）：在 `user/srv/src/` 加一个服务模块（`pub fn run()`）+ `bin/<name>.rs`
+> 入口（打印 `[up] <name> (domain N)` 后调 `run()`）+ `Cargo.toml` 里的 `[[bin]]`/`svc-<name>` feature；
+> 内核侧在 `kernel/src/main.rs` 的 `SERVICE_ELFS` 表加一行 `(域号, include_bytes!(..))`，并按域号
+> `domain::create()` → `cap::grant(..)` 授权；Makefile 的 `SRV_NAMES` 加该名字。目前仍手工接线，
+> 后续会由「进程管理器」服务统一创建。
 
 ---
 
 ## 3. 系统调用接口
 
-ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态一律通过 [syscall.rs](../user/src/syscall.rs) 的封装调用。
+ABI：编号在 `rax`，参数在 `rdi/rsi/rdx`，返回值在 `rax`。用户态一律通过 [syscall.rs](../user/libmorion/src/syscall.rs) 的封装调用。
 
 ### 3.1 进程控制
 
@@ -307,6 +312,11 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 
 约定：共享页映射到**双方约定的同一虚拟地址**，发送方通知后接收方直接读。
 
+⚠️ 同一接收方若有**多个**发送方共享，各发送方的共享页**不能用同一个虚拟地址**：`SYS_SHARE_PAGE`
+是把发送方的页映射进接收方的**同一地址**，第二次会在接收方撞上已映射页（`map_user_page`
+`PageAlreadyMapped` panic）。各发送方按自己的域 id 错开地址 —— `RESULT_BUF` / `SHELL_RESULT_BUF`
+（以及 `exec::spawn_file` 的读文件中转页）就是这么做的。
+
 ---
 
 ## 6. 能力模型
@@ -394,7 +404,7 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 
 - 用户态一律 `#![no_std]`，无动态分配器（`alloc` 暂不可用），内存通过 `sys_alloc_page` 手动管理。
 - 跨域结构体（`Message`、`PageFaultInfo`）必须 `#[repr(C)]` 且字段顺序/类型与内核一致。
-- 系统调用封装统一放在 `user/src/syscall.rs`，新增 syscall 时**内核编号与用户封装必须同步**。
+- 系统调用封装统一放在 `user/libmorion/src/syscall.rs`，新增 syscall 时**内核编号与用户封装必须同步**。
 - 用户态 panic 只能 `sys_exit()`，不要尝试恢复。
 - 注释使用中文，与现有代码保持一致。
 
