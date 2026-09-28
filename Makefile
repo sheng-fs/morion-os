@@ -42,9 +42,10 @@ KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
 KERNEL_EMBED  := boot/loader/morion-kernel.elf
 BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
-# 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF),
-# kernel/src/main.rs 用 include_bytes! 逐个嵌入 (见 SERVICE_ELFS)。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv
+# 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
+# E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
+# 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -117,7 +118,8 @@ USER_SRC   := $(shell find user -type f 2>/dev/null)
 .PHONY: kernel
 kernel: $(KERNEL_ELF)
 
-$(KERNEL_ELF): $(KERNEL_SRC) $(SRV_STAMP)
+# 内核不再 include_bytes! 服务 ELF (E3b: 由引导器从 ESP 读入), 故不依赖 $(SRV_STAMP)。
+$(KERNEL_ELF): $(KERNEL_SRC)
 	@echo "==> 构建微内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -201,7 +203,7 @@ $(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED)
 # ISO 镜像构建
 # ============================================================
 .PHONY: iso
-iso: kernel boot $(ISO_IMAGE)
+iso: kernel boot $(SRV_STAMP) $(ISO_IMAGE)
 
 $(ISO_IMAGE):
 	@echo "==> 创建可启动 ISO 镜像..."
@@ -238,6 +240,15 @@ $(ISO_IMAGE):
 	mmd -i $(EFIBOOT_IMG) ::/EFI
 	mmd -i $(EFIBOOT_IMG) ::/EFI/BOOT
 	mcopy -i $(EFIBOOT_IMG) $(BOOT_EFI) ::/EFI/BOOT/BOOTX64.EFI
+
+	# 服务 ELF (E3b): 引导器在 exit_boot_services 之前从**自己所在的那个卷**读它们
+	# (EFI/morion/services/<name>.elf), 所以必须放进 ESP —— 只放进 ISO 目录树是不够的。
+	mmd -i $(EFIBOOT_IMG) ::/EFI/morion
+	mmd -i $(EFIBOOT_IMG) ::/EFI/morion/services
+	@for n in $(SRV_NAMES); do \
+		mcopy -o -i $(EFIBOOT_IMG) $(SRV_DIR)/$$n.elf ::/EFI/morion/services/$$n.elf; \
+	done
+
 	$(CP) $(EFIBOOT_IMG) $(ISO_DIR)/efiboot.img
 
 	# 生成 ISO (EFI El Torito 启动, 指向 ESP 镜像)
@@ -402,7 +413,10 @@ run-ide: iso $(DISK_IMG)
 # 供 VFAT 长名读取 / 按长名打开的自测与交互验证使用。
 # 还放入 hello.mex —— 可执行文件加载 (E1/E2) 的演示程序: `run /hello.mex` 从这张盘上
 # 加载它。它是**独立编译的 ELF**, 故镜像依赖 $(HELLO_ELF) (hello 变了就重建镜像)。
-$(NVME_IMG): $(HELLO_ELF) Makefile
+#
+# 以及 `/system/services/*.elf` (E3c): 监督者 init 的**重启源** —— 它从这张根盘读回服务
+# 镜像, 用 `SYS_SPAWN_ELF_AT` 把退出的服务原地拉起来。故镜像依赖 $(SRV_STAMP)。
+$(NVME_IMG): $(HELLO_ELF) $(SRV_STAMP) Makefile
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
@@ -415,6 +429,12 @@ $(NVME_IMG): $(HELLO_ELF) Makefile
 	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
 	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/hello.mex
+	# 服务镜像 (E3c): init 的重启源。与 ESP 上那份同源 —— 都在 build/user/srv/。
+	mmd -i $(NVME_IMG) ::/system
+	mmd -i $(NVME_IMG) ::/system/services
+	@for n in $(SRV_NAMES); do \
+		mcopy -o -i $(NVME_IMG) $(SRV_DIR)/$$n.elf ::/system/services/$$n.elf; \
+	done
 	@echo "  ✓ NVMe 镜像: $(NVME_IMG)"
 
 # 创建 IDE 磁盘镜像并格式化为 FAT32

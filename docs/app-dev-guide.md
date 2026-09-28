@@ -63,11 +63,15 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 
 | | 载体 | 载入时机 | 现状 |
 |---|---|---|---|
-| **系统服务程序**（`user/srv/`，14 个服务各自一个 `[[bin]]`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：内核按 `SERVICE_ELFS` 表逐个载入**各自固定域** | E2b 起 |
+| **系统服务程序**（`user/srv/`，15 个程序各自一个 `[[bin]]`；其中 `init` 是监督者） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
 | **运行时程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
 
 两者都是**独立 ELF**，走同一条加载链（`elf::parse` + `exec`）—— 差别只在"什么时候、载入哪个域"：
 系统服务在引导期载入预先建好的固定域，运行时程序由某个域调用 `SYS_SPAWN_ELF` 新建域。
+监督者 `init`（域 14）另有两条原地重启原语：`SYS_SPAWN_ELF_MODULE(43)`（内核按域号从引导模块
+内存镜像取，**不依赖磁盘**，故文件服务自己崩了也能救）与 `SYS_SPAWN_ELF_AT(41)`（从盘读回
+镜像，作为回退）—— 都在**指定域**里原地重启已退出的服务（域号不变），服务域号是 ABI，
+`libvfs` 里那些 `FAT32_DOMAIN = 6` 之类的常量因此永远有效。
 
 独立程序的产物后缀约定见 [architecture.md 的命名约定](architecture.md#可执行文件与包的命名约定)
 （`.mex`）。加载**只看文件头**，不看后缀 —— 后缀是给人的提示。
@@ -75,7 +79,7 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 ### 构建与运行
 
 ```bash
-make user      # 系统服务 → build/user/srv/*.elf (14 份独立 ELF, 内核编译期嵌入)
+make user      # 系统服务 → build/user/srv/*.elf (15 份独立 ELF; 引导器从 ESP 读入, 同一批还进 FAT32 根盘做 init 的重启源)
 make hello     # 演示程序 → build/user/hello.elf (独立 ELF)
 make iso       # 完整镜像
 make build/nvme.img   # FAT32 卷(含 /hello.mex, 供 run 命令用)

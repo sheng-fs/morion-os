@@ -1,6 +1,6 @@
 #!/bin/bash
 # 模拟镜像全量 FS 回归: 7 个 namespace (FAT32 / MFS / ext2 / 分区盘 / exFAT / 空白盘 / 分区表盘)
-# 上跑 app 的 FS-1..FS-27 自测, 由日志判定通过与否。
+# 上跑 app 的 FS-1..FS-29 自测, 由日志判定通过与否。
 #
 #   bash scripts/fs-regress.sh [日志路径]
 #
@@ -41,6 +41,19 @@ if [ -f "$OUT_DIR/nvme.img" ]; then
   else
     echo "== 警告: $OUT_DIR/user/hello.elf 不存在, FS-27 (可执行文件加载) 会失败"
   fi
+fi
+# 服务镜像 (E3c): 监督者 init 的**重启源**在同一张根盘上 (`/system/services/*.elf`)。
+# 与 hello.mex 同样的理由就地补齐 —— 否则拿一份旧的 nvme.img 跑回归时, FS-29 (退出→重启)
+# 会因为盘上没有服务镜像而失败, 而现象看着像"监督者坏了"。
+if [ -f "$OUT_DIR/nvme.img" ] && [ -d "$OUT_DIR/user/srv" ]; then
+  mmd -i "$OUT_DIR/nvme.img" ::/system 2>/dev/null
+  mmd -i "$OUT_DIR/nvme.img" ::/system/services 2>/dev/null
+  srv_n=0
+  for f in "$OUT_DIR"/user/srv/*.elf; do
+    mcopy -o -i "$OUT_DIR/nvme.img" "$f" "::/system/services/$(basename "$f")" 2>/dev/null \
+      && srv_n=$((srv_n + 1))
+  done
+  echo "== 已注入服务镜像: /system/services/*.elf ($srv_n)"
 fi
 if [ "${MFS_KEEP:-0}" = "1" ]; then
   echo "== 保留既有 MFS 卷: $OUT_DIR/mfs.img (MFS_KEEP=1)"
@@ -122,7 +135,7 @@ echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
 # FS-28 进一步验证子程序退出后内核**自动回收**该域 (域号复用、空闲帧回到稳态)。
-grep -nE 'FS27|FS28|exec: ' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'FS27|FS28|FS29|exec: |init: restarted' "$log" 2>/dev/null || echo "(无)"
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 

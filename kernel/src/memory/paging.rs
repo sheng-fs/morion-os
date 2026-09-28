@@ -61,10 +61,28 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// 初始化分页 (建立页表 + 加载 CR3 + 初始化内核堆)
 pub fn init() {
+    enable_nx();
     let pml4_phys = setup_page_tables();
     load_cr3(pml4_phys);
     #[cfg(target_os = "none")]
     init_heap(pml4_phys);
+}
+
+/// 开启 `EFER.NXE` —— 页表项 NX (不可执行) 位生效的前提, W^X 依赖它。
+///
+/// 先查 CPUID 是否支持 NX: 长模式下普遍支持, 但不支持时 W^X 无法强制 ——
+/// 明确告警而不是静默地把"以为不可执行"当成安全属性。
+fn enable_nx() {
+    use x86_64::registers::model_specific::{Efer, EferFlags};
+    // CPUID.8000_0001H:EDX bit 20 = NX (No-Execute) 支持。
+    let supported = core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 20) != 0;
+    if !supported {
+        crate::video::println("[WARN] CPU 不支持 NX, 用户页 W^X 无法强制");
+        return;
+    }
+    unsafe {
+        Efer::update(|e| e.insert(EferFlags::NO_EXECUTE_ENABLE));
+    }
 }
 
 /// 4 KiB 对齐的页表存储。放在内核镜像的 `.bss` 中, 由链接器保留 (帧分配器不会
@@ -193,6 +211,14 @@ pub fn heap_size() -> usize {
     HEAP_SIZE
 }
 
+/// 该物理区间是否被内核的**恒等映射**覆盖（前 `MANAGED_MEMORY` 字节）。
+///
+/// 引导器交来的服务 ELF 镜像（E3b）以物理地址给出，内核靠恒等映射按物理地址读它；
+/// 落在覆盖范围之外的区间内核够不着，只能判失败而不是拿着地址去读。
+pub fn is_identity_mapped(addr: u64, len: u64) -> bool {
+    matches!(addr.checked_add(len), Some(end) if end <= MANAGED_MEMORY)
+}
+
 /// 判断虚拟地址是否属于用户空间 (P4[1], 即 `USER_SPACE_BASE` 起的 512 GiB)。
 ///
 /// 用于系统调用信任边界: 拒绝用户态传入的内核地址 (恒等 P4[0] / offset P4[256] /
@@ -202,11 +228,34 @@ pub fn is_user_address(vaddr: u64) -> bool {
     ((vaddr >> 39) & 0x1FF) == 1
 }
 
-/// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限)。
+/// 用户页权限。**W^X**: 任何一页都不同时可写、可执行 —— 只有 [`UserPagePerm::ReadExecute`]
+/// 是可执行的, 它必然不可写; 另外两种一律置 NX (依赖 `EFER.NXE`, 见 `enable_nx`)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UserPagePerm {
+    /// 只读、不可执行 (ELF 的只读数据段)。
+    ReadOnly,
+    /// 可读写、不可执行 (数据段 / 用户栈 / 共享缓冲 / 匿名页 —— 默认权限)。
+    ReadWrite,
+    /// 只读、可执行 (ELF 的代码段)。
+    ReadExecute,
+}
+
+/// 页权限 → 页表项标志 (W^X 的唯一落点, 单测覆盖)。
+fn flags_for(perm: UserPagePerm) -> PageTableFlags {
+    let base = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    match perm {
+        // 可执行: 不置 NX; 同时绝不置 WRITABLE。
+        UserPagePerm::ReadExecute => base,
+        UserPagePerm::ReadWrite => base | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        UserPagePerm::ReadOnly => base | PageTableFlags::NO_EXECUTE,
+    }
+}
+
+/// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限, 按 `perm`)。
 ///
 /// 用户空间使用独立的 PML4 条目 (P4[1], 基址见 `USER_SPACE_BASE`), 不干扰内核的
 /// 恒等/offset 映射。中间页表 (PDPT/PD/PT) 缺失时自动分配并清零。
-pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
+pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64, perm: UserPagePerm) {
     let pml4 = crate::domain::pml4_of(domain_id);
     // 通过 offset 映射访问目标域的 PML4。
     let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
@@ -214,8 +263,7 @@ pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64) {
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
-    let flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let flags = flags_for(perm);
 
     let mut allocator = KernelFrameAllocator;
     unsafe {
@@ -248,7 +296,8 @@ pub fn map_mmio(domain_id: u64, vaddr: u64, paddr: u64) {
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_CACHE;
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
 
     let mut allocator = KernelFrameAllocator;
     unsafe {
@@ -376,7 +425,56 @@ pub fn free_user_space(pml4_phys: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_user_address, USER_SPACE_BASE};
+    use super::{flags_for, is_identity_mapped, is_user_address, UserPagePerm, USER_SPACE_BASE};
+    use x86_64::structures::paging::PageTableFlags;
+
+    /// 引导模块可达性判定 (E3b): 恒等映射只覆盖前 4 GiB, 且地址加法回绕要判否。
+    #[test]
+    fn identity_map_covers_first_4gib_only() {
+        assert!(is_identity_mapped(0x1000, 0x1000));
+        assert!(is_identity_mapped(0xFFFF_F000, 0x1000)); // 恰好到 4 GiB 边界
+        assert!(!is_identity_mapped(0x1_0000_0000, 0x1000)); // 起于 4 GiB 之上
+        assert!(!is_identity_mapped(u64::MAX - 8, 0x1000)); // 加法回绕
+    }
+
+    /// W^X 契约: 可执行的页一律不可写, 可写的页一律不可执行。
+    #[test]
+    fn wx_invariant_holds_for_every_perm() {
+        for perm in [
+            UserPagePerm::ReadOnly,
+            UserPagePerm::ReadWrite,
+            UserPagePerm::ReadExecute,
+        ] {
+            let f = flags_for(perm);
+            assert!(f.contains(PageTableFlags::PRESENT), "{perm:?} 必须 present");
+            assert!(
+                f.contains(PageTableFlags::USER_ACCESSIBLE),
+                "{perm:?} 必须 USER"
+            );
+            let writable = f.contains(PageTableFlags::WRITABLE);
+            let executable = !f.contains(PageTableFlags::NO_EXECUTE);
+            assert!(
+                !(writable && executable),
+                "{perm:?} 违反 W^X: 同时可写可执行"
+            );
+        }
+    }
+
+    /// 三种权限各自的期望位 (防止 W^X 之外的位也悄悄变了)。
+    #[test]
+    fn flags_match_expected_permission_bits() {
+        let ro = flags_for(UserPagePerm::ReadOnly);
+        assert!(!ro.contains(PageTableFlags::WRITABLE));
+        assert!(ro.contains(PageTableFlags::NO_EXECUTE));
+
+        let rw = flags_for(UserPagePerm::ReadWrite);
+        assert!(rw.contains(PageTableFlags::WRITABLE));
+        assert!(rw.contains(PageTableFlags::NO_EXECUTE));
+
+        let rx = flags_for(UserPagePerm::ReadExecute);
+        assert!(!rx.contains(PageTableFlags::WRITABLE));
+        assert!(!rx.contains(PageTableFlags::NO_EXECUTE));
+    }
 
     /// 编码安全契约: 仅 P4[1] (用户空间) 放行, 其余一律拒绝。
     #[test]

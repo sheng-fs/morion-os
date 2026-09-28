@@ -9,7 +9,7 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：14 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：15 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。其中 14 个是服务，第 15 个是监督者 `init` (E3c) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
@@ -44,7 +44,9 @@ UEFI 固件
 | `BOOT_MAGIC` | `0x4D4F5249` | "MORI" 魔数 |
 | 内核加载地址 | `0x100000` | linker.ld `ENTRY(_start)` |
 
-`BootInfo` 字段：`magic, version, fb_addr, fb_width, fb_height, fb_stride, fb_bpp, mmap_addr, mmap_entry_count, mmap_entry_size`。
+`BootInfo` 字段：`magic, version, fb_addr, fb_width, fb_height, fb_stride, fb_bpp, mmap_addr, mmap_entry_count, mmap_entry_size, svc_addr, svc_count, svc_entry_size`。
+
+**服务模块表（E3b）**：`svc_addr` 指向一张 `ServiceModule { domain, addr, len }` 数组（引导器放在 `LOADER_DATA` 页里），内核经 `BootInfo::service_modules()` 取用 —— `svc_entry_size` 是布局校验（两个独立编译的产物，字段不一致就判为不可用）。这是 14 个引导期服务的镜像来源（不再是内核 `include_bytes!`）。
 
 ### 分页 / 地址空间（[kernel/src/memory/paging.rs](../../kernel/src/memory/paging.rs)）
 
@@ -145,12 +147,16 @@ UEFI 固件
 | 38 | `SYS_DOMAIN_DESTROY` | `rdi=domain` | **销毁一个域并回收它的全部资源**（E2b 地基）：地址空间（逐页按引用计数归还 + 页表帧 + PML4）、能力与句柄、邮箱、分页器登记、中断注册、任务与内核栈；域 id 槽位归还以便复用。返回 1/0。门禁是**两条一起**：`Capability::Spawn` **且** `pager::of(domain) == 调用者`（"谁加载谁负责"）—— 因此**自我销毁不可达**（拆自己正在用的页表/内核栈会当场崩） |
 | 39 | `SYS_DOMAIN_COUNT` | — | 当前**存活域数**（`domain::alive_count`），自测取证用：销毁之后应回到基线 |
 | 40 | `SYS_FRAME_FREE` | — | 当前**空闲物理帧数**（`frame_allocator::free_frames`），自测取证用：反复加载/销毁后不应下降 |
+| 41 | `SYS_SPAWN_ELF_AT` | `rdi=域 id, rsi=ptr, rdx=len` | **在指定域里加载并启动**（E3c，监督者重启服务）：不建新域，目标域须已存在且**无存活任务**；内核先清空它的用户地址空间（`domain::reset`）、摘掉已终止任务（`scheduler::reap_terminated`），再映射新镜像 → **域号不变**。需 `Capability::Spawn` |
+| 42 | `SYS_DOMAIN_ALIVE` | `rdi=域 id` | 该域**是否还有存活任务**（1/0）—— 监督者巡检原语。问的是"任务在不在"而不是"域槽位在不在"（引导域的任务退出后槽位仍在）。无能力门禁 |
+| 43 | `SYS_SPAWN_ELF_MODULE` | `rdi=域 id` | **用引导模块内存镜像在指定域原地重启**（E3c 后续）：与 41 共用同一套「验镜像 → 目标域无存活任务 → `domain::reset` → `reap_terminated` → 起任务」流程，区别只在镜像来源 —— 内核按域号去 `bootinfo::get().service_modules()`（E3b 交来的 `LOADER_DATA` 镜像）里取，过 `is_identity_mapped` 后映射，**不依赖磁盘**。返回域 id / `u64::MAX`。需 `Capability::Spawn` |
 
 ### MSR 配置（`syscall::init()`）
 
 | MSR | 配置 | 说明 |
 | --- | --- | --- |
 | `EFER` | 置位 `SYSTEM_CALL_EXTENSIONS` | 启用 syscall/sysret |
+| `EFER.NXE` | 置位 `NO_EXECUTE_ENABLE` —— 在 **`paging::init`** 里，不在这里 | 让页表项 NX（不可执行）位生效，用户页 **W^X** 的前提；CPU 无 NX（`CPUID.8000_0001H:EDX[20]=0`）时打印告警并跳过 |
 | `STAR` | sysret CS=4 / SS=3 (RPL3)，syscall CS=1 / SS=2 (RPL0) | 段基址 |
 | `LSTAR` | `syscall_entry` | syscall 入口 |
 | `SFMASK` | `INTERRUPT_FLAG` | 进入时清 IF |
@@ -227,8 +233,9 @@ UEFI 固件
 
 ### 分页（[kernel/src/memory/paging.rs](../../kernel/src/memory/paging.rs)）
 
-- `init()`
-- `map_user_page(domain_id: u64, vaddr: u64, paddr: u64)`（USER 权限映射）
+- `init()`（先 `enable_nx()` 开 `EFER.NXE`，再建页表并载入 CR3）
+- `UserPagePerm { ReadOnly, ReadWrite, ReadExecute }`（**W^X 的唯一落点**：只有 `ReadExecute` 可执行，它必然不可写；另两种一律 `NO_EXECUTE`。`ReadWrite` 是数据/栈/共享缓冲/匿名页的默认权限）
+- `map_user_page(domain_id: u64, vaddr: u64, paddr: u64, perm: UserPagePerm)`（USER 权限映射，权限由调用方给出）
 - `resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（遍历页表把 vaddr 反查为物理地址）
 - `unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（解除映射并返回原物理地址）
 - `free_user_space(pml4_phys: u64)`（**域销毁时调用**：只遍历 P4[1]——其余 PML4 条目是所有域共享的内核映射，不能动——逐页 `release_user_frame` 归还物理帧，再回收 PT/PD/PDPT 页表帧，最后清掉 P4[1] 条目。兼容 2 MiB 大页。调用者必须是**别的域**，不能拆自己正在用的页表）
@@ -249,10 +256,14 @@ UEFI 固件
 
 - `elf::parse(bytes) -> Option<Image>`（**信任边界**：镜像字节完全由用户态提供，故每个字段先校验再用 —— magic / `ELFCLASS64` / `ELFDATA2LSB` / `ET_EXEC` / `EM_X86_64` / `e_phentsize == 56` / `e_phnum ≤ 32`；每段 `p_filesz ≤ p_memsz`、文件内容不越界、段整体落在 `[USER_SPACE_BASE, USER_SPACE_END)`；**入口必须落在某个已载入段内**。全程不分配资源、不 panic，非法即 `None`）
 - `exec::spawn_elf(image, loader) -> Option<u64>`（**运行时**：解析 → `domain::create()` + `cap/ipc/pager::add_domain(domain[, loader])` → 逐段映射 → 映射用户栈 → `try_spawn_user`；返回新域 id）
-- `exec::spawn_elf_at(domain, image) -> bool`（**引导期**：不建域、不登记全局表 —— 14 个服务域由内核按固定域号先建好并授权，这里只"解析 → 映射镜像与栈 → 起任务"。内核经 `SERVICE_ELFS` 表把 14 份编译期嵌入（`include_bytes!`）的服务 ELF 逐个载入各自固定域，见 [kernel/src/main.rs](../../kernel/src/main.rs)）
+- `exec::spawn_elf_at(domain, image) -> bool`（**引导期**：不建域、不登记全局表 —— 14 个服务域由内核按固定域号先建好并授权，这里只"解析 → 映射镜像与栈 → 起任务"。镜像由**引导器**从 ESP 的 `EFI/morion/services/<name>.elf` 读入 `LOADER_DATA` 页，经 `BootInfo` 的模块表交来（见 `bootinfo::ServiceModule`；E3b 起内核不再 `include_bytes!`），见 [kernel/src/main.rs](../../kernel/src/main.rs)。镜像以**物理地址**给出，内核靠恒等映射读它 —— 故载入前用 `paging::is_identity_mapped(addr, len)` 判可达性）
 - 失败清理（E2b 地基）：`spawn_elf` 映射或起任务任一步失败 → `domain::destroy(domain)` 把半成品域拆干净（地址空间 + 各全局表行）后返回 `None`，不再漏域漏页。
-- 映射要点：**一页只映射一次**（相邻段常共享边界页，重复 `map_user_page` 会 panic）——已映射的页复用其物理帧；新页先**清零**再拷入文件内容（分配器不保证零，`.bss` 与段尾填充都依赖这一点）；物理地址 < 4 GiB 在恒等映射内，故可直接当指针写。
-- 不做的事（见 roadmap「E1 未完成」）：**不登记共享帧引用计数**（镜像页/栈帧都是该域独占，销毁时按「未登记即独占」直接归还，见物理帧分配小节）、**W^X**（`map_user_page` 无权限参数，所有段都可写）、**动态链接 / 重定位**（只吃 `ET_EXEC`）。域与帧的回收已在 E2b 地基落地（`SYS_DOMAIN_DESTROY` / 退出即回收）。
+- `elf::parse` 解析 `p_flags`（`PF_X`/`PF_W`）并**拒绝 `PF_W|PF_X` 的段**（W^X 的镜像侧前提）。
+- 映射要点：**分两遍** —— 先按「**页权限并集**」逐页建映射，再拷内容。这样相邻段共享边界页时，页权限在第一次映射时就已经是并集，不需要事后改页表项（`Mapper` 没有改标志的入口）。一页只映射一次，重复 map 会 panic；新页先**清零**再拷入文件内容（分配器不保证零，`.bss` 与段尾填充都依赖这一点）；物理地址 < 4 GiB 在恒等映射内，故可直接当指针写。
+- **W^X（E3a）**：段权限 → 页权限（`PF_X` → `ReadExecute`，`PF_W` → `ReadWrite`，其余 `ReadOnly`）；并集同时含 W 与 X 的页**拒绝加载**（不静默降级成 RWX）。用户栈与所有 syscall 映射的页（`SYS_ALLOC_PAGE`/`SYS_SHARE_PAGE`/`SYS_MAP_ANON`、NVMe 配置页与 DMA 页）一律 `ReadWrite`（RW + NX），MMIO 映射为 RW + NOCACHE + NX。
+- **链接脚本要求**：`user/linker.ld` 在 `.data` 前 `ALIGN(4096)` —— 否则 `.text/.rodata`(RX) 与 `.data/.bss`(RW) 会落在**同一页**（小镜像很常见），页级 W^X 无法满足、加载直接失败。
+- **保护违例不转发分页器**：用户态缺页带 `P=1`（页已映射、但这次访问的类型不被允许：写只读页 / 执行 NX 页）时按需分页补不了 —— 转给分页器只会让它去映射一个**已映射**的页，撞内核 `PageAlreadyMapped` panic。故 `#PF` 处理器对 `PROTECTION_VIOLATION` 直接**终止该任务**（走 E2b 的退出即回收），内核继续跑。
+- 不做的事（见 roadmap「E1 未完成」）：**不登记共享帧引用计数**（镜像页/栈帧都是该域独占，销毁时按「未登记即独占」直接归还，见物理帧分配小节）、**动态链接 / 重定位**（只吃 `ET_EXEC`）。域与帧的回收已在 E2b 地基落地（`SYS_DOMAIN_DESTROY` / 退出即回收）。
 
 ### 调度器（[kernel/src/scheduler/mod.rs](../../kernel/src/scheduler/mod.rs)）
 
@@ -362,7 +373,17 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv`（共 14 个域）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init`（共 15 个域）。
+
+### 服务监督者 init（E3c）
+
+`user/srv/src/init.rs`（域 14）补上"服务实例退出后没人管"这一环：
+
+- **巡检**：每 40 ms 对一批长期驻留的服务域问一次 `SYS_DOMAIN_ALIVE`（不设内核回调 —— 内核只需要机制，不需要认识"服务"这个用户态概念）。
+- **重启（两个镜像来源）**：发现某个域没有存活任务，**先试引导模块内存镜像**（`SYS_SPAWN_ELF_MODULE(43)`，内核按域号从 E3b 的模块表取，**不依赖磁盘**）；不可用时再回退到 FAT32 根卷的 `/system/services/<name>.elf`（`SYS_SPAWN_ELF_AT(41)`）。两条路都**原地**拉起 —— 域号不变，故 libvfs 里写死的 `FAT32_DOMAIN=6` 那类 ABI 全部照旧；日志会打印来源（`, from memory)` / `, from disk)`）。
+- **监督范围**：`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv / mfs_srv / ext2_srv / exfat_srv`（9 个）。内存镜像这条路让**文件服务本身**（fat32/mfs）也可被重启，解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。刻意不含两类：**block_srv(5)**（内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些物理帧还给帧分配器、甚至把 BAR0 的 MMIO 地址当成 RAM 交出去 —— 纳入监督前要先让 reset 跳过内核保留映射）与**按设计会正常退出**的 sender / receiver / app / shell（监督它们等于无休止重启）。局限与后续见 roadmap「E3c 后续」。
+- **自测 FS-29**（[user/srv/src/app.rs](../../user/srv/src/app.rs)）：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言域 3 一度"没有存活任务" → 等 init 拉起来 → 断言**域号仍是 3**、能正常回显（`call` 得 `tag+1`）、存活域数不变。
+- **注意**：`SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 只允许"重启"（目标无存活任务），不允许"抢占"；重启用的是 `domain::reset`（清用户地址空间、保留域与它的分页器/能力注册），不是 `domain::destroy`（那会把域号一起交还）。
 - **libvfs 路由**：每个路径操作先经 `mount_lookup(path)` 向 `mount_srv` 查询，回复打包为 `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 挂载点前缀长度`（**M1b** 起含卷编码：0 = 该服务的默认卷，否则 = 卷号 + 1）；`route()` 去掉挂载前缀得到子路径，并把**卷编码写进请求 tag 的高 32 位**（tag 正文仍是 4 字节 ASCII，服务端用 `vfs::tag_body` 剥掉高位 —— 路径类请求因此天然带上目标卷，不必给每个请求结构体加字段）。
 - **对外 fd 编码**：`[63:48] 能力句柄 | [47:32] 服务域 | [31:0] 服务内 fd`。`open`/`creat` 成功后向内核申请句柄（`SYS_CAP_ISSUE`）并编进高位；`read`/`write`/`readdir` 先经 `cap_guard`（`SYS_CAP_LOOKUP` 校验句柄有效且对象标识与 fd 一致）再下发；`close` 撤销句柄（`SYS_CAP_DROP`）。句柄被撤销后该 fd 上的任何 I/O 都失败——这就是「能力即句柄」的执行点。
 - **mount_srv**：维护「挂载点前缀 → 服务域 + 卷编码」表，组件边界敏感的最长前缀匹配（`/tmpfoo` 不匹配 `/tmp`）。表是**运行时可变的**：`mount_main` 启动时写入引导默认项 `/ → fat32_srv(6)`、`/tmp → tmpfs_srv(10)`、`/mfs → mfs_srv(11)`、`/ext2 → ext2_srv(12)`、`/usb → exfat_srv(13)`（卷编码 0 = 各服务的默认卷），此后任何服务都可经 `MNTA`/`MNTD` 在运行时挂载/卸载。表容量 `MOUNT_MAX = 16`（**M1b 起**由 8 提到 16：引导默认项 5 个 + 每个文件服务上报的额外卷各占一个，插一块两分区的 U 盘就会把 8 个槽用满，届时连 `MNTA` 自动分配的 `/mnt<N>` 都拿不到槽位）。`MNTA` payload 为 `MountReq { domain u64, prefix [u8; 24] }`：前缀为空则 mount_srv 自动分配最小的空闲 `/mnt<N>`，回复挂载槽位号（1 起）；`MNTD` payload 为前缀，回复 1/`u64::MAX`，根 `/` 不可卸载。**M1b 额外卷**：新增 tag `MNTV`（`MountVolReq { domain u64, vol u64 }`）—— 文件服务把它**自己那类**的额外卷上报给 mount_srv，后者自动挂到 `/usb<卷号>`（卷号 = block_srv 卷表里的 id），并把 `enc_of_vol(vol) = vol + 1` 记进该项；重复上报是幂等的（同域同卷返回既有槽位号）。启动期会打印 `mount-dbg: /usb4 domain=12 slot=6` 这类诊断行。
@@ -393,7 +414,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 命令 | 说明 |
 | --- | --- |
 | `make kernel` | 仅构建微内核 |
-| `make user` | 仅构建用户态服务 → `build/user/srv/*.elf`（14 份） |
+| `make user` | 仅构建用户态服务 → `build/user/srv/*.elf`（15 份） |
 | `make hello` | 仅构建可执行文件加载演示程序 → `build/user/hello.elf` |
 | `make boot` | 仅构建引导器 |
 | `make iso` | 构建完整 ISO（`build/morion-os.iso`） |
@@ -411,8 +432,11 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - 自定义 target：`user/x86_64-morion-user.json`（`code-model=large` + `rustc-abi=softfloat` + `relocation-model=static`），解决用户基址 `0x8000_0000_0000` 超出 32 位重定位范围的问题。
 - 链接脚本：`user/linker.ld`，`ENTRY(_start)`，链接到 `0x8000000000`，`_start` 置于镜像最前端。
 - **E2b 起每个服务是独立程序**：`user/srv`（crate `morion-srv`）里一个服务一个 `[[bin]]`，各模块用 `#[cfg(feature = "svc-<name>")]` 门控 —— 一个 bin 只编自己的服务模块 + `common`。入口 `_start(domain_id)`（libmorion 提供）调各 bin 的 `morion_main`，后者打印 `[up] <name> (domain N)` 后进 `morion_srv::<mod>::run()`。
-- 构建链：`cargo build --target user/x86_64-morion-user.json --package morion-srv --release -Z json-target-spec` → `build/user/srv/<name>.elf`（14 份，各自一份 ELF）。
-- 内核经 `include_bytes!("../../build/user/srv/<name>.elf")` 在编译期逐份嵌入（`SERVICE_ELFS` 表），引导期由 `exec::spawn_elf_at` 载入到各自固定域。
+- 构建链：`cargo build --target user/x86_64-morion-user.json --package morion-srv --release -Z json-target-spec` → `build/user/srv/<name>.elf`（15 份，各自一份 ELF）。
+- 服务 ELF 的**载体**（E3b 起）：引导器从**自己所在的 ESP**（`efiboot.img`）的 `\EFI\morion\services\<name>.elf` 读入内存 —— 故 Makefile 在生成 ESP 时 `mcopy` 这 15 份进去；内核镜像里**不再有服务副本**（内核体积因此从 ~686 KiB 降到 ~337 KiB）。
+- **同一批 ELF 还要进 FAT32 根盘**（E3c）：`nvme.img` 的 `/system/services/*.elf` 是监督者 `init` 的**盘上重启源**（E3c 后续起，重启**优先**走引导模块内存镜像，失败才回退它）。两个载体同源（都取自 `build/user/srv/`），任何一处落后都会让"回退重启"拿到旧镜像。
+- 读取方式：优先 `BootServices::get_image_file_system`（"本映像所在的卷"）；El Torito 光盘引导下这条链若解析不出来，退化为枚举所有 `SimpleFileSystem` 卷、用"能否读出第一个服务 ELF"判定。读文件走**裸 `SimpleFileSystem` 协议**（不用 `uefi::fs::FileSystem`：其 `read` 是 `vec![0; file_size]`，异种卷返回离谱大小时会 `capacity overflow` panic），并设 8 MiB 上限。
+- ⚠️ **引导器的全局分配器必须先 `uefi::allocator::init(&mut st)`**：uefi 的 `Allocator` 靠内部静态 `SYSTEM_TABLE` 找 BootServices，`#[entry]` 不代为登记；不初始化就在第一次 `Vec`/`String` 分配时崩（症状是 `#UD`，且引导器默认 panic 处理器只 spin、看不到任何输出）。`exit_boot_services` 前调 `uefi::allocator::exit_boot_services()`。
 
 ## 8. 工程约定
 
@@ -471,3 +495,6 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 43 | **可执行文件加载（ELF + 运行时 spawn）**（**E1**）：此前所有域跑的是同一份编译期嵌入的扁平二进制（`load_user_program` 拷到 `USER_BASE`，用户态 `_start(domain_id)` 按域分流），既跑不了用户编的程序，也没有"每程序独立地址空间"。新增内核 **ELF64 加载器**（`elf.rs`：magic/`ELFCLASS64`/`ET_EXEC`/`EM_X86_64`/`phentsize=56`/`phnum≤32`、每段 `filesz≤memsz`+文件不越界+段落在 `[USER_SPACE_BASE, USER_SPACE_END)`、**入口必须落在已载入段内**；不分配资源、不 panic）与 `exec.rs`（建域 + 逐段映射 + 栈 + 起任务），新 syscall `SYS_SPAWN_ELF(37)`（`Capability::Spawn` 门禁，返回新域 id；镜像字节来自用户态故校验全在核内，并按页确认缓冲**已映射**）。配套地基修正：`MAX_TASKS` 16→32 + `HEAP_SIZE` 1→4 MiB（每任务 32 KiB 内核栈来自内核堆）、`spawn` 满表改 `try_spawn_user` 返回 false（运行时用户可触发路径不 panic）、**`Domain::new` 显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 → 无隔离且 `PageAlreadyMapped`）、`USER_STACK_TOP/PAGES` 提到 `paging` 作唯一来源。演示程序 `user/hello` 是**独立 crate/独立 ELF**，自测 FS-27 把它写进 `/tmp` 再从**文件**读回加载。实测：314 s、零失败，`FS27 exec loaded 5568 bytes -> domain 14` + 子程序 `exec: … 我的域 = 14, 入口 = 0x8000000000`（入口正是其链接地址）；内核新增 4 个 ELF 解析单测（`cargo test --lib -p morion-kernel` 全过） | ✅ |
 | 44 | **用户态运行库 libmorion + `run` 命令**（**E2a**）：抽出 **libmorion**（`user/libmorion`，crate 名 `morion`）—— `syscall`（syscall 封装 + 打印 + `domain_id()`）与 `vfs`（libvfs）从 `morion-user` 移入库，库另提供入口样板 `_start(domain_id)`（放 `.text._start`，`ENTRY(_start)`）+ `#[panic_handler]`，程序只实现 `morion_main(domain_id)`（crt0 把域 id 交给它，返回即退出）—— `morion-user` 与 `morion-hello` 都依赖它，`hello` 从"自带 syscall 桩"瘦成 20 行主逻辑。新增 `exec::spawn_file(path)`：`vfs::open` → 分块读进本域内存 → `SYS_SPAWN_ELF`；**经一页中转**而不是把每个暂存页都共享出去（否则几百 KB 的程序要占几十个共享帧槽位，内核只有 64 个），且对同一 (页, 域) 只 `share_page` 一次、`alloc_page` 前先用 `sys_virt_to_phys` 判已映射 —— 两处漏了都会在**第二次** `run` 时撞 `PageAlreadyMapped` panic。**跨进程那处也漏过**：中转页地址原先所有客户端共用一个固定 vaddr，而 `SYS_SHARE_PAGE` 是映射进目标服务域的**同一地址** —— app 自测的 FS-27 共享给 fat32_srv 之后，shell 再 `run` 同一张盘就在服务域同址撞 `PageAlreadyMapped`（表现为跑完 `SELFTEST DONE` 后 `run` 必崩）。现按**调用方域 id 错开**中转页地址（与 `RESULT_BUF`/`SHELL_RESULT_BUF` 同一做法）。shell 新增 **`run <file>`** 命令（并补 `Capability::Spawn`），把"可执行文件加载"从自测里的证据变成**用户可见的功能**；FS-27 自测改为从**磁盘文件** `/hello.mex` 走同一条 `spawn_file` 路径（不再内嵌镜像、不再经 tmpfs 运输）。构建：`make hello`；`$(NVME_IMG)` 依赖 `$(HELLO_ELF)` 并 `mcopy` 成 `::/hello.mex`（回归脚本也会就地注入，免去"先 make 一遍镜像"的隐含前提）。实测：交互 `run /hello.mex` → `run: loaded /hello.mex -> new domain 14` 且子程序打印 `exec: … 我的域 = 14, 入口 = 0x8000000000`；全量回归零失败 | ✅ |
 | 45 | **域销毁 / 退出即回收 + 服务拆成独立程序**（**E2b**，三步）：**① 域销毁（地基）** —— 域表改 `Vec<Option<Domain>>` + `slot_for` **复用空槽**（域 id 是各全局表下标，单调增长会越界 `irq::ANY_MASK`），`domain::destroy` 顺序 = 摘域表槽位 → `paging::free_user_space`（遍历 P4[1] 逐页归还 + 回收页表帧）→ 清 `cap/ipc/pager/irq` 按域行 → `scheduler::remove_domain`（摘任务 + 唤醒等它的域）；帧记账规则 = `frame_allocator::release_user_frame`（登记过引用计数的按计数递减、**未登记**的镜像页/栈帧/页表帧视为独占直接归还）；新 syscall `SYS_DOMAIN_DESTROY(38)`（门禁 `Spawn` 且 `pager::of(target)==调用者`）/`SYS_DOMAIN_COUNT(39)`/`SYS_FRAME_FREE(40)`。**② 退出即回收** —— `exit_current` 若为本域最后一个任务则 `domain::request_destroy` **只登记**（不能就地拆自己正在用的栈/页表），由时钟 `tick` 开头 `reclaim_pending` 在别的任务上下文销毁；引导期服务域走白名单（`is_boot`/`BOOT_DOMAINS=14`）永不自动销毁。**③ 服务拆成独立程序** —— 新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → **各一份独立 ELF**，各模块 `#[cfg(feature="svc-<name>")]` 门控（一个 bin 只编自己的服务 + `common`），删掉 17814 行单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at(domain, image)`（不建域/不登记全局表）逐个载入**各自固定域**，删 `load_user_program`/`USER_PROGRAM`；每个程序入口打印 `[up] <name> (domain N)`。验证：内核单测 12 项全过；FS-28 `exit-reclaim OK (domain 14 reused 8x, frames stable)`；启动 `[OK] 14 service ELFs loaded (embedded)` + 14 行 `[up]`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |
+| 46 | **服务生命周期收口 ①：用户页 W^X**（**E3a**）：E1 起就记着的一笔 —— `map_user_page` 原先没有权限参数，所有用户页都可写、可执行。本轮：`elf::parse` 解析 `p_flags` 并**拒绝 `PF_W\|PF_X` 的段**（镜像侧）；`paging` 引入 `UserPagePerm { ReadOnly, ReadWrite, ReadExecute }`，`map_user_page` 带权限参数（`ReadOnly`/`ReadWrite` 置 `NO_EXECUTE`，仅 `ReadExecute` 可执行且绝不置 `WRITABLE`），`paging::init` 开 **`EFER.NXE`**（CPUID 无 NX 时告警并跳过）；`exec::map_image` 改**两遍**（先按「页权限并集」建映射、再拷内容，避免事后改页表项），并集为 W+X 的页**拒绝加载**（不静默降级成 RWX）；`user/linker.ld` 在 `.data` 前 `ALIGN(4096)` —— 否则 `.text/.rodata`(RX) 与 `.data/.bss`(RW) 会落在**同一页**（实测改前 `sender.elf` 三段全挤在 `0x…000..0x7d8`，页级 W^X 不可能满足）。顺带补上 W^X 引入的新失败模式：用户态 `P=1` 保护违例（写只读页 / 执行 NX 页）**终止该任务**，而不是转给分页器（那样会让它去映射一个**已映射**的页 → 内核 `PageAlreadyMapped` panic）。验证：内核单测 15 项（新增 W^X 位不变式、三种权限的期望位、W+X 段被拒）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` 无问题 | ✅ |
+| 47 | **服务生命周期收口 ②：服务移出内核镜像（引导模块）**（**E3b**）：14 份服务 ELF 原先由 `include_bytes!` 嵌进内核（`SERVICE_ELFS`），内核体积随服务数线性膨胀。改为：**引导器**在 `exit_boot_services` 之前用 UEFI 文件系统从**自己所在的 ESP**（`\EFI\morion\services\<name>.elf`）读入镜像，各拷进 `LOADER_DATA` 页（内核帧分配器只放行 `CONVENTIONAL`，故这些帧天然被保留），再把 `ServiceModule { domain, addr, len }` 表经**扩展的 `BootInfo`**（`version 2 → 3`，新增 `svc_addr/svc_count/svc_entry_size`）交给内核；内核删掉 `SERVICE_ELFS`，改遍历 `BootInfo::service_modules()` 并逐个 `exec::spawn_elf_at`（以物理地址给出的镜像先过 `paging::is_identity_mapped`）。构建：内核不再依赖服务 ELF，改由 `iso` 依赖 `$(SRV_STAMP)` 并把 14 份 `mcopy` 进 ESP。**内核 ELF 702200 → 345376 字节（−51%）**。踩到并修掉两个"引导器第一次读文件/分配内存"才会暴露的坑：① 引导器的全局分配器**必须显式 `uefi::allocator::init(&mut st)`**（`#[entry]` 不代为登记；不初始化就在第一次 `Vec`/`String` 分配时 `#UD`）；② `uefi::fs::FileSystem::read` 的 `vec![0; file_size]` 会在异种卷（ISO9660）上 `capacity overflow` panic → 改走**裸 `SimpleFileSystem` 协议**读取 + 8 MiB 上限。顺带把引导期进度与失败原因镜像到 **COM1**（原先只画帧缓冲，headless 下失败表现为"日志停在 BdsDxe"，无从定位）。验证：`[boot] service modules loaded: 14` + `[OK] 14 service ELFs loaded (boot modules)` + `[up]` × 14；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |
+| 48 | **服务生命周期收口 ③：监督者 + 原地重启**（**E3c**）：补上"服务实例退出后没人管"这一环。新增第 15 个引导模块/域 `init`（`user/srv/src/init.rs`，`svc-init` 门控；`BOOT_DOMAINS` 14 → 15，`ipc/cap/pager::init` 均改 15）+ 两个 syscall：`SYS_DOMAIN_ALIVE(42)`（该域**是否还有存活任务** —— 引导域槽位永不自动销毁，所以只能问任务）与 `SYS_SPAWN_ELF_AT(41)`（在**指定域**里加载并启动：先 `elf::parse` 验镜像，目标域须存在且**无存活任务**，再 `domain::reset` 清用户地址空间 + `scheduler::reap_terminated` 摘掉已终止任务与它们的 32 KiB 内核栈 —— 不摘则每轮重启漏一份、迟早占满 `MAX_TASKS` —— 最后映射新镜像，**域号不变**）。init 每 40 ms 巡检 `echo/kbd/mount_srv/tmpfs_srv/ext2_srv/exfat_srv`，实例没了就从 FAT32 根盘 `/system/services/<name>.elf` 读回镜像原地拉起（`morion::exec::spawn_file_at`，与 `spawn_file` 共用读盘链路）；监督范围刻意排除引导链（重启它们要先能读盘，而读盘靠 fat32，它自己死了没法自救）与按设计会正常退出的 sender/receiver/app/shell —— 局限见 roadmap「E3c 后续」。构建：`nvme.img` 规则新增 `/system/services/*.elf`（同一批 ELF 的第二载体），`fs-regress.sh` 也做同样注入。自测 **FS-29**：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT`（echo 加了一条控制消息处理）→ 断言域 3 一度"没有存活任务" → 等 init 拉起 → 断言**域号仍是 3**、新实例能正常回显（`call` 得 `tag+1`）、存活域数不变。验证：`init: restarted echo (domain 3, total 1)` + `app: FS29 supervisor restart OK (echo exited, revived at domain 3)`，启动 `[OK] 15 service ELFs loaded (boot modules)` + `[up]` × 15；全量回归两次均 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds=28672` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |

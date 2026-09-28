@@ -3292,7 +3292,70 @@ pub fn run() {
         return;
     }
 
+    // FS-29 (E3c): 监督者原地重启 —— 让 echo (域 3) 退出, init 应在巡检周期内把它拉起来。
+    if fs29_supervisor_restart().is_none() {
+        return;
+    }
+
     println("app: SELFTEST DONE");
+}
+
+/// FS-29 取证: 服务实例退出后, 监督者 `init` 把它**原地**重启。
+///
+/// 三条一起才算过:
+///   ① 退出是真的 —— 域 3 一度"没有存活任务" (引导域槽位还在, 所以只能问任务);
+///   ② 重启后**域号仍是 3** —— 域号是 ABI (libvfs 里写死, shell 直接 `SendTo`),
+///      所以监督者只能"原地重启", 不能换个新域号;
+///   ③ 新实例**能正常服务** (`call` 得到 `tag + 1` 的回显), 且存活域数没有漂移。
+///
+/// 触发方式是给 echo 发一条控制消息让它自己 `SYS_EXIT` —— 走的是正常的退出即回收路径,
+/// 不是内核杀进程。
+fn fs29_supervisor_restart() -> Option<()> {
+    const ECHO: u64 = 3;
+    const INIT_TIMEOUT_MS: u64 = 4000;
+
+    if sys_domain_alive(ECHO) == 0 {
+        println("app: FS29 echo not alive before test FAILED");
+        return None;
+    }
+    let base = sys_domain_count();
+
+    // 单向控制消息: 不等回复 (echo 收到后直接退出, 不会有人 reply)。
+    if sys_send(ECHO, ECHO_QUIT_TAG) != 1 {
+        println("app: FS29 send quit to echo FAILED");
+        return None;
+    }
+    if !wait_domain_alive(ECHO, false, 2000) {
+        println("app: FS29 echo did not exit FAILED");
+        return None;
+    }
+    if !wait_domain_alive(ECHO, true, INIT_TIMEOUT_MS) {
+        println("app: FS29 init did not restart echo FAILED");
+        return None;
+    }
+    if sys_call(ECHO, 0x5155) != 0x5156 {
+        println("app: FS29 restarted echo does not serve FAILED");
+        return None;
+    }
+    if sys_domain_count() != base {
+        println("app: FS29 domain count drift FAILED");
+        return None;
+    }
+    println("app: FS29 supervisor restart OK (echo exited, revived at domain 3)");
+    Some(())
+}
+
+/// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。
+fn wait_domain_alive(domain: u64, want: bool, budget_ms: u64) -> bool {
+    let mut waited = 0u64;
+    while waited < budget_ms {
+        if (sys_domain_alive(domain) != 0) == want {
+            return true;
+        }
+        sys_sleep(20);
+        waited += 20;
+    }
+    (sys_domain_alive(domain) != 0) == want
 }
 
 /// FS-28: 退出即回收。

@@ -70,8 +70,18 @@ pub const SYS_SPAWN_ELF: u64 = 37;
 pub const SYS_DOMAIN_DESTROY: u64 = 38;
 /// 存活域数 (自测取证: 销毁之后应回到基线)。
 pub const SYS_DOMAIN_COUNT: u64 = 39;
-/// 当前空闲物理帧数 (自测取证: 反复加载/销毁后不应下降)。
+/// 当前空闲物理帧数。
 pub const SYS_FRAME_FREE: u64 = 40;
+/// 在**指定域**里加载可执行文件并启动 (E3c): `(域 id, 镜像首地址, 长度)` → 域 id / `u64::MAX`。
+pub const SYS_SPAWN_ELF_AT: u64 = 41;
+/// 该域是否还有存活任务: `(域 id)` → 1 / 0。
+pub const SYS_DOMAIN_ALIVE: u64 = 42;
+/// 用**引导模块内存镜像**在指定域原地重启 (E3c 后续): `(域 id)` → 域 id / `u64::MAX`。
+///
+/// 镜像不走用户态: 内核按域号去引导模块表里取自己那一份 (见内核 `bootinfo::ServiceModule`),
+/// 故调用方只需给出目标域号。用于重启**文件服务本身** —— 它不依赖磁盘, 解掉"读盘要靠
+/// 文件服务"的鸡生蛋问题。需持有 `Capability::Spawn`。
+pub const SYS_SPAWN_ELF_MODULE: u64 = 43;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -198,6 +208,35 @@ pub fn sys_domain_destroy(domain: u64) -> u64 {
 /// 当前存活域数。
 pub fn sys_domain_count() -> u64 {
     unsafe { syscall(SYS_DOMAIN_COUNT, 0, 0, 0) }
+}
+
+/// 在**指定域**里加载可执行文件并启动, 成功返回该域 id (失败 `u64::MAX`)。
+///
+/// 目标域必须已存在且**没有存活任务** (旧实例已退出), 内核会先清空它的用户地址空间再
+/// 映射新镜像 —— 于是域号不变。监督者用它把退出/崩溃的服务原地拉起来 (E3c)。
+/// 需持有 `Capability::Spawn`。
+pub fn sys_spawn_elf_at(domain: u64, image: &[u8]) -> u64 {
+    unsafe {
+        syscall(
+            SYS_SPAWN_ELF_AT,
+            domain,
+            image.as_ptr() as u64,
+            image.len() as u64,
+        )
+    }
+}
+
+/// 该域是否**还有存活任务**: 1 / 0 (域不存在也算 0)。
+pub fn sys_domain_alive(domain: u64) -> u64 {
+    unsafe { syscall(SYS_DOMAIN_ALIVE, domain, 0, 0) }
+}
+
+/// 用**引导模块内存镜像**在指定域原地重启, 成功返回该域 id (失败 `u64::MAX`)。
+///
+/// 镜像由内核按域号从引导模块表取, 不依赖磁盘 —— 文件服务 (fat32_srv / mfs_srv) 自己
+/// 崩了也能被拉起来。目标域须已存在且没有存活任务 (与 `sys_spawn_elf_at` 同一前提)。
+pub fn sys_spawn_elf_module(domain: u64) -> u64 {
+    unsafe { syscall(SYS_SPAWN_ELF_MODULE, domain, 0, 0) }
 }
 
 /// 当前空闲物理帧数。

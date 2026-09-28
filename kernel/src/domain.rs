@@ -31,12 +31,16 @@ pub struct Domain {
 static DOMAINS: Mutex<Vec<Option<Domain>>> = Mutex::new(Vec::new());
 
 /// 引导期域数: 域 id `0..BOOT_DOMAINS` 是引导期建的长期服务域
-/// (sender/receiver/pager/echo/kbd/block/fat32/app/shell/mount/tmpfs/mfs/ext2/exfat)。
+/// (sender/receiver/pager/echo/kbd/block/fat32/app/shell/mount/tmpfs/mfs/ext2/exfat/init)。
 ///
 /// 它们的槽位**始终被占用**, 所以 `slot_for` 永远不会把运行时新域分配到这些 id 上 ——
 /// 「id < `BOOT_DOMAINS` 即引导域」是一条稳定不变量。这些域**永不自动销毁** (退出即回收
 /// 的白名单); 运行时经 `SYS_SPAWN_ELF` 建的域则在最后一个任务退出后自动回收。
-pub const BOOT_DOMAINS: u64 = 14;
+///
+/// 注意「永不自动销毁」不等于「实例永不退出」: 白名单域里的任务退出后域还留着 (槽位
+/// 仍占用), 由监督者 [`crate::syscall`] 的 `SYS_SPAWN_ELF_AT` 用 [`reset`] 原地重启
+/// (E3c) —— 见 `user/srv/src/init.rs`。
+pub const BOOT_DOMAINS: u64 = 15;
 
 /// 该域是否是引导期服务域 (白名单: 退出时不自动销毁)。
 pub fn is_boot(id: u64) -> bool {
@@ -124,6 +128,26 @@ pub fn destroy(id: u64) -> bool {
     crate::irq::remove_domain(id);
     // 4. 任务 (含唤醒等待者)。
     crate::scheduler::remove_domain(id);
+    true
+}
+
+/// 清空一个域的**用户地址空间**, 但保留域本身 (id / PML4 帧 / 分页器注册 / 能力表)。
+///
+/// 用于「同域重启」(`SYS_SPAWN_ELF_AT`, E3c): 上一个实例已退出, 但域还在 (引导期服务域
+/// 永不自动销毁), 它的用户页表与镜像页仍挂着 —— 不清掉就无法把新实例映射进同一棵树
+/// (`map_user_page` 会撞 `PageAlreadyMapped`)。清完之后 PML4 依旧是本域的根, 内核条目
+/// (恒等 / offset / 内核堆) 原样保留, 故接着映射新镜像即可。
+///
+/// 返回 `false` = 该域不存在。
+pub fn reset(id: u64) -> bool {
+    let pml4 = {
+        let domains = DOMAINS.lock();
+        match domains.get(id as usize).and_then(|slot| slot.as_ref()) {
+            Some(domain) => domain.pml4,
+            None => return false,
+        }
+    };
+    crate::memory::paging::free_user_space(pml4);
     true
 }
 

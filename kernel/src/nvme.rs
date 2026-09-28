@@ -177,12 +177,23 @@ pub fn setup(nvme_domain: u64, bus: u8, dev: u8, func: u8, bar0: u64) -> bool {
     }
 
     // 5. 映射配置页、BAR0 (MMIO, 4 页覆盖寄存器 + 门铃 + MSI-X 表/PBA) 与 DMA 各页。
-    paging::map_user_page(nvme_domain, NVME_CFG_VADDR, cfg_paddr);
+    //    配置页与 DMA 是数据: RW + NX。
+    paging::map_user_page(
+        nvme_domain,
+        NVME_CFG_VADDR,
+        cfg_paddr,
+        paging::UserPagePerm::ReadWrite,
+    );
     for i in 0..NVME_MMIO_PAGES {
         paging::map_mmio(nvme_domain, NVME_MMIO_VADDR + i * PAGE, bar0 + i * PAGE);
     }
     for i in 0..NVME_DMA_PAGES {
-        paging::map_user_page(nvme_domain, NVME_DMA_VADDR + i * PAGE, dma_paddr + i * PAGE);
+        paging::map_user_page(
+            nvme_domain,
+            NVME_DMA_VADDR + i * PAGE,
+            dma_paddr + i * PAGE,
+            paging::UserPagePerm::ReadWrite,
+        );
     }
 
     // 6. 授予 MMIO 能力 (允许 nvme_srv 后续自行管理映射)。
@@ -203,7 +214,12 @@ pub fn setup_empty(nvme_domain: u64) {
     unsafe {
         core::ptr::write_bytes(cfg_paddr as *mut u8, 0, PAGE as usize);
     }
-    paging::map_user_page(nvme_domain, NVME_CFG_VADDR, cfg_paddr);
+    paging::map_user_page(
+        nvme_domain,
+        NVME_CFG_VADDR,
+        cfg_paddr,
+        paging::UserPagePerm::ReadWrite,
+    );
 }
 
 /// MSI-X 的配置结果 (向量 0 = 未启用)。

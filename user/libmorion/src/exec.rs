@@ -14,7 +14,9 @@
 //!
 //! 本域需持有 `Capability::Spawn`（造进程）与对目标文件服务的 `MapInto`（共享中转页）。
 
-use crate::syscall::{sys_alloc_page, sys_share_page, sys_spawn_elf, sys_virt_to_phys};
+use crate::syscall::{
+    sys_alloc_page, sys_share_page, sys_spawn_elf, sys_spawn_elf_at, sys_virt_to_phys,
+};
 use crate::vfs;
 
 /// 镜像暂存区虚拟地址。所有程序共用同一套链接布局（见 `user/linker.ld`），故可用同一地址：
@@ -53,6 +55,30 @@ static mut BOUNCE_SHARED: u64 = 0;
 /// 从文件系统加载并启动一个可执行文件，返回新域 id；`None` = 失败（路径打不开、
 /// 镜像非法/超限、或内核拒绝）。
 pub fn spawn_file(path: &str) -> Option<u64> {
+    let len = read_image(path)?;
+    match sys_spawn_elf(staged_image(len)) {
+        u64::MAX => None,
+        domain => Some(domain),
+    }
+}
+
+/// 同 [`spawn_file`]，但在**指定域**里启动（E3c：监督者把已退出的服务原地拉起来，
+/// 域号因此不变）。目标域必须已存在且没有存活任务，否则内核拒绝。
+pub fn spawn_file_at(path: &str, domain: u64) -> Option<u64> {
+    let len = read_image(path)?;
+    match sys_spawn_elf_at(domain, staged_image(len)) {
+        u64::MAX => None,
+        d => Some(d),
+    }
+}
+
+/// 暂存区里前 `len` 字节的镜像切片。
+fn staged_image(len: u64) -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(ELF_STAGE as *const u8, len as usize) }
+}
+
+/// 把 `path` 的镜像读进本域暂存区 (`ELF_STAGE`)，返回字节数；`None` = 失败。
+fn read_image(path: &str) -> Option<u64> {
     let fd = vfs::open(path);
     if fd == u64::MAX {
         return None;
@@ -102,11 +128,7 @@ pub fn spawn_file(path: &str) -> Option<u64> {
     if len == 0 {
         return None;
     }
-    let image = unsafe { core::slice::from_raw_parts(ELF_STAGE as *const u8, len as usize) };
-    match sys_spawn_elf(image) {
-        u64::MAX => None,
-        domain => Some(domain),
-    }
+    Some(len)
 }
 
 /// 确保 `va` 已映射：已映射（同一进程里上一次 `spawn_file` 留下的）就直接复用 ——

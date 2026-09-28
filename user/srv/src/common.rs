@@ -38,6 +38,12 @@ pub const CAP_TOKEN: u64 = 0x5A5A_1234_5678_9ABC;
 /// `sender` 通知 `receiver`「新句柄已就绪」的 tag 基数: 低 8 位放句柄索引。
 pub const CAP_HANDLE_TAG: u64 = 0xCA00;
 
+/// echo 的控制消息 (E3c): 收到就退出。
+///
+/// 让"服务实例崩溃/退出"这件事可以被**从外部触发** —— 监督者 `init` 的巡检与自测 FS-29
+/// 都靠它模拟一次服务死亡 (走的是普通的 `SYS_EXIT` 退出即回收路径, 不是杀进程)。
+pub const ECHO_QUIT_TAG: u64 = 0x4543_4851; // "ECHQ"
+
 /// IPC 消息 (与内核 `ipc::Message` 布局一致: 24 字节头 + `PAYLOAD_LEN`)。
 #[repr(C)]
 #[allow(dead_code)]

@@ -124,6 +124,20 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::halt();
     }
 
+    // 用户态**保护违例** (P=1: 页已映射, 但这次访问的类型不被允许) —— 写只读页、
+    // 执行 NX 页、访问只属内核的页都属此类。按需分页只能补"未映射的页", 补不了权限;
+    // 转给分页器只会让它去映射一个**已映射**的页, 在内核里撞 `PageAlreadyMapped` panic。
+    // 这是程序自身的错 → 终止该任务 (走 E2b 的退出即回收), 内核继续跑。
+    // 此前用户页一律可写、可执行, 这类缺页不可能出现; W^X (E3a) 起才存在。
+    if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+        crate::video::print("user protection fault: cr2=0x");
+        crate::video::print_hex(fault_addr);
+        crate::video::print(" err=0x");
+        crate::video::print_hex(error_code.bits());
+        crate::video::println(" -> task terminated");
+        crate::scheduler::exit_current();
+    }
+
     // 按需分页: 捕获缺页地址并转发给该域的分页器, 然后阻塞当前任务。
     // 分页器映射页面并 reply 后, 本任务被重新调度, iretq 恢复现场并
     // 重新执行那条缺页指令。

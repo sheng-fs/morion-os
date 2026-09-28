@@ -9,7 +9,7 @@
 
 use crate::elf;
 use crate::memory::frame_allocator::{self, FRAME_SIZE};
-use crate::memory::paging::{self, map_user_page, USER_STACK_PAGES, USER_STACK_TOP};
+use crate::memory::paging::{self, map_user_page, UserPagePerm, USER_STACK_PAGES, USER_STACK_TOP};
 
 /// 一次加载允许占用的最大物理页数（防止一个坏镜像把内存吃光）。
 pub const MAX_IMAGE_PAGES: u64 = 4096; // 16 MiB
@@ -80,42 +80,83 @@ pub fn spawn_elf_at(domain: u64, image: &[u8]) -> bool {
 
 /// 把 `elf` 的各段与用户栈映射进 `domain`; 失败返回 `None` (调用方负责销毁域)。
 ///
-/// 逐段映射: 一页只映射一次 —— 相邻段（如 .data 紧接 .text）常共享边界页,
-/// 重复 map 会撞 `PageAlreadyMapped`。已映射的页直接复用其物理帧。
+/// 分两遍: 先按「页权限并集」建映射, 再拷内容。之所以要先建完再拷, 是因为相邻段常共享
+/// 边界页 —— 若边拷边建, 后一段可能要求与已建映射不同的权限; 先按并集建好, 就不需要
+/// 事后改权限 (页表项改标志在 `x86_64` 的 `Mapper` 上没有对应入口)。
+///
+/// 页权限取该页上**所有段的并集**; 并集同时含 W 与 X 时**拒绝加载** (W^X) ——
+/// `elf::parse` 已拒绝单个 W+X 段, 这里再挡住"RX 段与 RW 段共享一页"的情形。
 fn map_image(image: &[u8], elf: &elf::Image, domain: u64) -> Option<()> {
+    // 第一遍: 逐段逐页建映射 (一页只映射一次, 已映射的复用其物理帧)。
     for &seg in elf.segments() {
         let first = seg.vaddr & !(FRAME_SIZE as u64 - 1);
         let end = seg.vaddr + seg.memsz;
         let mut page_vaddr = first;
         while page_vaddr < end {
-            let paddr = match paging::resolve_user_page(domain, page_vaddr) {
-                Some(p) => p,
-                None => {
-                    let p = frame_allocator::allocate_frame()?;
-                    // 清零: `.bss` 与段末尾的填充都依赖"新页为 0", 而分配器不保证内容。
-                    // 物理地址 < 4 GiB 在恒等映射内, 可直接按虚拟地址写。
-                    unsafe {
-                        core::ptr::write_bytes(p as *mut u8, 0, FRAME_SIZE);
-                    }
-                    map_user_page(domain, page_vaddr, p);
-                    p
+            if paging::resolve_user_page(domain, page_vaddr).is_none() {
+                let perm = page_perm(elf, page_vaddr)?;
+                let p = frame_allocator::allocate_frame()?;
+                // 清零: `.bss` 与段末尾的填充都依赖"新页为 0", 而分配器不保证内容。
+                // 物理地址 < 4 GiB 在恒等映射内, 可直接按虚拟地址写。
+                unsafe {
+                    core::ptr::write_bytes(p as *mut u8, 0, FRAME_SIZE);
                 }
-            };
+                map_user_page(domain, page_vaddr, p, perm);
+            }
+            page_vaddr += FRAME_SIZE as u64;
+        }
+    }
+
+    // 第二遍: 把段内容写进已映射的物理帧 (内核经恒等映射写, 不受用户页权限限制)。
+    for &seg in elf.segments() {
+        let first = seg.vaddr & !(FRAME_SIZE as u64 - 1);
+        let end = seg.vaddr + seg.memsz;
+        let mut page_vaddr = first;
+        while page_vaddr < end {
+            let paddr = paging::resolve_user_page(domain, page_vaddr)?;
             copy_segment_page(image, seg, page_vaddr, paddr);
             page_vaddr += FRAME_SIZE as u64;
         }
     }
 
-    // 用户栈: 与引导期同一布局（所有程序共用一套链接地址）。
+    // 用户栈: 与引导期同一布局（所有程序共用一套链接地址）。数据页一律 RW + NX。
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * FRAME_SIZE as u64;
     for i in 0..USER_STACK_PAGES {
         let paddr = frame_allocator::allocate_frame()?;
         unsafe {
             core::ptr::write_bytes(paddr as *mut u8, 0, FRAME_SIZE);
         }
-        map_user_page(domain, stack_base + i * FRAME_SIZE as u64, paddr);
+        map_user_page(
+            domain,
+            stack_base + i * FRAME_SIZE as u64,
+            paddr,
+            UserPagePerm::ReadWrite,
+        );
     }
     Some(())
+}
+
+/// 页 `page_vaddr` 的权限 = 覆盖它的所有段的并集。
+///
+/// 并集同时可写、可执行时返回 `None`: 页级 W^X 无法满足, 调用方据此拒绝加载
+/// (不静默降级成 RWX, 也不猜测"哪个更该保留")。
+fn page_perm(elf: &elf::Image, page_vaddr: u64) -> Option<UserPagePerm> {
+    let mut writable = false;
+    let mut executable = false;
+    for seg in elf.segments() {
+        let start = seg.vaddr & !(FRAME_SIZE as u64 - 1);
+        let end = seg.vaddr + seg.memsz;
+        if page_vaddr >= start && page_vaddr < end {
+            writable |= seg.flags & elf::PF_W != 0;
+            executable |= seg.flags & elf::PF_X != 0;
+        }
+    }
+    match (writable, executable) {
+        (true, true) => None,
+        (_, true) => Some(UserPagePerm::ReadExecute),
+        (true, false) => Some(UserPagePerm::ReadWrite),
+        (false, false) => Some(UserPagePerm::ReadOnly),
+    }
 }
 
 /// 把 `seg` 落在 `page_vaddr` 这一页里的文件内容拷进物理帧 `paddr`。

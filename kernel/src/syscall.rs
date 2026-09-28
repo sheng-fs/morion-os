@@ -78,6 +78,30 @@ pub const SYS_DOMAIN_DESTROY: u64 = 38;
 pub const SYS_DOMAIN_COUNT: u64 = 39;
 /// 当前空闲物理帧数 (`frame_allocator::free_frames`) —— 自测取证用: 反复加载/销毁不应下降。
 pub const SYS_FRAME_FREE: u64 = 40;
+/// 在**指定域**里加载可执行文件并启动 (E3c 监督者重启服务):
+/// `rdi = 域 id, rsi = 镜像首地址, rdx = 长度`, 成功返回该域 id, 失败 `u64::MAX`。
+/// 需 `Capability::Spawn`。
+///
+/// 与 `SYS_SPAWN_ELF` 的区别是**不建新域**: 目标域必须已存在且**没有存活任务**
+/// (重启的前提是旧实例已退出), 内核随即原地清空它的用户地址空间
+/// ([`crate::domain::reset`]) 再映射新镜像。于是**域号不变** —— 服务域号是 ABI
+/// (`libvfs` 里写死了 `FAT32_DOMAIN=6` 等, `init` 是 14), 而分页器登记、能力表这些
+/// 按域 index 的东西也不受影响。
+pub const SYS_SPAWN_ELF_AT: u64 = 41;
+/// 该域**是否还有存活任务**: `rdi = 域 id`, 有返回 1, 没有 (或域已销毁) 返回 0。
+///
+/// 监督者 (`init`) 的巡检原语: 引导期服务域的槽位永不自动销毁, 所以"域还在"并不能
+/// 说明"服务还在跑" —— 要问的是任务。故意不设能力门禁: 它只暴露"某个域号活没活"。
+pub const SYS_DOMAIN_ALIVE: u64 = 42;
+/// 用**引导模块内存镜像**在指定域里原地重启 (E3c 后续): `rdi = 域 id`, 成功返回该域 id,
+/// 失败 `u64::MAX`。需 `Capability::Spawn`。
+///
+/// 与 `SYS_SPAWN_ELF_AT` 是同一套"原地重启"流程 (验镜像 → 目标域无存活任务 → 清地址空间
+/// → 起任务), 区别只在**镜像来源**: 这里由内核按域号去**引导模块表**
+/// ([`crate::bootinfo::BootInfo::service_modules`]) 里取 —— 那是引导器读进 `LOADER_DATA`
+/// 页的那一份, 与内核同生命周期、**不依赖磁盘**。于是 `init` 能重启文件服务本身
+/// (fat32_srv / mfs_srv), 解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。
+pub const SYS_SPAWN_ELF_MODULE: u64 = 43;
 
 /// `SYS_SPAWN_ELF` 接受的最大镜像长度 (1 MiB)。
 ///
@@ -182,6 +206,63 @@ fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
     }
 }
 
+/// 校验并取出用户态交来的 ELF 镜像缓冲区 (`SYS_SPAWN_ELF` / `SYS_SPAWN_ELF_AT` 共用)。
+///
+/// 信任边界: 镜像是用户态给的, 解析与映射全部在核内做 (`elf::parse` 先全量校验), 因此
+/// 加载器即使有 bug 也映射不出任意物理帧。用户缓冲按页确认**已映射** —— 内核以调用方的
+/// CR3 直接读它, 未映射会在内核态缺页。
+fn user_elf_image(ptr: u64, len: u64) -> Option<&'static [u8]> {
+    if !crate::memory::paging::is_user_address(ptr) || !(64..=MAX_ELF_LEN).contains(&len) {
+        return None;
+    }
+    let end = ptr.checked_add(len)?;
+    if !crate::memory::paging::is_user_address(end - 1) {
+        return None;
+    }
+    let from = crate::scheduler::current_domain();
+    let mut page = ptr & !0xFFF;
+    while page < end {
+        crate::memory::paging::resolve_user_page(from, page)?;
+        page += 4096;
+    }
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
+}
+
+/// 按域号取**引导模块内存镜像** (`SYS_SPAWN_ELF_MODULE` 用): 引导器读进 `LOADER_DATA`
+/// 页、经 `BootInfo` 模块表交过来的那一份, 与内核同生命周期、不依赖磁盘。
+///
+/// 与用户交来的镜像一样要在映射前过 `is_identity_mapped` 校验 (内核靠恒等映射读它);
+/// 域号不在表里 (该服务没被引导器打包) 返回 `None`。
+fn boot_module_image(domain: u64) -> Option<&'static [u8]> {
+    let modules = crate::bootinfo::get().service_modules()?;
+    let m = modules.iter().find(|m| m.domain == domain)?;
+    if m.len == 0 || !crate::memory::paging::is_identity_mapped(m.addr, m.len) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(m.addr as *const u8, m.len as usize) })
+}
+
+/// 「原地重启」的公共流程 (`SYS_SPAWN_ELF_AT` 与 `SYS_SPAWN_ELF_MODULE` 共用):
+/// 验镜像 → 目标域须存在且**已无存活任务** → 清空其用户地址空间 → 摘掉已终止任务
+/// (含释放内核栈, 否则每轮漏一份、终会占满 `MAX_TASKS`) → 映射新镜像起任务。
+/// 成功返回目标域号 (`exec::spawn_elf_at` 保证不换域 —— 域号是 ABI), 失败 `u64::MAX`。
+fn restart_in_place(target: u64, image: &[u8]) -> u64 {
+    // 先验镜像, 再动域状态: 镜像非法时不该白拆一次地址空间。
+    if crate::elf::parse(image).is_none() {
+        return u64::MAX;
+    }
+    if !crate::domain::is_alive(target) || crate::scheduler::live_tasks(target) != 0 {
+        return u64::MAX;
+    }
+    crate::domain::reset(target);
+    crate::scheduler::reap_terminated(target);
+    if crate::exec::spawn_elf_at(target, image) {
+        target
+    } else {
+        u64::MAX
+    }
+}
+
 /// 掩码校验: 每一位都必须是本域**注册过的**向量, 且本域持有对应 `Capability::Irq`。
 ///
 /// 掩码编码 (位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`) 与 `SYS_IRQ_POLL`/`SYS_IRQ_WAIT`
@@ -254,7 +335,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 None => return 0,
             };
             let domain = crate::scheduler::current_domain();
-            crate::memory::paging::map_user_page(domain, a1, paddr);
+            crate::memory::paging::map_user_page(
+                domain,
+                a1,
+                paddr,
+                crate::memory::paging::UserPagePerm::ReadWrite,
+            );
             crate::memory::frame_allocator::inc_ref(paddr);
             1
         }
@@ -269,7 +355,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             } else {
                 match crate::memory::paging::resolve_user_page(from, a1) {
                     Some(paddr) => {
-                        crate::memory::paging::map_user_page(a2, a1, paddr);
+                        crate::memory::paging::map_user_page(
+                            a2,
+                            a1,
+                            paddr,
+                            crate::memory::paging::UserPagePerm::ReadWrite,
+                        );
                         crate::memory::frame_allocator::inc_ref(paddr);
                         1
                     }
@@ -312,7 +403,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                                 crate::memory::frame_allocator::FRAME_SIZE,
                             );
                         }
-                        crate::memory::paging::map_user_page(a1, a2, p);
+                        crate::memory::paging::map_user_page(
+                            a1,
+                            a2,
+                            p,
+                            crate::memory::paging::UserPagePerm::ReadWrite,
+                        );
                         crate::memory::frame_allocator::inc_ref(p);
                         1
                     }
@@ -535,34 +631,41 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_SPAWN_ELF => {
             // 加载可执行文件并启动 (rdi = 镜像首地址, rsi = 长度) → 新域 id / u64::MAX。
-            //
-            // 信任边界: 镜像是用户态给的, 解析与映射全部在核内做 (elf::parse 先全量校验),
-            // 因此加载器即使有 bug 也映射不出任意物理帧。用户缓冲按页确认**已映射** ——
-            // 内核以调用方的 CR3 直接读它, 未映射会在内核态缺页。
             let from = crate::scheduler::current_domain();
             if !crate::cap::has(from, crate::cap::Capability::Spawn) {
                 return u64::MAX;
             }
-            let (ptr, len) = (a1, a2);
-            if !crate::memory::paging::is_user_address(ptr) || !(64..=MAX_ELF_LEN).contains(&len) {
+            let Some(image) = user_elf_image(a1, a2) else {
                 return u64::MAX;
-            }
-            let end = match ptr.checked_add(len) {
-                Some(e) => e,
-                None => return u64::MAX,
             };
-            if !crate::memory::paging::is_user_address(end - 1) {
+            crate::exec::spawn_elf(image, from).unwrap_or(u64::MAX)
+        }
+        SYS_SPAWN_ELF_AT => {
+            // 在**指定域**里加载并启动 (E3c: 监督者把退出/崩溃的服务原地拉起来)。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::Spawn) {
                 return u64::MAX;
             }
-            let mut page = ptr & !0xFFF;
-            while page < end {
-                if crate::memory::paging::resolve_user_page(from, page).is_none() {
-                    return u64::MAX;
-                }
-                page += 4096;
+            let Some(image) = user_elf_image(a2, a3) else {
+                return u64::MAX;
+            };
+            restart_in_place(a1, image)
+        }
+        SYS_SPAWN_ELF_MODULE => {
+            // 用**引导模块内存镜像**在指定域原地重启 (E3c 后续) —— 镜像来自内核侧,
+            // 不给用户态传地址, 故除了域号无需别的参数。
+            let from = crate::scheduler::current_domain();
+            if !crate::cap::has(from, crate::cap::Capability::Spawn) {
+                return u64::MAX;
             }
-            let image = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-            crate::exec::spawn_elf(image, from).unwrap_or(u64::MAX)
+            let Some(image) = boot_module_image(a1) else {
+                return u64::MAX;
+            };
+            restart_in_place(a1, image)
+        }
+        SYS_DOMAIN_ALIVE => {
+            // 该域是否**还有存活任务** (监督者巡检原语)。
+            (crate::domain::is_alive(a1) && crate::scheduler::live_tasks(a1) > 0) as u64
         }
         SYS_EXIT => crate::scheduler::exit_current(),
         SYS_DOMAIN_DESTROY => {

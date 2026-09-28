@@ -30,33 +30,16 @@ core::arch::global_asm!(
 );
 
 // ---------------------------------------------------------------------------
-// 阶段十 / E2b: 引导期加载服务程序 (每个服务一份独立 ELF, 见 user/srv)
+// 阶段十 / E2b + E3b: 引导期加载服务程序 (每个服务一份独立 ELF, 见 user/srv)
 // ---------------------------------------------------------------------------
-/// 引导期服务程序表: `(固定域号, 编译期嵌入的 ELF 镜像)`。
-///
-/// E2b 起每个服务是**独立程序** (独立 crate / 独立 ELF, 见 `user/srv`), 由内核在引导期
-/// 经 `exec::spawn_elf_at` 载入到**各自的固定域**。域号是 ABI: libvfs 写死
-/// `FAT32_DOMAIN=6` 等, shell 直接 `SendTo(5)`, 所以"域号 ↔ 程序"的对应必须稳定。
-///
-/// ELF 由 Makefile 构建到 `build/user/srv/<name>.elf` (`make` 先构建 `morion-srv` 的 14 个
-/// bin 再逐个拷贝)。此前 14 个域共用一份扁平二进制 (`build/user/user.bin`) 按域 id 分流 ——
-/// 那是过渡态, 现已删除; 现在每个域跑的是它自己那份 ELF, 各自独立地址空间。
-const SERVICE_ELFS: [(u64, &[u8]); 14] = [
-    (0, include_bytes!("../../build/user/srv/sender.elf")),
-    (1, include_bytes!("../../build/user/srv/receiver.elf")),
-    (2, include_bytes!("../../build/user/srv/pager.elf")),
-    (3, include_bytes!("../../build/user/srv/echo.elf")),
-    (4, include_bytes!("../../build/user/srv/kbd.elf")),
-    (5, include_bytes!("../../build/user/srv/block_srv.elf")),
-    (6, include_bytes!("../../build/user/srv/fat32_srv.elf")),
-    (7, include_bytes!("../../build/user/srv/app.elf")),
-    (8, include_bytes!("../../build/user/srv/shell.elf")),
-    (9, include_bytes!("../../build/user/srv/mount_srv.elf")),
-    (10, include_bytes!("../../build/user/srv/tmpfs_srv.elf")),
-    (11, include_bytes!("../../build/user/srv/mfs_srv.elf")),
-    (12, include_bytes!("../../build/user/srv/ext2_srv.elf")),
-    (13, include_bytes!("../../build/user/srv/exfat_srv.elf")),
-];
+// 服务 ELF **不在内核镜像里**: E2b 时它们由 `include_bytes!` 嵌进内核 (`SERVICE_ELFS` 表),
+// E3b 起改由**引导器**从自己所在的 ESP 读入 (`\EFI\morion\services\<name>.elf`), 经
+// `BootInfo` 的模块表交给内核 (见 `bootinfo::ServiceModule`) —— 于是内核体积不再随
+// 服务数量增长, 服务也能随 ISO 单独更新。
+//
+// 域号是 ABI: libvfs 写死 `FAT32_DOMAIN=6` 等, shell 直接 `SendTo(5)`, 所以
+// "域号 ↔ 程序"的对应必须稳定 —— 引导器的服务表 (`boot/src/main.rs` 的 `SERVICE_FILES`)
+// 与本函数建域的顺序 (0..13) 必须一致。
 
 /// 空闲任务: 当用户任务退出后兜底运行, 停机等待中断。
 ///
@@ -225,6 +208,7 @@ pub extern "C" fn kernel_main() -> ! {
     //  11 = mfs_srv   (MorionFS: 块设备后端的原创文件系统, 挂载于 /mfs)
     //  12 = ext2_srv  (ext2 只读兼容: 挂载既有 Linux 分区, 挂载于 /ext2)
     //  13 = exfat_srv (exFAT 读写: 挂载既有 exFAT 卷/U 盘, 挂载于 /usb)
+    //  14 = init      (监督者: 巡检被监督的服务域, 实例退出后从盘原地把它拉起来 —— E3c)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
     let pager_domain = domain::create();
@@ -239,11 +223,12 @@ pub extern "C" fn kernel_main() -> ! {
     let mfs_domain = domain::create();
     let ext2_domain = domain::create();
     let exfat_domain = domain::create();
+    let init_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(14);
-    cap::init(14);
-    pager::init(14, pager_domain);
+    ipc::init(15);
+    cap::init(15);
+    pager::init(15, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -266,6 +251,7 @@ pub extern "C" fn kernel_main() -> ! {
         mfs_domain,
         ext2_domain,
         exfat_domain,
+        init_domain,
     ] {
         cap::grant(pager_domain, cap::Capability::MapInto(d));
     }
@@ -321,6 +307,15 @@ pub extern "C" fn kernel_main() -> ! {
     // 新域默认零能力 —— 「能造进程」这张凭证只给需要它的域。
     cap::grant(app_domain, cap::Capability::Spawn);
     cap::grant(shell_domain, cap::Capability::Spawn);
+    // 授权: init (域 14, E3c 监督者) —— 造进程 + 从 FAT32 卷读服务镜像 (共用中转页) +
+    // 经 mount_srv 解析路径 + 向 echo 发控制消息。它是唯一持有 `SYS_SPAWN_ELF_AT` 的域。
+    cap::grant(init_domain, cap::Capability::Spawn);
+    cap::grant(init_domain, cap::Capability::SendTo(fat32_domain));
+    cap::grant(init_domain, cap::Capability::MapInto(fat32_domain));
+    cap::grant(init_domain, cap::Capability::SendTo(mount_domain));
+    cap::grant(init_domain, cap::Capability::SendTo(echo_domain));
+    // 授权: app 可直接给 echo 发控制消息 —— E3c 自测 FS-29 里让 echo 退出, 再看 init 重启它。
+    cap::grant(app_domain, cap::Capability::SendTo(echo_domain));
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
     // 服务自己的暂存页, 不需要共享缓冲, 故只给 SendTo。
     cap::grant(shell_domain, cap::Capability::SendTo(block_domain));
@@ -331,7 +326,7 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
-    video::println("[OK] IPC + capability + pager initialized (14 domains)");
+    video::println("[OK] IPC + capability + pager initialized (15 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
     // 找到则配置 MSI-X、映射 BAR0/队列/DMA 并授权 Mmio/Irq; 否则降级 (magic=0),
@@ -349,14 +344,35 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // 逐个加载服务 ELF 并起任务: 域号已按 `SERVICE_ELFS` 的顺序 (0..13) 建好, 故直接
-    // 按表内域号载入 —— 每个服务跑自己的 ELF、进自己的地址空间 (E2b)。
-    for (dom, image) in SERVICE_ELFS {
-        if !exec::spawn_elf_at(dom, image) {
-            video::println("[FAILED] service ELF load (embedded)");
+    // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
+    // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。
+    // 域号已按 0..13 建好, 故直接按模块表里的域号载入 —— 每个服务跑自己的 ELF、进自己的
+    // 地址空间 (E2b), 内核镜像里不再有它们的副本 (E3b)。
+    match info.service_modules() {
+        Some(modules) => {
+            let mut loaded = 0u64;
+            for m in modules {
+                // 镜像以物理地址给出, 内核靠恒等映射读它; 超出覆盖范围只能判失败。
+                if !memory::paging::is_identity_mapped(m.addr, m.len) {
+                    video::println("[FAILED] service ELF outside identity map (4 GiB)");
+                    continue;
+                }
+                let image =
+                    unsafe { core::slice::from_raw_parts(m.addr as *const u8, m.len as usize) };
+                if exec::spawn_elf_at(m.domain, image) {
+                    loaded += 1;
+                } else {
+                    video::println("[FAILED] service ELF load (boot module)");
+                }
+            }
+            video::print("[OK] ");
+            video::print_u64(loaded);
+            video::println(" service ELFs loaded (boot modules)");
+        }
+        None => {
+            video::println("[FAILED] bootloader provided no service modules");
         }
     }
-    video::println("[OK] 14 service ELFs loaded (embedded)");
 
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);

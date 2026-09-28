@@ -166,8 +166,9 @@
 
 > 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`user/srv`、`user/libmorion`、
 > `user/hello`、`kernel_test` 等 crate。内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
-> 都是**各自独立的用户态程序**（`user/srv` 里一个服务一个 `[[bin]]` → 一份独立 ELF），由内核在启动期
-> **逐个载入各自固定域**（E2b：不再是"一份扁平二进制按域 id 分流"）。
+> 都是**各自独立的用户态程序**（`user/srv` 里一个服务一个 `[[bin]]` → 一份独立 ELF），由**引导器
+> 在启动期从 ESP（`EFI/morion/services/`）读入**、经 `BootInfo` 模块表交给内核，内核再把它们
+> 逐个载入各自固定域（E2b：不再是"一份扁平二进制按域 id 分流"；E3b：服务也不再进内核镜像）。
 > UI 素材统一按用途归档：引导期资源在 `boot/loader/resources/`，系统全局资源在 `resources/system/`。
 
 ```
@@ -232,8 +233,9 @@
 │           ├── mfs_srv.rs    #     域 11 MorionFS
 │           ├── ext2_srv.rs   #     域 12 ext2 只读
 │           ├── exfat_srv.rs  #     域 13 exFAT 读写
+│           ├── init.rs       #     域 14 监督者 (巡检服务域, 退出后用内存镜像原地重启)
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     14 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     15 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -297,7 +299,7 @@
 
 ## 开发路线
 
-> 详细文件系统路线见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)。勾选项表示**已在 QEMU 实机跑通**。
+> 详细文件系统路线见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)，图形子系统路线见 [docs/roadmap-gfx.md](./docs/roadmap-gfx.md)。勾选项表示**已在 QEMU 实机跑通**。
 
 ### 阶段一 — 微内核核心（基本完成）
 
@@ -340,8 +342,9 @@
 - [x] **可执行文件加载（ELF + 运行时 spawn）**（**E1**：内核新增 **ELF64 加载器**（`elf.rs` 全量校验 + `exec.rs` 映射）与新 syscall `SYS_SPAWN_ELF`（`Capability::Spawn` 门禁）：解析 `ET_EXEC` 镜像 → 建**新域**（`domain::create()` + 能力/邮箱/分页器表补行）→ 按段映射（一页只映射一次、新页清零、`.bss` 补零）→ 映射用户栈 → 起 Ring 3 任务，返回新域 id；新域**零能力**、分页器登记为加载者。配套：`MAX_TASKS` 16 → 32 + 内核堆 1 → 4 MiB（每任务 32 KiB 栈）、任务表满时**返回失败而不再 panic**、`Domain::new` **显式跳过 P4[1]**（否则运行时建域会与调用者共用用户空间页表 —— 既无隔离又会撞车）。演示程序 `user/hello` 是**独立 crate / 独立 ELF**：自测把它写进 `/tmp` 再从**文件**读回来加载运行，子程序自己打印 `exec:` 行。自测 **FS-27**）
 - [x] **用户态运行库 libmorion + `run` 命令**（**E2a**：抽 `user/libmorion`（crate `morion`）= syscall 封装 + 打印 + `domain_id()` + libvfs + 入口样板（`_start`/`morion_main`/panic），`morion-user` 与 `morion-hello` 共用，`hello` 瘦成 20 行；新增 `exec::spawn_file(path)`；shell 加 **`run <file>`**（+ `Capability::Spawn`），把可执行文件加载变成**用户可见的功能**；FS-27 改为从**磁盘文件** `/hello.mex` 加载。交互实测 `run /hello.mex` → 新域 14 跑起来）
 - [x] **服务拆成独立程序 + 域销毁/帧回收**（**E2b**：① 域销毁——`domain::destroy` 摘域表槽位 + 释放用户地址空间（逐页按帧引用计数归还、回收页表帧）+ 清各子系统按域状态（能力/句柄、邮箱、分页器、中断）+ 摘除并终止其任务；域 id **复用空槽**（`slot_for`），配 `SYS_DOMAIN_DESTROY/COUNT/FRAME_FREE`。② **退出即回收**——任务退出时若为本域最后一个任务，登记该域、由时钟 `tick` 在别的上下文销毁（不可就地拆自己的栈/页表），引导域白名单永不销毁。③ **服务拆成独立程序**——新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → 各一份**独立 ELF**（`cfg` 门控，一个 bin 只编自己的服务 + `common`），删掉 17814 行的单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at` 逐个载入固定域，删 `load_user_program`；每个程序启动打印 `[up] <name> (domain N)`。自测新增 **FS-28**，交互 `run` 域号复用）
+- [x] **服务生命周期收口（E3a / E3b / E3c）**：① **用户页 W^X**（E3a）——段权限 → 页权限（`.text` RX、其余 RW+NX）、开 `EFER.NXE`、拒绝 W+X 段与页，链接脚本在 `.data` 前页对齐（否则三段挤在一页，页级 W^X 不可能满足）；顺带把用户态 `P=1` 保护违例改为**终止该任务**而不是转给分页器。② **服务移出内核镜像**（E3b）——引导器从**自己所在的 ESP** 读 `EFI/morion/services/*.elf`（`LOADER_DATA` 页），经扩展 `BootInfo` 的模块表交给内核按固定域号加载；内核 `include_bytes!` 全删，**内核 ELF 体积 −51%**（702 KB → 345 KB）；引导期进度与失败原因镜像到 COM1。③ **监督者 + 原地重启**（E3c）——新增域 14 `init`：巡检被监督服务域（`SYS_DOMAIN_ALIVE`），发现实例退出就从 FAT32 根盘 `/system/services/*.elf` 读回镜像、经 `SYS_SPAWN_ELF_AT` **原地**重启（域号不变，`domain::reset` 清用户地址空间但保留域与其分页器/能力注册）；自测 **FS-29** 让 echo 自杀再被拉起。④ **重启不依赖盘**（E3c 后续）——新增 `SYS_SPAWN_ELF_MODULE`：内核按域号从 E3b 的引导模块**内存镜像**取，init 重启优先走它、失败才回退盘；监督范围因此覆盖到 `pager / fat32_srv / mfs_srv`（文件服务自己崩了也能自救，解掉"读盘要靠文件服务"的鸡生蛋问题），唯一排除的是内核为其保留 NVMe 映射的 `block_srv`
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
-- [ ] 帧缓冲对用户态开放 / GUI 服务
+- [ ] 帧缓冲对用户态开放 / GUI 服务（规划见 [docs/roadmap-gfx.md](./docs/roadmap-gfx.md)：把图形输出外移到用户态 `gfx_srv`）
 - [ ] 网络协议栈
 
 ### 阶段三 — 性能飞地（未开始）

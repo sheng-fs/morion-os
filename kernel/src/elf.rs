@@ -15,6 +15,10 @@ pub const MAX_SEGMENTS: usize = 32;
 /// 程序头表项长度（ELF64 固定 56 字节）。
 const PHENT_SIZE: u64 = 56;
 
+/// 段权限位（`p_flags`）。
+pub const PF_X: u32 = 1;
+pub const PF_W: u32 = 2;
+
 /// 一个需要载入内存的段（`PT_LOAD`）。
 #[derive(Clone, Copy)]
 pub struct Segment {
@@ -26,6 +30,8 @@ pub struct Segment {
     pub filesz: u64,
     /// 段在内存中占的字节数（`p_memsz`，≥ `filesz`，差额即 `.bss`）。
     pub memsz: u64,
+    /// 段权限位（`p_flags`，见 `PF_X` / `PF_W`）。
+    pub flags: u32,
 }
 
 /// 解析结果：入口地址 + 全部 `PT_LOAD` 段。
@@ -119,6 +125,7 @@ pub fn parse(bytes: &[u8]) -> Option<Image> {
             vaddr: 0,
             filesz: 0,
             memsz: 0,
+            flags: 0,
         }; MAX_SEGMENTS],
         count: 0,
     };
@@ -129,10 +136,17 @@ pub fn parse(bytes: &[u8]) -> Option<Image> {
         if p_type != 1 {
             continue; // 只加载 PT_LOAD
         }
+        let p_flags = u32le(bytes, ph + 4)?;
         let p_offset = u64le(bytes, ph + 8)?;
         let p_vaddr = u64le(bytes, ph + 16)?;
         let p_filesz = u64le(bytes, ph + 32)?;
         let p_memsz = u64le(bytes, ph + 40)?;
+
+        // W^X: 一个段不允许同时可写、可执行 —— 这种镜像在加载前就拒绝,
+        // 而不是映出一页 RWX (页级 W^X 的镜像侧前提, 见 `exec::map_image`)。
+        if p_flags & PF_W != 0 && p_flags & PF_X != 0 {
+            return None;
+        }
 
         // 文件内容必须整段落在镜像里（`p_filesz == 0` 的纯 .bss 段除外）。
         let file_end = p_offset.checked_add(p_filesz)?;
@@ -160,6 +174,7 @@ pub fn parse(bytes: &[u8]) -> Option<Image> {
             vaddr: p_vaddr,
             filesz: p_filesz,
             memsz: p_memsz,
+            flags: p_flags,
         };
         image.count += 1;
     }
@@ -203,6 +218,7 @@ mod tests {
         b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
         let ph = 64;
         b[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
         b[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
         b[ph + 16..ph + 24].copy_from_slice(&USER_SPACE_BASE.to_le_bytes()); // p_vaddr
         b[ph + 32..ph + 40].copy_from_slice(&0x10u64.to_le_bytes()); // p_filesz
@@ -217,6 +233,26 @@ mod tests {
         assert_eq!(img.entry, USER_SPACE_BASE + 0x1000);
         assert_eq!(img.segments()[0].filesz, 0x10);
         assert_eq!(img.segments()[0].memsz, 0x2000);
+        // 段权限原样带出, 供 `exec::map_image` 决定页权限。
+        assert_eq!(img.segments()[0].flags, PF_X | 4);
+    }
+
+    /// W^X 的镜像侧契约: 同时可写可执行的段一律拒绝。
+    #[test]
+    fn rejects_writable_executable_segment() {
+        let mut bad = sample();
+        let ph = 64;
+        bad[ph + 4..ph + 8].copy_from_slice(&3u32.to_le_bytes()); // PF_W|PF_X
+        assert!(parse(&bad).is_none(), "W+X 段应拒绝");
+
+        // 只有 W (无 X) 与只有 X (无 W) 都应放行。
+        let mut ok = sample();
+        ok[ph + 4..ph + 8].copy_from_slice(&2u32.to_le_bytes()); // PF_W
+        assert!(parse(&ok).is_some(), "纯可写段应接受");
+
+        let mut ok = sample();
+        ok[ph + 4..ph + 8].copy_from_slice(&1u32.to_le_bytes()); // PF_X
+        assert!(parse(&ok).is_some(), "纯可执行段应接受");
     }
 
     #[test]

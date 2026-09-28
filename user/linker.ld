@@ -21,6 +21,11 @@ SECTIONS {
         *(.lrodata .lrodata.*)
     }
 
+    /* W^X: 代码段 (.text/.rodata -> RX) 与数据段 (.data/.bss -> RW) 必须落在**不同的页**,
+       否则同一页会同时要求可执行与可写, 页级 W^X 无法满足 (内核会拒绝加载)。
+       这里把 .data 对齐到页边界, 强制两者分页。 */
+    . = ALIGN(4096);
+
     .data : {
         *(.data .data.*)
         *(.ldata .ldata.*)

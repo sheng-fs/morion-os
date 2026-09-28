@@ -461,6 +461,50 @@ pub fn remove_domain(domain: u64) {
     }
 }
 
+/// 该域**存活** (未终止) 的任务数。
+///
+/// 供 `SYS_DOMAIN_ALIVE` (监督者巡检) 与 `SYS_SPAWN_ELF_AT` (重启前确认旧实例已退) 使用。
+/// 注意与 `domain::is_alive` 的区别: 那个问"域槽位还在不在", 这个问"里面还有没有在跑的
+/// 任务" —— 引导期服务域的任务退出后槽位仍在, 正是监督者要发现的情形。
+pub fn live_tasks(domain: u64) -> usize {
+    let guard = SCHEDULER.lock();
+    let Some(sched) = guard.as_ref() else {
+        return 0;
+    };
+    sched
+        .tasks
+        .iter()
+        .flatten()
+        .filter(|t| t.domain == domain && t.state != TaskState::Terminated)
+        .count()
+}
+
+/// 摘掉该域**已终止**的任务 (顺带释放各自的内核栈), 返回摘掉的个数。
+///
+/// 退出即回收只在 `domain::destroy` 里摘任务, 而「同域重启」(`SYS_SPAWN_ELF_AT`) 不走
+/// 销毁路径 —— 不主动摘的话, 每次重启都会留下一个已终止任务和它那份内核栈 (`Box<[u8]>`),
+/// 几轮之后 `MAX_TASKS` 就被占满了。
+///
+/// **不要在目标域自己的任务里调用** (会把正在使用的栈摘掉); 调用者是别的域, 且目标域
+/// 已无存活任务, 故天然安全。
+pub fn reap_terminated(domain: u64) -> usize {
+    let mut guard = SCHEDULER.lock();
+    let Some(sched) = guard.as_mut() else {
+        return 0;
+    };
+    let mut reaped = 0;
+    for slot in sched.tasks.iter_mut() {
+        if slot
+            .as_ref()
+            .is_some_and(|t| t.domain == domain && t.state == TaskState::Terminated)
+        {
+            *slot = None;
+            reaped += 1;
+        }
+    }
+    reaped
+}
+
 /// 启动调度器: 从当前 (main) 执行流切换到首个任务, 永不返回。
 pub fn run() -> ! {
     let mut guard = SCHEDULER.lock();

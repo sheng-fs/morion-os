@@ -2,10 +2,25 @@
 //!
 //! 与 boot/src/main.rs 中的 BootInfo 布局严格对应。
 
+/// 引导期服务模块表项（E3b）—— 与 boot/src/main.rs 的 `ServiceModule` 布局严格对应。
+///
+/// 引导器从自己所在的 ESP 读入服务 ELF（`\EFI\morion\services\<name>.elf`），
+/// 用 `LOADER_DATA` 页装下并把这张表交过来；内核据此把每个服务载入它的固定域。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ServiceModule {
+    /// 目标固定域号（域号是 ABI，见 kernel/src/main.rs）。
+    pub domain: u64,
+    /// ELF 镜像的物理地址（页对齐，位于前 4 GiB 的恒等映射内）。
+    pub addr: u64,
+    /// ELF 镜像字节数。
+    pub len: u64,
+}
+
 #[repr(C)]
 pub struct BootInfo {
     pub magic: u32,            // 0x4D4F5249 = "MORI"
-    pub version: u32,          // 2
+    pub version: u32,          // 3
     pub fb_addr: u64,          // 帧缓冲物理地址
     pub fb_width: u32,         // 宽度 (像素)
     pub fb_height: u32,        // 高度 (像素)
@@ -14,6 +29,36 @@ pub struct BootInfo {
     pub mmap_addr: u64,        // 内存图数据物理地址
     pub mmap_entry_count: u64, // 内存图条目数
     pub mmap_entry_size: u64,  // 单个条目字节数
+    pub svc_addr: u64,         // 服务模块表物理地址 (0 = 无)
+    pub svc_count: u64,        // 服务模块条目数
+    pub svc_entry_size: u64,   // 单个模块条目字节数
+}
+
+impl BootInfo {
+    /// 引导期服务模块表（E3b）。
+    ///
+    /// 引导器未提供（旧引导器 / 构建没有把服务放进 ESP）时返回 `None` —— 调用方据此
+    /// 明确报错，而不是静默地"一个服务都没起"。
+    ///
+    /// `svc_entry_size` 一并校验：内核与引导器是两个独立编译的产物，布局若不一致
+    /// （两边 `ServiceModule` 字段变了却没同步重建），宁可判定为"不可用"。
+    pub fn service_modules(&self) -> Option<&'static [ServiceModule]> {
+        if self.svc_addr == 0 || self.svc_count == 0 {
+            return None;
+        }
+        if self.svc_entry_size != core::mem::size_of::<ServiceModule>() as u64 {
+            return None;
+        }
+        // SAFETY: 表由引导器在 `LOADER_DATA` 页里放好并经 `svc_addr` 交过来；那些帧不在
+        // 内核帧分配器的空闲池里（见 `frame_allocator::init` 只放行 CONVENTIONAL），
+        // 故这块内存在本函数返回的 `'static` 生命周期内不会被复用。
+        Some(unsafe {
+            core::slice::from_raw_parts(
+                self.svc_addr as *const ServiceModule,
+                self.svc_count as usize,
+            )
+        })
+    }
 }
 
 /// Boot Info 所在的物理地址

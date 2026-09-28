@@ -850,8 +850,9 @@ exFAT 去上限：
 - **簇**：`spc_shift ≤ 9`（256 KiB 簇）；更大簇会因集群缓冲页数上限被拒绝（`stage=13`）。
 - **真实 U 盘端到端**：`/dev/sdX` 属 `root:disk`，非 root 无法直通给 QEMU；且现有卷层是
   「按类型认领第一个匹配卷」，要让真盘出现在 shell 里还需 **M1b**（额外卷挂到 `/usb<N>`）。
-- fat32_srv 仍按「整簇读进单页缓冲」工作，**大簇 FAT32 分区（如 32 KiB 簇的 53.6 GiB U 盘）
-  尚不能读**；块层已就绪，等 fat32 侧改造。
+- ~~fat32_srv 仍按「整簇读进单页缓冲」工作，大簇 FAT32 分区尚不能读~~ —— **已由 M1b 解决**
+  （整簇缓冲 16 页 = 64 KiB，覆盖 FAT32 允许的最大簇 `SecPerClus ≤ 128 × 512 B`；
+  `make NVME_CLU=64` = 32 KiB 簇已有写/读回用例 FS-18）。此条为 M1b 之前的旧描述，保留划线仅作沿革。
 
 #### M7 已完成 ✅
 
@@ -1601,6 +1602,141 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - **内核体积**：14 个 ELF 内嵌进内核（`include_bytes!`），镜像会明显变大；升级路径是
   引导器/init 从盘加载（同 D1 的 (b)/(c)）。
 - **拆分工作量**集中在把 `user/src/main.rs`（19k 行）按服务分文件 —— 这是 D3 定 (a) 后本轮的主要成本。
+
+### E3 规划：服务生命周期收口（三步 + 后续已全部完成）
+
+**目标（三条，按依赖排序）**
+
+E2b 让服务成了「独立程序 + 域可回收」，但服务的**生命周期**仍由内核写死：镜像编译期内嵌、
+固定域号、无监督、无重启。E3 把这三件事收到位：
+
+1. **W^X**：用户页绝不同时可写可执行 —— `map_user_page` 目前无权限参数、全部映为可写，
+   也没有置 NX（E1 起就记着的一笔）。这是后面所有加载路径的安全地基。
+2. **服务移出内核镜像**：14 份 ELF 现由 `include_bytes!` 嵌进内核（见 `SERVICE_ELFS`），
+   内核体积随服务数量线性膨胀。改为**引导模块**：引导器从 ISO 读服务 ELF 到内存，
+   经扩展 `BootInfo` 把「模块表」交给内核，内核按表加载。
+3. **init / 监督者服务 + 崩溃重启**：新增 `init`（持 `Capability::Spawn`、是各服务的 pager），
+   从盘读 `/system/services/*.elf` 起服务、监视退出并在崩溃后**重启**（复用 E2b 的域回收），
+   于是「服务可重启」从机制变成功能。
+
+**关键决策（待定 → 定）**
+
+| # | 问题 | 决定 |
+|---|---|---|
+| D1 | W^X 粒度 | **(a) 页级**：段权限取该页上所有段的**并集**；并集为 W+X 的页**拒绝加载**（不静默降级）。故链接脚本必须把 RX 段与 RW 段分到不同页 |
+| D2 | 服务镜像来源 | **(a) 引导模块**：引导器读 + `BootInfo` 模块表；内核不再 `include_bytes!`。理由：不与「文件系统服务先于文件系统」的鸡生蛋冲突 |
+| D3 | 固定域号 | **(a) 保留**（域号是 ABI）：故新增 `SYS_SPAWN_ELF_AT(域号, 镜像)`，让 init 能按表恢复「域号 ↔ 服务」 |
+| D4 | 重启判据 | **(a) 轮询**：init 定期 `SYS_DOMAIN_ALIVE(域号)`（新增），发现消失即重新 spawn；不做内核回调，保持内核最小 |
+
+**设计要点**
+
+*一、W^X（E3a）*
+
+- `elf.rs` 解析 `p_flags`（`PF_R/W/X`），**拒绝** `PF_W | PF_X` 的段。
+- `paging.rs` 引入 `UserPagePerm { ReadOnly, ReadWrite, ReadExecute }`，
+  `map_user_page` 带权限参数；`ReadOnly`/`ReadWrite` 置 `NO_EXECUTE`，`ReadExecute` 不置。
+- `paging::init` 开 `EFER.NXE`（W^X 的前提；与 `EFER.SCE` 同一类开关）。
+- `exec::map_image` 改**两遍**：先按「页权限并集」建映射，再拷内容 —— 一遍映射时若遇到
+  已被前一段映射的页，其权限已是并集，不会出现「先 RW 后又要 X」的更新需求。
+- `user/linker.ld` 在 `.data` 前 `ALIGN(4096)`，让 RX（.text+/.rodata）与 RW（.data/.bss）
+  落在不同页。**当前产物三段挤在同一页**（`sender.elf` 全部落在 `0x…000..0x7d8`），不改必失败。
+
+*二、引导模块（E3b）*
+
+- `BootInfo` 追加模块表：`mod_addr` / `mod_count` / `mod_entry_size`，每项 = 域号 + 物理地址 + 长度
+  （`boot/src/main.rs` 与 `kernel/src/bootinfo.rs` 布局严格对应）。
+- 引导器用 `SimpleFileSystem` 从 ESP `EFI/morion/services/<name>.elf` 读入内存。
+- **坑**：模块所在内存必须在内存图里保持「已用」（`EfiLoaderData`），否则内核帧分配器会把它
+  分出去、跑着跑着被覆盖。内核侧也要在帧分配前排除该区间。
+- 内核 `SERVICE_ELFS`（`include_bytes!`）删除，改为按模块表 `exec::spawn_elf_at`。
+
+*三、init 与重启（E3c）*
+
+- 新增 syscall：`SYS_SPAWN_ELF_AT(41)`（`a1 = 域号`，门禁 `Spawn` + 该域当前无任务）、
+  `SYS_DOMAIN_ALIVE(42)`（供监督者轮询）。
+- 引导集保持在内核/引导模块（block_srv + fat32/mfs + init）；其余服务由 init 从盘加载。
+- 自测 **FS-29**：杀一个服务 → init 检测到 → 重启 → 域号不变、存活域数回基线。
+
+**执行顺序（3 步，每步都能独立回归）**
+
+1. ✅ **已完成（E3a W^X）**：`elf.rs` 解析 `p_flags` 并**拒绝 W+X 段** + `paging.rs` 加 `UserPagePerm`
+   与 `EFER.NXE` + `exec.rs` 改**两遍映射**（页权限取并集，并集 W+X 则拒绝加载） +
+   `user/linker.ld` 在 `.data` 前 `ALIGN(4096)` 强制 RX/RW 分页；顺带补上「用户态 `P=1` 保护违例
+   直接终止任务」—— 否则分页器会去映射已映射的页、撞内核 `PageAlreadyMapped` panic。
+   内核单测 **15 项**全过（新增 W^X 位不变式 / 三种权限期望位 / W+X 段被拒）。
+   全量回归：`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds = 28672` 且 `poll_cmds = 0`、
+   宿主 `sgdisk -v` "No problems found"、启动 `[OK] 14 service ELFs loaded (embedded)` + `[up]` × 14。
+2. ✅ **已完成（E3b 引导模块）**：服务 ELF **移出内核镜像** —— 引导器在 `exit_boot_services`
+   之前用 UEFI 文件系统从**自己所在的 ESP** 的 `\EFI\morion\services\<name>.elf` 读入 14 份镜像，
+   各拷进 `LOADER_DATA` 页（内核帧分配器只放行 `CONVENTIONAL`，故这些帧天然被保留），
+   再把一张 `ServiceModule { domain, addr, len }` 表经**扩展的 `BootInfo`**（`version 2 → 3`）
+   交给内核；内核删掉 `SERVICE_ELFS`（`include_bytes!`），改按模块表 `exec::spawn_elf_at`
+   （载入前用 `paging::is_identity_mapped` 判镜像可达）。内核 ELF **702200 → 345376 字节（−51%）**；
+   Makefile：内核不再依赖 `$(SRV_STAMP)`，改由 `iso` 依赖它并把 14 份 ELF `mcopy` 进 ESP。
+   ⚠️ 过程里踩到两个坑（都属"引导器第一次读文件/分配内存"才会暴露）：① **引导器的全局分配器
+   必须显式 `uefi::allocator::init(&mut st)`**（`#[entry]` 不代为登记；不初始化就在第一次
+   `Vec`/`String` 分配时 `#UD`，而引导器默认 panic 处理器只 spin、毫无输出）；② `uefi::fs::FileSystem`
+   的 `read` 是 `vec![0; file_size]`，枚举异种卷（ISO9660）时会 `capacity overflow` panic ——
+   改为**裸 `SimpleFileSystem` 协议**读取 + 大小上限。顺带把引导期的进度与失败原因镜像到
+   **COM1**（原来只画帧缓冲，headless 下失败表现为"日志停在 BdsDxe"）。
+   全量回归：`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds = 28672` 且 `poll_cmds = 0`、
+   宿主 `sgdisk -v` "No problems found"、`[OK] 14 service ELFs loaded (boot modules)` + `[up]` × 14。
+3. ✅ **已完成（E3c init / 监督重启）**：新增域 14 `init`（`user/srv/src/init.rs` + `svc-init`
+   门控 + 第 15 个引导模块）+ 两个 syscall：`SYS_DOMAIN_ALIVE(42)`（该域是否还有存活任务）
+   与 `SYS_SPAWN_ELF_AT(41)`（在**指定域**里加载并启动 —— 先验镜像, 目标域须存在且**无存活
+   任务**, 然后 `domain::reset` 清用户地址空间 + `scheduler::reap_terminated` 摘已终止任务
+   (否则每轮重启漏一份 32 KiB 内核栈、迟早占满 `MAX_TASKS`), 再映射新镜像 ⇒ **域号不变**）。
+   监督者每 40 ms 巡检 `echo/kbd/mount_srv/tmpfs_srv/ext2_srv/exfat_srv`，实例没了就从 FAT32
+   根盘 `/system/services/<name>.elf` 读回镜像原地拉起（`BOOT_DOMAINS` 14 → 15）。
+   自测 **FS-29**：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言它一度
+   "没有存活任务" → 等 init 拉起 → 断言**域号仍是 3**、新实例能正常回显、存活域数不变。
+   回归实录：`init: restarted echo (domain 3, total 1)` + `app: FS29 supervisor restart OK`；
+   `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds = 28672` 且 `poll_cmds = 0`、宿主
+   `sgdisk -v` "No problems found"、启动 `[OK] 15 service ELFs loaded (boot modules)` + `[up]` × 15。
+4. ✅ **已完成（E3c 后续：init 手持内存镜像 → 覆盖引导链）**：新增 syscall
+   `SYS_SPAWN_ELF_MODULE(43)`（`rdi = 域号`）—— 与 `SYS_SPAWN_ELF_AT` 共用同一套「验镜像 →
+   目标域无存活任务 → `domain::reset` → `reap_terminated` → 起任务」流程，区别只在**镜像来源**：
+   内核按域号去 `bootinfo::get().service_modules()`（E3b 交来的 `LOADER_DATA` 镜像）里取，
+   过 `is_identity_mapped` 后直接映射，**不依赖磁盘**。init 重启时**先试内存镜像、失败再回退盘**
+   (`/system/services/<name>.elf`)，并打印来源。监督集 6 → 9：新增 **pager(2) / fat32_srv(6) /
+   mfs_srv(11)**，于是「读盘要靠文件服务、文件服务死了没法自救」的鸡生蛋问题不复存在。
+   **刻意排除 block_srv(5)**：内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些
+   **物理帧**还给帧分配器、甚至把 BAR0 的 MMIO 地址当成 RAM 交出去 —— 纳入监督前必须先让 reset
+   跳过内核保留映射。回归实录：`init: restarted echo (domain 3, total 1, from memory)`。
+
+**E3c 后续（已知局限, 未做）**
+
+- ✅ **引导链已可自救**: init 已手握引导模块内存镜像（见执行顺序第 4 步），监督范围覆盖
+  `pager / fat32_srv / mfs_srv`。
+- **block_srv 需先保护内核映射**: 唯一被排除的引导链服务是 block_srv(5) —— `domain::reset`
+  会释放内核为它映射的 NVMe 配置/DMA 帧、甚至把 BAR0 的 MMIO 地址当成 RAM 交给帧分配器。
+  要把它纳入监督，得先给 `domain::reset` 加「跳过内核保留区间」的能力（内核侧的映射登记/
+  白名单），或让 block_srv 重启后由内核重建这些映射。
+- **首次加载仍是内核**: E3c 只把"重启"交给 init, 服务的**首次**加载仍在引导期 (内核按模块表
+  逐个载入)。让 init 承担首次加载需要把引导集再切一刀 (只留 pager + block + fat32 + mfs + init),
+  随之要处理服务启动顺序与自测时序。
+- **只轮询、无心跳**: 现在的判据是"任务在不在", 抓不到"任务还在但卡死"。真要抓僵死需要
+  服务侧心跳 (或内核侧看门狗), 那是另一层设计。
+- **重启会丢客户端缓存**: 服务重启后日志/共享页等"已完成共享"的客户端静态缓存 (`BOUNCE_SHARED`)
+  会让它读数据失败 —— 属已知损失，需要客户端能感知服务重启后重连才彻底解决。
+
+**验收（沿用现有口径 + 新增）**
+
+| 项 | 判据 |
+|---|---|
+| W^X | 无 PT_LOAD 为 W+X；内核单测覆盖权限位与「W+X 段被拒」；`make NVME_CLU=8` 与默认回归不退化 |
+| 无内嵌 | 内核镜像里不再有服务 ELF（`SERVICE_ELFS` 消失）；内核 ELF 体积回落；启动日志仍 `[OK] 14 service ELFs loaded` + `[up]` × 14 |
+| 可重启 | FS-29：服务被杀后由 init 重启，**域号不变**、`SYS_DOMAIN_COUNT` 回基线 |
+| 不退化 | `SELFTEST DONE` 1 次、`FAILED`/`PANIC` 0 次、`irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found" |
+| 门禁 | `make fmt` / `check` / `clippy` 全 0 |
+
+**风险 / 必须一起做的地基项**
+
+- **页共享**：RX 与 RW 段共享一页时无法 W^X —— 靠 `linker.ld` 分页对齐消除；加载器对
+  并集为 W+X 的页**拒绝加载**而不是降级，避免"悄悄不安全"。
+- **引导模块内存**：必须钉在内存图里（见上），否则是被覆盖型的随机故障。
+- **NX 与内核映射**：开启 `NXE` 后，未置 NX 的内核映射仍可执行（内核自身 W^X 不在本轮）。
+- **`EFER.NXE` 依赖 CPUID 支持**：不支持则无法强制 W^X，需明确告警（QEMU/真机均支持）。
 
 ### 阶段 4 — 远期
 

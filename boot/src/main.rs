@@ -6,11 +6,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use morion_boot::boot::loader::{Elf64Header, Elf64ProgramHeader};
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
+use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{
-    MemoryDescriptor, MemoryType, OpenProtocolAttributes, OpenProtocolParams, SearchType,
+    AllocateType, MemoryDescriptor, MemoryType, OpenProtocolAttributes, OpenProtocolParams,
+    SearchType,
 };
 use uefi::Identify;
 
@@ -934,7 +938,7 @@ static KERNEL_ELF: &[u8] = include_bytes!("../loader/morion-kernel.elf");
 #[repr(C)]
 struct BootInfo {
     magic: u32,   // 0x4D4F5249 = "MORI"
-    version: u32, // 2
+    version: u32, // 3
     fb_addr: u64, // 帧缓冲物理地址
     fb_width: u32,
     fb_height: u32,
@@ -943,6 +947,226 @@ struct BootInfo {
     mmap_addr: u64,        // 内存图数据物理地址 (0x8000)
     mmap_entry_count: u64, // 内存图条目数
     mmap_entry_size: u64,  // 单个条目字节数 (40)
+    // --- 服务模块表 (E3b): 内核按它把 14 个服务载入各自固定域 ---
+    svc_addr: u64,       // 服务模块表物理地址
+    svc_count: u64,      // 服务模块条目数
+    svc_entry_size: u64, // 单个模块条目字节数
+}
+
+// ============================================================
+//  服务模块 (E3b): 从 ESP 读入服务 ELF, 交给内核按固定域号加载
+// ============================================================
+
+/// 引导期服务模块表项 — 与 kernel/src/bootinfo.rs 的 `ServiceModule` 布局严格对应。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ServiceModule {
+    domain: u64,
+    addr: u64,
+    len: u64,
+}
+
+/// 服务清单: `(固定域号, 文件名)`。域号是 ABI（libvfs / shell 写死了服务域号），
+/// 故这里与 `kernel/src/main.rs` 建域的顺序必须一致。
+const SERVICE_FILES: [(u64, &str); 15] = [
+    (0, "sender"),
+    (1, "receiver"),
+    (2, "pager"),
+    (3, "echo"),
+    (4, "kbd"),
+    (5, "block_srv"),
+    (6, "fat32_srv"),
+    (7, "app"),
+    (8, "shell"),
+    (9, "mount_srv"),
+    (10, "tmpfs_srv"),
+    (11, "mfs_srv"),
+    (12, "ext2_srv"),
+    (13, "exfat_srv"),
+    (14, "init"),
+];
+
+/// 服务 ELF 在 ESP 里的目录。
+const SERVICE_DIR: &str = "\\EFI\\morion\\services";
+/// 探测"这个卷上有没有服务"用的文件（第一个服务）。
+const SERVICE_PROBE: &str = "\\EFI\\morion\\services\\sender.elf";
+
+/// 内核的恒等映射只覆盖前 4 GiB —— 模块镜像必须落在范围内，否则内核读不到。
+const MAX_MODULE_ADDR: u64 = 4 * 1024 * 1024 * 1024;
+
+/// 单个服务 ELF 的大小上限（服务都是几十 KB 量级）。
+///
+/// 既挡住"异种卷对同一路径返回离谱大小"导致的分配 panic，也顺带挡住异常镜像。
+const MAX_SERVICE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 从已打开的卷读出文件 `path` 的全部内容；`None` = 打不开 / 大小为 0 / 超过上限。
+///
+/// 直接走裸 `SimpleFileSystem` 协议而不是 `uefi::fs::FileSystem`：后者的 `read` 内部是
+/// `vec![0; info.file_size()]`，而**异种卷**（如光盘上的 ISO9660）可能对同一条路径返回
+/// 离谱的大小，于是分配处直接 `capacity overflow` panic（实测踩到）。这里先看大小、
+/// 设上限，再按实际长度分配。
+fn read_from_volume(volume: &mut SimpleFileSystem, path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
+
+    let mut root = volume.open_volume().ok()?;
+    let path16 = uefi::CString16::try_from(path).ok()?;
+    let handle = root
+        .open(&path16, FileMode::Read, FileAttribute::empty())
+        .ok()?;
+    let mut file = handle.into_regular_file()?;
+    let info = file.get_boxed_info::<FileInfo>().ok()?;
+    let size = info.file_size();
+    if size == 0 || size > MAX_SERVICE_BYTES {
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; size as usize];
+    let n = file.read(buf.as_mut_slice()).ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// 找到"含服务 ELF 的卷"并对其执行 `f`。
+///
+/// 先试「本映像所在的卷」(`get_image_file_system`) —— 它走 LoadedImage → DevicePath →
+/// `locate_device_path::<SimpleFileSystem>`；在 **El Torito 光盘引导**下这条链解析不出来
+/// （实测返回失败），于是退化为**枚举所有 SimpleFileSystem 卷**，用"能不能读出第一个
+/// 服务 ELF"判定（反正紧接着就要读它们，这一探测不是额外成本）。
+fn with_service_volume<R>(
+    bt: &BootServices,
+    f: impl FnOnce(&mut SimpleFileSystem) -> R,
+) -> Option<R> {
+    match bt.get_image_file_system(bt.image_handle()) {
+        Ok(mut volume) => return Some(f(&mut volume)),
+        Err(e) => {
+            serial_write("[boot] get_image_file_system failed, status=0x");
+            serial_write_u64(e.status().0 as u64);
+            serial_write("\n");
+        }
+    }
+    serial_write("[boot] scanning volumes for services...\n");
+
+    let handles = bt.find_handles::<SimpleFileSystem>().ok()?;
+    for (i, handle) in handles.into_iter().enumerate() {
+        serial_write("[boot]   volume #");
+        serial_write_u64(i as u64);
+        serial_write(": ");
+        let Ok(mut volume) = bt.open_protocol_exclusive::<SimpleFileSystem>(handle) else {
+            serial_write("open failed\n");
+            continue;
+        };
+        match read_from_volume(&mut volume, SERVICE_PROBE) {
+            Some(d) => {
+                serial_write("has services (");
+                serial_write_u64(d.len() as u64);
+                serial_write(" bytes)\n");
+                return Some(f(&mut volume));
+            }
+            None => serial_write("no services\n"),
+        }
+    }
+    None
+}
+
+/// 把这 14 份服务 ELF 从 `volume` 读进 `LOADER_DATA` 页，返回模块表项。
+///
+/// **必须 `LOADER_DATA`**：内核帧分配器只把 `CONVENTIONAL` 帧放进空闲池
+/// （见 `kernel/src/memory/frame_allocator.rs`），`LOADER_DATA` 天然被保留 ——
+/// 否则这些镜像会被当成空闲内存分出去，跑着跑着被覆盖（症状是随机崩溃）。
+fn load_all_modules(
+    bt: &BootServices,
+    volume: &mut SimpleFileSystem,
+    fb: &mut Fb,
+) -> alloc::vec::Vec<ServiceModule> {
+    let mut modules: alloc::vec::Vec<ServiceModule> =
+        alloc::vec::Vec::with_capacity(SERVICE_FILES.len());
+    for (domain, name) in SERVICE_FILES {
+        let path = alloc::format!("{SERVICE_DIR}\\{name}.elf");
+        let data = match read_from_volume(volume, &path) {
+            Some(d) => d,
+            None => boot_fail(fb, "Missing/oversized service ELF on the ESP", &path),
+        };
+        // 基本校验: 只接受 ELF64 镜像 (与内核 `elf::parse` 的第一道门槛一致)。
+        if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 {
+            boot_fail(fb, "Bad service ELF on the ESP", &path);
+        }
+        let pages = data.len().div_ceil(4096);
+        let addr = match bt.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+            Ok(a) => a,
+            Err(_) => boot_fail(fb, "Out of memory loading service ELFs", &path),
+        };
+        if addr + data.len() as u64 > MAX_MODULE_ADDR {
+            boot_fail(fb, "Service ELF allocated above 4 GiB", &path);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        serial_write("[boot]   + ");
+        serial_write(&path);
+        serial_write("\n");
+        modules.push(ServiceModule {
+            domain,
+            addr,
+            len: data.len() as u64,
+        });
+    }
+    modules
+}
+
+/// 引导失败: 画红字提示后停机。
+///
+/// 不"尽力继续"：半个服务集跑起来比不启动更难查（文件服务缺失会表现为各种超时）。
+fn boot_fail(fb: &mut Fb, msg: &str, hint: &str) -> ! {
+    draw_text(fb, msg, 40, 40, Color::rgb(0xFF, 0x66, 0x66));
+    draw_text(fb, hint, 40, 60, Color::rgb(0xAA, 0xAA, 0xAA));
+    serial_write("[boot] FAIL: ");
+    serial_write(msg);
+    serial_write(" | ");
+    serial_write(hint);
+    serial_write("\n");
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// 从引导器自己所在的卷（ESP）读入 14 份服务 ELF，各拷进 `LOADER_DATA` 页，
+/// 再把一张模块表放进同样类型的页里，返回 `(表物理地址, 条目数)`。
+///
+/// 两个"必须"：
+/// - **必须 `LOADER_DATA`**：内核帧分配器只把 `CONVENTIONAL` 帧放进空闲池
+///   （见 `kernel/src/memory/frame_allocator.rs`），`LOADER_DATA` 天然被保留 ——
+///   否则这些镜像会被当成空闲内存分出去，跑着跑着被覆盖（症状是随机崩溃）。
+/// - **必须在 `exit_boot_services` 之前读**：文件系统与页分配都是引导服务。
+fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64) {
+    serial_write("[boot] reading service ELFs from the ESP...\n");
+    let modules = match with_service_volume(bt, |volume| load_all_modules(bt, volume, fb)) {
+        Some(m) => m,
+        None => boot_fail(
+            fb,
+            "Cannot open a volume containing service ELFs",
+            "(the ESP must contain EFI/morion/services/*.elf)",
+        ),
+    };
+
+    // 表本身也放进 `LOADER_DATA` 页 —— 不放引导器镜像里的静态变量：内核只保证不碰
+    // 自己的镜像与低内存，引导器镜像所在区域不在那个保证范围内。
+    let bytes = modules.len() * core::mem::size_of::<ServiceModule>();
+    let pages = bytes.div_ceil(4096);
+    let table = match bt.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+        Ok(a) => a,
+        Err(_) => boot_fail(fb, "Out of memory for the service module table", ""),
+    };
+    if table + bytes as u64 > MAX_MODULE_ADDR {
+        boot_fail(fb, "Service module table allocated above 4 GiB", "");
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(modules.as_ptr() as *const u8, table as *mut u8, bytes);
+    }
+    serial_write("[boot] service modules loaded: ");
+    serial_write_u64(modules.len() as u64);
+    serial_write("\n");
+    (table, modules.len() as u64)
 }
 
 fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
@@ -967,10 +1191,21 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
         }
     }
 
+    // 读入服务 ELF (E3b): 必须在 `exit_boot_services` 之前 —— 用的是 UEFI 文件系统
+    // (`SimpleFileSystem` on the ESP) 与 UEFI 页分配; 内核侧不再内嵌这些镜像。
+    draw_text(
+        fb,
+        "Loading service modules from ESP...",
+        40,
+        40,
+        Color::rgb(0xCC, 0xCC, 0xCC),
+    );
+    let (svc_addr, svc_count) = load_service_modules(st.boot_services(), fb);
+
     // 设置 Boot Info 到 0x7000
     let boot_info = BootInfo {
         magic: 0x4D4F5249, // "MORI"
-        version: 2,
+        version: 3,
         fb_addr: fb.base as u64,
         fb_width: fb.w,
         fb_height: fb.h,
@@ -979,6 +1214,9 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
         mmap_addr: 0,
         mmap_entry_count: 0,
         mmap_entry_size: 0,
+        svc_addr,
+        svc_count,
+        svc_entry_size: core::mem::size_of::<ServiceModule>() as u64,
     };
     unsafe {
         let ptr = 0x7000 as *mut BootInfo;
@@ -1032,6 +1270,8 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
 
     // 退出引导服务并获取 UEFI 内存图
     let (_rt, mmap) = st.exit_boot_services(MemoryType::LOADER_DATA);
+    // 之后不能再分配（`Allocator` 已失效），按文档通知分配器库。
+    uefi::allocator::exit_boot_services();
 
     // 复制内存图到物理地址 0x8000 (内核已知位置)
     let entry_size = core::mem::size_of::<MemoryDescriptor>();
@@ -1222,9 +1462,104 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 //  UEFI 入口点
 // ============================================================
 
+// ============================================================
+//  COM1 串口镜像 (引导期诊断)
+// ============================================================
+//
+// 引导器的正常输出走 GOP 帧缓冲, 而 CI / headless 场景只看串口日志 —— 引导期一旦失败
+// (服务 ELF 缺失、页分配失败、panic…), 日志就只剩"停在 BdsDxe"。故这里用最原始的方式
+// (直接读写 COM1 端口) 镜像一份引导期进度与失败原因: 不依赖任何 UEFI 协议, 因而在
+// panic 处理器里也能用。
+const COM1: u16 = 0x3F8;
+
+/// 串口是否已初始化 (首次写入时初始化, 之后不再动寄存器)。
+static SERIAL_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn outb(port: u16, val: u8) {
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val,
+            options(nomem, nostack, preserves_flags));
+    }
+}
+
+fn inb(port: u16) -> u8 {
+    let value: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") value,
+            options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// 初始化 COM1 (115200 8N1, FIFO 开) — 与内核 `video` 模块同一套参数。
+fn serial_init_hw() {
+    outb(COM1 + 1, 0x00); // 关中断
+    outb(COM1 + 3, 0x80); // DLAB=1
+    outb(COM1, 0x01); // 除数低字节 = 1 (115200)
+    outb(COM1 + 1, 0x00); // 除数高字节
+    outb(COM1 + 3, 0x03); // 8N1
+    outb(COM1 + 2, 0xC7); // FIFO 使能 + 清空
+    outb(COM1 + 4, 0x0B); // DTR/RTS 置位
+}
+
+fn serial_ensure() {
+    if !SERIAL_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        serial_init_hw();
+        SERIAL_READY.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn serial_putc(c: u8) {
+    while inb(COM1 + 5) & 0x20 == 0 {} // 等发送保持寄存器空
+    outb(COM1, c);
+}
+
+/// 写一段文本到 COM1 (`\n` 展开为 `\r\n`)。可重入、可在 panic 里调用。
+fn serial_write(s: &str) {
+    serial_ensure();
+    for b in s.bytes() {
+        if b == b'\n' {
+            serial_putc(b'\r');
+        }
+        serial_putc(b);
+    }
+}
+
+/// 写一个十进制无符号数 (panic 里报行号用)。
+fn serial_write_u64(mut v: u64) {
+    serial_ensure();
+    if v == 0 {
+        serial_putc(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for b in &buf[i..] {
+        serial_putc(*b);
+    }
+}
+
 #[cfg(target_os = "uefi")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // 引导器只画 GOP 帧缓冲, 而 CI / headless 只看串口日志 —— 静默 spin 会让失败表现为
+    // "日志停在 BdsDxe 那一行"。故这里先把 panic 现场写到 COM1 再停机。
+    serial_write("[boot] PANIC: ");
+    if let Some(msg) = info.message().as_str() {
+        serial_write(msg);
+        serial_write(" @ ");
+    }
+    if let Some(loc) = info.location() {
+        serial_write(loc.file());
+        serial_write(":");
+        serial_write_u64(loc.line() as u64);
+    }
+    serial_write("\n");
     loop {
         core::hint::spin_loop();
     }
@@ -1232,6 +1567,13 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[entry]
 fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
+    // 全局分配器必须**显式初始化**：uefi 的 `Allocator` 靠内部一个静态 `SYSTEM_TABLE`
+    // 指针去找 BootServices，`#[entry]` 不会替我们登记（见其模块文档 "Call the `init`
+    // function with a reference to the boot services table. Failure to do so before calling
+    // a memory allocating function will panic"）。引导器此前从不分配内存，所以一直没暴露；
+    // E3b 读服务 ELF 要用 `Vec`/`String`，不初始化就会在第一次分配时崩（表现为 #UD）。
+    unsafe { uefi::allocator::init(&mut st) };
+
     // 先获取 stdin (需要 &mut st)，获取后立即转为裸指针释放借用
     let stdin_ptr: *mut uefi::proto::console::text::Input = st.stdin() as *mut _;
     let stdin = unsafe { &mut *stdin_ptr };

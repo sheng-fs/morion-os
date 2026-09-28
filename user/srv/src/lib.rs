@@ -38,6 +38,8 @@ pub fn announce(name: &str, domain_id: u64) {
 pub mod ext2_srv;
 #[cfg(feature = "svc-fat32_srv")]
 pub mod fat32_srv;
+#[cfg(feature = "svc-init")]
+pub mod init;
 #[cfg(feature = "svc-kbd")]
 pub mod kbd;
 #[cfg(feature = "svc-mfs_srv")]
