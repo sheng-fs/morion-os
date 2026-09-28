@@ -170,6 +170,8 @@ extern "C" {
 ///
 /// `ptr` 为 0 表示无 payload (返回全零); 非用户空间地址同样拒绝 (返回全零),
 /// 避免 syscall 在 Ring0 下读取内核内存 (与 SYS_ALLOC_PAGE 等信任边界一致)。
+/// 只检查 "地址合法性" (P4 索引), 不逐页 resolve —— 一旦命中未映射页会触发
+/// 内核态 #PF → DoS, 但 `PAYLOAD_LEN=96` 远小于单页, 这种路径几乎不可能。
 fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
     if ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
         return [0; crate::ipc::PAYLOAD_LEN];
@@ -180,6 +182,35 @@ fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
         buf.copy_from_slice(src);
         buf
     }
+}
+
+/// 校验 `(ptr, len)` 是否完整落在 `domain` **已映射**的用户空间内。
+///
+/// 内核态 syscall 会以 Ring0 + 用户 CR3 直接读写用户缓冲; 没有这层校验的话,
+/// 传入未映射的有效用户地址会触发内核态 #PF → `page_fault_handler` 红屏停机 →
+/// 是一个可由任意域触发的 DoS 向量。`is_user_address` 只挡内核地址, 挡不住
+/// P4 对但 PT 里 Present=0 的页 —— 那正是 `resolve_user_page` 在逐页帮我们补的。
+fn verify_user_range(domain: u64, ptr: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !crate::memory::paging::is_user_address(ptr) {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    if end != 0 && !crate::memory::paging::is_user_address(end - 1) {
+        return false;
+    }
+    let mut page = ptr & !0xFFF;
+    while page < end {
+        if crate::memory::paging::resolve_user_page(domain, page).is_none() {
+            return false;
+        }
+        page += 4096;
+    }
+    true
 }
 
 /// 掩码校验: 每一位都必须是本域**注册过的**向量, 且本域持有对应 `Capability::Irq`。
@@ -222,12 +253,16 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
             let msg = crate::ipc::receive();
             if a1 != 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        &msg as *const crate::ipc::Message as *const u8,
-                        a1 as *mut u8,
-                        core::mem::size_of::<crate::ipc::Message>(),
-                    );
+                let domain = crate::scheduler::current_domain();
+                let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+                if verify_user_range(domain, a1, msg_size) {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            &msg as *const crate::ipc::Message as *const u8,
+                            a1 as *mut u8,
+                            core::mem::size_of::<crate::ipc::Message>(),
+                        );
+                    }
                 }
             }
             msg.tag
@@ -436,20 +471,37 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_PORT_IN8 => {
             // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            // 必须持有对应端口的 PortIo 能力 —— 否则任意域都能直接读写硬件。
             let port = a1 as u16;
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo(port)) {
+                return 0;
+            }
             unsafe { Port::<u8>::new(port).read() as u64 }
         }
         SYS_PORT_IN16 => {
             let port = a1 as u16;
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo(port)) {
+                return 0;
+            }
             unsafe { Port::<u16>::new(port).read() as u64 }
         }
         SYS_PORT_OUT8 => {
             let port = a1 as u16;
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo(port)) {
+                return 0;
+            }
             unsafe { Port::<u8>::new(port).write(a2 as u8) };
             0
         }
         SYS_PORT_OUT16 => {
             let port = a1 as u16;
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo(port)) {
+                return 0;
+            }
             unsafe { Port::<u16>::new(port).write(a2 as u16) };
             0
         }
@@ -466,11 +518,16 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 阻塞读取一行控制台输入: 把内核输入行队列中的一行拷入用户缓冲 `a1`
             // (最多 `a2` 字节, 不含换行), 返回行长度。队列为空则阻塞当前任务,
             // 由键盘域经 SYS_TERM_PUT 回车提交时唤醒 (wait_on = INPUT_WAIT)。
-            if a1 == 0 || !crate::memory::paging::is_user_address(a1) {
+            if a1 == 0 || a2 == 0 {
+                return u64::MAX;
+            }
+            let domain = crate::scheduler::current_domain();
+            if !verify_user_range(domain, a1, a2) {
                 return u64::MAX;
             }
             loop {
-                // 调用方已用 is_user_address 校验过 a1, 满足 input_read 的安全前提。
+                // `verify_user_range` 已确认 (a1, a2) 完整落在本域已映射的用户空间,
+                // 满足 input_read 的安全前提。
                 if let Some(n) = unsafe { crate::video::input_read(a1 as *mut u8, a2 as usize) } {
                     return n as u64;
                 }
@@ -527,7 +584,17 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
-            // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            //
+            // 信任边界: 调用方给的 (ptr, len) 必须完全落在本域**已映射**的用户空间里 ——
+            // 内核以 Ring 0 + 用户 CR3 解引用, 传入内核地址或未映射页会触发内核态
+            // #PF → 红屏停机 (DoS)。逐页 resolve_user_page 是最轻量的防御。
+            if a2 == 0 || a2 > 4096 {
+                return 0;
+            }
+            let domain = crate::scheduler::current_domain();
+            if !verify_user_range(domain, a1, a2) {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
             let s = unsafe { core::str::from_utf8_unchecked(slice) };
             crate::video::print(s);

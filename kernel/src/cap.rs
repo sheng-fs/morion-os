@@ -24,6 +24,12 @@ pub enum Capability {
     /// 无参数 —— 该能力本身就是"可以造进程"这张凭证。与其它能力一样默认不授予,
     /// 由信任方显式给（引导期给 shell / 自测域）。
     Spawn,
+    /// 访问指定 I/O 端口的能力 (`SYS_PORT_IN8/16` / `SYS_PORT_OUT8/16`)。
+    ///
+    /// 微内核的 I/O 端口是硬件敏感资源 (IDE/NIC/键盘控制器等), 无能力则任意域
+    /// 都能直接读写 —— 是纯安全漏洞。与其它能力一样默认不授予, 由引导器/授权方
+    /// 按具体设备所需的端口显式给予。
+    PortIo(u16),
 }
 
 /// 每域能力槽数量。
@@ -37,6 +43,8 @@ pub const CAP_KIND_IRQ: u64 = 2;
 pub const CAP_KIND_MMIO: u64 = 3;
 /// `Spawn` 无参数, 故 `arg` 被忽略（但保留两段式编码, 委派路径才不必特判）。
 pub const CAP_KIND_SPAWN: u64 = 4;
+/// I/O 端口访问: `arg` 为端口号 (u16)。
+pub const CAP_KIND_PORT_IO: u64 = 5;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -51,6 +59,7 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         CAP_KIND_IRQ if arg <= u8::MAX as u64 => Some(Capability::Irq(arg as u8)),
         CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
         CAP_KIND_SPAWN => Some(Capability::Spawn),
+        CAP_KIND_PORT_IO if arg <= u16::MAX as u64 => Some(Capability::PortIo(arg as u16)),
         _ => None,
     }
 }
