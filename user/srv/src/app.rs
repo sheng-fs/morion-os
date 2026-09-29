@@ -152,6 +152,19 @@ pub fn run() {
         return;
     }
 
+    // 图形自测 (GS-1 / GT-1) 放在**最前**: 它是唯一"看屏幕"的取证, 提前跑就不必等后面
+    // 几分钟的 NVMe FS 压测 —— 每次回归/开发都能立刻拿到图形结果 (g3b-reorder)。
+    // `gfx_srv` (域 15) 是后启动的服务, 帧缓冲要等它接管后才写得进去; 这里不必自旋等待 ——
+    // 首个 `ipc::call` 会一直等到它有回 (接管 + 进入请求循环) 为止。
+    // GS-1 (G2): 图形原语 + 共享表面 —— 画色带 → blit 上屏 → 服务端回读校验。
+    if gs1_gfx_primitives().is_none() {
+        return;
+    }
+    // GT-1 (G3a): 文本渲染外移 —— 服务内终端按显示列排版, 逐像素写后回读校验。
+    if gt1_text_rendering().is_none() {
+        return;
+    }
+
     // 1. open -> read -> close: 读整个文件。
     let fd = vfs::open("/hello.txt");
     if fd == u64::MAX {
@@ -3294,16 +3307,6 @@ pub fn run() {
 
     // FS-29 (E3c): 监督者原地重启 —— 让 echo (域 3) 退出, init 应在巡检周期内把它拉起来。
     if fs29_supervisor_restart().is_none() {
-        return;
-    }
-
-    // GS-1 (G2): 图形原语 + 共享表面 —— 画色带 → blit 上屏 → 服务端回读校验。
-    if gs1_gfx_primitives().is_none() {
-        return;
-    }
-
-    // GT-1 (G3a): 文本渲染外移 —— 服务内终端按显示列排版, 逐像素写后回读校验。
-    if gt1_text_rendering().is_none() {
         return;
     }
 

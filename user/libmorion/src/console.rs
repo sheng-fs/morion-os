@@ -44,12 +44,10 @@ pub fn readline(buf: &mut [u8]) -> u64 {
                     flush();
                 }
             }
-            b if (0x20..=0x7E).contains(&b) => {
-                if len < buf.len() {
-                    buf[len] = b;
-                    len += 1;
-                    echo(b);
-                }
+            b if (0x20..=0x7E).contains(&b) && len < buf.len() => {
+                buf[len] = b;
+                len += 1;
+                echo(b);
             }
             _ => {} // 其它控制键与非 ASCII 字节: 忽略
         }
