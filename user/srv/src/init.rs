@@ -58,16 +58,39 @@ const POLL_MS: u64 = 40;
 /// 盘上服务目录 (FAT32 根卷)。
 const SERVICE_DIR: &str = "/system/services/";
 
+/// 每个被监督域「上一轮已发现它没有存活任务」的标记（两连击去抖，见 [`run`]）。
+static mut PENDING: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
+
 /// 监督循环: 每轮检查一遍被监督域，缺谁补谁。
+///
+/// **两连击去抖**: 一次「没有存活任务」只记一笔，下一轮仍是同样结果才重启。
+/// 这样做的两个理由:
+///  * 单次采样可能正踩在服务刚退出/刚起步的边界上，连看两轮更稳；
+///  * 「死亡」这个状态因此**至少持续一个巡检周期** (`POLL_MS`)，轮询式的观察者
+///    (如自测 FS-29 断言"它一度没有存活任务") 才可能稳定看到它 —— 否则从内存镜像
+///    重启只要一两个 tick，窗口短到轮询方根本采样不到。
 pub fn run() {
     println(
         "init: supervising pager/echo/kbd/fat32_srv/mount_srv/tmpfs_srv/mfs_srv/ext2_srv/exfat_srv",
     );
     let mut restarts = 0u64;
     loop {
-        for (domain, name) in SUPERVISED {
+        for (i, &(domain, name)) in SUPERVISED.iter().enumerate() {
             if sys_domain_alive(domain) != 0 {
+                unsafe {
+                    PENDING[i] = false;
+                }
                 continue;
+            }
+            // 两连击: 第一次发现"没有存活任务"只记一笔, 下一轮仍然如此才重启。
+            if !unsafe { PENDING[i] } {
+                unsafe {
+                    PENDING[i] = true;
+                }
+                continue;
+            }
+            unsafe {
+                PENDING[i] = false;
             }
             // 域号必须原样回来 (内核只允许"原地重启") —— 不相等说明约定被破坏，宁可报错。
             let (revived, from_disk) = restart(domain, name);

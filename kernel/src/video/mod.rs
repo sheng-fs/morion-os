@@ -16,6 +16,7 @@ pub mod logo;
 pub mod unicode;
 
 use crate::bootinfo::BootInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use framebuffer::Framebuffer;
 use spin::Mutex;
 
@@ -23,6 +24,19 @@ use spin::Mutex;
 static mut FB: Framebuffer = Framebuffer::empty();
 static mut CURSOR_X: u32 = 0;
 static mut CURSOR_Y: u32 = 0;
+
+/// 帧缓冲物理基址与字节数 (初始化时记录), 供 `SYS_FB_INFO` / `SYS_FB_MAP` 查询。
+static mut FB_BASE: u64 = 0;
+static mut FB_BYTES: u64 = 0;
+/// 帧缓冲几何 `(宽, 高, 行跨度像素, 每像素位数)`。
+static mut FB_GEOM: (u32, u32, u32, u32) = (0, 0, 0, 0);
+
+/// 用户态图形服务是否已**接管**显示 (`SYS_FB_TAKEOVER`)。
+///
+/// 置位后内核终端不再写帧缓冲 (历史 / 输入行 / 光标 / 重绘全部跳过), 输出只保留 COM1 ——
+/// 屏幕从此由用户态 `gfx_srv` 负责。早期引导与 panic 输出仍走内核路径 (那时还没接管),
+/// 故 panic 永远不依赖用户态服务。
+static FB_TAKEN_OVER: AtomicBool = AtomicBool::new(false);
 
 const MARGIN: u32 = 16;
 /// 行高 (字符高 + 行间距)
@@ -161,6 +175,9 @@ pub fn init(info: &BootInfo) {
         FB = Framebuffer::init(info.fb_addr, info.fb_width, info.fb_height, info.fb_stride);
         CURSOR_X = MARGIN;
         CURSOR_Y = MARGIN;
+        FB_BASE = info.fb_addr;
+        FB_BYTES = info.fb_height as u64 * info.fb_stride as u64 * (info.fb_bpp as u64 / 8);
+        FB_GEOM = (info.fb_width, info.fb_height, info.fb_stride, info.fb_bpp);
     }
     bg_fill_all();
 }
@@ -168,6 +185,33 @@ pub fn init(info: &BootInfo) {
 /// 帧缓冲是否可用 (panic/异常处理在打印前检查)
 pub fn ready() -> bool {
     unsafe { FB.is_ready() }
+}
+
+/// 帧缓冲物理基址 (供 `SYS_FB_INFO` / `SYS_FB_MAP`)。
+pub fn fb_base() -> u64 {
+    unsafe { FB_BASE }
+}
+
+/// 帧缓冲字节数 (按 `height * stride * bpp/8` 计算, 可能与帧分配器口径一致)。
+pub fn fb_bytes() -> u64 {
+    unsafe { FB_BYTES }
+}
+
+/// 帧缓冲几何 `(宽, 高, 行跨度像素, 每像素位数)`。
+pub fn fb_geometry() -> (u32, u32, u32, u32) {
+    unsafe { FB_GEOM }
+}
+
+/// 宣告用户态**接管**显示: 之后内核终端不再写帧缓冲 (输出只留 COM1)。
+///
+/// 由 `SYS_FB_TAKEOVER` 在持 `Capability::Fb` 时调用; 幂等。
+pub fn take_over() {
+    FB_TAKEN_OVER.store(true, Ordering::SeqCst);
+}
+
+/// 显示是否已被用户态接管。
+pub fn is_taken_over() -> bool {
+    FB_TAKEN_OVER.load(Ordering::SeqCst)
 }
 
 pub fn width() -> u32 {
@@ -206,6 +250,9 @@ pub fn clear(color: u32) {
 
 /// 清屏并复位终端状态 (历史 / 输入行 / 光标 / 回滚), 供 `SYS_CLEAR` 使用。
 pub fn clear_screen() {
+    if is_taken_over() {
+        return; // 屏幕已交给用户态图形服务, 内核不再干预
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     unsafe {
@@ -625,6 +672,9 @@ fn char_cells(bytes: &[u8], pos: usize) -> u32 {
 
 /// 键盘 ↑: 光标上移一行; 光标已在可视区顶部时再触发向上滚动
 pub fn scroll_view_up() {
+    if is_taken_over() {
+        return;
+    }
     unsafe {
         if CUR_ROW < cur_row_max() {
             CUR_ROW += 1;
@@ -644,6 +694,9 @@ pub fn scroll_view_up() {
 
 /// 键盘 ↓: 光标下移一行; 光标已回到输入行时再触发向下滚动 (恢复 live)
 pub fn scroll_view_down() {
+    if is_taken_over() {
+        return;
+    }
     unsafe {
         if CUR_ROW > 0 {
             CUR_ROW -= 1;
@@ -734,6 +787,15 @@ pub fn print(s: &str) {
     // 镜像到 COM1 串口, 供 headless 调试捕获。
     serial_write(s);
 
+    // 显示已被用户态接管: 不再碰帧缓冲, 输出到此为止 (串口已写)。
+    if is_taken_over() {
+        drop(guard);
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        return;
+    }
+
     let detached = input_detach();
     // 两个调用都要执行 (不能短路: 输出提交与输入接回是两件独立的事)。
     let out_committed = append_text(s);
@@ -765,6 +827,9 @@ pub fn println(s: &str) {
 /// 横向错切 (这是此前 LOGO「形状不对」的原因)。原先逐字符/逐行调用
 /// `print()` 还会触发上百次整屏重绘 (启动明显卡顿), 这里改为批量追加后只重绘一次。
 pub fn print_logo() {
+    if is_taken_over() {
+        return;
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let guard = PRINT_LOCK.lock();
@@ -802,6 +867,9 @@ pub fn print_logo() {
 ///
 /// 光标在历史区 (CUR_ROW > 0) 时, 字符直接插入到该历史行光标处, 不跳回输入行。
 pub fn term_put(c: u8) {
+    if is_taken_over() {
+        return; // 显示已交给用户态: 内核不再编辑/重绘 (输入由图形侧后续接管)
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -918,6 +986,9 @@ fn insert_hist_char(c: u8) {
 ///
 /// 光标在历史区时删除该历史行光标前字符, 不跳回输入行。
 pub fn term_backspace() {
+    if is_taken_over() {
+        return;
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -982,6 +1053,9 @@ fn backspace_hist_char() {
 
 /// 光标左移
 pub fn term_left() {
+    if is_taken_over() {
+        return;
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -1017,6 +1091,9 @@ pub fn term_left() {
 
 /// 光标右移
 pub fn term_right() {
+    if is_taken_over() {
+        return;
+    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 

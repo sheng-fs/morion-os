@@ -102,6 +102,37 @@ pub const SYS_DOMAIN_ALIVE: u64 = 42;
 /// 页的那一份, 与内核同生命周期、**不依赖磁盘**。于是 `init` 能重启文件服务本身
 /// (fat32_srv / mfs_srv), 解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。
 pub const SYS_SPAWN_ELF_MODULE: u64 = 43;
+/// 取帧缓冲几何 (G1 图形子系统): `rdi = 用户缓冲指针`, 成功写入 [`FbInfo`] 并返回 1, 失败 0。
+/// 需 `Capability::Fb`。
+///
+/// 形如 `SYS_FB_MAP` / `SYS_FB_TAKEOVER` 的入口: 帧缓冲是内核仅存的「全局唯一」输出设备,
+/// 交给用户态图形服务独占 —— 故单独一类能力 (`Fb`), 而不是逐页的 `Mmio`。
+pub const SYS_FB_INFO: u64 = 44;
+/// 把**整块帧缓冲**映射进本域: `rdi = 用户虚拟地址` (页对齐), 成功返回 1, 失败 0。
+/// 需 `Capability::Fb`。
+///
+/// 映射按 4 KiB 页逐页建立 (与 `SYS_MAP_MMIO` 同口径, 非缓存); 若目标区间**已有**映射则
+/// 整体拒绝 (不半途映射, 也避免撞内核 `PageAlreadyMapped` panic)。
+pub const SYS_FB_MAP: u64 = 45;
+/// 宣告本域**接管**显示: 之后内核终端不再写帧缓冲, 输出只保留 COM1 —— 屏幕交给用户态。
+/// 成功返回 1。需 `Capability::Fb`。幂等。
+pub const SYS_FB_TAKEOVER: u64 = 46;
+
+/// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FbInfo {
+    /// 帧缓冲物理基址。
+    pub addr: u64,
+    /// 宽 (像素)。
+    pub width: u32,
+    /// 高 (像素)。
+    pub height: u32,
+    /// 行跨度 (像素)。
+    pub stride: u32,
+    /// 每像素位数。
+    pub bpp: u32,
+}
 
 /// `SYS_SPAWN_ELF` 接受的最大镜像长度 (1 MiB)。
 ///
@@ -662,6 +693,72 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 return u64::MAX;
             };
             restart_in_place(a1, image)
+        }
+        SYS_FB_INFO => {
+            // 取帧缓冲几何, 写回用户缓冲 (G1: 用户态图形服务用它算页面范围)。
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::Fb) {
+                return 0;
+            }
+            let size = core::mem::size_of::<FbInfo>() as u64;
+            if a1 == 0
+                || !crate::memory::paging::is_user_address(a1)
+                || !crate::memory::paging::is_user_address(a1 + size - 1)
+            {
+                return 0;
+            }
+            let (width, height, stride, bpp) = crate::video::fb_geometry();
+            let info = FbInfo {
+                addr: crate::video::fb_base(),
+                width,
+                height,
+                stride,
+                bpp,
+            };
+            unsafe {
+                core::ptr::write(a1 as *mut FbInfo, info);
+            }
+            1
+        }
+        SYS_FB_MAP => {
+            // 把整块帧缓冲映射进本域 (按 4 KiB 页, 非缓存)。先整段确认"未映射"再动手 ——
+            // 已有映射时半途返回会留下脏状态, 且逐页 map 撞已映射页会 panic。
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::Fb) {
+                return 0;
+            }
+            let base = crate::video::fb_base();
+            let bytes = crate::video::fb_bytes();
+            if base == 0 || bytes == 0 || a1 & 0xFFF != 0 {
+                return 0;
+            }
+            let Some(end) = a1.checked_add(bytes) else {
+                return 0;
+            };
+            if !crate::memory::paging::is_user_address(a1)
+                || !crate::memory::paging::is_user_address(end - 1)
+            {
+                return 0;
+            }
+            let pages = bytes.div_ceil(4096);
+            for i in 0..pages {
+                if crate::memory::paging::resolve_user_page(domain, a1 + i * 4096).is_some() {
+                    return 0; // 目标区间已被占用: 不映射, 也不 panic
+                }
+            }
+            for i in 0..pages {
+                crate::memory::paging::map_mmio(domain, a1 + i * 4096, base + i * 4096);
+            }
+            1
+        }
+        SYS_FB_TAKEOVER => {
+            // 用户态宣告接管显示: 内核终端此后不再写帧缓冲 (输出只留 COM1)。
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::Fb) {
+                return 0;
+            }
+            crate::video::take_over();
+            1
         }
         SYS_DOMAIN_ALIVE => {
             // 该域是否**还有存活任务** (监督者巡检原语)。

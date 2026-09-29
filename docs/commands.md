@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | `make` | 默认目标，等价 `make iso` | `build/morion-os.iso` |
 | `make kernel` | 仅构建微内核 | `build/kernel/morion-kernel` |
-| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（15 份独立 ELF） |
+| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（16 份独立 ELF） |
 | `make hello` | 仅构建可执行文件加载演示程序 | `build/user/hello.elf` |
 | `make boot` | 仅构建 UEFI 引导器 | `build/boot/morion-boot.efi` |
 | `make iso` | 构建完整可启动 ISO | `build/morion-os.iso` |
@@ -24,7 +24,7 @@
 
 依赖关系（E3b 起）：`iso → kernel, boot, user`。`boot` 需要先 `make kernel` 产出
 `boot/loader/morion-kernel.elf`（引导器把它 `include_bytes!` 嵌进 `morion-boot.efi`）；
-15 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
+16 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
 `exit_boot_services` 之前用 UEFI 文件系统读它们 —— 故**内核不再依赖服务 ELF**；
 同时也放进 **FAT32 根盘的 `/system/services/`**（E3c：监督者 `init` 的**盘上**重启源 —— 重启
 优先用引导模块内存镜像，失败才回退它）。

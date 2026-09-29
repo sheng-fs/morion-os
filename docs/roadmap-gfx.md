@@ -46,9 +46,9 @@
 
 | # | 问题 | 候选 | 决定 |
 |---|---|---|---|
-| D1 | 帧缓冲授权方式 | (a) 复用 `Capability::Mmio` + `SYS_MAP_MMIO`；(b) 新增专用 `SYS_MAP_FB` | **(a)**：机制已就绪，fb 也是一个「物理 MMIO 区间」，不必新增 syscall |
-| D2 | 帧缓冲缓存属性 | (a) 沿用 `NO_CACHE`；(b) 加 **write-combining (PAT)** | **先 (a) 跑通功能**，G3 后按实测决定是否补 (b) —— 未缓存 MMIO **逐像素**写会明显拖慢填充/文字 |
-| D3 | 内核终端去留 | (a) 一次性删除；(b) **分两阶段**：先与 gfx 并行，验证后再降级为 panic-only | **(b)**：早期引导日志、panic 输出、回归取证都依赖它，不能一次断 |
+| D1 | 帧缓冲授权方式 | (a) 复用 `Capability::Mmio(页对齐基址)` + `SYS_MAP_MMIO`；(b) **单列 `Capability::Fb`** + 三个 `SYS_FB_*` | **(b)（实现时修正）**：`Mmio` 能力按「页对齐物理基址」**逐页**匹配（设备 BAR 一页一条），而帧缓冲是**一整块**（可达上千页）——逐页授权既塞不下 16 个能力槽，也无意义。故新增无参能力 `Fb` + `SYS_FB_INFO` / `SYS_FB_MAP` / `SYS_FB_TAKEOVER`；映射仍复用 `paging::map_mmio` 的 4 KiB 非缓存页 |
+| D2 | 帧缓冲缓存属性 | (a) 沿用 `NO_CACHE`；(b) 加 **write-combining (PAT)** | **先 (a) 跑通功能**（G1 已按此实现），G3 后按实测决定是否补 (b) —— 未缓存 MMIO **逐像素**写会明显拖慢填充/文字 |
+| D3 | 内核终端去留 | (a) 一次性删除；(b) **分两阶段**：先与 gfx 并行，验证后再降级为 panic-only | **(b)**：G1 已实现「**接管开关**」（`SYS_FB_TAKEOVER` → 内核终端停止写帧缓冲、只留 COM1）；早期引导与 panic 输出仍走内核路径，永远不依赖用户态服务 |
 | D4 | 文本渲染归属 | (a) 字库与排版搬到用户态；(b) 内核保留、gfx 只做 `draw_text` 薄封装 | **(a)**：把 276 KB 字库与排版逻辑移出内核；内核另留**最小 ASCII 字库**供 panic 路径 |
 | D5 | 图形 API 形态 | (a) IPC 原语 `fill/rect/blit/text`；(b) 只把 scanout 直通给特权客户端 | **(a) 起步**：客户端画在**共享页**，服务 blit 上屏；(b) 属「性能飞地」主题，另议 |
 | D6 | COM1 日志 sink | 必须保留一条串口输出路径 | **硬约束**：任何输出迁移都不得让 `SELFTEST DONE` 这类关键行从串口消失，否则回归直接失明 |
@@ -57,20 +57,25 @@
 
 ## 4. 设计要点
 
-### G1 — 帧缓冲授权 + `gfx_srv` 起屏
+### G1 — 帧缓冲授权 + `gfx_srv` 起屏 ✅ 已完成
 
 - 新增域 **15 `gfx_srv`**：`domain::create()` 增一个 + `BOOT_DOMAINS` 15 → 16 + `cap/ipc/pager::init` 计数 15 → 16 + `SERVICE_FILES` 加 `(15, "gfx_srv")` + `SRV_NAMES` 加 `gfx_srv`（沿用 E3b/E3c 的建域/打包流程）。
-- 内核把 fb 物理区间（页对齐，长度按 `stride*height*bpp/8` 向上取整）作为 `Capability::Mmio(fb_pa)` 授给 `gfx_srv`。
-- `gfx_srv` 启动：`sys_map_mmio` 映射 fb → 清屏成渐变 + 画一个矩形/文字。
-- **交接协议**：内核终端在 `gfx_srv`「接手」**之前**照常画（引导日志可见 + COM1 镜像）；接手后内核停止写屏，仅保留 COM1 与 panic 路径。需要一个「谁来画」的开关（内核侧一个 `FB_OWNER` 标志，或 gfx_srv 首次刷新时通知内核）。
-- **验收**：屏幕出现预期图元；`SYS_MAP_MMIO` 返回 1；宿主侧用 QEMU `screendump`（ppm）做像素断言，或用串口 marker 断言到达。
+- 内核新增**无参能力 `Fb`**（帧缓冲全局唯一，逐页 `Mmio` 塞不下），授给 `gfx_srv`；配套三个 syscall：
+  `SYS_FB_INFO(44)`（写回 `FbInfo { addr, width, height, stride, bpp }`）、
+  `SYS_FB_MAP(45)`（把整块帧缓冲按 4 KiB 页映射进本域，先整段查重再映射）、
+  `SYS_FB_TAKEOVER(46)`（宣告接管）。
+- **接管开关**：内核 `video` 加 `FB_TAKEN_OVER` 标志；`SYS_FB_TAKEOVER` 置位后，`print` / `print_logo` / `clear_screen` / `term_*` / `scroll_*` 全部**跳过帧缓冲**，`print` 仍写 COM1 —— 于是串口日志不断（D6），屏幕归用户态。
+- `gfx_srv` 启动：`SYS_FB_INFO` → `SYS_FB_MAP`（映射到 `USER_SPACE_BASE + 1 GiB`）→ 画测试图案（全屏底色 + 居中色块）→ **回读校验**（四角 + 中心像素必须等于写入值）→ `SYS_FB_TAKEOVER` → 重画一次并打印 `gfx: framebuffer takeover OK (kernel console detached)`。回读校验是自动化取证：证明这块映射确实可写、几何算得对，不依赖人工看屏。
+- **验收**：串口出现 `gfx: framebuffer takeover OK` + `gfx: framebuffer 1280x800 stride=1280 phys=0x80000000`；**回读校验**（服务内写后读回、值必须一致）是自动化取证。⚠️ 本机 QEMU（`screendump` + virtio/std 两种 vga 都试过）取到的是一张**占位表面**（全域 `0x000033`），无法当作帧缓冲内容的证据 —— 裸写帧缓冲不经 `virtio-gpu` 的 flush，且 QEMU 11 在该组合下不反映 guest 显存；要肉眼确认需带真实显示前端的 QEMU。故正式判据以**回读 + 串口 marker + 全量回归**为准。
 
-### G2 — 图形原语 + 共享面 + `libmorion::gfx`
+### G2 — 图形原语 + 共享面 + `libmorion::gfx` ✅ 已完成
 
-- `gfx_srv` 实现原语：`GFX_FILL` / `GFX_RECT` / `GFX_BLIT`（面 → 屏）。
-- 新增客户端库 `libmorion::gfx`（分配共享面、提交绘制请求），模式照抄 `libvfs`。
-- **共享面**：客户端把一页/多页共享给 `gfx_srv`（`SYS_SHARE_PAGE`），服务把面内容 blit 到 fb。地址约定避开已有固定区（见 dev-reference「共享缓冲地址约定」）。
-- **自测 GS-1**：app 画到一个共享面（多条色带/方块）→ `gfx_srv` 拷上屏 → 串口 marker + 像素断言。
+- `gfx_srv` 实现三个原语（[gfx_srv.rs](../../user/srv/src/gfx_srv.rs)）：`GFX_OP_FILL`（整屏铺色）、`GFX_OP_RECT`（屏幕矩形）、`GFX_OP_BLIT`（面 → 屏，带裁剪）；另有 `GFX_OP_PING` 存活探测。请求循环**在接管之后**才启动，故客户端的第一条请求必然落在「屏幕已归用户态」之后。
+- 新增客户端库 [`libmorion::gfx`](../../user/libmorion/src/gfx.rs)（模式照抄 `libvfs`）：协议（`GfxReq` / `GFX_OP_*` / `GFX_TAG`）+ `Surface`（分配 / 共享 / 像素 / `rect` / `blit`）+ 屏幕级 `fill_screen` / `screen_rect` / `ping`。
+- **共享面**：客户端 `SYS_ALLOC_PAGE` + `SYS_SHARE_PAGE` 把表面**同址**共享给 `gfx_srv`，服务按请求里的 VA 直接读。地址按域 id 错开（`SURFACE_BASE = USER_BASE + 64 MiB`，步长 4 MiB，单面上限 1 MiB）—— 否则多个客户端会把表面共享到服务域的同一个 VA，第二个就撞 `PageAlreadyMapped`（与 libvfs 中转页是同一个坑）。
+- **端到端取证（关键）**：`GFX_OP_BLIT` 在拷完后**回读帧缓冲**抽 5 个点与表面比对，全部相等才回 `1` —— 于是「真的画上去了」在**无显示器**时也可断言（本机 `screendump` 取不到内容，见 G1）。
+- **自测 GS-1**（app）：`ping` → `fill_screen` + `screen_rect` → 建 160×120 表面画四条竖直色带 → 客户端侧回读 → `blit` 到 (16,16)（服务端回读校验）→ 打印 `app: GS1 gfx primitives + shared surface OK (blit verified on framebuffer)`。
+- **能力**：app / shell 各授予 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`。
 
 ### G3 — 文本渲染外移
 

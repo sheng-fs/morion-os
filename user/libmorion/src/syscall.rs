@@ -82,6 +82,12 @@ pub const SYS_DOMAIN_ALIVE: u64 = 42;
 /// 故调用方只需给出目标域号。用于重启**文件服务本身** —— 它不依赖磁盘, 解掉"读盘要靠
 /// 文件服务"的鸡生蛋问题。需持有 `Capability::Spawn`。
 pub const SYS_SPAWN_ELF_MODULE: u64 = 43;
+/// 取帧缓冲几何: `(用户缓冲指针)` → 1 / 0 (写入 [`FbInfo`])。需 `Capability::Fb`。
+pub const SYS_FB_INFO: u64 = 44;
+/// 把**整块帧缓冲**映射进本域: `(页对齐用户虚拟地址)` → 1 / 0。需 `Capability::Fb`。
+pub const SYS_FB_MAP: u64 = 45;
+/// 宣告本域**接管**显示 (内核终端停止写帧缓冲): `()` → 1 / 0。需 `Capability::Fb`。
+pub const SYS_FB_TAKEOVER: u64 = 46;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -239,6 +245,37 @@ pub fn sys_spawn_elf_module(domain: u64) -> u64 {
     unsafe { syscall(SYS_SPAWN_ELF_MODULE, domain, 0, 0) }
 }
 
+/// 帧缓冲几何 (`SYS_FB_INFO` 写回的布局, 与内核 `syscall::FbInfo` 严格对应)。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FbInfo {
+    /// 帧缓冲物理基址。
+    pub addr: u64,
+    /// 宽 (像素)。
+    pub width: u32,
+    /// 高 (像素)。
+    pub height: u32,
+    /// 行跨度 (像素)。
+    pub stride: u32,
+    /// 每像素位数。
+    pub bpp: u32,
+}
+
+/// 取帧缓冲几何; 成功返回 1 并写入 `info`, 失败 0 (需 `Capability::Fb`)。
+pub fn sys_fb_info(info: &mut FbInfo) -> u64 {
+    unsafe { syscall(SYS_FB_INFO, info as *mut FbInfo as u64, 0, 0) }
+}
+
+/// 把整块帧缓冲映射到本域的 `vaddr` (页对齐); 成功返回 1, 失败 0 (需 `Capability::Fb`)。
+pub fn sys_fb_map(vaddr: u64) -> u64 {
+    unsafe { syscall(SYS_FB_MAP, vaddr, 0, 0) }
+}
+
+/// 宣告本域接管显示 (内核终端此后不再写帧缓冲); 成功返回 1 (需 `Capability::Fb`)。
+pub fn sys_fb_takeover() -> u64 {
+    unsafe { syscall(SYS_FB_TAKEOVER, 0, 0, 0) }
+}
+
 /// 当前空闲物理帧数。
 pub fn sys_frame_free() -> u64 {
     unsafe { syscall(SYS_FRAME_FREE, 0, 0, 0) }
@@ -363,6 +400,9 @@ pub const CAP_KIND_SEND_TO: u64 = 0;
 pub const CAP_KIND_MAP_INTO: u64 = 1;
 pub const CAP_KIND_IRQ: u64 = 2;
 pub const CAP_KIND_MMIO: u64 = 3;
+/// `Spawn` / `Fb` 无参数, `arg` 被忽略 (与内核 `CAP_KIND_*` 一致)。
+pub const CAP_KIND_SPAWN: u64 = 4;
+pub const CAP_KIND_FB: u64 = 5;
 
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 `to`, 成功返回 1。
 ///

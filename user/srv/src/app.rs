@@ -3297,7 +3297,66 @@ pub fn run() {
         return;
     }
 
+    // GS-1 (G2): 图形原语 + 共享表面 —— 画色带 → blit 上屏 → 服务端回读校验。
+    if gs1_gfx_primitives().is_none() {
+        return;
+    }
+
     println("app: SELFTEST DONE");
+}
+
+/// GS-1 取证 (G2 图形子系统): 屏幕级原语 + 客户端共享表面。
+///
+/// 三条一起才算过:
+///   ① `gfx_srv` 在跑 (`ping`);
+///   ② 屏幕级原语 (`fill_screen` / `screen_rect`) 被接受;
+///   ③ 客户端表面 (本域分配 + `SYS_SHARE_PAGE` 给 gfx_srv) 经 `blit` 画上屏 —— `gfx_srv`
+///      **回读帧缓冲**校验通过才回 1, 这是"真的画上去了"的端到端证据 (无显示器也可断言);
+///      另有客户端侧表面回读, 确认自己写进去的就是预期像素。
+fn gs1_gfx_primitives() -> Option<()> {
+    const W: u32 = 160;
+    const H: u32 = 120;
+    /// 四条竖直色带 (红 / 绿 / 蓝 / 黄)。
+    const BAND: [u32; 4] = [0xC0_20_20, 0x20_C0_20, 0x20_20_C0, 0xE0_E0_20];
+
+    if !morion::gfx::ping() {
+        println("app: GS1 gfx_srv ping FAILED");
+        return None;
+    }
+    // 屏幕级原语: 铺底色 + 画一个矩形。
+    if !morion::gfx::fill_screen(0x08_08_10) {
+        println("app: GS1 fill_screen FAILED");
+        return None;
+    }
+    if !morion::gfx::screen_rect(0, 0, 320, 240, 0x40_40_60) {
+        println("app: GS1 screen_rect FAILED");
+        return None;
+    }
+
+    // 共享表面: 竖向色带。
+    let surf = match morion::gfx::Surface::new(W, H) {
+        Some(s) => s,
+        None => {
+            println("app: GS1 surface alloc FAILED");
+            return None;
+        }
+    };
+    let bw = W / 4;
+    for (i, &c) in BAND.iter().enumerate() {
+        surf.rect((i as u32) * bw, 0, bw, H, c);
+    }
+    // 客户端侧回读: 表面在 app 本域, 可直接读。
+    if surf.read(0, 0) != BAND[0] || surf.read(W - 1, H - 1) != BAND[3] {
+        println("app: GS1 surface readback FAILED");
+        return None;
+    }
+    // blit 上屏: 服务端拷完会回读校验, 通过才回 1。
+    if !surf.blit(16, 16) {
+        println("app: GS1 blit FAILED");
+        return None;
+    }
+    println("app: GS1 gfx primitives + shared surface OK (blit verified on framebuffer)");
+    Some(())
 }
 
 /// FS-29 取证: 服务实例退出后, 监督者 `init` 把它**原地**重启。

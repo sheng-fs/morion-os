@@ -19,6 +19,12 @@ pub enum Capability {
     Irq(u8),
     /// 把指定物理基址 (页对齐) 的 MMIO 区域映射进本域的能力。
     Mmio(u64),
+    /// 访问**帧缓冲**的能力（`SYS_FB_INFO` / `SYS_FB_MAP` / `SYS_FB_TAKEOVER`）。
+    ///
+    /// 无参数 —— 帧缓冲是全局唯一资源。与 `Mmio` 的区别：MMIO 能力按「页对齐物理基址」
+    /// 逐页匹配（设备 BAR 一页一条），而帧缓冲是**一整块**（可达数百页），逐页授权既塞不下
+    /// 能力槽也无意义，故单列一类。
+    Fb,
     /// 加载可执行文件并启动的能力 (`SYS_SPAWN_ELF`): 允许建新域 + 载入镜像 + 起任务。
     ///
     /// 无参数 —— 该能力本身就是"可以造进程"这张凭证。与其它能力一样默认不授予,
@@ -27,7 +33,7 @@ pub enum Capability {
 }
 
 /// 每域能力槽数量。
-const CAP_SLOTS: usize = 16;
+const CAP_SLOTS: usize = 32;
 
 /// `SYS_CAP_SEND` 的 `kind` 编码 —— 能力是枚举, 而 syscall 参数只有整数,
 /// 故用 `(kind, arg)` 两段表示 (与用户态 `syscall::CAP_KIND_*` 一致)。
@@ -37,6 +43,8 @@ pub const CAP_KIND_IRQ: u64 = 2;
 pub const CAP_KIND_MMIO: u64 = 3;
 /// `Spawn` 无参数, 故 `arg` 被忽略（但保留两段式编码, 委派路径才不必特判）。
 pub const CAP_KIND_SPAWN: u64 = 4;
+/// `Fb` 无参数（帧缓冲全局唯一），`arg` 同样被忽略。
+pub const CAP_KIND_FB: u64 = 5;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -51,6 +59,7 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         CAP_KIND_IRQ if arg <= u8::MAX as u64 => Some(Capability::Irq(arg as u8)),
         CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
         CAP_KIND_SPAWN => Some(Capability::Spawn),
+        CAP_KIND_FB => Some(Capability::Fb),
         _ => None,
     }
 }
@@ -240,8 +249,14 @@ pub fn grant(domain: u64, cap: Capability) -> bool {
             break;
         }
     }
+    drop(table);
     if was_enabled {
         x86_64::instructions::interrupts::enable();
+    }
+    if !ok {
+        // 能力槽耗尽 (该域需要的凭证比 CAP_SLOTS 多)。必须吵出来: 调用方拿到 false 后
+        // 若静静丢掉, 表现就是运行期莫名其妙的"权限缺失", 极难定位。
+        crate::video::println("[WARN] capability table full: grant dropped");
     }
     ok
 }

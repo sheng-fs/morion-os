@@ -135,7 +135,7 @@ echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
 # FS-28 进一步验证子程序退出后内核**自动回收**该域 (域号复用、空闲帧回到稳态)。
-grep -nE 'FS27|FS28|FS29|exec: |init: restarted' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'FS27|FS28|FS29|GS1|exec: |init: restarted|gfx: ' "$log" 2>/dev/null || echo "(无)"
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 

@@ -209,6 +209,7 @@ pub extern "C" fn kernel_main() -> ! {
     //  12 = ext2_srv  (ext2 只读兼容: 挂载既有 Linux 分区, 挂载于 /ext2)
     //  13 = exfat_srv (exFAT 读写: 挂载既有 exFAT 卷/U 盘, 挂载于 /usb)
     //  14 = init      (监督者: 巡检被监督的服务域, 实例退出后从盘原地把它拉起来 —— E3c)
+    //  15 = gfx_srv   (图形服务: 持帧缓冲并在用户态渲染, 内核终端退役 —— G1)
     let sender_domain = domain::create();
     let receiver_domain = domain::create();
     let pager_domain = domain::create();
@@ -224,11 +225,12 @@ pub extern "C" fn kernel_main() -> ! {
     let ext2_domain = domain::create();
     let exfat_domain = domain::create();
     let init_domain = domain::create();
+    let gfx_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(15);
-    cap::init(15);
-    pager::init(15, pager_domain);
+    ipc::init(16);
+    cap::init(16);
+    pager::init(16, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -252,6 +254,7 @@ pub extern "C" fn kernel_main() -> ! {
         ext2_domain,
         exfat_domain,
         init_domain,
+        gfx_domain,
     ] {
         cap::grant(pager_domain, cap::Capability::MapInto(d));
     }
@@ -314,6 +317,17 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(init_domain, cap::Capability::MapInto(fat32_domain));
     cap::grant(init_domain, cap::Capability::SendTo(mount_domain));
     cap::grant(init_domain, cap::Capability::SendTo(echo_domain));
+    // 授权: gfx_srv (域 15, G1 图形服务) —— 独占帧缓冲: 取几何 (`SYS_FB_INFO`)、
+    // 映射整块 (`SYS_FB_MAP`)、宣告接管显示 (`SYS_FB_TAKEOVER`)。这是内核把"屏幕"
+    // 交出去的**唯一凭证**; 只有持它者能让内核终端停止写帧缓冲。
+    cap::grant(gfx_domain, cap::Capability::Fb);
+    // 授权: app / shell 可向 gfx_srv 提交绘图请求 (`SendTo`) 并把表面页共享给它 (`MapInto`)。
+    //   - app: G2 自测 GS-1 (共享表面 → blit → 服务端回读校验);
+    //   - shell: 为 G3 的文本渲染/控制台铺路。
+    cap::grant(app_domain, cap::Capability::SendTo(gfx_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(gfx_domain));
+    cap::grant(shell_domain, cap::Capability::SendTo(gfx_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(gfx_domain));
     // 授权: app 可直接给 echo 发控制消息 —— E3c 自测 FS-29 里让 echo 退出, 再看 init 重启它。
     cap::grant(app_domain, cap::Capability::SendTo(echo_domain));
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
@@ -326,7 +340,7 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
-    video::println("[OK] IPC + capability + pager initialized (15 domains)");
+    video::println("[OK] IPC + capability + pager initialized (16 domains)");
 
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
     // 找到则配置 MSI-X、映射 BAR0/队列/DMA 并授权 Mmio/Irq; 否则降级 (magic=0),
@@ -376,7 +390,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] 14 service tasks + idle task spawned");
+    video::println("[OK] 16 service tasks + idle task spawned");
     video::println("");
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();

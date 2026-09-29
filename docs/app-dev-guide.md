@@ -63,7 +63,7 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 
 | | 载体 | 载入时机 | 现状 |
 |---|---|---|---|
-| **系统服务程序**（`user/srv/`，15 个程序各自一个 `[[bin]]`；其中 `init` 是监督者） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
+| **系统服务程序**（`user/srv/`，16 个程序各自一个 `[[bin]]`；含监督者 `init`、图形服务 `gfx_srv`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
 | **运行时程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
 
 两者都是**独立 ELF**，走同一条加载链（`elf::parse` + `exec`）—— 差别只在"什么时候、载入哪个域"：
@@ -79,7 +79,7 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 ### 构建与运行
 
 ```bash
-make user      # 系统服务 → build/user/srv/*.elf (15 份独立 ELF; 引导器从 ESP 读入, 同一批还进 FAT32 根盘做 init 的重启源)
+make user      # 系统服务 → build/user/srv/*.elf (16 份独立 ELF; 引导器从 ESP 读入, 同一批还进 FAT32 根盘做 init 的重启源)
 make hello     # 演示程序 → build/user/hello.elf (独立 ELF)
 make iso       # 完整镜像
 make build/nvme.img   # FAT32 卷(含 /hello.mex, 供 run 命令用)
@@ -196,7 +196,7 @@ sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直�
 > - **不是原子的**：能力转移是同一 IPC 会话里的独立 syscall（先传、再发消息），并非随消息头原子送达；极端情况下存在「能力已给出但消息未送达」的窗口。
 > - **没有级联撤销**：能力委派出去就收不回来（`revoke` 只作用于本域），也没有「域退出时回收它发出的所有能力」。
 > - **没有 `dup`**：不能复制本域的句柄（只能签发新的），句柄移交是移动语义，因此「传出后自己还想继续用」需要重新 `sys_cap_issue`。
-> - **槽位满时无回收策略**：`CAP_SLOTS = 16` / `HANDLE_SLOTS = 32` 用尽即失败。
+> - **槽位满时无回收策略**：`CAP_SLOTS = 32` / `HANDLE_SLOTS = 32` 用尽即失败（能力槽满时内核会打印 `[WARN] capability table full: grant dropped`）。
 
 ### 3.5 终端 / 视频（文本）
 
@@ -332,7 +332,7 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 | `Irq(u8)` | 注册接收指定 IRQ |
 | `Mmio(u64)` | 把指定物理基址（页对齐）的 MMIO 区域映射进本域 |
 
-- 每域 `CAP_SLOTS = 16` 个能力槽。
+- 每域 `CAP_SLOTS = 32` 个能力槽。
 - 新域默认**无任何能力**，由授权方在启动时 `cap::grant` 显式授予（见 [kernel/src/main.rs](../kernel/src/main.rs)）。
 - 启动授权之外，能力还可以**在运行时经 IPC 传递**：`sys_cap_send`（委派，复制且无放大）与 `sys_handle_send`（句柄移交，移动）。详见 3.4 节。
 - 应用侧通过 syscall 的返回 1/0 感知「是否被授权」；无能力时操作被内核拒绝。
@@ -636,6 +636,7 @@ payload = { capability_id: u32, request_len: u32, response_cap: u64, _pad }   //
 | 能力系统（能力槽 + 能力句柄） | ✅ 已就绪 | `SYS_CAP_ISSUE/LOOKUP/DROP`（29/30/31）；**能力随 IPC 传递** `SYS_HANDLE_SEND`/`SYS_CAP_SEND`（32/33，句柄移交为移动、能力委派为复制且无放大）；见第 6 节 |
 | IPC 与共享内存 | ✅ 已就绪 | `sys_call` / `sys_reply` / `sys_alloc_page` / `sys_share_page`；见第 4、5 节 |
 | 文件系统统一接口 libvfs | ✅ 已就绪 | `open/read/readdir/stat/close` + 挂载路由；可作为首批 AI 能力的底座 |
+| 图形接口 libgfx（G2） | ✅ 已就绪 | `libmorion::gfx`：`Surface`（`sys_alloc_page` + `sys_share_page` 共享给 `gfx_srv`）+ `fill_screen/screen_rect/blit`；需 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`；文本渲染见 [roadmap-gfx.md](roadmap-gfx.md) G3 |
 | 用户态 JSON 序列化 / 解析 | ⏳ 缺失 | 当前 `#![no_std]` 且无 `alloc`；需先补一个最小的 `no_std` JSON 解析器与分配器 |
 | `#[ai_capability]` 过程宏 / 构建脚本 | ⏳ 缺失 | 宿主侧代码生成，不依赖目标端 `no_std` |
 | 能力注册 / 发现服务 | ⏳ 缺失 | 需新增用户态域；索引可先用内存表，后续换持久化 |

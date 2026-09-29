@@ -43,13 +43,13 @@
 | 方向 | 状态 | 说明 |
 |------|------|------|
 | 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度（含**带超时阻塞**）、地址空间与按需分页、中断路由（PIC + **LAPIC/MSI-X**，含**阻塞等中断**与**多向量 `wait_any`**）、能力系统（含**能力随 IPC 传递**） |
-| 系统调用接口 | ✅ 约 37 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
+| 系统调用接口 | ✅ 约 40 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退） |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
-| 图形 / GUI | ⏳ 未开始 | 目前仅有内核帧缓冲**文本控制台**（8x16 ASCII + 16x16 汉字点阵，支持中文/全角标点与宽窄混排）；帧缓冲 MMIO 映射能力（`sys_map_mmio`）已就绪 |
+| 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，`SYS_FB_TAKEOVER` 后内核终端不再写屏（输出只留 COM1），屏幕由用户态绘制。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功 —— 无显示器也能断言"真画上去了"（自测 GS-1）。内核文本控制台（8x16 ASCII + 16x16 汉字点阵）仍作引导期与 panic 输出 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
 
@@ -219,7 +219,7 @@
 │       ├── lib.rs
 │       └── main.rs
 ├── user/                     # 用户态: 运行库 + 服务程序
-│   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / 入口样板
+│   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / libgfx / 入口样板
 │   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
 │   └── srv/                  #   系统服务 (crate `morion-srv`): 每个服务一个 [[bin]] → 一份独立 ELF
 │       └── src/
@@ -234,8 +234,9 @@
 │           ├── ext2_srv.rs   #     域 12 ext2 只读
 │           ├── exfat_srv.rs  #     域 13 exFAT 读写
 │           ├── init.rs       #     域 14 监督者 (巡检服务域, 退出后用内存镜像原地重启)
+│           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染)
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     15 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     16 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -343,8 +344,9 @@
 - [x] **用户态运行库 libmorion + `run` 命令**（**E2a**：抽 `user/libmorion`（crate `morion`）= syscall 封装 + 打印 + `domain_id()` + libvfs + 入口样板（`_start`/`morion_main`/panic），`morion-user` 与 `morion-hello` 共用，`hello` 瘦成 20 行；新增 `exec::spawn_file(path)`；shell 加 **`run <file>`**（+ `Capability::Spawn`），把可执行文件加载变成**用户可见的功能**；FS-27 改为从**磁盘文件** `/hello.mex` 加载。交互实测 `run /hello.mex` → 新域 14 跑起来）
 - [x] **服务拆成独立程序 + 域销毁/帧回收**（**E2b**：① 域销毁——`domain::destroy` 摘域表槽位 + 释放用户地址空间（逐页按帧引用计数归还、回收页表帧）+ 清各子系统按域状态（能力/句柄、邮箱、分页器、中断）+ 摘除并终止其任务；域 id **复用空槽**（`slot_for`），配 `SYS_DOMAIN_DESTROY/COUNT/FRAME_FREE`。② **退出即回收**——任务退出时若为本域最后一个任务，登记该域、由时钟 `tick` 在别的上下文销毁（不可就地拆自己的栈/页表），引导域白名单永不销毁。③ **服务拆成独立程序**——新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → 各一份**独立 ELF**（`cfg` 门控，一个 bin 只编自己的服务 + `common`），删掉 17814 行的单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at` 逐个载入固定域，删 `load_user_program`；每个程序启动打印 `[up] <name> (domain N)`。自测新增 **FS-28**，交互 `run` 域号复用）
 - [x] **服务生命周期收口（E3a / E3b / E3c）**：① **用户页 W^X**（E3a）——段权限 → 页权限（`.text` RX、其余 RW+NX）、开 `EFER.NXE`、拒绝 W+X 段与页，链接脚本在 `.data` 前页对齐（否则三段挤在一页，页级 W^X 不可能满足）；顺带把用户态 `P=1` 保护违例改为**终止该任务**而不是转给分页器。② **服务移出内核镜像**（E3b）——引导器从**自己所在的 ESP** 读 `EFI/morion/services/*.elf`（`LOADER_DATA` 页），经扩展 `BootInfo` 的模块表交给内核按固定域号加载；内核 `include_bytes!` 全删，**内核 ELF 体积 −51%**（702 KB → 345 KB）；引导期进度与失败原因镜像到 COM1。③ **监督者 + 原地重启**（E3c）——新增域 14 `init`：巡检被监督服务域（`SYS_DOMAIN_ALIVE`），发现实例退出就从 FAT32 根盘 `/system/services/*.elf` 读回镜像、经 `SYS_SPAWN_ELF_AT` **原地**重启（域号不变，`domain::reset` 清用户地址空间但保留域与其分页器/能力注册）；自测 **FS-29** 让 echo 自杀再被拉起。④ **重启不依赖盘**（E3c 后续）——新增 `SYS_SPAWN_ELF_MODULE`：内核按域号从 E3b 的引导模块**内存镜像**取，init 重启优先走它、失败才回退盘；监督范围因此覆盖到 `pager / fat32_srv / mfs_srv`（文件服务自己崩了也能自救，解掉"读盘要靠文件服务"的鸡生蛋问题），唯一排除的是内核为其保留 NVMe 映射的 `block_srv`
+- [x] **图形子系统 G1（帧缓冲用户态化）**（帧缓冲从内核交到用户态 `gfx_srv`（域 15）独占：新增无参能力 `Fb` 与三个 syscall —— `SYS_FB_INFO`（取几何）/ `SYS_FB_MAP`（整块映射进本域）/ `SYS_FB_TAKEOVER`（宣告接管）；内核 `video` 加 `FB_TAKEN_OVER`，置位后终端不再写帧缓冲、只留 COM1（headless 回归不受影响）；`gfx_srv` 取几何 → 映射到 `USER_BASE+1 GiB` → 画测试图案 → **回读校验** → 接管 → 重画，打印 `gfx: framebuffer takeover OK`。规划见 [docs/roadmap-gfx.md](./docs/roadmap-gfx.md)）
+- [x] **图形子系统 G2（绘制原语 + 共享表面 + `libmorion::gfx`）**（`gfx_srv` 加请求循环与 `GFX_OP_FILL/RECT/BLIT/PING`；客户端 `Surface` 用 `SYS_ALLOC_PAGE`+`SYS_SHARE_PAGE` 把表面**同址**共享给服务（地址按域 id 错开，避免多客户端撞 `PageAlreadyMapped`）；`blit` 拷完**回读帧缓冲**抽 5 点比对、全等才回 1 —— 无显示器也能断言；自测 GS-1。顺带把 `CAP_SLOTS` 16 → 32 并让 `grant` 槽满时报 `[WARN]`：app 的槽被 `gfx` 的两张凭证占满会导致其后的 `SendTo(echo)` 静默失败）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
-- [ ] 帧缓冲对用户态开放 / GUI 服务（规划见 [docs/roadmap-gfx.md](./docs/roadmap-gfx.md)：把图形输出外移到用户态 `gfx_srv`）
 - [ ] 网络协议栈
 
 ### 阶段三 — 性能飞地（未开始）

@@ -33,6 +33,7 @@
 #![no_std]
 
 pub mod exec;
+pub mod gfx;
 pub mod syscall;
 pub mod vfs;
 
