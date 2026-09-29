@@ -6,7 +6,7 @@
 #![no_main]
 
 use morion_kernel::{
-    arch, bootinfo, cap, domain, exec, ipc, memory, nvme, pager, scheduler, syscall, video,
+    arch, bootinfo, cap, device, domain, exec, ipc, memory, pager, scheduler, syscall, video,
 };
 
 extern crate alloc;
@@ -226,11 +226,16 @@ pub extern "C" fn kernel_main() -> ! {
     let exfat_domain = domain::create();
     let init_domain = domain::create();
     let gfx_domain = domain::create();
+    // 域 16 — net_srv (网络驱动, 驱动路线 N0): 供通用设备授权把 virtio-net 交出去 (N1/N2)。
+    let _net_domain = domain::create();
 
-    // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 域数量)。
-    ipc::init(16);
-    cap::init(16);
-    pager::init(16, pager_domain);
+    // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
+    // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
+    // 否则访问新域 (如 16 号 net_srv) 会越界 panic。
+    let boot_domains = domain::BOOT_DOMAINS as usize;
+    ipc::init(boot_domains);
+    cap::init(boot_domains);
+    pager::init(boot_domains, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -340,20 +345,32 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
-    video::println("[OK] IPC + capability + pager initialized (16 domains)");
+    video::println("[OK] IPC + capability + pager initialized (17 domains)");
 
-    // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
-    // 找到则配置 MSI-X、映射 BAR0/队列/DMA 并授权 Mmio/Irq; 否则降级 (magic=0),
-    // block 回退 IDE PIO。
+    // 探测 NVMe 控制器并把设备**通用地**授权给 block 域（D1: 通用设备授权）:
+    // 内核只负责 BAR 映射 / DMA 分配 / MSI-X / 能力签发, NVMe 的队列排版与协议在驱动里。
+    // 找到则授权; 否则降级 (描述页 magic=0), block 回退 IDE PIO。
     match arch::pci::find_nvme(&pci_devices) {
         Some((bus, dev, func, bar0)) => {
-            nvme::setup(block_domain, bus, dev, func, bar0);
+            device::grant(device::GrantRequest {
+                domain: block_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar0,
+                // NVMe: BAR0 至少 16 KiB (寄存器 + 门铃 + MSI-X 表/PBA) 取 4 页;
+                // DMA 7 页 (admin ASQ/ACQ + 两条 I/O 队列的 SQ/CQ + data 页); 3 条完成队列向量。
+                bar_pages: 4,
+                dma_pages: 7,
+                msix_vectors: 3,
+                label: "nvme",
+            });
             video::print("[OK] NVMe controller BAR0=0x");
             video::print_hex(bar0);
             video::println("");
         }
         None => {
-            nvme::setup_empty(block_domain);
+            device::grant_empty(block_domain);
             video::println("[OK] no NVMe controller, block falls back to IDE PIO");
         }
     }

@@ -40,7 +40,7 @@ static DOMAINS: Mutex<Vec<Option<Domain>>> = Mutex::new(Vec::new());
 /// 注意「永不自动销毁」不等于「实例永不退出」: 白名单域里的任务退出后域还留着 (槽位
 /// 仍占用), 由监督者 [`crate::syscall`] 的 `SYS_SPAWN_ELF_AT` 用 [`reset`] 原地重启
 /// (E3c) —— 见 `user/srv/src/init.rs`。
-pub const BOOT_DOMAINS: u64 = 16;
+pub const BOOT_DOMAINS: u64 = 17;
 
 /// 该域是否是引导期服务域 (白名单: 退出时不自动销毁)。
 pub fn is_boot(id: u64) -> bool {

@@ -41,6 +41,7 @@ default = [
     "svc-exfat_srv",
     "svc-init",
     "svc-gfx_srv",
+    "svc-net_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -58,6 +59,7 @@ svc-ext2_srv = []
 svc-exfat_srv = []
 svc-init = []
 svc-gfx_srv = []
+svc-net_srv = []
 
 [[bin]]
 name = "sender"
@@ -138,6 +140,11 @@ required-features = ["svc-init"]
 name = "gfx_srv"
 path = "src/bin/gfx_srv.rs"
 required-features = ["svc-gfx_srv"]
+
+[[bin]]
+name = "net_srv"
+path = "src/bin/net_srv.rs"
+required-features = ["svc-net_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。

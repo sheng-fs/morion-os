@@ -5,12 +5,52 @@ use morion::syscall::*;
 // 域 5 — NVMe 块设备驱动服务 (文件系统阶段 1)
 // ===========================================================================
 
-/// 内核映射到本域的配置结构虚拟地址 (见 kernel/src/nvme.rs, 属 USER_DATA_BASE 区)。
-const NVME_CFG_VADDR: u64 = USER_DATA_BASE + 0x1_0000;
-/// 配置结构 magic 校验值 (与内核一致)。
-const NVME_CONFIG_MAGIC: u64 = 0x004E_564D_454F_5321;
+/// 内核映射到本域的**通用设备授权描述**虚拟地址 (见 kernel/src/device.rs, 属 USER_DATA_BASE 区)。
+const DEVICE_CFG_VADDR: u64 = USER_DATA_BASE + 0x1_0000;
+/// 描述结构 magic 校验值 (与内核 `device::DEVICE_GRANT_MAGIC` 一致)。
+const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131;
 
-/// NVMe 配置结构 (与内核 `nvme::NvmeConfig` 布局完全一致)。
+/// 内核写入、用户态读取的**通用设备授权描述** (与 kernel/src/device.rs 布局完全一致)。
+///
+/// D1 起内核不再知道 NVMe 的事: 它只交出"BAR + DMA 块 + MSI-X 参数", 队列怎么排、协议怎么走
+/// 全由驱动决定 —— 这就是"加新驱动不必改内核"的前提。
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct DeviceGrant {
+    magic: u64,
+    bar_paddr: u64,
+    bar_vaddr: u64,
+    bar_bytes: u64,
+    dma_paddr: u64,
+    dma_vaddr: u64,
+    dma_bytes: u64,
+    msix_vector_base: u32,
+    msix_vector_count: u32,
+    msix_table_offset: u32,
+    msix_msg_addr: u32,
+    page_size: u32,
+    _reserved: u32,
+}
+
+/// 页大小 (字节)。
+const PAGE: u64 = 4096;
+
+/// **本驱动自己**在 DMA 块里的队列排版 (每项一页), 内核不再规定 —— 设备专属布局留在驱动域。
+const DMA_OFF_ASQ: u64 = 0;
+const DMA_OFF_ACQ: u64 = 1;
+const DMA_OFF_ISQ: u64 = 2;
+const DMA_OFF_ICQ: u64 = 3;
+const DMA_OFF_ISQ2: u64 = 4;
+const DMA_OFF_ICQ2: u64 = 5;
+const DMA_OFF_DATA: u64 = 6;
+/// 本驱动需要的 DMA 页数 (与上面 7 个偏移一致)。
+const DMA_PAGES: u64 = 7;
+/// admin / I/O 队列深度 (条目数, 取 2 的幂; 64 条 SQE 正好填满一页)。
+const ADMIN_QDEPTH: u16 = 64;
+const IO_QDEPTH: u16 = 64;
+
+/// 驱动**本地**的运行期配置: 由 `DeviceGrant` 推导 (队列地址 = DMA 块基址 + 页偏移)。
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -49,10 +89,45 @@ struct NvmeConfig {
     msix_vector_count: u32,
 }
 
+/// 由内核的 [`DeviceGrant`] 推导本驱动本地布局。
+///
+/// 队列地址 = DMA 块基址 + 页偏移 (本驱动的约定), 而不是内核写死的字段 —— 这正是 D1 把
+/// 设备专属知识搬进驱动域的地方。
+fn config_from_grant(g: &DeviceGrant) -> NvmeConfig {
+    let d = |off: u64| g.dma_paddr + off * PAGE;
+    let v = |off: u64| g.dma_vaddr + off * PAGE;
+    NvmeConfig {
+        magic: g.magic,
+        bar0_paddr: g.bar_paddr,
+        mmio_vaddr: g.bar_vaddr,
+        asq_paddr: d(DMA_OFF_ASQ),
+        acq_paddr: d(DMA_OFF_ACQ),
+        isq_paddr: d(DMA_OFF_ISQ),
+        icq_paddr: d(DMA_OFF_ICQ),
+        isq2_paddr: d(DMA_OFF_ISQ2),
+        icq2_paddr: d(DMA_OFF_ICQ2),
+        data_paddr: d(DMA_OFF_DATA),
+        asq_vaddr: v(DMA_OFF_ASQ),
+        acq_vaddr: v(DMA_OFF_ACQ),
+        isq_vaddr: v(DMA_OFF_ISQ),
+        icq_vaddr: v(DMA_OFF_ICQ),
+        isq2_vaddr: v(DMA_OFF_ISQ2),
+        icq2_vaddr: v(DMA_OFF_ICQ2),
+        data_vaddr: v(DMA_OFF_DATA),
+        admin_qdepth: ADMIN_QDEPTH,
+        io_qdepth: IO_QDEPTH,
+        page_size: g.page_size,
+        msix_vector: g.msix_vector_base,
+        msix_table_offset: g.msix_table_offset,
+        msix_addr: g.msix_msg_addr,
+        msix_vector_count: g.msix_vector_count,
+    }
+}
+
 /// I/O 队列数 (qid 1..=IO_QUEUES; qid 0 是 admin 队列)。
 const IO_QUEUES: usize = 2;
 
-/// 内核为本控制器分配的 MSI-X 向量数上限 (镜像 `kernel/src/nvme.rs::NVME_MSIX_VECTORS`)。
+/// 本驱动支持的 MSI-X 向量数上限 (与 `main.rs` 里给 NVMe 声明的 `msix_vectors: 3` 一致)。
 ///
 /// 完成队列 `i` ↔ 表项 `i` ↔ 向量 `msix_vector + i` ↔ 等待掩码位 `i`, 故它同时也是
 /// 「本驱动支持的完成队列数上限」。集群小于实际分配数时按实际值用。
@@ -632,11 +707,18 @@ fn nvme_ns_sectors_of(nsid: u32) -> u32 {
 
 /// 域 5 — NVMe 驱动服务: 复位控制器 → Admin 队列 → Identify → I/O 队列 → 块服务。
 fn nvme_main() {
-    let cfg = unsafe { core::ptr::read_volatile(NVME_CFG_VADDR as *const NvmeConfig) };
-    if cfg.magic != NVME_CONFIG_MAGIC {
-        println("nvme: bad config magic, aborting");
+    // 读通用设备授权描述 (内核已映射到本域)。magic 不对 = 内核没授权 (无控制器), 优雅退出;
+    // DMA 块不够本驱动排 7 页也当作没授权 —— 布局由本驱动决定, 故这里也要自己验。
+    let g = unsafe { core::ptr::read_volatile(DEVICE_CFG_VADDR as *const DeviceGrant) };
+    if g.magic != DEVICE_GRANT_MAGIC {
+        println("nvme: no device grant, aborting");
         return;
     }
+    if g.dma_bytes < DMA_PAGES * PAGE {
+        println("nvme: device grant DMA too small, aborting");
+        return;
+    }
+    let cfg = config_from_grant(&g);
     let mmio = cfg.mmio_vaddr;
 
     // 0. 选择完成路径 (阶段 39/40 MSI/MSI-X 多向量)。三步缺一不可, 任一步失败都退回轮询:
@@ -2397,8 +2479,8 @@ fn nvme_part_create(
 /// 接收 `BlockReq` (op/lba/count/buf), 读扇区写入调用方共享的缓冲页,
 /// 回复状态 tag (1=成功, 0=失败)。数据经共享页零拷贝回传, IPC 仅传控制信息。
 pub fn run() {
-    let magic = unsafe { core::ptr::read_volatile(NVME_CFG_VADDR as *const u64) };
-    if magic == NVME_CONFIG_MAGIC {
+    let magic = unsafe { core::ptr::read_volatile(DEVICE_CFG_VADDR as *const u64) };
+    if magic == DEVICE_GRANT_MAGIC {
         nvme_main();
     } else {
         ide_block_main();

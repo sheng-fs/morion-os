@@ -293,6 +293,11 @@ fn restart_in_place(target: u64, image: &[u8]) -> u64 {
         return u64::MAX;
     }
     crate::domain::reset(target);
+    // 丢掉上一实例邮箱里**未处理**的请求: 它们的 payload 常引用客户端共享过来的页
+    // (如 `GFX_OP_TEXT` 的文本页), 而 `domain::reset` 已把那些映射从本域清掉 —— 新实例
+    // 再去处理就会读到悬空地址而缺页崩溃。请求方此刻多半也已通过 `ipc::call` 的超时
+    // 失败返回并在重试, 故丢弃是安全的。
+    crate::ipc::remove_domain(target);
     crate::scheduler::reap_terminated(target);
     if crate::exec::spawn_elf_at(target, image) {
         target
@@ -496,9 +501,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::irq::take_pending_any(a1, domain).map_or(0, |v| v as u64)
         }
         SYS_MSIX_ENABLE => {
-            // 打开 NVMe 控制器的 MSI-X (驱动已写好表项)。只有该控制器的驱动域能调用,
+            // 打开被授权设备的 MSI-X (驱动已写好表项)。只有该设备的驱动域能调用,
             // 且只能成功一次; 配置空间写因此不会被下放到驱动域。
-            if crate::nvme::enable_msix() {
+            if crate::device::enable_msix() {
                 1
             } else {
                 0

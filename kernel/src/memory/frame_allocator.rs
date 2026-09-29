@@ -23,6 +23,38 @@ static mut FRAME_BITMAP: [u8; BITMAP_SIZE] = [0; BITMAP_SIZE];
 static mut TOTAL_FRAMES: usize = 0;
 static mut FREE_FRAMES: usize = 0;
 
+/// 内核**保留**的物理帧区间 (页对齐的 `[start, end)`), 任何路径都不得释放。
+///
+/// 目前只有帧缓冲: 它被 `SYS_FB_MAP` 映射进 `gfx_srv` 的用户空间 (`map_mmio`, **不**走
+/// 引用计数), 于是「同域重启」里 `free_user_space` 逐页归还时, 会把显存当"本域独占帧"
+/// 直接 `free_frame` —— 大内存配置下等于把屏幕内存交回分配器, 之后谁拿到谁涂花屏。
+/// 登记成保留区间后 `free_frame` 对它们空操作。与 `reserve_frame` 的区别: 那个只在初始化
+/// 时"占位", 这个挡的是运行期的释放。
+const MAX_PINNED_RANGES: usize = 4;
+static mut PINNED_RANGES: [(u64, u64); MAX_PINNED_RANGES] = [(0, 0); MAX_PINNED_RANGES];
+static mut PINNED_LEN: usize = 0;
+
+/// 登记一段**保留**物理区间 `[start, end)` (字节地址, 内部按帧对齐)。
+fn pin_range(start: u64, end: u64) {
+    let s = start & !(FRAME_SIZE as u64 - 1);
+    let e = (end + FRAME_SIZE as u64 - 1) & !(FRAME_SIZE as u64 - 1);
+    unsafe {
+        if PINNED_LEN < MAX_PINNED_RANGES {
+            PINNED_RANGES[PINNED_LEN] = (s, e);
+            PINNED_LEN += 1;
+        }
+    }
+}
+
+/// 该物理帧是否落在保留区间内 (保留帧不可释放)。
+fn is_pinned(addr: u64) -> bool {
+    unsafe {
+        PINNED_RANGES[..PINNED_LEN]
+            .iter()
+            .any(|&(s, e)| addr >= s && addr < e)
+    }
+}
+
 // 链接脚本导出的内核镜像结束地址
 extern "C" {
     static _kernel_end: u8;
@@ -64,6 +96,10 @@ pub fn init(info: &BootInfo) {
     let fb_bytes = info.fb_height as u64 * info.fb_stride as u64 * (info.fb_bpp as u64 / 8);
     let fb_start_frame = info.fb_addr / FRAME_SIZE as u64;
     let fb_end_frame = (info.fb_addr + fb_bytes).div_ceil(FRAME_SIZE as u64);
+
+    // 帧缓冲是**内核保留**区间: 既在下面被排除出空闲集, 也要挡住运行期误释放
+    // (`SYS_FB_MAP` 不走引用计数, 「同域重启」清地址空间时会想归还它)。
+    pin_range(info.fb_addr, info.fb_addr + fb_bytes);
 
     // 白名单策略: 全部标记为占用
     unsafe {
@@ -217,6 +253,10 @@ pub fn allocate_frames(count: usize) -> Option<u64> {
 
 /// 释放一个物理帧。
 pub fn free_frame(addr: u64) {
+    // 内核保留区间 (帧缓冲) 永不释放 —— 见 `PINNED_RANGES`。
+    if is_pinned(addr) {
+        return;
+    }
     let idx = (addr / FRAME_SIZE as u64) as usize;
     if idx < MAX_MANAGED_FRAMES && bitmap_test(idx) {
         bitmap_clear(idx);

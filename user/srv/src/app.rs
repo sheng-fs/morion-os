@@ -164,6 +164,10 @@ pub fn run() {
     if gt1_text_rendering().is_none() {
         return;
     }
+    // GS-2 (G6): 图形服务自愈 —— 杀掉 gfx_srv, init 监督重启, 客户端重建共享会话后恢复。
+    if gs2_gfx_srv_restart().is_none() {
+        return;
+    }
 
     // 1. open -> read -> close: 读整个文件。
     let fd = vfs::open("/hello.txt");
@@ -3316,31 +3320,33 @@ pub fn run() {
 /// GT-1 取证 (G3a 图形子系统): 文本渲染搬到用户态后的端到端验证。
 ///
 /// 清屏 → 写 ASCII → 写汉字, 每步都用 `SYS_CALL` 问 `gfx_srv` 的光标位置来断言**排版列数**:
-/// `"GT-1 "` 是 5 个 ASCII 字符 = 5 列; `"汉字宽字符"` 是 5 个汉字 × 2 列 = 10 列, 故光标应落在
-/// 第 15 列。列数由**服务端字库的宽度表**算出, 所以这条断言同时证明了 UTF-8 解码、宽窄混排与
-/// 光标推进; 而"真的画到帧缓冲上了"由服务端**逐像素写后回读**保证 (`GFX_OP_TEXT` 回 1 才算过)。
+/// `"GT-1 "` 是 5 个 ASCII 字符 = 5 列; `"汉字宽字符"` 是 5 个汉字 × 2 列 = 10 列。列数由
+/// **服务端字库的宽度表**算出, 所以这条断言同时证明了 UTF-8 解码、宽窄混排与光标推进;
+/// 而"真的画到帧缓冲上了"由服务端**逐像素写后回读**保证 (`GFX_OP_TEXT` 回 1 才算过)。
+///
+/// ⚠️ 屏幕是**多客户端共享**的 (shell 也镜像打印到同一终端、共用一条光标): shell 的启动
+/// 横幅/提示符可能正好插在"清屏 → 写 → 问光标"之间, 把光标挪走, 让本次测得列数偏大 ——
+/// 那不是排版错了。故测量**重试到干净窗口**为止 (shell 打完启动输出就阻塞在等输入, 之后
+/// 屏幕安静, 一定能测到); 这样不必给服务端加"原子返回列数"的协议。
 fn gt1_text_rendering() -> Option<()> {
-    if !morion::gfx::clear_screen() {
-        println("app: GT1 clear_screen FAILED");
-        return None;
+    /// 写 `text` 后光标应前进 `want_col` 列; 在并发写者留下的空隙里测量 (最多重试 ~2s)。
+    fn measure(text: &str, want_col: u32) -> bool {
+        for _ in 0..100 {
+            if !morion::gfx::clear_screen() || !morion::gfx::print(text) {
+                return false;
+            }
+            if morion::gfx::cursor() == Some((want_col, 0)) {
+                return true;
+            }
+            sys_sleep(20);
+        }
+        false
     }
-    if morion::gfx::cursor() != Some((0, 0)) {
-        println("app: GT1 cursor after clear isn't (0,0)");
-        return None;
-    }
-    if !morion::gfx::print("GT-1 ") {
-        println("app: GT1 print ascii FAILED");
-        return None;
-    }
-    if morion::gfx::cursor() != Some((5, 0)) {
+    if !measure("GT-1 ", 5) {
         println("app: GT1 ascii advance isn't 5 cols (ansi 8x16?)");
         return None;
     }
-    if !morion::gfx::print("汉字宽字符") {
-        println("app: GT1 print cjk FAILED");
-        return None;
-    }
-    if morion::gfx::cursor() != Some((15, 0)) {
+    if !measure("汉字宽字符", 10) {
         println("app: GT1 cjk advance isn't 10 cols (16x16 wide glyphs?)");
         return None;
     }
@@ -3417,6 +3423,77 @@ fn gs1_gfx_primitives() -> Option<()> {
         return None;
     }
     println("app: GS1 gfx primitives + shared surface OK (blit verified on framebuffer)");
+    Some(())
+}
+
+/// GS-2 取证 (图形服务自愈): `gfx_srv` 退出 → init 监督**就地重启** → 客户端**重建共享会话**恢复。
+///
+/// 走的是与 FS-29 同款路径: 用一条控制请求让服务自己 `SYS_EXIT` (不是内核杀进程)。这里要
+/// 覆盖"服务重启会清空它域内的页表"带来的连锁反应, 分两轮:
+///
+/// ① **客户端没在空窗期调用**: 客户端的共享页标志仍为"已共享", 但服务侧映射已随重启消失 ——
+///    服务端对这块悬空页回 [`morion::gfx::GFX_REPLY_NO_SESSION`], 客户端据此**重建共享**
+///    (重发 `SYS_SHARE_PAGE`, 不重新分配) 后重试成功。这正是 shell 的情形 (它多半在空窗期
+///    正阻塞等输入, 不会调用)。
+/// ② **客户端在空窗期调用**: 此时服务域无存活任务, `ipc::call` 必须**快速失败返回**而不是
+///    让客户端永久挂起 (老行为会卡死), 并顺带作废会话。
+fn gs2_gfx_srv_restart() -> Option<()> {
+    const GFX: u64 = morion::gfx::GFX_DOMAIN;
+
+    if !morion::gfx::ping() {
+        println("app: GS2 gfx_srv not serving before test FAILED");
+        return None;
+    }
+
+    // ---- ① 空窗期不调用: 靠服务端 NO_SESSION + 客户端重建共享恢复 ----
+    if !morion::gfx::exit_server() {
+        println("app: GS2 exit request FAILED");
+        return None;
+    }
+    if !wait_domain_alive(GFX, false, 2000) {
+        println("app: GS2 gfx_srv did not exit FAILED");
+        return None;
+    }
+    if !wait_domain_alive(GFX, true, 4000) {
+        println("app: GS2 init did not restart gfx_srv FAILED");
+        return None;
+    }
+    if !morion::gfx::print("GS-2 screen recovered via session rebuild") {
+        println("app: GS2 print after restart FAILED");
+        return None;
+    }
+    // 串尾不带换行: 换行会把列归零, 而这里正是要看"写完之后光标确实前进了"。
+    match morion::gfx::cursor() {
+        Some((col, _)) if col > 0 => {}
+        _ => {
+            println("app: GS2 cursor after restart FAILED");
+            return None;
+        }
+    }
+
+    // ---- ② 空窗期调用: 必须快速失败、不挂起, 重建后又能用 ----
+    if !morion::gfx::exit_server() {
+        println("app: GS2 second exit request FAILED");
+        return None;
+    }
+    if !wait_domain_alive(GFX, false, 2000) {
+        println("app: GS2 gfx_srv did not exit (2nd) FAILED");
+        return None;
+    }
+    if morion::gfx::ping() {
+        println("app: GS2 ping on dead gfx_srv unexpectedly succeeded FAILED");
+        return None;
+    }
+    if !wait_domain_alive(GFX, true, 4000) {
+        println("app: GS2 init did not restart gfx_srv (2nd) FAILED");
+        return None;
+    }
+    if !morion::gfx::ping() {
+        println("app: GS2 restarted gfx_srv does not serve FAILED");
+        return None;
+    }
+
+    println("app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)");
     Some(())
 }
 

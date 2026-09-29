@@ -25,13 +25,19 @@
 //! # 监督范围
 //!
 //! 监督**长期驻留、且镜像能自举**的服务: pager / echo / kbd / fat32_srv / mount_srv /
-//! tmpfs_srv / mfs_srv / ext2_srv / exfat_srv。刻意不在列的两类:
+//! tmpfs_srv / mfs_srv / ext2_srv / exfat_srv / gfx_srv / net_srv。刻意不在列的两类:
 //!
 //! - **block_srv (域 5)**: 内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把那些
 //!   映射连同**物理帧**一起还给帧分配器，甚至把 BAR0 的 MMIO 地址当成 RAM 交出去 ——
 //!   重启它等于先破坏内核侧的设备状态。真要监督它，得先让 reset 跳过内核保留映射。
 //! - **sender / receiver / app / shell**: 它们按设计会**正常退出** (演示/自测跑完就返回)，
 //!   监督它们等于无休止重启。
+//!
+//! **gfx_srv (域 15)** 原也因 reset 隐患排除在外，现已纳入 —— 它带来两个配套前提: ① 帧缓冲
+//! 被登记为**内核保留区间** (内核 `frame_allocator` 的 `pin_range`)，`domain::reset` 不会再把
+//! 它当普通帧释放; ② 客户端库 ([`morion::gfx`]) 在服务重启后会**重建共享会话** (重发
+//! `SYS_SHARE_PAGE`)，且 `ipc::call` 在目标域无存活任务时**失败返回**而非永久挂起 ——
+//! 三者缺一，重启后的屏幕要么涂花、要么陷入崩溃循环、要么把客户端卡死。
 
 use morion::exec;
 use morion::syscall::*;
@@ -40,7 +46,7 @@ use morion::syscall::*;
 ///
 /// 域号是 ABI (见内核对域布局的注释)，与 `kernel/src/main.rs` 建域顺序一致。盘上镜像名只
 /// 在内存镜像不可用时用作回退路径。
-const SUPERVISED: [(u64, &str); 9] = [
+const SUPERVISED: [(u64, &str); 11] = [
     (2, "pager"),
     (3, "echo"),
     (4, "kbd"),
@@ -50,6 +56,8 @@ const SUPERVISED: [(u64, &str); 9] = [
     (11, "mfs_srv"),
     (12, "ext2_srv"),
     (13, "exfat_srv"),
+    (15, "gfx_srv"),
+    (16, "net_srv"),
 ];
 
 /// 巡检周期 (ms)。
@@ -71,7 +79,7 @@ static mut PENDING: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
 ///    重启只要一两个 tick，窗口短到轮询方根本采样不到。
 pub fn run() {
     println(
-        "init: supervising pager/echo/kbd/fat32_srv/mount_srv/tmpfs_srv/mfs_srv/ext2_srv/exfat_srv",
+        "init: supervising pager/echo/kbd/fat32_srv/mount_srv/tmpfs_srv/mfs_srv/ext2_srv/exfat_srv/gfx_srv/net_srv",
     );
     let mut restarts = 0u64;
     loop {

@@ -1532,7 +1532,8 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - 构建：每个服务一个 ELF 产物 + 内核 `include_bytes!`；`$(KERNEL_ELF)` 的依赖从
   `USER_BIN`（单份）改为各服务 ELF（内核体积会变大，见风险）。
 - 能力与资源仍**按域号**授予（现有 `cap::grant` 表基本原样保留）；`nvme::setup(block_domain)`
-  不变。
+  不变。（**后注**：图形/D1 批次已把它抽成通用 `device::grant(block_domain, …)`，见
+  [roadmap-driver.md](roadmap-driver.md) D1 —— 语义不变，只是内核不再认识 NVMe。）
 
 *二、域销毁（内核）*
 
@@ -1712,6 +1713,7 @@ E2b 让服务成了「独立程序 + 域可回收」，但服务的**生命周�
   会释放内核为它映射的 NVMe 配置/DMA 帧、甚至把 BAR0 的 MMIO 地址当成 RAM 交给帧分配器。
   要把它纳入监督，得先给 `domain::reset` 加「跳过内核保留区间」的能力（内核侧的映射登记/
   白名单），或让 block_srv 重启后由内核重建这些映射。
+  - 进展（图形线 **G6**）：内核已有 **`frame_allocator::pin_range`（保留区间，`free_frame` 对其空操作）**，帧缓冲已用它挡住「同域重启误放显存」。**block_srv 剩下的只是把内核为它建立的 NVMe 配置页/DMA 帧也登记进去**（这些是内核侧 `paging` 映射，不是用户 `SYS_SHARE_PAGE`），登记后即可纳入监督。
 - **首次加载仍是内核**: E3c 只把"重启"交给 init, 服务的**首次**加载仍在引导期 (内核按模块表
   逐个载入)。让 init 承担首次加载需要把引导集再切一刀 (只留 pager + block + fat32 + mfs + init),
   随之要处理服务启动顺序与自测时序。

@@ -22,6 +22,12 @@ pub const PAYLOAD_LEN: usize = 96;
 /// 每域邮箱容量 (超出则发送失败)。
 const MAILBOX_CAP: usize = 16;
 
+/// `call` 等待回复时的超时轮询间隔 (ms)。
+///
+/// 只作「顺便检查目标域还活着没有」的节拍用: 正常回复远早于它; 目标域若在回复前死掉,
+/// 客户端最多等这么久就能失败返回, 而不是永久挂起。
+const CALL_POLL_MS: u64 = 200;
+
 /// IPC 消息。
 /// `#[repr(C)]` 保证与用户态同名字段结构体布局一致 (可由 `SYS_RECV` 写回)。
 #[derive(Clone, Copy, Debug)]
@@ -172,19 +178,27 @@ pub fn receive() -> Message {
 
 /// 同步调用: 发送请求到 `to` 并阻塞等待回复, 返回回复消息。
 ///
-/// 需 `Capability::SendTo(to)`。失败 (无能力) 时返回 `tag == u64::MAX` 的空消息。
+/// 需 `Capability::SendTo(to)`。失败时返回 `tag == u64::MAX` 的空消息 —— 三种情形:
+/// 无能力、目标域**已无存活任务** (服务崩了 / 正被监督者重启), 或等待期间目标域死掉。
+///
+/// ⚠️ **为什么不等无限**: 调用方阻塞在**自己的域**键上 (发往本域的任何消息都会唤醒它),
+/// 服务若在回复前退出, 就再没人回这条请求 —— 无限等下去客户端**永久挂死** (这正是
+/// 「`gfx_srv` 一崩, shell 的 ipc 卡死」的根因)。故改为**带超时轮询**: 每 [`CALL_POLL_MS`]
+/// 醒一次, 顺便看目标域还活着没有; 不活就失败返回, 让客户端能降级 / 重试。
+///
+/// 正常调用不受影响: 回复通常在 1~2 个时钟 tick (10~20 ms) 内到达, 早于超时。
 pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     x86_64::instructions::interrupts::disable();
     let me = crate::scheduler::current_domain();
 
     if !crate::cap::has(me, Capability::SendTo(to)) {
         x86_64::instructions::interrupts::enable();
-        return Message {
-            from: 0,
-            to: 0,
-            tag: u64::MAX,
-            payload: [0; PAYLOAD_LEN],
-        };
+        return failed();
+    }
+    // 目标域已无存活任务: 直接失败, 不必白等一轮 —— 请求发过去也没人取。
+    if crate::scheduler::live_tasks(to) == 0 {
+        x86_64::instructions::interrupts::enable();
+        return failed();
     }
 
     // 构造并投递请求。
@@ -207,7 +221,7 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     // 故须循环阻塞, 直到真正收到来自 `to` 的回复为止。被无关消息唤醒时, 该消息
     // 仍留在本域邮箱, 交由后续 `receive` 处理。
     loop {
-        crate::scheduler::block_current(me);
+        crate::scheduler::block_current_timeout_ms(me, CALL_POLL_MS);
 
         let reply = {
             let mut boxes = MAILBOXES.lock();
@@ -220,7 +234,21 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
             x86_64::instructions::interrupts::enable();
             return r;
         }
-        // 被无关消息唤醒: 继续阻塞, 等待真正的回复。
+        // 没等到回复: 目标域若已无存活任务, 就失败返回 (否则可能是被无关消息唤醒, 继续等)。
+        if crate::scheduler::live_tasks(to) == 0 {
+            x86_64::instructions::interrupts::enable();
+            return failed();
+        }
+    }
+}
+
+/// 构造一条「调用失败」的回复 (无能力 / 目标域已死)。
+fn failed() -> Message {
+    Message {
+        from: 0,
+        to: 0,
+        tag: u64::MAX,
+        payload: [0; PAYLOAD_LEN],
     }
 }
 

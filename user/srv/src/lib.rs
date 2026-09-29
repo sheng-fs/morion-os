@@ -50,6 +50,8 @@ pub mod kbd;
 pub mod mfs_srv;
 #[cfg(feature = "svc-mount_srv")]
 pub mod mount_srv;
+#[cfg(feature = "svc-net_srv")]
+pub mod net_srv;
 #[cfg(feature = "svc-pager")]
 pub mod pager;
 #[cfg(feature = "svc-receiver")]

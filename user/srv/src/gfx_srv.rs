@@ -21,8 +21,8 @@ use crate::common::Message;
 use crate::gfx::term::Term;
 use crate::gfx::Fb;
 use morion::gfx::{
-    GfxReq, GFX_OP_BLIT, GFX_OP_CLEAR, GFX_OP_FILL, GFX_OP_MOVE, GFX_OP_PING, GFX_OP_QUERY,
-    GFX_OP_RECT, GFX_OP_TEXT, GFX_TAG,
+    GfxReq, GFX_OP_BLIT, GFX_OP_CLEAR, GFX_OP_EXIT, GFX_OP_FILL, GFX_OP_MOVE, GFX_OP_PING,
+    GFX_OP_QUERY, GFX_OP_RECT, GFX_OP_TEXT, GFX_REPLY_NO_SESSION, GFX_TAG,
 };
 use morion::syscall::*;
 
@@ -124,15 +124,21 @@ pub fn run() {
             payload: [0; PAYLOAD_LEN],
         };
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
-        let reply = handle(&fb, &mut term, msg.tag, msg.payload.as_ptr());
+        let (reply, exit) = handle(&fb, &mut term, msg.tag, msg.payload.as_ptr());
         sys_reply(reply);
+        if exit {
+            // 自测用退出钩子: **先回复再退出** (若先退出, 请求方会等不到回复)。
+            // 退出后域仍由 init 监督 —— 它会就地重启本服务 (域号不变)。
+            println("gfx: exit requested (self-test), stopping for supervisor restart");
+            return;
+        }
     }
 }
 
-/// 处理一条绘图/文本请求, 返回回复值 (`1` = 成功, 其它 = 失败)。
-fn handle(fb: &Fb, term: &mut Term, tag: u64, payload: *const u8) -> u64 {
+/// 处理一条绘图/文本请求, 返回 `(回复值, 是否请求退出)`。
+fn handle(fb: &Fb, term: &mut Term, tag: u64, payload: *const u8) -> (u64, bool) {
     if tag != GFX_TAG {
-        return u64::MAX;
+        return (u64::MAX, false);
     }
     let req: GfxReq = unsafe { core::ptr::read_unaligned(payload as *const GfxReq) };
     // 坐标为 u64, 一律先夹到 u32 可表示的范围 (屏幕坐标本就很小), 免得截断成怪值。
@@ -141,9 +147,9 @@ fn handle(fb: &Fb, term: &mut Term, tag: u64, payload: *const u8) -> u64 {
         || req.w > u32::MAX as u64
         || req.h > u32::MAX as u64
     {
-        return 0;
+        return (0, false);
     }
-    match req.op {
+    let reply = match req.op {
         GFX_OP_FILL => {
             fb.fill(req.color as u32);
             1
@@ -175,15 +181,20 @@ fn handle(fb: &Fb, term: &mut Term, tag: u64, payload: *const u8) -> u64 {
             let (row, col) = term.cursor();
             ((row as u64) << 32) | col as u64
         }
+        // 自测用: 回 1, 由调用方在回复后退出 (见请求循环)。
+        GFX_OP_EXIT => 1,
         GFX_OP_PING => 1,
         _ => 0,
-    }
+    };
+    (reply, req.op == GFX_OP_EXIT)
 }
 
 /// 把客户端共享过来的文本写进终端 (落笔逐像素回读校验); 成功返回 1。
 ///
 /// 文本页由客户端 `SYS_SHARE_PAGE` **同址**共享过来, 故这里可直接按 `req.buf` 读。读之前
-/// 先确认首尾字节**落在本域已映射的页里** (`SYS_VIRT_TO_PHYS` 反映的是调用方 = 本域的映射)。
+/// 先确认首尾字节**落在本域已映射的页里** (`SYS_VIRT_TO_PHYS` 反映的是调用方 = 本域的映射);
+/// 不在映射里多半是**本服务刚重启过** (旧共享映射已随 `reset` 消失), 回
+/// [`GFX_REPLY_NO_SESSION`] 让客户端重建共享后重试。
 fn text(term: &mut Term, req: &GfxReq) -> u64 {
     let len = req.w as usize;
     if req.buf == 0 || len == 0 || len > MAX_TEXT_BYTES {
@@ -191,7 +202,7 @@ fn text(term: &mut Term, req: &GfxReq) -> u64 {
     }
     let last = req.buf + len as u64 - 1;
     if sys_virt_to_phys(req.buf) == 0 || sys_virt_to_phys(last) == 0 {
-        return 0;
+        return GFX_REPLY_NO_SESSION;
     }
     let bytes = unsafe { core::slice::from_raw_parts(req.buf as *const u8, len) };
     if term.write(bytes) {
@@ -205,7 +216,8 @@ fn text(term: &mut Term, req: &GfxReq) -> u64 {
 ///
 /// 表面由客户端 `SYS_SHARE_PAGE` **同址**共享过来, 故这里可直接按 `req.buf` 读。读之前先
 /// 确认首尾像素**落在本域已映射的页里** (`SYS_VIRT_TO_PHYS` 反映的是调用方 = 本域的映射) ——
-/// 否则一个没共享过来的地址会让服务在读像素时缺页。
+/// 否则一个没共享过来的地址会让服务在读像素时缺页; 不在映射里也回 [`GFX_REPLY_NO_SESSION`]
+/// (多半是本服务刚重启过), 让客户端重建共享。
 fn blit_to_screen(fb: &Fb, req: &GfxReq) -> u64 {
     let (sw, sh, sstride) = (req.w, req.h, req.stride);
     if req.buf == 0 || sw == 0 || sh == 0 || sstride == 0 {
@@ -214,7 +226,7 @@ fn blit_to_screen(fb: &Fb, req: &GfxReq) -> u64 {
     let src = req.buf;
     let last = src + (sh - 1) * sstride * 4 + (sw - 1) * 4;
     if sys_virt_to_phys(src) == 0 || sys_virt_to_phys(last) == 0 {
-        return 0;
+        return GFX_REPLY_NO_SESSION;
     }
 
     let mut drawn = 0u64;

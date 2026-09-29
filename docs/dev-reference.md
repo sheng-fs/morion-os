@@ -82,7 +82,7 @@ UEFI 固件
 | fat32 整簇缓冲 | `USER_BASE + 0x20_0000` 起 | 16 页 = 64 KiB（`FAT32_CLU_VADDR`/`FAT32_CLU_PAGES`，M1b 大簇支持），`dir_buf`/`file_buf` 都别名到它 |
 | ELF 加载中转页 + 暂存区 | `USER_BASE + 0x1F_F000`（中转 1 页）/ `+0x20_0000` 起（暂存，最多 256 页 = 1 MiB） | 运行时可执行文件加载（E1/E2，`morion::exec`）：中转页要**共享给读取的文件服务**（同地址），暂存区只在本域内、**不共享**。⚠️ `+0x20_0000` 与 fat32 的整簇缓冲同址但**不同域**（一个是 fat32 自己的、一个是 shell/app 的），不冲突；也正因如此 `spawn_file` 的调用方不能是文件服务 |
 | 用户栈 | `USER_BASE + 0x3F_9000 .. +0x40_1000` | **8 页（32 KiB），栈顶 `+0x40_1000` 向下增长**。单页不够：VFS 请求/回复在栈上构造 `Message`（96 B payload）并层层调用，app 在最早的几次 VFS 调用就会越过一页栈底，过去靠按需分页静默补页（不可靠） |
-| 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 NVMe 配置、+0x2_0000 MMIO、+0x3_0000 DMA（7 页：admin 的 ASQ/ACQ + 两条 I/O 队列的 SQ/CQ + data 页，**S5 起**每条 I/O 队列各一套；与内核 `nvme::NVME_DMA_PAGES` 同值） |
+| 固定数据区 | `USER_BASE + 0x80_0000` 起 | +0x00 共享页（sender/receiver）、+0x1_0000 **设备授权描述页**（D1 起通用，原为 NVMe 专属配置结构）、+0x2_0000 BAR 窗口、+0x3_0000 DMA 块（NVMe 驱动自行排 7 页：admin 的 ASQ/ACQ + 两条 I/O 队列的 SQ/CQ + data 页 —— **布局由驱动决定**，内核只给一个连续 DMA 块） |
 | 按需分页测试地址 | `USER_BASE + 0x1_0000_0000` | sender 触发的缺页演示 |
 
 > ⚠️ 每个程序自己的镜像都会随代码增长。所有固定映射地址必须留在**所有**镜像的增长范围
@@ -118,7 +118,7 @@ UEFI 固件
 | 8 | `SYS_UNMAP` | `rdi=vaddr` | 解除本域 `vaddr` 映射并递减引用计数，归零时释放物理帧，返回 1/0 |
 | 9 | `SYS_MAP_ANON` | `rdi=domain, rsi=vaddr` | 分页器：给 `domain` 的 `vaddr` 映射匿名零帧；需 `Capability::MapInto(domain)`，返回 1/0 |
 | 10 | `SYS_PAGE_FAULT_REPLY` | — | 分页器：唤醒最近一次 `SYS_RECV` 到的缺页域（回复目标由内核记录），返回 1/0 |
-| 12 | `SYS_CALL` | `rdi=to, rsi=tag` | 同步调用：发送请求并阻塞等回复，返回回复 `tag`；需 `Capability::SendTo(to)`，失败返回 `u64::MAX` |
+| 12 | `SYS_CALL` | `rdi=to, rsi=tag` | 同步调用：发送请求并阻塞等回复，返回回复 `tag`；需 `Capability::SendTo(to)`，失败返回 `u64::MAX`。**G6 起**：目标域若**无存活任务**（服务崩了/正被监督者重启）立即失败返回；等待期间目标域死掉也会在超时轮询（`CALL_POLL_MS = 200`）后失败返回 —— 不再永久挂起 |
 | 13 | `SYS_REPLY` | `rdi=tag` | 回复当前任务最近一次 `SYS_RECV` 到的调用者（回复目标由内核在 `receive` 时记录），返回 1/0 |
 | 14 | `SYS_REGISTER_IRQ` | `rdi=irq` | 注册当前域接收 `irq`；需 `Capability::Irq(irq)`，返回 1/0 |
 | 15..20 | ~~`SYS_SCROLL_UP/DOWN`、`SYS_BACKSPACE`、`SYS_TERM_PUT`、`SYS_TERM_LEFT/RIGHT`~~ | — | **已随 G4 退役**：这六个号曾用于「内核终端输入行」（历史滚动 / 退格 / 逐键编辑 / 回车提交）。输入搬进用户态后**不再分配**，键字节改走 48 / 49 |
@@ -136,13 +136,13 @@ UEFI 固件
 | 32 | `SYS_HANDLE_SEND` | `rdi=to, rsi=handle` | **能力随 IPC 传递（句柄移交）**：把本域 `handle` 槽里的不透明对象**移入** `to` 域，返回 `to` 域里的新句柄索引；**移动语义**（成功后本域该句柄立即失效）。需 `Capability::SendTo(to)`；源槽空 / 目标槽满返回 `u64::MAX` 且不改变任何状态 |
 | 33 | `SYS_CAP_SEND` | `rdi=to, rsi=kind, rdx=arg` | **能力随 IPC 传递（能力委派）**：把本域**持有**的能力**复制**给 `to` 域，返回 1/0。需 `Capability::SendTo(to)`，且**不允许放大**（自己没持有的能力给不出去）；`to` 已持有该项时幂等成功、不占新槽。`kind` 取 `cap::CAP_KIND_*`：`0=SendTo / 1=MapInto / 2=Irq / 3=Mmio / 4=Spawn / 5=Fb`，`arg` 为该能力的参数（目标域 id / IRQ 号 / 页对齐 MMIO 基址；`Spawn`/`Fb` 无参、`arg` 忽略） |
 | 34 | `SYS_IRQ_POLL` | `rdi=mask` | 非阻塞取走**掩码 `mask` 覆盖的 MSI/MSI-X 向量**中任意一个的「待处理」标志，命中返回**该向量号**，无 / 非法返回 0。位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`；掩码里每个位都须满足 `Capability::Irq(vector)` 且是该向量的注册者，否则整体非法。中断不投 IPC（见「IRQ 转发」），驱动用它走「中断已到」的快路径，未命中再 `SYS_IRQ_WAIT` 阻塞 |
-| 35 | `SYS_MSIX_ENABLE` | — | 打开 NVMe 控制器的 MSI-X（置 Enable、清 Function Mask）；只有该控制器的驱动域能调用且只成功一次，**PCI 配置空间写因此留在内核**。返回 1/0 |
+| 35 | `SYS_MSIX_ENABLE` | — | 打开**被授权设备**的 MSI-X（置 Enable、清 Function Mask）；由该设备的驱动域调用且只成功一次，**PCI 配置空间写因此留在内核**。D1 起转调 `device::enable_msix()`（原为 `nvme::enable_msix`）。返回 1/0 |
 | 36 | `SYS_IRQ_WAIT` | `rdi=mask, rsi=timeout_ms` | **阻塞等待掩码里任意一条向量**的中断（`wait_any`）：命中返回该向量号，超时返回 0（调用方据此回退轮询）。阻塞期间本域让出 CPU（不空转），由中断处理器唤醒；超时由 `tick()` 兜底。校验同 `SYS_IRQ_POLL`。syscall 入口已用 SFMASK 清 IF，故「查标志 → 登记掩码 → 阻塞」之间不会插进中断处理，不丢唤醒 |
 | 37 | `SYS_SPAWN_ELF` | `rdi=ptr, rsi=len` | **加载可执行文件并启动**（E1）：把本域内存里的 ELF64 `ET_EXEC` 镜像校验后载入**新域**并起一个 Ring 3 任务，成功返回**新域 id**，失败 `u64::MAX`。需 `Capability::Spawn`。解析与映射全在核内（`elf::parse` 全量校验 + `exec::spawn_elf`），新域**零能力**、其分页器登记为调用者。**失败时会把半成品域销毁掉**（地址空间与各全局表行都不留） |
 | 38 | `SYS_DOMAIN_DESTROY` | `rdi=domain` | **销毁一个域并回收它的全部资源**（E2b 地基）：地址空间（逐页按引用计数归还 + 页表帧 + PML4）、能力与句柄、邮箱、分页器登记、中断注册、任务与内核栈；域 id 槽位归还以便复用。返回 1/0。门禁是**两条一起**：`Capability::Spawn` **且** `pager::of(domain) == 调用者`（"谁加载谁负责"）—— 因此**自我销毁不可达**（拆自己正在用的页表/内核栈会当场崩） |
 | 39 | `SYS_DOMAIN_COUNT` | — | 当前**存活域数**（`domain::alive_count`），自测取证用：销毁之后应回到基线 |
 | 40 | `SYS_FRAME_FREE` | — | 当前**空闲物理帧数**（`frame_allocator::free_frames`），自测取证用：反复加载/销毁后不应下降 |
-| 41 | `SYS_SPAWN_ELF_AT` | `rdi=域 id, rsi=ptr, rdx=len` | **在指定域里加载并启动**（E3c，监督者重启服务）：不建新域，目标域须已存在且**无存活任务**；内核先清空它的用户地址空间（`domain::reset`）、摘掉已终止任务（`scheduler::reap_terminated`），再映射新镜像 → **域号不变**。需 `Capability::Spawn` |
+| 41 | `SYS_SPAWN_ELF_AT` | `rdi=域 id, rsi=ptr, rdx=len` | **在指定域里加载并启动**（E3c，监督者重启服务）：不建新域，目标域须已存在且**无存活任务**；内核先清空它的用户地址空间（`domain::reset`）、**丢弃它邮箱里未处理的请求**（`ipc::remove_domain`，G6：这些请求常引用客户端共享过来的页，而 `reset` 已把映射清掉）、摘掉已终止任务（`scheduler::reap_terminated`），再映射新镜像 → **域号不变**。需 `Capability::Spawn` |
 | 42 | `SYS_DOMAIN_ALIVE` | `rdi=域 id` | 该域**是否还有存活任务**（1/0）—— 监督者巡检原语。问的是"任务在不在"而不是"域槽位在不在"（引导域的任务退出后槽位仍在）。无能力门禁 |
 | 43 | `SYS_SPAWN_ELF_MODULE` | `rdi=域 id` | **用引导模块内存镜像在指定域原地重启**（E3c 后续）：与 41 共用同一套「验镜像 → 目标域无存活任务 → `domain::reset` → `reap_terminated` → 起任务」流程，区别只在镜像来源 —— 内核按域号去 `bootinfo::get().service_modules()`（E3b 交来的 `LOADER_DATA` 镜像）里取，过 `is_identity_mapped` 后映射，**不依赖磁盘**。返回域 id / `u64::MAX`。需 `Capability::Spawn` |
 | 44 | `SYS_FB_INFO` | `rdi=用户缓冲指针` | **取帧缓冲几何**（G1）：把 `FbInfo { addr, width, height, stride, bpp }`（24 字节）写回用户缓冲，成功 1 / 失败 0。需 `Capability::Fb` |
@@ -226,6 +226,7 @@ UEFI 固件
   正在生效的地址翻译，导致启动到 `paging::init` 即 #PF → #DF → triple fault（且随镜像大小变化时有时无）。
 - 内核保留上界取 `_kernel_end` **向上对齐到 64 KiB**：链接符号与镜像实际占用末尾可能有少量出入，
   留余量可确保内核栈顶所在的帧不会被当作空闲帧分配（栈顶就在镜像末尾附近，被复用为页表会立刻被栈写坏）。
+- **内核保留区间 `pin_range(start, end)`**（G6）：登记「任何路径都不得释放」的物理区间，`free_frame` 对其**空操作**。目前只登记**帧缓冲** —— 它是被 `SYS_FB_MAP`（`map_mmio`，**不走引用计数**）映射进 `gfx_srv` 的，若不挡，「同域重启」清地址空间时 `free_user_space` 会把它当本域独占帧 `free_frame`，大内存配置下等于把显存交回分配器。与 `reserve_frame`（初始化时占位）互补：那个管分配，这个管释放。
 
 ### 分页（[kernel/src/memory/paging.rs](../../kernel/src/memory/paging.rs)）
 
@@ -234,7 +235,7 @@ UEFI 固件
 - `map_user_page(domain_id: u64, vaddr: u64, paddr: u64, perm: UserPagePerm)`（USER 权限映射，权限由调用方给出）
 - `resolve_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（遍历页表把 vaddr 反查为物理地址）
 - `unmap_user_page(domain_id: u64, vaddr: u64) -> Option<u64>`（解除映射并返回原物理地址）
-- `free_user_space(pml4_phys: u64)`（**域销毁时调用**：只遍历 P4[1]——其余 PML4 条目是所有域共享的内核映射，不能动——逐页 `release_user_frame` 归还物理帧，再回收 PT/PD/PDPT 页表帧，最后清掉 P4[1] 条目。兼容 2 MiB 大页。调用者必须是**别的域**，不能拆自己正在用的页表）
+- `free_user_space(pml4_phys: u64)`（**域销毁 / 同域重启时调用**：只遍历 P4[1]——其余 PML4 条目是所有域共享的内核映射，不能动——逐页 `release_user_frame` 归还物理帧，再回收 PT/PD/PDPT 页表帧，最后清掉 P4[1] 条目。兼容 2 MiB 大页。调用者必须是**别的域**，不能拆自己正在用的页表。**G6**：内核保留区间（帧缓冲）由 `free_frame` 内部挡下，不会被归还）
 - `heap_start() / heap_size()`
 
 ### 域（[kernel/src/domain.rs](../../kernel/src/domain.rs)）
@@ -242,7 +243,7 @@ UEFI 固件
 - `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
 - `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
 - `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
-- `is_boot(id)` / `BOOT_DOMAINS = 16`（**白名单**：引导期服务域 `0..15` 退出时不自动销毁；它们的槽位始终被占用，故「id < 16 即引导域」是稳定不变量）
+- `is_boot(id)` / `BOOT_DOMAINS = 17`（**白名单**：引导期服务域 `0..16` 退出时不自动销毁；它们的槽位始终被占用，故「id < 17 即引导域」是稳定不变量。**N0** 由 16 扩到 17，给 `net_srv`(16) 腾号）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
 - `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
 - **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
@@ -370,7 +371,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv`（共 16 个域）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv`（共 17 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 服务监督者 init（E3c）
 
@@ -378,7 +379,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 - **巡检**：每 40 ms 对一批长期驻留的服务域问一次 `SYS_DOMAIN_ALIVE`（不设内核回调 —— 内核只需要机制，不需要认识"服务"这个用户态概念）。
 - **重启（两个镜像来源）**：发现某个域没有存活任务，**先试引导模块内存镜像**（`SYS_SPAWN_ELF_MODULE(43)`，内核按域号从 E3b 的模块表取，**不依赖磁盘**）；不可用时再回退到 FAT32 根卷的 `/system/services/<name>.elf`（`SYS_SPAWN_ELF_AT(41)`）。两条路都**原地**拉起 —— 域号不变，故 libvfs 里写死的 `FAT32_DOMAIN=6` 那类 ABI 全部照旧；日志会打印来源（`, from memory)` / `, from disk)`）。
-- **监督范围**：`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv / mfs_srv / ext2_srv / exfat_srv`（9 个）。内存镜像这条路让**文件服务本身**（fat32/mfs）也可被重启，解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。刻意不含两类：**block_srv(5)**（内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些物理帧还给帧分配器、甚至把 BAR0 的 MMIO 地址当成 RAM 交出去 —— 纳入监督前要先让 reset 跳过内核保留映射）与**按设计会正常退出**的 sender / receiver / app / shell（监督它们等于无休止重启）。局限与后续见 roadmap「E3c 后续」。
+- **监督范围**：`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv / mfs_srv / ext2_srv / exfat_srv / gfx_srv`（10 个）。内存镜像这条路让**文件服务本身**（fat32/mfs）也可被重启，解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。**gfx_srv(15) 于 G6 纳入**（原与 block_srv 同理被排除）：前提是 ① 帧缓冲已登记为内核保留区间（`frame_allocator::pin_range`），`domain::reset` 不再误放显存；② 客户端在服务重启后**重建共享会话**（`morion::gfx` 重发 `SYS_SHARE_PAGE`）且 `ipc::call` 不再永久挂起 —— 见本文件「图形服务 gfx_srv」的 G6 段与 [roadmap-gfx.md](roadmap-gfx.md)。仍刻意不含：**block_srv(5)**（内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些物理帧还给帧分配器 —— 帧缓冲那类保留帧现在挡住了，但 NVMe 的**内核侧映射**还未登记，纳入前仍要先做这件事）与**按设计会正常退出**的 sender / receiver / app / shell（监督它们等于无休止重启）。
 - **自测 FS-29**（[user/srv/src/app.rs](../../user/srv/src/app.rs)）：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言域 3 一度"没有存活任务" → 等 init 拉起来 → 断言**域号仍是 3**、能正常回显（`call` 得 `tag+1`）、存活域数不变。
 - **注意**：`SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 只允许"重启"（目标无存活任务），不允许"抢占"；重启用的是 `domain::reset`（清用户地址空间、保留域与它的分页器/能力注册），不是 `domain::destroy`（那会把域号一起交还）。
 - **libvfs 路由**：每个路径操作先经 `mount_lookup(path)` 向 `mount_srv` 查询，回复打包为 `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 挂载点前缀长度`（**M1b** 起含卷编码：0 = 该服务的默认卷，否则 = 卷号 + 1）；`route()` 去掉挂载前缀得到子路径，并把**卷编码写进请求 tag 的高 32 位**（tag 正文仍是 4 字节 ASCII，服务端用 `vfs::tag_body` 剥掉高位 —— 路径类请求因此天然带上目标卷，不必给每个请求结构体加字段）。
@@ -440,6 +441,16 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - shell：`morion::console::readline` 取代 `sys_readline`；`clear` 命令改清**屏幕控制台**（`gfx::clear_screen`）。控制台不可用时 shell 如实报错退出（没有回显通道 = 没有输入源）。
 - **运行期证据**（QEMU monitor `sendkey` 无头实测）：注入 `h e l p ⏎` → 串口出现 `help` 回显 + 完整命令列表；注入 `echo hiz` + 退格 + `⏎` → 串口出现 `echo hiz\x08` + `hi`，证明「取键 → 回显 → 退格删缓冲并擦屏 → 回车提交」整条链路。
 
+**G6 — 图形服务自愈（监督重启 + 客户端会话重建）**：
+
+- **问题**：`gfx_srv` 原不在 init 监督集里 —— 它一崩，屏幕永久死掉；更糟的是 `ipc::call` 的调用方把请求塞进它邮箱后就**无限等回复**，服务没了就**永久挂死**（shell 的打印镜像首当其冲）。
+- **内核侧两处**：① `ipc::call` 改为**带超时轮询**（`CALL_POLL_MS = 200`）并在目标域**无存活任务**时立即失败返回（`u64::MAX`）—— 客户端不再永久挂起；② 帧缓冲登记为**内核保留区间**（`frame_allocator::pin_range`），`domain::reset` 清地址空间时不会把它当普通帧释放。另外「同域重启」现在会**丢弃目标域邮箱里未处理的请求**（`restart_in_place` 里加 `ipc::remove_domain`），否则新实例会去处理那些引用已失效共享页的旧请求而再次崩。
+- **客户端会话重建**（[`user/libmorion/src/gfx.rs`](../../user/libmorion/src/gfx.rs)）：服务重启会清空它域内的页表，之前 `SYS_SHARE_PAGE` 共享过去的文本页/表面**随之消失**。客户端库因此：`call` 收到 `u64::MAX` 时把会话标记失效；`ensure_shared` 重建时**只重发 `share`、不再 `alloc`**（页仍在本域，用 `SYS_VIRT_TO_PHYS` 判断），并在重发前**有界等待服务活过来**（必须等 `reset` 之后重发才安全，否则撞 `map_user_page` panic）；若服务端对悬空共享页回 `GFX_REPLY_NO_SESSION(2)`（发生在"重启落在两次调用之间、本域还没察觉"时，即 shell 的常态），`print`/`blit` 会**重建共享再试一次**。
+- **gfx_srv 侧**：`GFX_OP_EXIT(8)` 自测钩子（**先回复再退出**，否则请求方等不到回复）；`text`/`blit` 在发现共享页不在本域映射时回 `GFX_REPLY_NO_SESSION`。
+- **init**：把 `gfx_srv(15)` 纳入 `SUPERVISED`（见上）。
+- **自测 GS-2**（app，跑在 GS-1/GT-1 之后）：杀 `gfx_srv` 两轮 —— ① 空窗期不调用：靠 `NO_SESSION` + 重建共享恢复；② 空窗期调用：`ipc::call` 必须快速失败（不挂起），重启后又能用 → `app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)`。
+- **GT-1 的并发修正**：屏幕是**多客户端共享**的（shell 也镜像打印、共用一条光标），GT-1 的"清屏 → 写 → 问光标"可能被 shell 的启动输出插队，测得列数偏大。改为**重试到干净窗口**（shell 打完启动输出就阻塞等输入），不引入新协议。
+
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
 - `gdt::init()` / `gdt::set_rsp0(stack_top: u64)`
@@ -449,6 +460,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `keyboard::read_scancode()`
 - `apic::init() -> Option<u32>` / `apic::msi_address() -> u32` / `apic::eoi()`（LAPIC 最小支撑，见下）
 - `pci::enumerate()` / `pci::find_nvme()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
+- `device::grant(GrantRequest) -> bool` / `device::grant_empty(domain)` / `device::enable_msix()`（**D1 通用设备授权**：BAR 映射 + DMA 块分配 + MSI-X 向量段分配 + `Mmio`/`Irq` 能力签发 + 写 `DeviceGrant` 描述；内核**不含**任何设备专属逻辑 —— 原 `nvme::setup` 已并入）
 
 ## 7. 构建 / 测试命令（Makefile）
 
@@ -546,3 +558,6 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 54 | **图形子系统 G3c：内核卸 CJK 字库（−276 KB）**：内核侧 `cjk.bin` 的 `include_bytes!`（275983 字节）、定长 37 字节记录的二分查表（`Glyph`/`glyph`）与「有字形就按字形宽度排版」那条路径全部删除。留下接管前那几秒 + panic 屏够用的最小集：UTF-8 `decode`/`prev_index`/`next_index` **原样保留**（退格与 ←/→ 不切开多字节字符）、`width`/`str_width` 改按**东亚宽度**粗判（ASCII 1 格、汉字类 2 格、控制字符 0 格，与用户态 `gfx_srv` 口径一致，接管前后列数不突变）、`draw` 非 ASCII 画**空心豆腐块**（仍按 2 格占位）。**内核 ELF 347376 → 70504 字节（−276872，≈ −80%）**，`cjk.bin` 只剩 `user/srv/src/gfx/cjk.bin` 一份。代价（已知且接受）：`gfx_srv` 接管前的几秒与 panic 屏上中文是豆腐块；**COM1 全程原样 UTF-8**（`print` 不经过本模块），headless 回归判据不变。顺带补 4 条 host 单测锁住宽度口径 / 混排列数 / 字符边界 / 截断序列（内核单测 16 → 20） | ✅ |
 | 55 | **图形子系统 G4：输入搬出内核（行编辑外移）**：内核侧删光输入机件 —— `term_put`/`term_backspace`/`term_left`/`term_right`/`scroll_view_up/down`/`input_read`/输入行队列/`INPUT_BASE`（行内提示符）/输入输出隔离（`input_detach`+`input_reattach`+`IN_SAVE_*`）/跨行累积 `IN_ACCUM`/`CURSOR_X,Y`+`set_cursor`/历史区光标导航（`CUR_ROW`/`CUR_COL`/`SCROLL_OFFSET`），`scheduler::is_waiting_on` 也一并删除；`video` 从此只有「512 行历史环 + 一行当前输出」，`print` 在接管后只写 COM1（内核终端只剩引导期日志与 panic 屏）。新增 [`key.rs`](../../kernel/src/key.rs)（64 字节环形键队列，满则丢新键）+ `SYS_KEY_PUSH(48)` / `SYS_KEY_READ(49)`（阻塞取键，`wake_one(KEY_WAIT)`，原名 `INPUT_WAIT`）；15..20 与 27 号 syscall **退役不再分配**。`kbd_srv` 只做 scancode→字节（可打印 / 退格 `0x08` / 回车 `'\n'`，方向键丢弃）；行编辑与回显落在 [`morion::console::readline`](../../user/libmorion/src/console.rs)（内核只搬字节；放客户端是因为 `gfx_srv` 单线程，服务端阻塞等键会饿死 app 自测的绘图请求）；`Term::write` 支持 `\b`（左移一列 + 涂背景，走逐像素回读）供退格擦屏；shell 的 `clear` 改清屏幕控制台。**顺带修掉一个真实竞态**：`gfx_srv` 原先「整屏绘制 → 回读校验 → 接管」，而接管前内核仍在整幅重绘，校验点会被擦成背景渐变 → 假失败（实测 `gfx: framebuffer readback FAILED`，随即 shell 报无控制台）；改为「顶部带 `probe` 探测 → 接管 → 独占后 `paint`+`verify`」。内核 ELF 70504 → 66040 字节。运行期证据（QEMU monitor `sendkey`）：`help⏎` → 回显 + 完整命令列表；`echo hiz`+退格+`⏎` → `echo hiz\x08` + `hi` | ✅ |
 | 56 | **图形自测提前（g3b-reorder）**：把 app 自测的图形取证 **GS-1 / GT-1** 从 `run()` 的**末尾**（在 ~6 分钟的 NVMe FS 压测之后）挪到**最前**（共享结果页之后、第 1 条 FS 用例之前）—— 图形是唯一"看屏幕"的取证，提前跑让每次回归/开发都能**立刻**拿到图形结果，不必干等 FS 全套。纯重排，两处仍是"失败即 `return`"的语义（图形回归在开头 fail-fast，不被 FS 结果拖到最后）；`gfx_srv`（域 15）后启动，首个 `ipc::call` 会等到它接管并进入请求循环，无需自旋。顺带修掉 [`morion::console::readline`](../../user/libmorion/src/console.rs) 里一处 `clippy::collapsible_match`（内层 `if len < buf.len()` 折进 match guard），`make clippy -- -D warnings` 恢复全绿。验证：GS-1/GT-1 现出现在日志第 ~142 / ~144 行（shell 自证之后、FS 压测之前），且 `SELFTEST DONE` 与 `FAILED`/`PANIC` 0 不变 | ✅ |
+| 57 | **图形子系统 G6：图形服务自愈（监督重启 + 客户端会话重建）**：修掉「`gfx_srv` 一崩，shell 的 ipc 永久挂死、屏幕永久死」这个真实缺口。**内核三处**：① `ipc::call` 由无限阻塞改为**带超时轮询**（`CALL_POLL_MS = 200`）+ 目标域**无存活任务**时立即失败返回 `u64::MAX`（调用方阻塞在**自己的域**键上，服务死在回复前就再没人回它，是挂死根因）；② 帧缓冲登记为**内核保留区间**（`frame_allocator::pin_range`，`free_frame` 空操作）—— `SYS_FB_MAP` 走 `map_mmio` 不计引用计数，「同域重启」清地址空间时 `free_user_space` 会把它当独占帧释放（大内存下把显存交回分配器）；③ 「原地重启」新增**丢弃目标域邮箱里未处理的请求**（`restart_in_place` 加 `ipc::remove_domain`），否则新实例会去读旧请求里的悬空共享页而再崩。**客户端**（[`morion::gfx`](../../user/libmorion/src/gfx.rs)）：服务重启会清空它域内页表，共享过去的文本页/表面随之消失 —— `call` 收 `u64::MAX` 时作废会话；`ensure_shared` 重建**只重发 `share` 不再 `alloc`**、且先**有界等待服务活过来**（`reset` 之后重发才安全）；服务端对悬空共享页回新码 `GFX_REPLY_NO_SESSION(2)`，`print`/`blit` 据此**重建共享再试一次**（覆盖"重启落在两次调用之间、客户端没察觉"，shell 的常态）。**服务**：`GFX_OP_EXIT(8)` 自测钩子（**先回复再退出**），`text`/`blit` 对不在本域映射的共享页回 `NO_SESSION`。**init**：`gfx_srv(15)` 纳入 `SUPERVISED`（10 个）。**顺带**：GT-1 的列数断言原依赖**全局光标**，被 shell 的启动输出插队会偏大 → 改为**重试到干净窗口**（屏幕多客户端共享，不引入原子返回列数的协议）。**自测 GS-2**：杀 `gfx_srv` 两轮（① 空窗期不调用走 `NO_SESSION` 重建；② 空窗期调用走 `ipc::call` 快速失败），日志 `init: restarted gfx_srv (domain 15, total N, from memory)` ×2 + `app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)`。回归：`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == 28672` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found" | ✅ |
+| 58 | **驱动通用化 D1：通用设备授权**：把内核里 **NVMe 专属**的 bring-up 抽成**通用**原语，让"加新驱动不必改内核"。新增 [`kernel/src/device.rs`](../../kernel/src/device.rs)（**取代 `kernel/src/nvme.rs`**）：`DeviceGrant` 描述结构（BAR + 连续 DMA 块 + MSI-X 参数，**不含**设备语义）+ `GrantRequest` + `grant()`（映射 BAR/DMA/描述页、签发 `Mmio` 能力）+ `grant_empty()` 降级 + `enable_msix()`；**MSI 向量段改为按设备分配**（原来每台设备都从段首拿固定几条，只够一台 NVMe —— 现游标 `MSI_NEXT` 从 `idt::MSI_VECTOR_BASE` 递增、段尽则降级轮询）。`main.rs` 里 NVMe 只剩一条**声明式需求**（`bar_pages: 4 / dma_pages: 7 / msix_vectors: 3`）；`SYS_MSIX_ENABLE` 转调 `device::enable_msix()`。驱动侧 [`block_srv.rs`](../../user/srv/src/block_srv.rs)：读通用描述 + **自行推导队列布局**（`DMA_OFF_*` 页偏移，ASQ/ACQ/ISQ1/ICQ1/ISQ2/ICQ2/data）—— 设备专属知识搬回驱动域。**纯重构，行为零变化**：回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds=28672 poll_cmds=0`（MSI 向量段仍 `0x50..0x52`）、`[OK] 16 service ELFs loaded`、`sgdisk` No problems found | ✅ |
+| 59 | **驱动路线 N0：域表扩容 + `net_srv` 骨架**：为网络驱动腾出域号 —— `domain::BOOT_DOMAINS` 16 → **17**、内核 `main.rs` 多建一个域（16）、引导器 `SERVICE_FILES` 加 `(16, "net_srv")`、`Makefile` 的 `SRV_NAMES` 加 `net_srv`、`morion-srv` 新增 `net_srv` feature/`[[bin]]`、`init` 监督集加 `(16, "net_srv")`（11 个）。内核 `ipc::init`/`cap::init`/`pager::init` 由**字面量 16 改为 `domain::BOOT_DOMAINS`** —— 这些表按域 id 下标访问，扩域后若表长不同步会**越界 panic**。`net_srv` 本步只是骨架（报到 + `sys_sleep` 保活），N2 才填 virtio-net 驱动。**验证**：启动日志 `[OK] 17 service ELFs loaded (boot modules)`、`[up] net_srv (domain 16)`、`init: supervising …/net_srv`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found（运行时 spawn 的域号随之 16 → 17，FS-28 用动态基线故无需改） | ✅ |
