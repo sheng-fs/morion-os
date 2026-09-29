@@ -2,10 +2,11 @@
 //!
 //! **N0**：只起域 + 报到 + 保持存活。
 //! **N1**：内核按类找到 virtio-net、用通用 `device::grant` 交出 `DeviceGrant`。
-//! **N2（本步）**：用户态 virtio-net modern 驱动 —— 通过 `SYS_DEVICE_CONFIG_READ` 自行解析
+//! **N2**：用户态 virtio-net modern 驱动 —— 通过 `SYS_DEVICE_CONFIG_READ` 自行解析
 //! virtio PCI 能力（common/notify/ISR/device 四个区域都在内核交给的 BAR 里）→ 复位 → 协商
 //! 特性 → 读 MAC → 建 RX/TX virtqueue（环落在内核交出的**连续 DMA 块**里）→ 投 RX 缓冲 →
-//! `DRIVER_OK` → 轮询取帧（MSI-X 表在 BAR1，中断化留 N2b）。
+//! `DRIVER_OK` → 收帧；MSI-X 表在 BAR1，内核把它另映射给本域（`msix_table_vaddr`），
+//! 驱动写表项 + 注册向量，**中断驱动**收 RX（无中断则回落轮询）。
 //! **N3**：发 ARP 请求 → 收应答（端到端取证）。
 //!
 //! 内核侧只交出"BAR + DMA 块 + 配置空间只读通道"，设备协议全在本域 —— 这正是 D1/N 的目的。
@@ -36,6 +37,8 @@ struct DeviceGrant {
     msix_msg_addr: u32,
     page_size: u32,
     _reserved: u32,
+    /// MSI-X 表所在 BAR 映射到本域的虚拟地址（表在该 BAR 的 `msix_table_offset` 处）。
+    msix_table_vaddr: u64,
 }
 
 // ===========================================================================
@@ -100,6 +103,8 @@ const RX_BUF_PAGE: u64 = 2;
 const BUF_SZ: u64 = 2048;
 /// 本驱动需要的 DMA 页数（与 `main.rs` 里给 net 声明的 `dma_pages: 8` 一致）。
 const DMA_PAGES: u64 = 8;
+/// 中断模式下 `SYS_IRQ_WAIT` 的超时（毫秒）：超时即回落重扫 used 环，兼顾延迟与兜底。
+const IRQ_WAIT_MS: u64 = 200;
 /// 一个 ring 页内的子偏移。
 const OFF_AVAIL: u64 = 0x100;
 const OFF_USED: u64 = 0x200;
@@ -251,13 +256,15 @@ fn notify(c: &Caps, qindex: u16, notify_off: u16) {
     wr16(addr, qindex);
 }
 
-/// 配置一个 virtqueue：设置大小与三个环的**物理**地址并使之生效。
+/// 配置一个 virtqueue：设置大小、MSI-X 向量下标与三个环的**物理**地址并使之生效。
 ///
+/// `msix_index` 是 MSI-X **表项下标**（`VIRTIO_MSI_NO_VECTOR` = 不给这个队列中断）。
 /// 返回 `(实际深度, notify_off)`；深度 0 表示失败。
 fn setup_queue(
     c: &Caps,
     idx: u16,
     want: u16,
+    msix_index: u16,
     desc_pa: u64,
     avail_pa: u64,
     used_pa: u64,
@@ -272,9 +279,23 @@ fn setup_queue(
     c_w64(c, C_Q_DESC, desc_pa);
     c_w64(c, C_Q_DRIVER, avail_pa);
     c_w64(c, C_Q_DEVICE, used_pa);
-    c_w16(c, C_Q_MSIX, NO_VECTOR);
+    c_w16(c, C_Q_MSIX, msix_index);
     c_w16(c, C_Q_ENABLE, 1);
     (size, c_r16(c, C_Q_NOTIFY_OFF))
+}
+
+/// 写一条 MSI-X 表项：消息地址 + 数据（= 中断向量号）+ 不屏蔽。
+///
+/// 表在**内核额外映射给本域的那根 BAR** 上（N2b：virtio-net 的表在 BAR1，窗口基址来自
+/// `DeviceGrant.msix_table_vaddr`）—— 内核到不了这个 BAR，故配置空间写留在内核、表由驱动写。
+fn write_msix_entry(g: &DeviceGrant, entry: u16, vector: u16) {
+    let p = (g.msix_table_vaddr + g.msix_table_offset as u64 + entry as u64 * 16) as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(p, g.msix_msg_addr); // 消息地址 (低 32 位)
+        core::ptr::write_volatile(p.add(1), 0); // 消息地址 (高 32 位); 物理目的模式恒 0
+        core::ptr::write_volatile(p.add(2), vector as u32); // 消息数据 = 中断向量
+        core::ptr::write_volatile(p.add(3), 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
+    }
 }
 
 /// 建一个 virtqueue 的坐标（环都排在 `dma_vaddr` 的 `ring_page` 那页）。
@@ -377,11 +398,20 @@ pub fn run() {
     let mac_hi = rd16(caps.device + 4);
     let mac = ((mac_hi as u64) << 32) | mac_lo as u64;
 
-    // 6. 建 RX(0) / TX(1) 两个 virtqueue。
+    // 6. MSI-X 判定：内核给了向量段 + 表窗口（N2b：表在 BAR1，内核已另映射给本域）才走中断。
+    let want_irq = g.msix_vector_base != 0 && g.msix_table_vaddr != 0 && g.msix_vector_count >= 2;
+    let irq_base = g.msix_vector_base as u16;
+    let rx_msix = if want_irq { 0 } else { NO_VECTOR };
+    let tx_msix = if want_irq { 1 } else { NO_VECTOR };
+    // 不做配置变更中断（本驱动不需要）。
+    c_w16(&caps, C_MSIX_CONFIG, NO_VECTOR);
+
+    // 7. 建 RX(0) / TX(1) 两个 virtqueue（各自绑一条 MSI-X 表项）。
     let (rx_size, rx_noff) = setup_queue(
         &caps,
         0,
         Q_SIZE,
+        rx_msix,
         g.dma_paddr + RX_RING_PAGE * PAGE,
         g.dma_paddr + RX_RING_PAGE * PAGE + OFF_AVAIL,
         g.dma_paddr + RX_RING_PAGE * PAGE + OFF_USED,
@@ -390,6 +420,7 @@ pub fn run() {
         &caps,
         1,
         Q_SIZE,
+        tx_msix,
         g.dma_paddr + TX_RING_PAGE * PAGE,
         g.dma_paddr + TX_RING_PAGE * PAGE + OFF_AVAIL,
         g.dma_paddr + TX_RING_PAGE * PAGE + OFF_USED,
@@ -411,7 +442,33 @@ pub fn run() {
     print_u64(tx_size as u64);
     println("");
 
-    // 7. 投满 RX 缓冲（每个描述符一格缓冲；设备收包时写进对应格）。
+    // 8. MSI-X：写表项（表在内核另映射的窗口里）→ 注册向量 → 请内核打开 MSI-X。
+    //    任一环节不成就退回轮询（等待期用 sys_sleep）。
+    let mut irq_vectors: u64 = 0;
+    let mut irq_mask: u64 = 0;
+    if want_irq {
+        write_msix_entry(&g, 0, irq_base);
+        write_msix_entry(&g, 1, irq_base + 1);
+        let r0 = sys_register_irq(irq_base as u64);
+        let r1 = sys_register_irq((irq_base + 1) as u64);
+        if sys_msix_enable() == 1 && r0 == 1 && r1 == 1 {
+            irq_vectors = 2;
+            // 掩码位 `i` ↔ 向量 `MSI_VECTOR_BASE + i`：本设备向量段不从段首开始，整体左移。
+            let shift = (irq_base as u64).wrapping_sub(MSI_VECTOR_BASE);
+            irq_mask = ((1u64 << irq_vectors) - 1) << shift;
+            print("net: MSI-X enabled vectors=0x");
+            print_hex(irq_base as u64);
+            print("..0x");
+            print_hex((irq_base + 1) as u64);
+            println("");
+        } else {
+            println("net: MSI-X enable/register failed, polling");
+        }
+    } else {
+        println("net: no MSI-X (kernel gave no vectors/table window), polling");
+    }
+
+    // 9. 投满 RX 缓冲（每个描述符一格缓冲；设备收包时写进对应格）。
     let mut i = 0u16;
     while i < rx_size {
         let buf_pa = g.dma_paddr + RX_BUF_PAGE * PAGE + (i as u64) * BUF_SZ;
@@ -424,16 +481,17 @@ pub fn run() {
     fence();
     notify(&caps, 0, rx.notify_off);
 
-    // 8. DRIVER_OK：驱动就绪，设备开始收包。
+    // 10. DRIVER_OK：驱动就绪，设备开始收包。
     set_status(
         &caps,
         ST_ACKNOWLEDGE | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK,
     );
-    println("net: DRIVER_OK, RX buffers posted (polling; MSI-X in N2b)");
+    println("net: DRIVER_OK, RX buffers posted");
 
-    // 9. 轮询 RX：取 used 环、统计并补投（中断化留 N2b）。
+    // 11. 收帧：有中断走中断（快路径 poll + 阻塞 wait，超时回落重扫），否则轮询。
     let mut last_used: u16 = 0;
     let mut rx_frames: u64 = 0;
+    let mut irq_hits: u64 = 0;
     loop {
         let used_idx = rd16(rx.used + 2);
         let mut drained = 0u32;
@@ -456,8 +514,18 @@ pub fn run() {
             notify(&caps, 0, rx.notify_off);
             print("net: rx frames=");
             print_u64(rx_frames);
+            print(" irq_hits=");
+            print_u64(irq_hits);
             println("");
         }
-        sys_sleep(20);
+        if irq_vectors != 0 {
+            // 快路径 poll 命中就不睡；否则阻塞等下一次中断，超时回落重扫。
+            let hit = sys_irq_poll(irq_mask) != 0 || sys_irq_wait(irq_mask, IRQ_WAIT_MS) != 0;
+            if hit {
+                irq_hits += 1;
+            }
+        } else {
+            sys_sleep(20);
+        }
     }
 }

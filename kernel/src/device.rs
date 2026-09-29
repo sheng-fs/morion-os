@@ -33,6 +33,8 @@ const PAGE: u64 = 4096;
 pub const DEVICE_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x81_0000;
 pub const DEVICE_BAR_VADDR: u64 = paging::USER_SPACE_BASE + 0x82_0000;
 pub const DEVICE_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x83_0000;
+/// MSI-X 表所在 BAR 的映射窗口（仅当表**不在**设备 BAR 上时才用，如 virtio-net 的表在 BAR1）。
+pub const DEVICE_MSIX_VADDR: u64 = paging::USER_SPACE_BASE + 0x84_0000;
 
 /// 描述结构 magic (校验内核与用户态布局一致)。
 pub const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131; // "DEVOS!1"
@@ -68,6 +70,9 @@ pub struct DeviceGrant {
     pub page_size: u32,
     /// 保留 (对齐 / 将来扩展)。
     pub _reserved: u32,
+    /// MSI-X 表所在 BAR 映射到驱动域的虚拟地址（表在该 BAR 的 `msix_table_offset` 处）。
+    /// 0 = 未映射 (未启用 MSI-X); 表与设备 BAR 同根时 = `bar_vaddr`。
+    pub msix_table_vaddr: u64,
 }
 
 /// 一次设备授权请求 (由 boot 侧的"设备需求"声明给出)。
@@ -140,6 +145,7 @@ pub fn grant(req: GrantRequest) -> bool {
         msix_msg_addr: msix.msg_addr,
         page_size: PAGE as u32,
         _reserved: 0,
+        msix_table_vaddr: msix.table_vaddr,
     };
     unsafe {
         core::ptr::write(cfg_paddr as *mut DeviceGrant, desc);
@@ -241,6 +247,8 @@ struct MsixSetup {
     count: u32,
     table_offset: u32,
     msg_addr: u32,
+    /// 表所在 BAR 映射到驱动域的虚拟地址 (0 = 未启用)。
+    table_vaddr: u64,
 }
 
 const MSIX_DISABLED: MsixSetup = MsixSetup {
@@ -248,6 +256,7 @@ const MSIX_DISABLED: MsixSetup = MsixSetup {
     count: 0,
     table_offset: 0,
     msg_addr: 0,
+    table_vaddr: 0,
 };
 
 /// MSI 向量段的**分配游标** (从 [`idt::MSI_VECTOR_BASE`] 起按设备递增)。
@@ -327,14 +336,6 @@ fn setup_msix(
             return MSIX_DISABLED;
         }
     };
-    // 表必须落在第 0 根 BAR (BIR=0 = `bar_paddr`), 且要被映射给驱动的窗口盖住。
-    if cap.table_bir != 0 {
-        crate::video::print(label);
-        crate::video::print(": MSI-X table in BAR");
-        crate::video::print_u64(cap.table_bir as u64);
-        crate::video::println(", not BAR0 -> polling");
-        return MSIX_DISABLED;
-    }
     if cap.table_size < want_vectors as u16 {
         log(
             label,
@@ -342,11 +343,34 @@ fn setup_msix(
         );
         return MSIX_DISABLED;
     }
-    let table_end = cap.table_offset as u64 + want_vectors as u64 * 16;
-    if table_end > bar_pages * PAGE {
-        log(label, ": MSI-X table outside mapped BAR window -> polling");
-        return MSIX_DISABLED;
-    }
+    // 表在哪根 BAR 决定怎么把它交给驱动:
+    //   - BIR=0 = 内核已经映射的设备 BAR (NVMe 就是): 直接用它的窗口;
+    //   - BIR!=0 = 表在**另一根** BAR 上 (virtio-net 的表在 BAR1): 内核把那根 BAR 也
+    //     非缓存地映射给驱动 (窗口 DEVICE_MSIX_VADDR), 驱动写表项时用这个窗口基址。
+    let table_bytes = cap.table_offset as u64 + want_vectors as u64 * 16;
+    let table_vaddr = if cap.table_bir == 0 {
+        if table_bytes > bar_pages * PAGE {
+            log(label, ": MSI-X table outside mapped BAR window -> polling");
+            return MSIX_DISABLED;
+        }
+        DEVICE_BAR_VADDR
+    } else {
+        let msix_bar = match pci::read_bar(bus, dev, func, cap.table_bir) {
+            Some(p) => p,
+            None => {
+                crate::video::print(label);
+                crate::video::print(": MSI-X BAR");
+                crate::video::print_u64(cap.table_bir as u64);
+                crate::video::println(" unreadable -> polling");
+                return MSIX_DISABLED;
+            }
+        };
+        let pages = table_bytes.div_ceil(PAGE);
+        for i in 0..pages {
+            paging::map_mmio(domain, DEVICE_MSIX_VADDR + i * PAGE, msix_bar + i * PAGE);
+        }
+        DEVICE_MSIX_VADDR
+    };
     // LAPIC 是 MSI 消息的接收方, 没有它就没有中断可言。
     if apic::init().is_none() {
         log(label, ": no LAPIC, MSI-X off (polling)");
@@ -383,6 +407,10 @@ fn setup_msix(
     crate::video::print_hex(apic::msi_address() as u64);
     crate::video::print(" table_off=0x");
     crate::video::print_hex(cap.table_offset as u64);
+    crate::video::print(" table_bar=");
+    crate::video::print_u64(cap.table_bir as u64);
+    crate::video::print(" table_vaddr=0x");
+    crate::video::print_hex(table_vaddr);
     crate::video::print(" entries=");
     crate::video::print_u64(cap.table_size as u64);
     crate::video::println("");
@@ -391,6 +419,7 @@ fn setup_msix(
         count: want_vectors,
         table_offset: cap.table_offset,
         msg_addr: apic::msi_address(),
+        table_vaddr,
     }
 }
 

@@ -199,6 +199,12 @@ pub fn sys_msix_enable() -> u64 {
     unsafe { syscall(SYS_MSIX_ENABLE, 0, 0, 0) }
 }
 
+/// MSI/MSI-X 向量段的基址（须与内核 `arch::idt::MSI_VECTOR_BASE` 一致）。
+///
+/// `SYS_IRQ_POLL` / `SYS_IRQ_WAIT` 的掩码**位 `i` 对应向量 `MSI_VECTOR_BASE + i`**：驱动拿到的
+/// 向量段不一定从段首开始（多设备各占一段），故掩码要整体左移 `向量段基址 - MSI_VECTOR_BASE`。
+pub const MSI_VECTOR_BASE: u64 = 0x50;
+
 /// 读本域被授权设备的 PCI 配置空间 dword (`offset` 会被对齐到 4)。
 ///
 /// 驱动靠它自行解析能力链表 (PCI 通用能力 / 厂商能力, 如 virtio 各 BAR 区域偏移) ——
