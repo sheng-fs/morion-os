@@ -94,7 +94,7 @@
 - **运行库**：`libmorion::syscall` 里把打印的唯一出口收成 `sink()`（`SYS_PUTS` + 可选镜像），加 `screen_mirror_on()` 开关；[`gfx::print`](../../user/libmorion/src/gfx.rs) 作为镜像目标。**镜像按进程 opt-in**：只有 shell 打开，自测那种成千上万条打印的路径不受影响（每条多一次 IPC 往返不划算）。
 - **shell**：[shell.rs](../../user/srv/src/shell.rs) 启动时有界等待（上限 `CONSOLE_WAIT_MS = 1000`，到点就退回"只写串口"）→ 确认 `SYS_CONSOLE_READY` 且 `gfx_srv` 有活任务 → 开镜像。于是 shell 的横幅、中文欢迎语、每条命令输出都**同时**进串口（内核终端）与屏幕控制台。
 - **盲测自证**：开镜像后立刻用 `GFX_OP_QUERY` 问服务端光标，`row > 0` 就打印 `shell: screen console mirror OK (gfx_srv cursor advanced)`（这句走 `sys_puts`，只进串口，不占屏幕）—— 没有显示器也能证明"shell 的输出真的写进了 gfx_srv 的终端"。
-- **输入仍可用**：接管只关掉内核的**重绘**（[`redraw`](../../kernel/src/video/mod.rs) / `redraw_input_line` 在接管后为空操作），`term_put` / 退格 / 左右移的**编辑与回车提交照旧执行** —— 否则回车不会把输入行推进队列，阻塞在 `SYS_READLINE` 的 shell 将永远收不到命令（表现为「终端卡死」）。这是接管初期踩过的坑。
+- **输入仍可用**：接管只关掉内核的**重绘**（[`redraw`](../../kernel/src/video/mod.rs) / `redraw_input_line` 在接管后为空操作），`term_put` / 退格 / 左右移的**编辑与回车提交照旧执行** —— 否则回车不会把输入行推进队列，阻塞在 `SYS_READLINE` 的 shell 将永远收不到命令（表现为「终端卡死」）。这是接管初期踩过的坑。（**G4 后输入整体搬出内核**，这一节的 `term_put` / `SYS_READLINE` 等已删除，见下方 G4。）
 - **已知限制（归 G4）**：内核终端负责的**输入行回显**还没外移，故在屏幕上打字看不见（提示符与命令输出看得见；打字仍能提交、命令仍能执行）。屏幕控制台也不做行级保护 —— 目前只有 shell 一个镜像客户端，暂不会互相顶掉。
 
 ### G3c — 内核卸字库、终端降为 ASCII + 豆腐块 ✅ 已完成
@@ -105,10 +105,20 @@
 - **代价（已知且接受）**：`gfx_srv` 接管**之前**那几秒，屏上内核日志里的中文是豆腐块；panic 屏上的中文同理。**COM1 串口全程不变**（`print` 直接写 UTF-8 字节，不经本模块），故 headless 回归与判据完全不受影响。
 - **单测**：`video/unicode.rs` 加 4 条 host 单测（宽度口径 / 混排列数 / 字符边界 / 截断序列），内核单测 16 → **20**。
 
-### G4（可选后续）— 控制台 / 窗口服务化
+### G4 — 输入搬出内核（行编辑/回显外移）✅ 已完成
 
-- 把**输入行编辑 + 行历史 + 光标**从内核迁到用户态 console 服务，内核只剩 panic 输出（微内核最小化真正到位）。
-- 引入 surface 合成 / 多窗口，为「桌面」铺路。
+- **内核只剩搬运**：新增 `SYS_KEY_PUSH(48)` / `SYS_KEY_READ(49)` 与 `kernel/src/key.rs`（64 字节环形键队列，满则丢新键、绝不阻塞内核）。`kbd_srv` 只把 scancode 译成字节（可打印 / 退格 `0x08` / 回车 `'\n'`，方向键丢弃），**不带任何编辑语义**。15..20 与 27 号 syscall（内核终端输入行）与 `INPUT_WAIT`（改名 `KEY_WAIT`）一并退役。
+- **内核侧删除**：`term_put` / `term_backspace` / `term_left` / `term_right` / `scroll_view_up/down` / `input_read` / 输入行队列 / `INPUT_BASE`（行内提示符）/ 输入输出隔离（`input_detach`+`input_reattach`+`IN_SAVE_*`）/ 跨行累积 `IN_ACCUM` / `CURSOR_X,Y`+`set_cursor` / 历史区光标导航（`CUR_ROW`/`CUR_COL`/`SCROLL_OFFSET`）—— `video` 从此只有「512 行历史环 + 一行当前输出」，即**引导期日志 + panic 屏**两件事。
+- **行编辑落在客户端库**：[`morion::console::readline`](../../user/libmorion/src/console.rs) 阻塞取键、可打印字符追加并**立刻回显**（走 `print` ⇒ 串口 + 可选屏幕镜像，所以**打字终于看得见了**）、退格发 `\b`、回车成行。
+  - ⚠️ **为什么不放服务端**：`gfx_srv` 单线程，服务端一旦阻塞在「等按键」就出不了请求循环 —— app 自测的 `GFX_OP_FILL`/`GFX_OP_TEXT` 会被饿到有人按键为止。`SYS_KEY_READ` 在**客户端**阻塞是免费的（内核把任务睡下，有键再唤醒）。
+  - ⚠️ 代价：输入不再有内核兜底，**屏幕控制台不可用时 shell 没有输入源**（如实报错退出，不再"盲打可用"）。
+- **屏幕侧配合**：`Term::write` 支持 `\b`（光标左移一列 + 把该格涂成背景色，与其它落笔一样逐像素回读）；键盘输入目前全是 ASCII，故一次退格 = 一列。
+- **顺带修掉一个真实竞态**：`gfx_srv` 原先「整屏绘制 → 回读校验 → 接管」，而接管前内核仍在整幅重绘日志，被校验的像素会被擦成背景渐变 → **假失败**（实测 `gfx: framebuffer readback FAILED`，随后 shell 报无控制台）。改为「顶部带 `probe` 探测映射可写 → 接管 → 独占后 `paint`+`verify`」。
+- **实测**：内核 ELF `70504 → 66040` 字节。QEMU monitor `sendkey` 无头实测：`h e l p ⏎` → 串口出现 `help` 回显 + 完整命令列表；`e c h o spc h i z ⌫ ⏎` → 串口出现 `echo hiz\x08` + `hi`（取键 → 回显 → 退格删缓冲并擦屏 → 回车提交整条链路）。
+
+### G5（可选后续）— surface 合成 / 多窗口
+
+- 引入 surface 合成与多窗口，为「桌面」铺路。当前只有一个全屏文本控制台客户端。
 
 ---
 
@@ -119,7 +129,8 @@
 3. **G3a 服务内终端**（✅ 已完成）：字库/排版搬进 `gfx_srv` + `GFX_TEXT/CLEAR/MOVE/QUERY` + 自测 GT-1。
 4. **G3b shell 输出上屏**（✅ 已完成）：`SYS_CONSOLE_READY(47)` + `libmorion` 打印镜像 + shell 开镜像与串口自证。
 5. **G3c 内核减重**（✅ 已完成）：卸掉内核侧字库（−276 KB），终端降为 ASCII + 豆腐块；视实测决定是否上 write-combining（D2）。
-6. **G4（可选）控制台/窗口服务化**：输入行与合成外移，内核降为 panic-only。
+6. **G4 输入外移**（✅ 已完成）：键盘字节走 `SYS_KEY_PUSH`/`SYS_KEY_READ`，行编辑/回显落在 `morion::console`，内核终端只剩输出。
+7. **G5（可选）surface 合成 / 多窗口**：为「桌面」铺路。
 
 ---
 

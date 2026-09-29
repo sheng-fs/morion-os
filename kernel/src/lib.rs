@@ -22,6 +22,7 @@ pub mod elf;
 pub mod exec;
 pub mod ipc;
 pub mod irq;
+pub mod key;
 pub mod memory;
 pub mod nvme;
 pub mod pager;

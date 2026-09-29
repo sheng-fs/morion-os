@@ -39,19 +39,14 @@ pub const SYS_PAGE_FAULT_REPLY: u64 = 10;
 pub const SYS_CALL: u64 = 12;
 pub const SYS_REPLY: u64 = 13;
 pub const SYS_REGISTER_IRQ: u64 = 14;
-pub const SYS_SCROLL_UP: u64 = 15;
-pub const SYS_SCROLL_DOWN: u64 = 16;
-pub const SYS_BACKSPACE: u64 = 17;
-pub const SYS_TERM_PUT: u64 = 18;
-pub const SYS_TERM_LEFT: u64 = 19;
-pub const SYS_TERM_RIGHT: u64 = 20;
+// 15..=20 与 27 曾用于「内核终端输入行」(滚动 / 退格 / 逐键编辑 / 读一行);
+// G4 把输入搬进用户态屏幕控制台后**退役** —— 输入改走表尾的 SYS_KEY_PUSH / SYS_KEY_READ。
 pub const SYS_MAP_MMIO: u64 = 21;
 pub const SYS_PORT_IN8: u64 = 22;
 pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
 pub const SYS_VIRT_TO_PHYS: u64 = 26;
-pub const SYS_READLINE: u64 = 27;
 pub const SYS_CLEAR: u64 = 28;
 pub const SYS_CAP_ISSUE: u64 = 29;
 pub const SYS_CAP_LOOKUP: u64 = 30;
@@ -90,6 +85,10 @@ pub const SYS_FB_MAP: u64 = 45;
 pub const SYS_FB_TAKEOVER: u64 = 46;
 /// 显示是否已交用户态 (无能力要求)。见 [`sys_console_ready`]。
 pub const SYS_CONSOLE_READY: u64 = 47;
+/// 把一个**按键字节**推进内核键队列: `(字节)` → 1。键盘域 (`kbd_srv`) 用。
+pub const SYS_KEY_PUSH: u64 = 48;
+/// **阻塞取**一个按键字节: `()` → 字节值。队列空则睡到有键为止。
+pub const SYS_KEY_READ: u64 = 49;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -291,28 +290,16 @@ pub fn sys_frame_free() -> u64 {
     unsafe { syscall(SYS_FRAME_FREE, 0, 0, 0) }
 }
 
-pub fn sys_scroll_up() -> u64 {
-    unsafe { syscall(SYS_SCROLL_UP, 0, 0, 0) }
+/// 把一个按键字节推进内核键队列 (`kbd_srv` 用; 队列满时该字节被丢弃)。
+///
+/// 内核不解释这个字节 —— 可打印字符 / 退格 / 回车一视同仁, 行编辑在用户态。
+pub fn sys_key_push(c: u8) -> u64 {
+    unsafe { syscall(SYS_KEY_PUSH, c as u64, 0, 0) }
 }
 
-pub fn sys_scroll_down() -> u64 {
-    unsafe { syscall(SYS_SCROLL_DOWN, 0, 0, 0) }
-}
-
-pub fn sys_backspace() -> u64 {
-    unsafe { syscall(SYS_BACKSPACE, 0, 0, 0) }
-}
-
-pub fn sys_term_put(c: u8) -> u64 {
-    unsafe { syscall(SYS_TERM_PUT, c as u64, 0, 0) }
-}
-
-pub fn sys_term_left() -> u64 {
-    unsafe { syscall(SYS_TERM_LEFT, 0, 0, 0) }
-}
-
-pub fn sys_term_right() -> u64 {
-    unsafe { syscall(SYS_TERM_RIGHT, 0, 0, 0) }
+/// **阻塞**取一个按键字节: 无键可用时睡眠, 由键盘域推键唤醒。
+pub fn sys_key_read() -> u64 {
+    unsafe { syscall(SYS_KEY_READ, 0, 0, 0) }
 }
 
 pub fn sys_alloc_page(vaddr: u64) -> u64 {
@@ -369,13 +356,7 @@ pub fn sys_virt_to_phys(vaddr: u64) -> u64 {
     unsafe { syscall(SYS_VIRT_TO_PHYS, vaddr, 0, 0) }
 }
 
-/// 阻塞读取一行控制台输入到 `buf` (最多 `buf.len()` 字节, 不含换行)。
-/// 返回实际读到的字节数, 失败返回 `u64::MAX`。无输入时阻塞, 直到键盘回车提交一行。
-pub fn sys_readline(buf: &mut [u8]) -> u64 {
-    unsafe { syscall(SYS_READLINE, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
-}
-
-/// 清屏并复位终端状态 (历史 / 输入行 / 光标)。返回 1。
+/// 清屏并复位内核终端状态 (历史 / 当前行)。返回 1。
 pub fn sys_clear() -> u64 {
     unsafe { syscall(SYS_CLEAR, 0, 0, 0) }
 }

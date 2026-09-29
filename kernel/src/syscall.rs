@@ -33,19 +33,14 @@ pub const SYS_PAGE_FAULT_REPLY: u64 = 10;
 pub const SYS_CALL: u64 = 12;
 pub const SYS_REPLY: u64 = 13;
 pub const SYS_REGISTER_IRQ: u64 = 14;
-pub const SYS_SCROLL_UP: u64 = 15;
-pub const SYS_SCROLL_DOWN: u64 = 16;
-pub const SYS_BACKSPACE: u64 = 17;
-pub const SYS_TERM_PUT: u64 = 18;
-pub const SYS_TERM_LEFT: u64 = 19;
-pub const SYS_TERM_RIGHT: u64 = 20;
+// 15..=20 与 27 曾用于「内核终端输入行」(历史滚动 / 退格 / 逐键编辑 / 阻塞读一行)。
+// G4 把输入搬进用户态屏幕控制台后**退役**, 号段不再分配 —— 新号接在表尾 (48 / 49)。
 pub const SYS_MAP_MMIO: u64 = 21;
 pub const SYS_PORT_IN8: u64 = 22;
 pub const SYS_PORT_IN16: u64 = 23;
 pub const SYS_PORT_OUT8: u64 = 24;
 pub const SYS_PORT_OUT16: u64 = 25;
 pub const SYS_VIRT_TO_PHYS: u64 = 26;
-pub const SYS_READLINE: u64 = 27;
 pub const SYS_CLEAR: u64 = 28;
 pub const SYS_CAP_ISSUE: u64 = 29;
 pub const SYS_CAP_LOOKUP: u64 = 30;
@@ -122,6 +117,13 @@ pub const SYS_FB_TAKEOVER: u64 = 46;
 /// 给「要把输出镜像到用户态屏幕控制台」的客户端用: 接管之前镜像只会把字写进没人看的帧缓冲,
 /// 而 `SYS_CALL` 到图形服务要等它进请求循环 —— 先问这一句就不必白等。
 pub const SYS_CONSOLE_READY: u64 = 47;
+/// 把一个**按键字节**推进内核键队列 (G4): `rdi = 字节` → 1。由用户态键盘域调用。
+///
+/// 内核**不解释**这个字节 (可打印字符 / 退格 / 回车一视同仁): 行编辑、回显、行历史都在
+/// 用户态屏幕控制台。队列满时丢弃该字节 —— 交互输入绝不阻塞内核。
+pub const SYS_KEY_PUSH: u64 = 48;
+/// **阻塞取**一个按键字节 (G4): `()` → 字节值 (0..=255)。队列空则阻塞, 由 `SYS_KEY_PUSH` 唤醒。
+pub const SYS_KEY_READ: u64 = 49;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -529,30 +531,8 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 醒来的原因可能是被中断唤醒, 也可能是超时: 只有标志真在才算等到。
             crate::irq::take_pending_any(mask, domain).map_or(0, |v| v as u64)
         }
-        SYS_SCROLL_UP => {
-            crate::video::scroll_view_up();
-            1
-        }
-        SYS_SCROLL_DOWN => {
-            crate::video::scroll_view_down();
-            1
-        }
-        SYS_BACKSPACE => {
-            crate::video::term_backspace();
-            1
-        }
-        SYS_TERM_PUT => {
-            crate::video::term_put(a1 as u8);
-            1
-        }
-        SYS_TERM_LEFT => {
-            crate::video::term_left();
-            1
-        }
-        SYS_TERM_RIGHT => {
-            crate::video::term_right();
-            1
-        }
+        // 15..=20 (内核终端输入行: 滚动 / 退格 / 逐键编辑) 已随 G4 退役 ——
+        // 输入改走 SYS_KEY_PUSH / SYS_KEY_READ, 行编辑在用户态屏幕控制台。
         SYS_MAP_MMIO => {
             // 把物理 MMIO 页 (a1, 页对齐) 映射到当前域 a2 虚拟地址, 需 Mmio 能力。
             let domain = crate::scheduler::current_domain();
@@ -594,23 +574,8 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 0
             }
         }
-        SYS_READLINE => {
-            // 阻塞读取一行控制台输入: 把内核输入行队列中的一行拷入用户缓冲 `a1`
-            // (最多 `a2` 字节, 不含换行), 返回行长度。队列为空则阻塞当前任务,
-            // 由键盘域经 SYS_TERM_PUT 回车提交时唤醒 (wait_on = INPUT_WAIT)。
-            if a1 == 0 || !crate::memory::paging::is_user_address(a1) {
-                return u64::MAX;
-            }
-            loop {
-                // 调用方已用 is_user_address 校验过 a1, 满足 input_read 的安全前提。
-                if let Some(n) = unsafe { crate::video::input_read(a1 as *mut u8, a2 as usize) } {
-                    return n as u64;
-                }
-                crate::scheduler::block_current(crate::scheduler::INPUT_WAIT);
-            }
-        }
         SYS_CLEAR => {
-            // 清屏并复位终端状态 (历史 / 输入行 / 光标)。
+            // 清屏并复位内核终端状态 (历史 / 当前行)。
             crate::video::clear_screen();
             1
         }
@@ -766,6 +731,20 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             1
         }
         SYS_CONSOLE_READY => crate::video::is_taken_over() as u64,
+        SYS_KEY_PUSH => {
+            // 键盘域推一个按键字节进来; 内核只做搬运, 不解释语义。
+            crate::key::push(a1 as u8);
+            1
+        }
+        SYS_KEY_READ => {
+            // 阻塞取一个按键字节: 队列空就睡, 由 `SYS_KEY_PUSH` 唤醒 (wait_on = KEY_WAIT)。
+            loop {
+                if let Some(c) = crate::key::pop() {
+                    return c as u64;
+                }
+                crate::scheduler::block_current(crate::scheduler::KEY_WAIT);
+            }
+        }
         SYS_DOMAIN_ALIVE => {
             // 该域是否**还有存活任务** (监督者巡检原语)。
             (crate::domain::is_alive(a1) && crate::scheduler::live_tasks(a1) > 0) as u64

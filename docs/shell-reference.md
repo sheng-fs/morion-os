@@ -13,10 +13,12 @@ shell: type 'help' for commands
 ```
 
 - 提示符 = `[morion@morion ` + 当前工作目录 + `]$ `（无空格分隔的 `]` 与 `$`）。
-- 提示符与用户输入在**同一行**编辑；内核终端会记录「输入起点」，回车只提交用户输入段，
-  不把提示符当作命令。
+- 提示符与用户输入在**同一行**显示：shell 用 `print` 打印提示符后 `flush()`，随后由
+  [`morion::console::readline`](../user/libmorion/src/console.rs) **就地回显**键入字符（G4 起行编辑在客户端）。
 - 启动时 cwd = `/`。
-- `sys_readline` 阻塞读一行；读失败打印 `shell: readline FAILED` 并退出。
+- `morion::console::readline` 阻塞取键读一行（回车提交，退格就地擦除）；读失败（返回 `u64::MAX`）
+  打印 `shell: readline FAILED` 并退出。**没有屏幕控制台就没有回显通道**，此时 shell 打印
+  `shell: screen console unavailable (gfx_srv) - no input channel` 并退出。
 - 每行只解析**第一个空格**：`cmd` = 空格前，`arg` = 其余部分（两侧去空白）。
   因此参数内可含空格（如 `echo a b` 输出 `a b`）。
 

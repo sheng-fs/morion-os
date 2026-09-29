@@ -121,20 +121,15 @@ UEFI 固件
 | 12 | `SYS_CALL` | `rdi=to, rsi=tag` | 同步调用：发送请求并阻塞等回复，返回回复 `tag`；需 `Capability::SendTo(to)`，失败返回 `u64::MAX` |
 | 13 | `SYS_REPLY` | `rdi=tag` | 回复当前任务最近一次 `SYS_RECV` 到的调用者（回复目标由内核在 `receive` 时记录），返回 1/0 |
 | 14 | `SYS_REGISTER_IRQ` | `rdi=irq` | 注册当前域接收 `irq`；需 `Capability::Irq(irq)`，返回 1/0 |
-| 15 | `SYS_SCROLL_UP` | — | 控制台历史向上滚动一屏，返回 1 |
-| 16 | `SYS_SCROLL_DOWN` | — | 控制台历史向下滚动一屏，返回 1 |
-| 17 | `SYS_BACKSPACE` | — | 退格：删除输入行光标前一个字符，返回 1 |
-| 18 | `SYS_TERM_PUT` | `rdi=ch` | 在输入行光标处插入字符 `ch`（`ch=0x0A` 提交当前行），返回 1 |
-| 19 | `SYS_TERM_LEFT` | — | 输入行光标左移，返回 1 |
-| 20 | `SYS_TERM_RIGHT` | — | 输入行光标右移，返回 1 |
+| 15..20 | ~~`SYS_SCROLL_UP/DOWN`、`SYS_BACKSPACE`、`SYS_TERM_PUT`、`SYS_TERM_LEFT/RIGHT`~~ | — | **已随 G4 退役**：这六个号曾用于「内核终端输入行」（历史滚动 / 退格 / 逐键编辑 / 回车提交）。输入搬进用户态后**不再分配**，键字节改走 48 / 49 |
 | 21 | `SYS_MAP_MMIO` | `rdi=bar, rsi=vaddr` | 把物理 MMIO 页（`bar`，页对齐）映射到本域 `vaddr`（非缓存）；需 `Capability::Mmio(bar)`，返回 1/0 |
 | 22 | `SYS_PORT_IN8` | `rdi=port` | 从 I/O 端口读 1 字节（用户态设备驱动用） |
 | 23 | `SYS_PORT_IN16` | `rdi=port` | 从 I/O 端口读 2 字节 |
 | 24 | `SYS_PORT_OUT8` | `rdi=port, rsi=val` | 向 I/O 端口写 1 字节 |
 | 25 | `SYS_PORT_OUT16` | `rdi=port, rsi=val` | 向 I/O 端口写 2 字节 |
 | 26 | `SYS_VIRT_TO_PHYS` | `rdi=vaddr` | 本域用户虚拟地址反查物理地址（供 NVMe PRP），失败返回 0 |
-| 27 | `SYS_READLINE` | `rdi=buf, rsi=max` | 阻塞读取一行控制台输入到 `buf`（最多 `max` 字节，不含换行），返回长度，失败返回 `u64::MAX`；队列空时阻塞至键盘回车 |
-| 28 | `SYS_CLEAR` | — | 清屏并复位终端状态（历史 / 输入行 / 光标 / 回滚），返回 1 |
+| 27 | ~~`SYS_READLINE`~~ | — | **已随 G4 退役**：内核不再提供「读一行」—— 行编辑在用户态 [`morion::console::readline`](../../user/libmorion/src/console.rs)（键字节走 48 / 49） |
+| 28 | `SYS_CLEAR` | — | 清屏并复位内核终端状态（历史 / 当前行），返回 1 |
 | 29 | `SYS_CAP_ISSUE` | `rdi=obj` | 「能力即句柄」：为调用方域的不透明对象 `obj` 签发句柄，返回句柄索引（0 起），槽满返回 `u64::MAX` |
 | 30 | `SYS_CAP_LOOKUP` | `rdi=handle` | 校验句柄是否有效，有效返回其对象标识，被撤销 / 非法返回 `u64::MAX` |
 | 31 | `SYS_CAP_DROP` | `rdi=handle` | 撤销句柄（关闭打开对象时调用），返回 1/0 |
@@ -154,6 +149,8 @@ UEFI 固件
 | 45 | `SYS_FB_MAP` | `rdi=页对齐用户虚拟地址` | **把整块帧缓冲映射进本域**（G1）：按 4 KiB 页逐页映射（非缓存，与 `SYS_MAP_MMIO` 同口径）；若目标区间**已有映射**则整体拒绝（不半途映射，也不撞 `PageAlreadyMapped`）。成功 1 / 失败 0。需 `Capability::Fb` |
 | 46 | `SYS_FB_TAKEOVER` | — | **宣告本域接管显示**（G1）：置内核 `video::FB_TAKEN_OVER`，此后内核终端跳过帧缓冲（`print` 仍写 COM1），屏幕归用户态。成功 1。需 `Capability::Fb`，幂等 |
 | 47 | `SYS_CONSOLE_READY` | — | 显示**是否已交用户态**（`FB_TAKEN_OVER` 曾置位，1/0）。无能力门禁。给「要把输出镜像到屏幕控制台的客户端」用 —— 接管前镜像只会白等一次 `SYS_CALL`（G3b） |
+| 48 | `SYS_KEY_PUSH` | `rdi=字节` | **推进一个按键字节**（G4）：用户态键盘域（`kbd_srv`）调用，内核只搬运、**不解释**（可打印字符 / 退格 / 回车一视同仁）。队列（64 字节环形）满则丢弃该字节，返回 1 |
+| 49 | `SYS_KEY_READ` | — | **阻塞取一个按键字节**（G4）：队列空则睡眠，由 `SYS_KEY_PUSH` 唤醒（`wake_one(KEY_WAIT)`）；返回字节值。行编辑 / 回显 / 行历史全在用户态（[`morion::console`](../../user/libmorion/src/console.rs)） |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -178,24 +175,17 @@ UEFI 固件
 - `init(info: &BootInfo)` / `ready() -> bool`
 - `print(s: &str)` / `println(s: &str)`
 - `print_hex(v: u64)` / `print_u64(v: u64)`
-- `clear(color: u32)` / `set_cursor(x: u32, y: u32)`
+- `clear(color: u32)` / `clear_screen()`
 - `width() -> u32` / `height() -> u32`
-- `term_put(c)` / `term_backspace()` / `term_left()` / `term_right()`（终端编辑：光标处插入 / 删光标前 / 左右移动光标）
-- `scroll_view_up()` / `scroll_view_down()`（控制台行历史回滚）
-- `unsafe input_read(out: *mut u8, max: usize) -> Option<usize>`（`SYS_READLINE` 用：从输入行队列取走一行，键盘回车时由 `term_put('\n')` 入队并唤醒等待者）
-- `term_put` 记录本轮**用户输入起点** `INPUT_BASE`（首个按键时锁定为当时行尾），回车只提交该起点之后的内容，
-  由此支持「行内提示符」：提示符可先 `print` 到输入行，`SYS_READLINE` 只回传用户键入部分；退格/左移不会越过该起点。
-- **输出与输入互不干扰**：输入输出原本共用同一条 `CUR_LINE`，别的域在你打字时打印一行日志就会
-  把半截命令推进历史并清空 —— 看起来像"命令自己回车执行了"。`print` 现在会先 `input_detach()`
-  把「提示符 + 已输入」整体摘下、打完再 `input_reattach()` 原样接回（幂等；无输入时走原路径），
-  故**只有回车才提交**。跨行（超列宽）输入由 `IN_ACCUM` 累积、回车时用 `input_queue_push_pair` 拼接提交，不再腰斩。
-- **保护范围含"还没开打的提示符行"**：摘下条件是 `INPUT_ACTIVE || scheduler::is_waiting_on(INPUT_WAIT)`
-  且当前行非空。shell 是"先打印提示符、再 `SYS_READLINE` 阻塞"的，所以只要**有任务在等输入**，
-  这一行就是 shell 的输入行 —— 只保护"已敲入的半截"不够：用户还没按第一个键时 `INPUT_ACTIVE`
-  仍为 false，异步日志会把**整行提示符**推进历史，屏幕上看就像"这一行被回车执行掉了"。
-  接回时 `INPUT_ACTIVE` 按摘下时的原值恢复（`IN_SAVE_ACTIVE`），不能在用户尚未敲键时凭空置真，
-  否则 `INPUT_BASE` 停在 0、不再锁定提示符末尾，提交会把提示符一起送给 shell。
 - `print_logo()`（打印启动 LOGO，整体水平居中；内容见 `logo.rs`，纯 ASCII）
+- **内核终端只管输出**（G4）：输入行编辑 / 行历史导航 / 光标**都不在内核**了 —— 键盘字节经
+  [`crate::key`](../../kernel/src/key.rs) 交给用户态（`SYS_KEY_PUSH` / `SYS_KEY_READ`），
+  行编辑与回显在 [`morion::console`](../../user/libmorion/src/console.rs)。内核终端因此只服务
+  **引导期日志**（`gfx_srv` 接管前）与 **panic 屏**；接管后 `print` 只写 COM1。
+- 屏幕模型：`HISTORY`（512 行环形缓冲）+ 一行「当前未提交行」`LINE`。`redraw()` 先铺背景渐变，
+  再画历史里最后 `hist_visible()` 行与当前行；`\n` 提交当前行，行满（按**显示列**）自动提交。
+  原先「历史区 + 底部固定输入行 + 光标下划线」两区布局、以及配套的输入/输出隔离
+  （`input_detach`/`input_reattach`、`INPUT_BASE`、`IN_ACCUM` 跨行累积）**已随 G4 一并删除**。
 - **文本绘制**（[kernel/src/video/unicode.rs](../../kernel/src/video/unicode.rs)，G3c 后只剩最小 ASCII）：
   - ASCII（0x20..=0x7E）用 `font.rs` 的 **8x16** 字模；**其余字符一律画空心豆腐块**。
     汉字/全角点阵（`cjk.bin`，≈276 KB）与「按字形宽度排版」的能力已随 G3a/G3c 搬到用户态
@@ -285,8 +275,8 @@ UEFI 固件
 - `set_current_reply_target(target: u64)` / `current_reply_target() -> u64`（`reply` 回复目标追踪；`u64::MAX` 表示无）
 - `exit_current() -> !`（`SYS_EXIT` 调用的任务退出入口；若这是所属域的**最后一个**任务，会 `domain::request_destroy` 登记该域 —— **延迟**到 `tick` 真正销毁，因为此刻仍跑在本域的栈与页表上，见域小节）
 - `remove_domain(domain: u64)`（**域销毁时调用**：把该域的任务槽位置 `None`（drop 归还内核栈），并唤醒所有 `wait_on == domain` 的阻塞任务 —— 否则等它的域会永远睡下去。`SCHEDULER` 尚未初始化时直接返回）
-- `INPUT_WAIT`（伪域 id `u64::MAX-1`：表示等待控制台输入行；`SYS_READLINE` 用 `block_current(INPUT_WAIT)`，`video::term_put` 回车时 `wake_one(INPUT_WAIT)`）
-- `IRQ_WAIT_MARK` / `irq_wait_token(domain: u64)`（伪等待键 `u64::MAX-0x300-domain`，落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`：`SYS_IRQ_WAIT` 以它阻塞、`irq::set_pending` 按掩码命中后以它唤醒。**按域取键**而非按向量 —— 一个域同时只可能有一个任务在等中断，掩码等待天然属于「域」；与真实域 id、`INPUT_WAIT` 都不重叠，故中断唤醒不会误撞 IPC 的唤醒）
+- `KEY_WAIT`（伪域 id `u64::MAX-1`：表示等待**一个按键字节**；`SYS_KEY_READ` 用 `block_current(KEY_WAIT)`，`key::push` 推键后 `wake_one(KEY_WAIT)`。G4 前这名号叫 `INPUT_WAIT`，语义是「等一行输入」）
+- `IRQ_WAIT_MARK` / `irq_wait_token(domain: u64)`（伪等待键 `u64::MAX-0x300-domain`，落点 `[u64::MAX-0x3FF, u64::MAX-0x300]`：`SYS_IRQ_WAIT` 以它阻塞、`irq::set_pending` 按掩码命中后以它唤醒。**按域取键**而非按向量 —— 一个域同时只可能有一个任务在等中断，掩码等待天然属于「域」；与真实域 id、`KEY_WAIT` 都不重叠，故中断唤醒不会误撞 IPC 的唤醒）
 - **空闲任务** `task_idle`（[kernel/src/main.rs](../../kernel/src/main.rs)）循环 `hlt(); yield_now();` —— `hlt` 交出 CPU（KVM 里 vCPU 因此退出客户机，宿主设备模型才有机会 post 完成并投中断），返回后立即让出，使**刚被中断唤醒的域马上接手**而不必再等一个时钟 tick。
 
 任务表常量：`MAX_TASKS = 32`（含运行时 `SYS_SPAWN_ELF` 建的域，故留足余量），内核栈 `STACK_SIZE = 4096 * 8`（32 KiB）。**每任务 32 KiB 内核栈来自内核堆**，所以任务表上限与 `paging::HEAP_SIZE` 是绑在一起的（32 × 32 KiB ≈ 1 MiB，堆因此为 4 MiB）。
@@ -298,7 +288,7 @@ UEFI 固件
 - `deliver(from: u64, to: u64, tag: u64, payload: &[u8]) -> bool`（内核内部投递，绕过能力检查，用于缺页等异常转发）
 - `receive() -> Message`（阻塞，记录回复目标供 `reply` 使用）
 - `call(to: u64, tag: u64, payload: &[u8]) -> Message`（同步调用：发送请求 + 阻塞等回复）
-- `is_waiting_on(key: u64) -> bool`（是否有任务阻塞在该等待键上；终端用它判断「输入行是否正被用户占用」，见 `video::reader_waiting`）
+- `wake_one(key: u64)`（把第一个 `wait_on == key` 的阻塞任务置回就绪；**域销毁**与**按键到达**都靠它）
 - `reply(tag: u64, payload: &[u8]) -> bool`（回复最近一次 `receive` 到的调用者）
 - `PAYLOAD_LEN = 96`（VFS 请求要把绝对路径整条装进 payload），邮箱容量 `MAILBOX_CAP = 16`
 - `Message { from, to, tag, payload }`（`#[repr(C)]`，与用户态同布局）
@@ -410,10 +400,11 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 `user/srv/src/gfx_srv.rs`（域 15）把**屏幕**从内核搬到用户态：
 
-- **内核侧交出屏幕**：新增无参能力 `Fb` + 三个 syscall —— `SYS_FB_INFO`（取几何）、`SYS_FB_MAP`（把整块帧缓冲映射进本域）、`SYS_FB_TAKEOVER`（宣告接管）。内核 `video` 加 `FB_TAKEN_OVER` 标志；置位后内核**不再画帧缓冲** —— `print` / `print_logo` / `clear_screen` 直接跳过，`redraw` / `redraw_input_line` 变成空操作，`print` 仍写 COM1。**输入编辑不受影响**：`term_put`（含回车提交）/ 退格 / 左右移 / ↑↓ 照常改状态并唤醒 `SYS_READLINE`，只是不重绘 —— 否则接管后回车不再提交，shell 会永远收不到命令（「终端卡死」）。于是 headless 回归的串口日志不受影响，屏幕也不再被内核改写。
+- **内核侧交出屏幕**：新增无参能力 `Fb` + 三个 syscall —— `SYS_FB_INFO`（取几何）、`SYS_FB_MAP`（把整块帧缓冲映射进本域）、`SYS_FB_TAKEOVER`（宣告接管）。内核 `video` 加 `FB_TAKEN_OVER` 标志；置位后内核**不再画帧缓冲** —— `print` / `print_logo` / `clear_screen` 直接跳过，`redraw` 变成空操作，`print` 仍写 COM1。于是 headless 回归的串口日志不受影响，屏幕也不再被内核改写。（G4 前这里还提过「输入编辑照旧」，那一整套输入机件现已删除，见 G4。）
 - **映射**：`SYS_FB_MAP` 复用 `paging::map_mmio` 的 4 KiB 非缓存页（D2：先用 `NO_CACHE` 跑通），映射前**先整段查重**（目标区间已映射则整体拒绝，不半途映射、也不撞 `PageAlreadyMapped`）。
-- **gfx_srv 启动序**：`SYS_FB_INFO` → `SYS_FB_MAP`（映射到 `USER_SPACE_BASE + 1 GiB`，远离镜像/共享缓冲/用户栈）→ 画测试图案 → **回读校验**（四角与中心像素必须等于写入值）→ `SYS_FB_TAKEOVER` → `Term::clear` + 写横幅，打印 `gfx: 1280x800 text console ready (kernel console detached)`。回读是自动化取证，不依赖人工看屏。
-- **后续**：绘制原语 / 共享面 / 文本渲染 / 输入行外移见 [roadmap-gfx.md](roadmap-gfx.md) 的 G2 / G3 / G4。
+- **gfx_srv 启动序**：`SYS_FB_INFO` → `SYS_FB_MAP`（映射到 `USER_SPACE_BASE + 1 GiB`，远离镜像/共享缓冲/用户栈）→ **`probe` 探测映射可写**（只写 `y = 0` 那一行并回读）→ `SYS_FB_TAKEOVER` → 独占后 `paint` 整屏（底色 + 居中色块）+ `verify` 回读校验 → `Term::clear` + 写横幅，打印 `gfx: 1280x800 text console ready (kernel console detached)`。
+  ⚠️ **顺序不能倒**：接管前内核还在整幅重绘日志（它的文本区自 `y = MARGIN` 起），若先整屏绘制再校验，内核一次重绘就把被校验的像素擦成背景渐变 → **假失败**（实测踩到过：`gfx: framebuffer readback FAILED`，随后 shell 拿不到控制台）。故探测点只取内核不碰的顶部带，整屏校验放到接管之后（那时屏幕只有一个写者）。
+- **后续**：绘制原语 / 共享面 / 文本渲染 / 输入外移见 [roadmap-gfx.md](roadmap-gfx.md) 的 G2 / G3 / G4；surface 合成见 G5。
 
 **G2 — 绘制原语 + 共享表面**：
 
@@ -438,7 +429,16 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `libmorion::syscall` 把打印出口收成 `sink()`（`SYS_PUTS` → 内核终端 + COM1，**可选**再镜像一份给 `gfx::print`），开关是 `screen_mirror_on()`（`static`，按进程 opt-in）。shell 打开它；app/其它服务不打开 —— 自测里成千上万条打印不该每条多一次 IPC 往返。
 - shell 启动：有界等待屏幕控制台（`CONSOLE_WAIT_MS = 1000`，每 1 ms 查一次 `SYS_CONSOLE_READY`；到点就退回只写串口）→ 确认 `SYS_CONSOLE_READY` 且 `sys_domain_alive(15)`（镜像走 `SYS_CALL`，目标没有活任务会一直等回复）→ `screen_mirror_on()`。
 - 盲测自证：开镜像后用 `GFX_OP_QUERY` 问光标，`row > 0` 打 `shell: screen console mirror OK (gfx_srv cursor advanced)`（走 `sys_puts`，只进串口，不占屏幕）。
-- **已知限制（归 G4）**：输入行回显仍在内核终端，屏幕上打字看不见（但打字能提交、命令能执行）；屏幕控制台无行级保护（目前只有 shell 一个镜像客户端）。
+
+**G4 — 输入搬出内核（行编辑外移）**：
+
+- **内核只剩搬运**：新增 `SYS_KEY_PUSH(48)` / `SYS_KEY_READ(49)` 与 [`kernel/src/key.rs`](../../kernel/src/key.rs)（64 字节环形队列；满则丢新键，绝不阻塞内核）。`kbd_srv` 只把 scancode 译成字节推进去（可打印字符 / 退格 `0x08` / 回车 `'\n'`，方向键丢弃），**不再有任何编辑语义**。队列非空时 `key::push` 会 `wake_one(KEY_WAIT)`（原名 `INPUT_WAIT`）。
+- **删除的输入机件**：`term_put` / `term_backspace` / `term_left` / `term_right` / `scroll_view_up/down` / `input_read` / 输入行队列 / `INPUT_BASE`（行内提示符）/ 输入输出隔离（`input_detach`/`input_reattach`/`IN_SAVE_*`）/ 跨行累积 `IN_ACCUM` / 光标 `CURSOR_X/Y` 与 `set_cursor` / 历史区光标导航（`CUR_ROW`/`CUR_COL`/`SCROLL_OFFSET`）—— 连带 15..20 与 27 号 syscall 一起退役。`video` 从此只有「历史 + 一行当前输出」。
+- **行编辑在客户端库**：[`user/libmorion/src/console.rs`](../../user/libmorion/src/console.rs) 的 `readline(buf)` —— 阻塞取键、可打印字符追加并**立刻回显**（走 `print` ⇒ 串口 + 可选屏幕镜像，所以打字看得见了）、退格发 `\b`、回车成行。
+  ⚠️ **为什么不做成服务端功能**：`gfx_srv` 是单线程服务，一旦阻塞在「等按键」就出不了请求循环，别的客户端（app 自测的 `GFX_OP_FILL`/`GFX_OP_TEXT`）会被饿到有人按键为止。`SYS_KEY_READ` 在**客户端**阻塞则完全免费（内核把任务睡下，有键再唤醒）。
+- **屏幕侧配合**：`Term::write` 支持 `\b`（光标左移一列 + 把该格涂成背景色，走同一条逐像素回读路径），行编辑器的退格因此能擦屏。键盘输入目前全是 ASCII，故一次退格 = 一列。
+- shell：`morion::console::readline` 取代 `sys_readline`；`clear` 命令改清**屏幕控制台**（`gfx::clear_screen`）。控制台不可用时 shell 如实报错退出（没有回显通道 = 没有输入源）。
+- **运行期证据**（QEMU monitor `sendkey` 无头实测）：注入 `h e l p ⏎` → 串口出现 `help` 回显 + 完整命令列表；注入 `echo hiz` + 退格 + `⏎` → 串口出现 `echo hiz\x08` + `hi`，证明「取键 → 回显 → 退格删缓冲并擦屏 → 回车提交」整条链路。
 
 ### 架构（[kernel/src/arch/](../../kernel/src/arch/)）
 
@@ -544,3 +544,4 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 52 | **图形子系统 G3a：服务内终端 + 文本渲染外移**：字库归用户态 —— `user/srv/src/gfx/` 新增 `mod.rs`（`Fb` 视图）/`font.rs`（ASCII 8×16 字模表）/`glyphs.rs`（UTF-8 解码 + 字形二分查找 + 显示宽度）/`term.rs`（按**显示列**排版：光标、换行、滚动、清屏、`\r`/`\t`），`cjk.bin`（≈276 KB）`git mv` 进服务（内核 `unicode.rs` 暂留但改指用户态那份，G3c 删）。`gfx_srv` 接管后清屏用服务内终端写横幅。**落笔即校验**：每字符整格逐像素「算色 → 写 → 读回比对」，不一致回 0。新协议 `GFX_OP_TEXT(4)`/`CLEAR(5)`/`MOVE(6)`/`QUERY(7)`（文本经**共享页**传 —— 本域窗口 +1 MiB 一页，不塞 payload；`MOVE` 越界拒而不夹取）；客户端 `morion::gfx::{print, clear_screen, move_cursor, cursor}`。自测 **GT-1**：`TEXT("GT-1 ")` 断言光标列 = 5、`TEXT("汉字宽字符")` 断言列 = 15（5×2 列）→ `app: GT1 text console OK (layout cols verified, framebuffer pixel readback matched)` | ✅ |
 | 53 | **图形子系统 G3b：shell 输出上屏**：内核加 `SYS_CONSOLE_READY(47)`（无能力门禁，读 `video::FB_TAKEN_OVER`）—— 客户端不必用一次 `SYS_CALL` 白等图形服务。`libmorion::syscall` 把打印唯一出口收成 `sink()`（`SYS_PUTS` → 内核终端 + COM1，**可选**镜像给 `gfx::print`），开关 `screen_mirror_on()` 按进程 opt-in（只有 shell 打开；自测成千上万条打印不该每条多一次 IPC 往返）。shell 启动有界等待控制台（`CONSOLE_WAIT_MS = 1000`，1 ms 一次查 `SYS_CONSOLE_READY`，到点退回只写串口）→ 确认 `SYS_CONSOLE_READY` 且 `sys_domain_alive(15)`（镜像走 `SYS_CALL`，目标没活任务会一直等回复）→ 开镜像；随后用 `GFX_OP_QUERY` 问光标、`row > 0` 打串口行 `shell: screen console mirror OK (gfx_srv cursor advanced)`（盲测自证）。**接管只停重绘、不停输入**：`term_put`（含回车提交）/退格/左右移/↑↓ 照常改状态并唤醒 `SYS_READLINE` —— 曾经这些函数在接管后一律早退，回车不再提交输入行，shell 永远收不到命令（表现为"终端卡死"），后来收成「只让 `redraw`/`redraw_input_line` 空操作」才对。已用 QEMU monitor `sendkey` 无头实测：注入 `h e l p ⏎` → 串口出完整命令列表；注入带退格的 `echo hi` → 出 `hi`。已知限制归 G4：输入行回显仍在**内核**终端，屏幕上打字看不见；屏幕控制台无行级保护 | ✅ |
 | 54 | **图形子系统 G3c：内核卸 CJK 字库（−276 KB）**：内核侧 `cjk.bin` 的 `include_bytes!`（275983 字节）、定长 37 字节记录的二分查表（`Glyph`/`glyph`）与「有字形就按字形宽度排版」那条路径全部删除。留下接管前那几秒 + panic 屏够用的最小集：UTF-8 `decode`/`prev_index`/`next_index` **原样保留**（退格与 ←/→ 不切开多字节字符）、`width`/`str_width` 改按**东亚宽度**粗判（ASCII 1 格、汉字类 2 格、控制字符 0 格，与用户态 `gfx_srv` 口径一致，接管前后列数不突变）、`draw` 非 ASCII 画**空心豆腐块**（仍按 2 格占位）。**内核 ELF 347376 → 70504 字节（−276872，≈ −80%）**，`cjk.bin` 只剩 `user/srv/src/gfx/cjk.bin` 一份。代价（已知且接受）：`gfx_srv` 接管前的几秒与 panic 屏上中文是豆腐块；**COM1 全程原样 UTF-8**（`print` 不经过本模块），headless 回归判据不变。顺带补 4 条 host 单测锁住宽度口径 / 混排列数 / 字符边界 / 截断序列（内核单测 16 → 20） | ✅ |
+| 55 | **图形子系统 G4：输入搬出内核（行编辑外移）**：内核侧删光输入机件 —— `term_put`/`term_backspace`/`term_left`/`term_right`/`scroll_view_up/down`/`input_read`/输入行队列/`INPUT_BASE`（行内提示符）/输入输出隔离（`input_detach`+`input_reattach`+`IN_SAVE_*`）/跨行累积 `IN_ACCUM`/`CURSOR_X,Y`+`set_cursor`/历史区光标导航（`CUR_ROW`/`CUR_COL`/`SCROLL_OFFSET`），`scheduler::is_waiting_on` 也一并删除；`video` 从此只有「512 行历史环 + 一行当前输出」，`print` 在接管后只写 COM1（内核终端只剩引导期日志与 panic 屏）。新增 [`key.rs`](../../kernel/src/key.rs)（64 字节环形键队列，满则丢新键）+ `SYS_KEY_PUSH(48)` / `SYS_KEY_READ(49)`（阻塞取键，`wake_one(KEY_WAIT)`，原名 `INPUT_WAIT`）；15..20 与 27 号 syscall **退役不再分配**。`kbd_srv` 只做 scancode→字节（可打印 / 退格 `0x08` / 回车 `'\n'`，方向键丢弃）；行编辑与回显落在 [`morion::console::readline`](../../user/libmorion/src/console.rs)（内核只搬字节；放客户端是因为 `gfx_srv` 单线程，服务端阻塞等键会饿死 app 自测的绘图请求）；`Term::write` 支持 `\b`（左移一列 + 涂背景，走逐像素回读）供退格擦屏；shell 的 `clear` 改清屏幕控制台。**顺带修掉一个真实竞态**：`gfx_srv` 原先「整屏绘制 → 回读校验 → 接管」，而接管前内核仍在整幅重绘，校验点会被擦成背景渐变 → 假失败（实测 `gfx: framebuffer readback FAILED`，随即 shell 报无控制台）；改为「顶部带 `probe` 探测 → 接管 → 独占后 `paint`+`verify`」。内核 ELF 70504 → 66040 字节。运行期证据（QEMU monitor `sendkey`）：`help⏎` → 回显 + 完整命令列表；`echo hiz`+退格+`⏎` → `echo hiz\x08` + `hi` | ✅ |

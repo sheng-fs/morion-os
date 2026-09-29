@@ -24,7 +24,6 @@ extern "x86-interrupt" fn double_fault_handler(
     error_code: u64,
 ) -> ! {
     crate::video::clear(0x330000);
-    crate::video::set_cursor(20, 20);
     crate::video::println("DOUBLE FAULT");
     crate::video::print("error code: 0x");
     crate::video::print_hex(error_code);
@@ -106,7 +105,6 @@ extern "x86-interrupt" fn page_fault_handler(
     // 因此这里直接红屏打印现场并停机, 便于定位。
     if !error_code.contains(PageFaultErrorCode::USER_MODE) {
         crate::video::clear(0x003300);
-        crate::video::set_cursor(4, 4);
         crate::video::println("=== KERNEL PAGE FAULT (bug) ===");
         crate::video::print("cr2:        0x");
         crate::video::print_hex(fault_addr);
@@ -270,7 +268,6 @@ const EXCEPTION_NAMES: [&str; 32] = [
 /// 到 "CPU EXCEPTION" 之前 — 那本身也是有价值的定位信息。
 fn report_crash(vector: usize, error_code: Option<u64>, frame: &InterruptStackFrame) -> ! {
     crate::video::clear(0x330000);
-    crate::video::set_cursor(4, 4);
     let name = EXCEPTION_NAMES.get(vector).copied().unwrap_or("未知异常");
     crate::video::println("=========== CPU EXCEPTION (崩溃黑匣子) ===========");
     crate::video::print("exception:  ");

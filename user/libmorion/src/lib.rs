@@ -3,6 +3,7 @@
 //! 这是所有用户态程序共用的"运行时"—— 相当于 C 程序的 crt0 + libc 的最小子集：
 //!
 //! - [`syscall`]：系统调用封装（`sys_*`）+ 终端打印（`print` / `println` / `print_u64` …）
+//! - [`console`]：用户态行编辑器（G4 起内核只搬运按键字节，行编辑与回显在这里）
 //! - [`vfs`]：libvfs（fd / 挂载路由 / 能力句柄守卫），文件服务的客户端
 //! - [`exec`]：可执行文件加载 —— 从文件系统读一个 `.mex` 镜像交给内核启动
 //! - 程序入口样板：`_start`（crt0）+ `#[panic_handler]`，程序只写自己的 `morion_main`
@@ -32,6 +33,7 @@
 
 #![no_std]
 
+pub mod console;
 pub mod exec;
 pub mod gfx;
 pub mod syscall;

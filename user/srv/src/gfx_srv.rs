@@ -1,4 +1,4 @@
-//! 域 15 — gfx_srv (图形服务, G1 / G2 / G3a)
+//! 域 15 — gfx_srv (图形 / 屏幕控制台服务, G1 → G4)
 //!
 //! 内核把**帧缓冲**交给用户态: 本服务持 `Capability::Fb`, 先用 `SYS_FB_INFO` 取几何、
 //! `SYS_FB_MAP` 把整块帧缓冲映射进自己的地址空间, 再用 `SYS_FB_TAKEOVER` 宣告接管显示 ——
@@ -11,7 +11,11 @@
 //!   滚动 / 清屏) 从内核搬到本服务 (见 [`crate::gfx`]); 客户端用 `GFX_OP_TEXT` 写字、
 //!   `GFX_OP_QUERY` 问光标。落笔**逐像素写后回读**, 帧缓冲映射一旦失效立刻在回复值里暴露。
 //!
-//! 输入行编辑 / surface 合成见 [docs/roadmap-gfx.md](../../docs/roadmap-gfx.md) 的 G4。
+//! - **G4** 输入搬出内核: 键盘字节由 `kbd_srv` 经 `SYS_KEY_PUSH` 推进内核键队列, 客户端用
+//!   `SYS_KEY_READ` 阻塞取键、在用户态做行编辑/回显 ([`morion::console`]); 本服务只负责
+//!   把回显画到屏幕上 (含 `\b` 退格擦除)。
+//!
+//! surface 合成 / 多窗口见 [docs/roadmap-gfx.md](../../docs/roadmap-gfx.md) 的 G5。
 
 use crate::common::Message;
 use crate::gfx::term::Term;
@@ -75,16 +79,24 @@ pub fn run() {
         stride: info.stride,
     };
 
-    // 先画一遍并**回读校验**: 证明映射确实可写、几何算得对 (回读值必须等于写入值)。
-    paint(&fb);
-    if !verify(&fb) {
+    // 先**探测映射** (仍在接管之前): 证明"映射可写 + 几何算得对", 否则不该宣告接管 ——
+    // 映射坏了还接管, 内核控制台与屏幕会一起没。
+    if !probe(&fb) {
         println("gfx: framebuffer readback FAILED");
         return;
     }
 
-    // 校验通过才宣告接管 —— 此刻起内核终端不再写屏, 屏幕只由本服务负责。
+    // 探测通过才宣告接管 —— 此刻起内核终端不再写屏, 屏幕只由本服务负责。
     if sys_fb_takeover() != 1 {
         println("gfx: SYS_FB_TAKEOVER FAILED");
+        return;
+    }
+
+    // 接管**之后**才整屏绘制并回读校验: 此时屏幕只有一个写者, 校验结果才是确定的。
+    // (顺序不能倒过来 —— 接管前内核随时可能重绘, 会把我们要校验的像素擦成背景渐变。)
+    paint(&fb);
+    if !verify(&fb) {
+        println("gfx: full-screen paint verify FAILED (after takeover)");
         return;
     }
 
@@ -251,6 +263,18 @@ fn verify_blit(fb: &Fb, req: &GfxReq, src: u64) -> u64 {
         }
     }
     1
+}
+
+/// 映射探测: 证明这块帧缓冲映射**确实可写** (而不是画到空气里)。
+///
+/// 只动**内核终端不会写**的顶部带 (`y < MARGIN`, 即 `0` 那一行): 接管之前内核还在往帧缓冲
+/// 整幅重绘日志 (它的文本区自 `y = MARGIN` 起), 探测点若落在文本区, 内核一次重绘就能把它
+/// 擦成背景渐变 —— 那是**假失败**, 正是这个竞态迫使我们先探测、后接管、最后才整屏绘制校验。
+fn probe(fb: &Fb) -> bool {
+    let (x0, x1) = (0, fb.width - 1);
+    fb.pixel(x0, 0, FG);
+    fb.pixel(x1, 0, BG);
+    fb.read(x0, 0) == FG && fb.read(x1, 0) == BG
 }
 
 /// 画测试图案: 全屏底色 + 居中色块。

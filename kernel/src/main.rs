@@ -422,7 +422,6 @@ impl core::fmt::Write for VidWriter {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     if video::ready() {
         video::clear(0x000033);
-        video::set_cursor(2, 2);
         video::println("KERNEL PANIC");
         // 打印 panic 位置与消息, 便于定位崩溃点 (黑匣子)。
         // 注意: 这里不用 format! (依赖堆), 否则堆一旦异常会造成 panic 递归。

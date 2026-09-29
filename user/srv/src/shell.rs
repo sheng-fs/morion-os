@@ -180,6 +180,14 @@ pub fn run() {
     };
     st.cwd[0] = b'/';
 
+    // G4: **输入完全在用户态** —— 内核只把按键字节搬进队列, 行编辑/回显由
+    // `morion::console::readline` 做 (它经 `SYS_KEY_READ` 阻塞, 有键才醒)。
+    // 但**没有屏幕控制台就没有回显通道**, 故控制台不可用时如实报错退出。
+    if !mirrored {
+        println("shell: screen console unavailable (gfx_srv) - no input channel");
+        return;
+    }
+
     let mut line = [0u8; SHELL_LINE_MAX];
     loop {
         // 行内提示符: 与用户输入同处一行, 形如正常终端 `[user@host cwd]$ `。
@@ -188,7 +196,7 @@ pub fn run() {
         print("]$ ");
         syscall::flush();
 
-        let n = sys_readline(&mut line);
+        let n = morion::console::readline(&mut line);
         if n == u64::MAX {
             println("shell: readline FAILED");
             return;
@@ -276,7 +284,13 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             }
         }
         "clear" => {
-            sys_clear();
+            // 屏幕已交 gfx_srv 时清的是**屏幕控制台** (内核终端此时根本不画屏);
+            // 没交出去 (极早期) 才回落到内核终端。
+            if sys_console_ready() {
+                morion::gfx::clear_screen();
+            } else {
+                sys_clear();
+            }
         }
         _ => {
             print("shell: unknown command: ");

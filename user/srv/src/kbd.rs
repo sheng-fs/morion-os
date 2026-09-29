@@ -71,8 +71,11 @@ fn key_char(sc: u8, shift: bool) -> Option<u8> {
     }
 }
 
-/// 域 4 — 用户态键盘驱动: 注册接收 IRQ1, 循环接收 scancode 并解码成字符回显。
-/// 方向键 (E0 前缀) 滚动控制台历史, 其余键位按 shift 状态输出对应字符。
+/// 域 4 — 用户态键盘驱动: 注册接收 IRQ1, 循环接收 scancode, 解码成字节推进内核键队列。
+///
+/// **G4 起内核不解释按键**: 这里只做 scancode → 字节的翻译 —— 可打印字符按 shift 状态取
+/// 对应字符, 退格发 `0x08`, (小/数字键盘的) 回车发 `'\n'`; 方向键等非字符键直接丢弃
+/// (行编辑 / 行历史在 `gfx_srv` 的屏幕控制台)。
 pub fn run() {
     if sys_register_irq(1) != 1 {
         println("kbd: register irq1 FAILED");
@@ -99,26 +102,11 @@ pub fn run() {
             continue;
         }
 
-        // 扩展按下码 (方向键等)。
+        // 扩展按下码: 只认数字键盘回车, 其余 (方向键等) 丢弃。
         if ext {
             ext = false;
-            match sc {
-                0x48 => {
-                    sys_scroll_up(); // ↑ 滚动历史
-                }
-                0x50 => {
-                    sys_scroll_down(); // ↓ 滚动历史
-                }
-                0x4B => {
-                    sys_term_left(); // ← 光标左移
-                }
-                0x4D => {
-                    sys_term_right(); // → 光标右移
-                }
-                0x1C => {
-                    sys_term_put(b'\n'); // 数字键盘 Enter = E0 0x1C, 同样提交当前行
-                }
-                _ => {}
+            if sc == 0x1C {
+                sys_key_push(b'\n'); // 数字键盘 Enter
             }
             continue;
         }
@@ -127,14 +115,14 @@ pub fn run() {
         match sc {
             0x2A | 0x36 => shift = true, // 左右 shift 按下
             0x0E => {
-                sys_backspace(); // 退格
+                sys_key_push(0x08); // 退格
             }
             0x1C => {
-                sys_term_put(b'\n'); // 回车
+                sys_key_push(b'\n'); // 回车
             }
             _ => {
                 if let Some(c) = key_char(sc, shift) {
-                    sys_term_put(c);
+                    sys_key_push(c);
                 }
             }
         }

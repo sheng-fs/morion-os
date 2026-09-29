@@ -29,10 +29,10 @@ const MAX_TASKS: usize = 32;
 /// 每任务内核栈大小 (32 KiB, 足以容纳中断帧 + 若干层函数调用)。
 const STACK_SIZE: usize = 4096 * 8;
 
-/// 伪域 id: 表示「等待控制台输入行」而非某个域的邮箱。
-/// 供 `SYS_READLINE` 阻塞 (block_current) 与 `video::term_put` 回车唤醒 (wake_one) 使用。
+/// 伪域 id: 表示「等待一个按键字节」而非某个域的邮箱。
+/// 供 `SYS_KEY_READ` 阻塞 (block_current) 与 `key::push` 唤醒 (wake_one) 使用。
 /// 真实域 id 均为小整数, 故用 `u64::MAX - 1` 作哨兵不会冲突 (`u64::MAX` 已用作「无回复目标」)。
-pub const INPUT_WAIT: u64 = u64::MAX - 1;
+pub const KEY_WAIT: u64 = u64::MAX - 1;
 
 /// 伪等待键: 「等待一组 MSI/MSI-X 向量中任意一个」(`SYS_IRQ_WAIT` 的掩码等待)。
 ///
@@ -74,7 +74,7 @@ pub struct Task {
     user_stack: u64,
     /// 睡眠唤醒的 tick 时刻 (仅 `Sleeping` 状态有效)。
     sleep_until: u64,
-    /// 阻塞等待的等待键 (仅 `Blocked` 状态有效): 真实域 id 或 `INPUT_WAIT` /
+    /// 阻塞等待的等待键 (仅 `Blocked` 状态有效): 真实域 id 或 `KEY_WAIT` /
     /// `irq_wait_token` 伪键, 由 `wake_one` 匹配。
     wait_on: u64,
     /// 阻塞超时的 tick 时刻 (仅带超时的 `Blocked` 状态有效, 0 表示无限等待)。
@@ -410,24 +410,6 @@ pub fn wake_one(domain: u64) {
             task.wake_deadline = 0;
             break;
         }
-    }
-}
-
-/// 是否有任务正阻塞在等待键 `key` 上。
-///
-/// 终端用它判断"输入行是否正被用户使用": shell 是先打印提示符、再 `SYS_READLINE`
-/// (阻塞在 `INPUT_WAIT`) 的, 所以有等待者 = 当前行是 shell 的输入行, 即使一个字符
-/// 都还没敲。这样异步日志就不会把提示符那一行推进历史。
-/// 调度器初始化前返回 `false` (引导期还没有任务)。
-pub fn is_waiting_on(key: u64) -> bool {
-    let guard = SCHEDULER.lock();
-    match guard.as_ref() {
-        Some(sched) => sched
-            .tasks
-            .iter()
-            .flatten()
-            .any(|t| t.state == TaskState::Blocked && t.wait_on == key),
-        None => false,
     }
 }
 

@@ -38,6 +38,7 @@ pub const GFX_OP_PING: u64 = 3;
 /// 往**终端光标**处写一段 UTF-8 文本（`buf` = 文本页地址，`w` = 字节数）。服务逐像素
 /// 写后回读校验，全对才回 1。
 pub const GFX_OP_TEXT: u64 = 4;
+
 /// 清屏并把光标归零。
 pub const GFX_OP_CLEAR: u64 = 5;
 /// 定位光标（`x` = 列，`y` = 行）；越界回 0。

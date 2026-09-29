@@ -112,7 +112,7 @@ match morion::exec::spawn_file("/hello.mex") {
 | 5 | block_srv | 块设备服务（NVMe / IDE PIO） |
 | 6 | fat32_srv | FAT32 文件服务 |
 | 7 | app | 测试应用（libvfs 读文件 + FS 自测） |
-| 8 | shell | 命令行解释器（`SYS_READLINE` 阻塞读行 + libvfs） |
+| 8 | shell | 命令行解释器（`morion::console::readline` 阻塞读行 + libvfs） |
 | 9 | mount_srv | 挂载服务（路径前缀 → 文件服务域；libvfs 据此路由） |
 | 10 | tmpfs_srv | 内存文件系统（挂载于 `/tmp`） |
 | 11 | mfs_srv | MorionFS 原创文件系统（挂载于 `/mfs`；块设备后端 + COW + 快照） |
@@ -203,13 +203,13 @@ sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直�
 | 编号 | 封装 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
 | 4 | `sys_puts(s)` | `rdi=ptr, rsi=len` | — | 打印字符串（UTF-8 字节）。**G3c 后内核终端不再带字库**：ASCII 按 8x16 单格、其余字符画空心豆腐块（占 2 格）—— 真正的汉字渲染在用户态 `gfx_srv`；要往屏幕控制台上屏见 `libmorion::screen_mirror_on()`（G3b）。COM1 串口始终是原样 UTF-8 |
-| 15 | `sys_scroll_up()` | — | 1 | 光标上移 / 到顶滚动历史 |
-| 16 | `sys_scroll_down()` | — | 1 | 光标下移 / 到底滚动历史 |
-| 17 | `sys_backspace()` | — | 1 | 删除输入行光标前一个字符 |
-| 18 | `sys_term_put(ch)` | `rdi=ch` | 1 | 在输入行光标处插入字符（`ch=0x0A` 提交当前行） |
-| 19 | `sys_term_left()` | — | 1 | 光标左移 |
-| 20 | `sys_term_right()` | — | 1 | 光标右移 |
-| 28 | `sys_clear()` | — | 1 | 清屏并复位终端状态（历史 / 输入行 / 光标） |
+| ~~15~~ | ~~`sys_scroll_up()`~~ | — | — | **G4 退役**（不再分配）；输入与历史导航已搬出内核 |
+| ~~16~~ | ~~`sys_scroll_down()`~~ | — | — | **G4 退役**（不再分配） |
+| ~~17~~ | ~~`sys_backspace()`~~ | — | — | **G4 退役**（不再分配）；退格改由客户端库 `morion::console::readline` 处理 |
+| ~~18~~ | ~~`sys_term_put(ch)`~~ | — | — | **G4 退役**（不再分配） |
+| ~~19~~ | ~~`sys_term_left()`~~ | — | — | **G4 退役**（不再分配） |
+| ~~20~~ | ~~`sys_term_right()`~~ | — | — | **G4 退役**（不再分配） |
+| 28 | `sys_clear()` | — | 1 | 清屏并复位内核终端状态（历史 / 当前输出行） |
 
 > 打印辅助函数（基于 `sys_puts`）：`print(s)`、`println(s)`、`print_u64(v)`、`print_hex(v)`、`flush()`。
 >
@@ -223,12 +223,14 @@ sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直�
 
 | 编号 | 封装 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
-| 27 | `sys_readline(buf)` | `rdi=buf ptr, rsi=len` | 行长度 | 阻塞读取一行控制台输入到 `buf`（最多 `len` 字节，不含换行）；无输入时阻塞，直到键盘回车提交一行（由键盘域经 `SYS_TERM_PUT` 驱动）。失败返回 `u64::MAX` |
+| 48 | `sys_key_push(c)` | `rdi=字节` | 1 | 把一个按键字节压入内核键队列（供**键盘域**调用；队列 64 字节，满则丢弃该字节）。推入后唤醒一个等待取键的任务 |
+| 49 | `sys_key_read()` | — | 字节 / `0x1_0000` | 取走键队列中最老的字节；**队列空则阻塞**（内核把本任务睡下，有键再唤醒）。返回 `> 0xFF` 表示失败 |
+| ~~27~~ | ~~`sys_readline(buf)`~~ | — | — | **G4 退役**（不再分配）；行编辑改在客户端库 |
 
-> 提示符支持**行内显示**（与用户键入内容处于同一行，形如正常终端 `[morion@morion <cwd>]$ `）：
-> 内核记录本轮用户输入起点（第一个按键时锁定为当时行尾），`sys_readline` **只返回用户输入部分**，
-> 不含此前打印的提示符；退格/左移也不会越过输入起点（不会删掉提示符）。因此 shell 用
-> `print(...)` 打印提示符后调用 `flush()` 即可，无需 `println`。
+> **G4 起行编辑在客户端**：内核只做「按键字节搬运」（`gfx_srv` 是单线程服务，若让服务端阻塞等键就会饿死其它客户端）；
+> 应用要「读一行」用 [`morion::console::readline`](../user/libmorion/src/console.rs)（可打印字符入缓冲并回显、
+> `\b`/`0x7F` 退格删缓冲并擦屏、回车提交返回长度；`sys_key_read` 在客户端阻塞是免费的）。
+> 回显依赖打印出口 `print()`：只有开了屏幕镜像（`screen_mirror_on()`）才上屏，否则只进 COM1。
 
 ---
 
@@ -355,7 +357,7 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 | mfs_srv (11) | MorionFS 原创文件系统，挂载于 `/mfs` | `recv` VFS tag → 4 KiB 块 + CRC32 + COW 写时复制 → 经 block_srv 访问 MFS 卷；**目录项存 inode 号**，号到块的映射由 inode 表（索引块 `MFIX` → 表块 `MFIT`）给出，故多个名字可共享同一对象（硬链接）；目录是 ext2 风格**变长目录项**（名字 ≤255 字节、大小写敏感，条目区满后挂 `MFXI` 扩展目录块）；节点带**元数据**（`mode`/`owner`/`nlink`/`mtime`/`ctime`/`atime`，时间取自 CMOS RTC；`mode` 只存储与显示、不强制）；额外支持 `LINK`（硬链接）、`TRNC`（truncate，扩展为稀疏）、`RENM`（rename，可跨目录）、`CHMD`（chmod）；另有快照 tag `MSNP/MSNL/MSNR`、空间回收 `MSGC`（mark & sweep，回收不可达的 COW 旧块）与用量查询 `MSST`（回复 `(总块数 << 32) | 空闲块数`）；**多卷**：内存态只有一份，按请求 tag 的卷编码（fd 类请求由 fd 绑定的卷）**切卷重载**，非主卷挂到 `/usb<卷号>`，空白卷/已有 MFS 卷可用 **`MKFS`**（`vfs::mfs_mkfs(vol)`）显式格式化（会**擦除**该卷；护栏拒绝 FAT/exFAT/ext2 卷） |
 | ext2_srv (12) | ext2 只读兼容，挂载于 `/ext2` | `recv` VFS tag → 只服务 `OPEN/READ/READDIR/STAT/CLOSE`（写类 tag 回 `u64::MAX`）→ 解析超级块 / 块组描述符 / inode 块映射 / 目录项 → 经 block_srv 访问 ext2 卷 |
 | exfat_srv (13) | exFAT（读 + 写），挂载于 `/usb` | `recv` VFS tag → `OPEN/READ/READDIR/STAT/CLOSE` + `CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`RENM`/`CHMD`/`LINK` 回 `u64::MAX`）→ 解析引导区 + boot checksum / FAT 链 / entry set（含 set checksum 与 NameHash 生成）/ 分配位图 / upcase 表 → 经 block_srv 访问 exFAT 卷 |
-| shell (8) | 命令行解释器 | `sys_readline` 取行 → 命令 `help / echo / pwd / ls ([-l]) / cat / cd / mkdir / touch / rm / mv / ln / chmod / truncate / stat / mkfs.mfs / clear`（含 cwd 相对路径）→ libvfs(先查 mount_srv 路由, 再 `sys_call` 目标服务) |
+| shell (8) | 命令行解释器 | `morion::console::readline` 取行 → 命令 `help / echo / pwd / ls ([-l]) / cat / cd / mkdir / touch / rm / mv / ln / chmod / truncate / stat / mkfs.mfs / clear`（含 cwd 相对路径）→ libvfs(先查 mount_srv 路由, 再 `sys_call` 目标服务) |
 
 > libvfs 对每个路径先向 mount_srv 查询，再由 fd 高 32 位的服务域字段路由后续
 > `read/write/readdir/close`。应用只看到单一根 `/`：`/tmp/**` 落到 tmpfs_srv、
