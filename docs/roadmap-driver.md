@@ -128,11 +128,23 @@
   `net: MSI-X table in BAR1, not BAR0 -> polling`）。N2 需让授权支持"另映射 MSI-X 表所在 BAR"。
 
 #### N2 — `net_srv`（用户态 virtio-net 驱动）
-- 读 `DeviceGrant` → 解析 **virtio PCI 能力**（common cfg / notify / ISR / device cfg 各自的
-  BAR 与偏移）→ 复位 → 置 `ACKNOWLEDGE|DRIVER` → 读 device cfg 取 **MAC** → 协商特性。
-- 建 **RX/TX virtqueue**（descriptor / avail / used 三环，落在 DMA 块里；环内存由内核交出的
-  连续 DMA 页充当）→ 驱动就绪 → 置 `DRIVER_OK`。
-- 收 **RX 中断**（MSI-X 向量）→ 取 used ring 项 → 把帧交给上层（本批先只做取帧 + 统计）。
+**N2a（已完成）—— 设备 bring-up + 轮询取帧**
+- 新增内核窄接口 **`SYS_DEVICE_CONFIG_READ(50)`**（只放行"读**自己那台**设备"的配置空间 dword）：
+  驱动据此**自行解析** virtio PCI 能力（common/notify/ISR/device 四个区域都在内核交给的 BAR 里），
+  内核因此**不必懂 virtio 协议**。
+- `net_srv`：复位 → `ACKNOWLEDGE|DRIVER` → 协商特性（必须 `VIRTIO_F_VERSION_1`，另取
+  `VIRTIO_NET_F_MAC`）→ `FEATURES_OK` → 读 device cfg 取 **MAC** → 建 RX(0)/TX(1) virtqueue
+  （三环落在内核交出的**连续 DMA 块**里，深度 8）→ 投 RX 缓冲 → `DRIVER_OK` → 轮询 used 环
+  取帧 + 补投 + 统计。
+- 取证：`net: virtio-net up MAC=563412005452 num_queues=3 rx=8 tx=8`、`net: DRIVER_OK …`，
+  回归里**真的收到帧**（`net: rx frames=1`）。
+
+**N2b（待做）—— MSI-X 中断化**
+- virtio-net 的 **MSI-X 表在 BAR1**（与设备 BAR 不同根）：D1 的 `grant` 目前只映射一根 BAR 且
+  要求 `table_bir == 0`，故现在打印 `net: MSI-X table in BAR1 -> polling`（**降级轮询**）。
+- 要做的：让 `grant` 支持"另映射 MSI-X 表所在 BAR"（新增 `DeviceGrant.msix_table_vaddr`），
+  驱动写表项 → 设 `queue_msix_vector` → `SYS_MSIX_ENABLE` → 注册向量 → 用 `SYS_IRQ_WAIT` 收
+  RX 中断（`SYS_IRQ_POLL` 快路径 + 轮询兜底）。
 
 #### N3 — 自测（端到端取证）
 - 发一帧 **ARP 请求**（问 QEMU user-net 网关的 MAC）→ 等 **ARP 应答** → 断言收到了长度/类型
@@ -183,7 +195,7 @@
 1. **D1 通用设备授权**（✅ 已完成，boot 路径）：抽 `device.rs` 通用原语 + 描述结构，把 `nvme` 迁过去；**功能零变化**，回归口径不变。运行期 syscall 路径（D1b）随网络/后续驱动一起做。
 2. **N0 域表扩容**（✅ 已完成）：`BOOT_DOMAINS` 16 → 17 + boot 侧服务表同步 + `net_srv` 骨架。
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
-4. **N2 `net_srv`**：virtio-net 初始化（PCI 能力 / MAC / virtqueue / MSI-X）。
+4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；N2b：MSI-X 中断化）。
 5. **N3 网络自测**：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice 双形态**：抽 `libdevice` crate，`block_srv` 改为服务形态消费者。
 7. **D3 virtio-blk**：用通用路径加第二个驱动 + 自测（含 D1b 的运行期 `SYS_DEVICE_*`）。
@@ -204,7 +216,8 @@
 | D1 | `nvme` 驱动走 `SYS_DEVICE_*`，内核里不再有 NVMe 专属结构；块设备自测与全量回归不变 |
 | N0 | 扩容后全量回归仍全绿（存活域数基线、`SELFTEST DONE`×1、`FAILED`/`PANIC` 0）—— ✅ `[OK] 17 service ELFs loaded` + `[up] net_srv (domain 16)` |
 | N1 | 内核找到 virtio-net 并把 `DeviceGrant` 交给域 16：日志有 `[OK] virtio-net modern BAR4=…` 与 `net: device grant …`；全量回归不退化 —— ✅ |
-| N2 | QEMU 里 `net_srv` 读到 MAC、virtqueue 建好、`DRIVER_OK`；MSI-X 表在 BAR1（先轮询，能开中断后再出现 `net: MSI-X prepared …`） |
+| N2a | net_srv 读到 MAC、RX/TX virtqueue 建好、`DRIVER_OK`，并能取到帧 —— ✅ `net: virtio-net up MAC=… rx=8 tx=8`、`net: rx frames=1` |
+| N2b | MSI-X 中断化（表在 BAR1，需 D1 支持另映射 MSI-X 表 BAR）：出现 `net: MSI-X prepared …` 且中断驱动 |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=…, ARP reply OK`） |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |

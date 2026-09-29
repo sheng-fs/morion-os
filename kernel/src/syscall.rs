@@ -124,6 +124,11 @@ pub const SYS_CONSOLE_READY: u64 = 47;
 pub const SYS_KEY_PUSH: u64 = 48;
 /// **阻塞取**一个按键字节 (G4): `()` → 字节值 (0..=255)。队列空则阻塞, 由 `SYS_KEY_PUSH` 唤醒。
 pub const SYS_KEY_READ: u64 = 49;
+/// 读**本域被授权设备**的 PCI 配置空间 dword: `rdi = offset` → 该 dword。
+///
+/// 驱动靠它自行解析能力链表 (PCI 通用能力 / 厂商能力), 内核不必懂设备协议; 只放行
+/// "读自己那台设备"。本域没有被授权设备时返回 `u64::MAX`。
+pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -508,6 +513,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             } else {
                 0
             }
+        }
+        SYS_DEVICE_CONFIG_READ => {
+            // 读本域被授权设备的 PCI 配置空间 dword (N2: 驱动自行解析能力链表)。
+            // 只放行"读自己那台设备"; 没有绑定设备返回 u64::MAX。
+            crate::device::config_read(a1 as u32).map_or(u64::MAX, |v| v as u64)
         }
         SYS_IRQ_WAIT => {
             // 阻塞等待 `a1` (向量掩码, 编码同 `SYS_IRQ_POLL`) 里任意一个向量的中断,

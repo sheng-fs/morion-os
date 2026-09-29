@@ -95,6 +95,10 @@ pub fn grant(req: GrantRequest) -> bool {
     let bar_paddr = req.bar_paddr & !(PAGE - 1);
     let dma_pages = req.dma_pages.max(1);
 
+    // 记下"域 → 设备 PCI 位置": 驱动之后用 `SYS_DEVICE_CONFIG_READ` 自行解析能力链表,
+    // 而该 syscall 只放行"读自己那台设备"。
+    bind(req.domain, req.bus, req.dev, req.func);
+
     // 0. MSI-X。必须在写描述结构之前完成: 向量 / 表位置要写进描述。
     let msix = setup_msix(
         req.domain,
@@ -188,6 +192,46 @@ pub fn grant_empty(domain: u64) {
         cfg_paddr,
         paging::UserPagePerm::ReadWrite,
     );
+}
+
+/// 域 → 已授权设备的 PCI 位置 (供 [`config_read`] 限定"驱动只能读自己那台设备")。
+static BINDINGS: spin::Mutex<Vec<DeviceBinding>> = spin::Mutex::new(Vec::new());
+
+/// 一条"域 ↔ 设备"绑定。
+struct DeviceBinding {
+    domain: u64,
+    bus: u8,
+    dev: u8,
+    func: u8,
+}
+
+/// 记下某域被授权的设备 PCI 位置 (同一域重新授权时覆盖)。
+fn bind(domain: u64, bus: u8, dev: u8, func: u8) {
+    let mut bindings = BINDINGS.lock();
+    if let Some(e) = bindings.iter_mut().find(|e| e.domain == domain) {
+        e.bus = bus;
+        e.dev = dev;
+        e.func = func;
+    } else {
+        bindings.push(DeviceBinding {
+            domain,
+            bus,
+            dev,
+            func,
+        });
+    }
+}
+
+/// 读**调用域**被授权设备的 PCI 配置空间 dword (`offset` 内部对齐到 4)。
+///
+/// 驱动靠它自行解析能力链表 (PCI 通用能力 / 厂商能力, 如 virtio 各 BAR 区域偏移) ——
+/// 内核因此不必懂任何设备协议; 只放行"读自己那台设备", 别的设备读不到。
+/// 返回 `None` = 本域没有被授权设备。
+pub fn config_read(offset: u32) -> Option<u32> {
+    let me = crate::scheduler::current_domain();
+    let bindings = BINDINGS.lock();
+    let e = bindings.iter().find(|e| e.domain == me)?;
+    Some(pci::config_read_dword(e.bus, e.dev, e.func, offset as u8))
 }
 
 /// MSI-X 的配置结果 (向量 0 = 未启用)。

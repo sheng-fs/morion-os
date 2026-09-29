@@ -45,7 +45,7 @@
 | 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度（含**带超时阻塞**）、地址空间与按需分页、中断路由（PIC + **LAPIC/MSI-X**，含**阻塞等中断**与**多向量 `wait_any`**）、能力系统（含**能力随 IPC 传递**） |
 | 系统调用接口 | ✅ 约 40 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
-| 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N1 已按类找到网卡并把 `DeviceGrant` 交给它（BAR4），驱动本体在 N2。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局回到驱动域 —— "加新驱动不必改内核"的前提 |
+| 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2a 驱动已 up（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK`，能收帧），MSI-X 中断化在 N2b。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力 |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |

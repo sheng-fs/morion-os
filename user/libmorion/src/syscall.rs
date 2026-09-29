@@ -89,6 +89,8 @@ pub const SYS_CONSOLE_READY: u64 = 47;
 pub const SYS_KEY_PUSH: u64 = 48;
 /// **阻塞取**一个按键字节: `()` → 字节值。队列空则睡到有键为止。
 pub const SYS_KEY_READ: u64 = 49;
+/// 读本域被授权设备的 PCI 配置空间 dword (N2): `rdi = offset` → dword; 无设备返回 `u64::MAX`。
+pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -195,6 +197,14 @@ pub fn sys_irq_wait(mask: u64, timeout_ms: u64) -> u64 {
 /// 只有该设备的驱动域能调用, 且只成功一次; 配置空间写留在内核。
 pub fn sys_msix_enable() -> u64 {
     unsafe { syscall(SYS_MSIX_ENABLE, 0, 0, 0) }
+}
+
+/// 读本域被授权设备的 PCI 配置空间 dword (`offset` 会被对齐到 4)。
+///
+/// 驱动靠它自行解析能力链表 (PCI 通用能力 / 厂商能力, 如 virtio 各 BAR 区域偏移) ——
+/// 内核因此不必懂设备协议。没有绑定设备时返回 `u64::MAX`。
+pub fn sys_device_config_read(offset: u64) -> u64 {
+    unsafe { syscall(SYS_DEVICE_CONFIG_READ, offset, 0, 0) }
 }
 
 /// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回**新域 id** (失败 `u64::MAX`)。
