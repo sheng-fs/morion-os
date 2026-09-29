@@ -90,6 +90,7 @@ $QEMU \
   -drive file="$OUT_DIR/exfat.img",if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
   -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -drive file="$OUT_DIR/pt.img",if=none,id=n7,format=raw -device nvme-ns,drive=n7,bus=nvme0,nsid=7 \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
   -display none -monitor none -serial file:"$log" -no-reboot ${accel} ${QEMU_EXTRA:-} \
   >/dev/null 2>&1 &
 pid=$!

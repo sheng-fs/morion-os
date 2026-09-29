@@ -322,6 +322,8 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device nvme-ns,drive=nvme0n6,bus=nvme0,nsid=6 \
 		-drive file=$(PT_IMG),if=none,id=nvme0n7,format=raw \
 		-device nvme-ns,drive=nvme0n7,bus=nvme0,nsid=7 \
+		-netdev user,id=n0 \
+		-device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors

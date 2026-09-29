@@ -120,21 +120,56 @@ pub fn find_nvme(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
-/// 读取设备 BAR0 (支持 64 位 MMIO BAR), 返回其物理基址。
-pub fn read_bar0(bus: u8, dev: u8, func: u8) -> Option<u64> {
-    let low = config_read_dword(bus, dev, func, 0x10);
-    // bit0=0 表示内存空间 BAR (MMIO); bit0=1 表示 I/O 空间, NVMe 不支持。
+/// 在枚举结果中查找 **virtio 网卡** (网络控制器 class `02`, vendor `1AF4`), 返回其
+/// PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
+///
+/// 只认 virtio: 别的网卡本内核没有驱动, 认出来也无用。virtio-modern 把
+/// common cfg / notify / device cfg / ISR 都排在 **BAR4** (QEMU 给的是 64 位可预取 MMIO),
+/// 而 legacy 用的是 I/O 空间 BAR0 —— 本内核只支持 MMIO, 故只走 modern 路径。
+/// QEMU `virtio-net-pci` 默认 (transitional) 报 legacy id `1000`, `disable-legacy=on`
+/// 报 modern id `1041`; 两者都带 BAR4, 故两个 id 都认。
+pub fn find_net(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x02 || d.vendor != 0x1AF4 {
+            continue;
+        }
+        if d.device != 0x1041 && d.device != 0x1000 {
+            continue;
+        }
+        if let Some(bar4) = read_bar(d.bus, d.dev, d.func, 4) {
+            return Some((d.bus, d.dev, d.func, bar4));
+        }
+    }
+    None
+}
+
+/// 读取设备第 `index` 根 BAR (`0..=5`) 的物理基址; `None` = 该 BAR 不存在或为 I/O 空间
+/// (本内核只驱动 MMIO 设备)。
+pub fn read_bar(bus: u8, dev: u8, func: u8, index: u8) -> Option<u64> {
+    let off = 0x10 + index * 4;
+    let low = config_read_dword(bus, dev, func, off);
+    // bit0=1: I/O 空间 BAR (MMIO 驱动用不到)。
     if low & 0x1 != 0 {
         return None;
     }
-    let bar_type = (low >> 1) & 0x3;
-    if bar_type == 0b10 {
-        // 64 位 BAR: 与下一 dword 拼接。
-        let high = config_read_dword(bus, dev, func, 0x14);
-        Some(((high as u64) << 32) | ((low & 0xFFFF_FFF0) as u64))
+    let addr = if (low >> 1) & 0x3 == 0b10 {
+        // 64 位 BAR: 与下一 dword 拼接。基址可能高于 4 GiB, 此时低 dword 只剩标志位,
+        // 故**不能**拿低 dword 判"未实现"。
+        let high = config_read_dword(bus, dev, func, off + 4);
+        ((high as u64) << 32) | ((low & 0xFFFF_FFF0) as u64)
     } else {
-        Some((low & 0xFFFF_FFF0) as u64)
+        (low & 0xFFFF_FFF0) as u64
+    };
+    // 未实现的 BAR 读回 0 (基址为 0 视为不存在)。
+    if addr == 0 {
+        return None;
     }
+    Some(addr)
+}
+
+/// 读取设备 BAR0 (支持 64 位 MMIO BAR), 返回其物理基址。
+pub fn read_bar0(bus: u8, dev: u8, func: u8) -> Option<u64> {
+    read_bar(bus, dev, func, 0)
 }
 
 // ---------------------------------------------------------------------------

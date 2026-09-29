@@ -226,8 +226,8 @@ pub extern "C" fn kernel_main() -> ! {
     let exfat_domain = domain::create();
     let init_domain = domain::create();
     let gfx_domain = domain::create();
-    // 域 16 — net_srv (网络驱动, 驱动路线 N0): 供通用设备授权把 virtio-net 交出去 (N1/N2)。
-    let _net_domain = domain::create();
+    // 域 16 — net_srv (网络驱动, 驱动路线 N0): 通用设备授权把 virtio-net 交给它 (N1/N2)。
+    let net_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -372,6 +372,34 @@ pub extern "C" fn kernel_main() -> ! {
         None => {
             device::grant_empty(block_domain);
             video::println("[OK] no NVMe controller, block falls back to IDE PIO");
+        }
+    }
+
+    // 探测 virtio 网卡并**通用地**授权给 net 域（驱动路线 N1: PCI 查找 + 设备声明）:
+    // 与 NVMe 走同一条 `device::grant` 路径 —— 加这台新设备没给内核加任何设备专属逻辑。
+    // virtio-modern 的配置结构在 BAR4（MSI-X 表在 BAR1, 见 N2）。
+    match arch::pci::find_net(&pci_devices) {
+        Some((bus, dev, func, bar4)) => {
+            device::grant(device::GrantRequest {
+                domain: net_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar4,
+                // virtio-modern 配置区 (common/notify/device/isr) 共 16 KiB -> 4 页;
+                // DMA 8 页 (RX/TX virtqueue 环 + 收包缓冲)。
+                bar_pages: 4,
+                dma_pages: 8,
+                msix_vectors: 2,
+                label: "net",
+            });
+            video::print("[OK] virtio-net modern BAR4=0x");
+            video::print_hex(bar4);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(net_domain);
+            video::println("[OK] no virtio-net controller, net_srv idle");
         }
     }
 
