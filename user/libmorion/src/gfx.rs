@@ -35,6 +35,15 @@ pub const GFX_OP_RECT: u64 = 1;
 pub const GFX_OP_BLIT: u64 = 2;
 /// 存活探测：服务在跑就回 1。
 pub const GFX_OP_PING: u64 = 3;
+/// 往**终端光标**处写一段 UTF-8 文本（`buf` = 文本页地址，`w` = 字节数）。服务逐像素
+/// 写后回读校验，全对才回 1。
+pub const GFX_OP_TEXT: u64 = 4;
+/// 清屏并把光标归零。
+pub const GFX_OP_CLEAR: u64 = 5;
+/// 定位光标（`x` = 列，`y` = 行）；越界回 0。
+pub const GFX_OP_MOVE: u64 = 6;
+/// 问光标位置，回复 `(行 << 32) | 列`。
+pub const GFX_OP_QUERY: u64 = 7;
 
 /// 绘图请求（序列化进 IPC payload；`repr(C)`，与 `gfx_srv` 严格对应）。
 ///
@@ -110,14 +119,8 @@ impl Surface {
         let va = surface_va();
         unsafe {
             if !SURFACE_READY {
-                for i in 0..pages {
-                    let p = va + i * 4096;
-                    if sys_alloc_page(p) != 1 {
-                        return None;
-                    }
-                    if sys_share_page(p, GFX_DOMAIN) != 1 {
-                        return None;
-                    }
+                if !map_and_share(va, pages) {
+                    return None;
                 }
                 SURFACE_READY = true;
             }
@@ -211,6 +214,74 @@ pub fn ping() -> bool {
     }) == 1
 }
 
+/// 文本页相对本域表面窗口的偏移：表面最多占窗口头部 1 MiB，文本从 +1 MiB 起另开一页。
+const TEXT_OFF: u64 = 0x0010_0000;
+
+/// 一次能提交的文本上限（字节）。文本页就是一页，服务端也只收这么多。
+pub const TEXT_MAX: usize = 4096;
+
+/// 本域文本页地址（与 `gfx_srv` **同址**共享）。
+pub fn text_va() -> u64 {
+    surface_va() + TEXT_OFF
+}
+
+/// 本域文本页是否已分配并共享（重复 `share_page` 会在服务域撞 panic）。
+static mut TEXT_READY: bool = false;
+
+/// 往屏幕终端写一段 UTF-8 文本（当前光标处；自动换行、到底滚动）；成功返回 `true`。
+///
+/// 文本经**共享页**传（不塞进 IPC payload）：一行可能很长，含汉字时一字节一列对不上，
+/// 走共享页就不必关心长度上限，也不需要分片。
+pub fn print(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let n = bytes.len().min(TEXT_MAX);
+    unsafe {
+        if !TEXT_READY {
+            if !map_and_share(text_va(), 1) {
+                return false;
+            }
+            TEXT_READY = true;
+        }
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), text_va() as *mut u8, n);
+    }
+    call(&GfxReq {
+        op: GFX_OP_TEXT,
+        buf: text_va(),
+        w: n as u64,
+        ..Default::default()
+    }) == 1
+}
+
+/// 清屏并把光标归零。
+pub fn clear_screen() -> bool {
+    call(&GfxReq {
+        op: GFX_OP_CLEAR,
+        ..Default::default()
+    }) == 1
+}
+
+/// 把光标移到字符格 `(col, row)`；越界返回 `false`（服务端不夹取，直接拒）。
+pub fn move_cursor(col: u32, row: u32) -> bool {
+    call(&GfxReq {
+        op: GFX_OP_MOVE,
+        x: col as u64,
+        y: row as u64,
+        ..Default::default()
+    }) == 1
+}
+
+/// 问服务端的光标位置 `(col, row)`；服务不可用时返回 `None`。
+pub fn cursor() -> Option<(u32, u32)> {
+    let r = call(&GfxReq {
+        op: GFX_OP_QUERY,
+        ..Default::default()
+    });
+    if r == u64::MAX {
+        return None;
+    }
+    Some(((r & 0xFFFF_FFFF) as u32, (r >> 32) as u32))
+}
+
 /// 发一条绘图请求给 `gfx_srv`，返回回复值（`1` = 成功）。
 fn call(req: &GfxReq) -> u64 {
     let payload = unsafe {
@@ -220,6 +291,23 @@ fn call(req: &GfxReq) -> u64 {
         )
     };
     sys_call_payload(GFX_DOMAIN, GFX_TAG, payload)
+}
+
+/// 逐页分配并**同址**共享给 `gfx_srv`。
+///
+/// `share_page` 是把本域的页映射进目标域的**同一虚拟地址**，重复调用会在服务域撞上已映射页
+/// (`map_user_page` panic)，所以调用方必须用"只做一次"的开关把它包住（表面页与文本页各一个）。
+unsafe fn map_and_share(va: u64, pages: u64) -> bool {
+    for i in 0..pages {
+        let p = va + i * 4096;
+        if sys_alloc_page(p) != 1 {
+            return false;
+        }
+        if sys_share_page(p, GFX_DOMAIN) != 1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// 表面页是否已映射（供调用方判断能否复用，避免重复 `alloc_page` panic）。

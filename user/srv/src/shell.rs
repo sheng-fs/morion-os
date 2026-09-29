@@ -121,6 +121,10 @@ fn resolve_in_cwd(cwd: &str, arg: &str) -> Option<&'static str> {
     }
 }
 
+/// 等屏幕控制台就绪的上限 (毫秒)。`gfx_srv` 接管帧缓冲的实测量级是几十毫秒; 这个上限只是
+/// 「最坏情况别把 shell 卡住」的保险 —— 到点就退回"只写串口/内核终端"的老路。
+const CONSOLE_WAIT_MS: u64 = 1000;
+
 /// 域 8 — Shell: 分配结果页 → 循环「提示符 → 读行 → 执行命令」。
 pub fn run() {
     // 分配 shell 专用结果页并共享给各文件服务 (同地址映射); ls/cat 的结果写在此页。
@@ -137,10 +141,37 @@ pub fn run() {
         println("shell: share result buf FAILED");
         return;
     }
+    // G3b: 帧缓冲归用户态后, 把 shell 的输出**镜像**一份到屏幕控制台 (`gfx_srv`) —— 内核终端
+    // 与 COM1 那条路照旧, 屏幕只是"多出来的一份" (D6: 串口是回归的命脉, 绝不能替换掉)。
+    //
+    // `gfx_srv` 是后启动的服务域 (域 15), 帧缓冲要等它接管之后才写得进去, 故在这里**有界等待**
+    // 一下; 上限到点就走"没有屏幕"的老路 —— 绝不能因为它没起来就把 shell 卡死。
+    let mut waits = 0u64;
+    while waits < CONSOLE_WAIT_MS && !sys_console_ready() {
+        sys_sleep(1);
+        waits += 1;
+    }
+    let mirrored = sys_console_ready() && sys_domain_alive(morion::gfx::GFX_DOMAIN) != 0;
+    if mirrored {
+        // 镜像走 `SYS_CALL`, 目标域没有活任务时会一直等回复, 故上面先确认它活着。
+        screen_mirror_on();
+    }
+
     println("shell: type 'help' for commands");
-    // 用户态打印中文: 经 `SYS_PUTS` 把 UTF-8 原样交给内核终端 —— Ring 3 一路到
-    // 16x16 点阵字形 (全角标点也是双宽度), 这条是端到端的渲染验证。
+    // 用户态打印中文: 一份经 `SYS_PUTS` 给内核终端 (内核顺带写 COM1), 开了屏幕镜像再给
+    // `gfx_srv` 一份 —— Ring 3 的 UTF-8 一路走到 16x16 点阵字形 (全角标点是双宽度)。
     println("你好，世界！MorionOS 终端支持中文、全角标点与宽窄混排。");
+
+    // G3b 自证 (串口可见, 不占屏幕控制台): 上面两行已过屏幕镜像写进 `gfx_srv` 的终端,
+    // 问一下它的光标就知道字真的落了笔 —— 盲测环境下这就是"shell 输出上屏"的证据。
+    if mirrored {
+        match morion::gfx::cursor() {
+            Some((_, row)) if row > 0 => {
+                sys_puts("shell: screen console mirror OK (gfx_srv cursor advanced)\n")
+            }
+            _ => sys_puts("shell: screen console mirror FAILED (gfx_srv cursor not advanced)\n"),
+        }
+    }
 
     // 初始工作目录为根。
     let mut st = ShellState {

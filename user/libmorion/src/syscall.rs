@@ -88,6 +88,8 @@ pub const SYS_FB_INFO: u64 = 44;
 pub const SYS_FB_MAP: u64 = 45;
 /// 宣告本域**接管**显示 (内核终端停止写帧缓冲): `()` → 1 / 0。需 `Capability::Fb`。
 pub const SYS_FB_TAKEOVER: u64 = 46;
+/// 显示是否已交用户态 (无能力要求)。见 [`sys_console_ready`]。
+pub const SYS_CONSOLE_READY: u64 = 47;
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -276,6 +278,14 @@ pub fn sys_fb_takeover() -> u64 {
     unsafe { syscall(SYS_FB_TAKEOVER, 0, 0, 0) }
 }
 
+/// 显示是否已交用户态 (`gfx_srv` 接管过帧缓冲)。
+///
+/// `print` 的屏幕镜像 ([`screen_mirror_on`]) 必须先问这一句: 没接管时内核终端根本不写屏,
+/// 镜像只会白等一次 `SYS_CALL`。
+pub fn sys_console_ready() -> bool {
+    unsafe { syscall(SYS_CONSOLE_READY, 0, 0, 0) == 1 }
+}
+
 /// 当前空闲物理帧数。
 pub fn sys_frame_free() -> u64 {
     unsafe { syscall(SYS_FRAME_FREE, 0, 0, 0) }
@@ -459,6 +469,29 @@ impl<T> StaticCell<T> {
 static PRINT_BUF: StaticCell<[u8; 256]> = StaticCell::new([0; 256]);
 static PRINT_LEN: StaticCell<usize> = StaticCell::new(0);
 
+/// 本进程是否把打印**镜像**一份到用户态屏幕控制台 (`gfx_srv`)。
+///
+/// 只有需要上屏的程序 (目前是 shell) 显式打开 —— 每提交一行都要多一次 `SYS_CALL` 往返,
+/// 让自测那种成千上万条的路径去付这个代价不划算。
+static SCREEN_MIRROR: StaticCell<bool> = StaticCell::new(false);
+
+/// 打开屏幕镜像 (幂等)。
+///
+/// **前提**: 帧缓冲已交用户态 ([`sys_console_ready`]) 且 `gfx_srv` 活着 —— 镜像走 `SYS_CALL`,
+/// 目标域若没有活任务, 调用方会一直等回复。
+pub fn screen_mirror_on() {
+    *SCREEN_MIRROR.borrow_mut() = true;
+}
+
+/// 打印的唯一出口: 内核终端 (经 `SYS_PUTS`, 内核顺带写 COM1) —— 开了镜像再送一份给屏幕控制台。
+fn sink(s: &str) {
+    sys_puts(s);
+    if *SCREEN_MIRROR.borrow_mut() {
+        // 服务端逐像素回读校验; 失败也不影响串口这条主路, 故忽略返回值。
+        crate::gfx::print(s);
+    }
+}
+
 /// 把字符串追加到行缓冲 (缓冲满时先提交当前行, 再继续写入)。
 fn print_push(s: &str) {
     for &b in s.as_bytes() {
@@ -467,7 +500,7 @@ fn print_push(s: &str) {
         if *len >= buf.len() {
             // 缓冲已满: 先提交当前行, 避免后续字节被静默丢弃。
             let line = unsafe { core::str::from_utf8_unchecked(&buf[..*len]) };
-            sys_puts(line);
+            sink(line);
             *len = 0;
         }
         buf[*len] = b;
@@ -481,7 +514,7 @@ fn print_flush() {
     if *len > 0 {
         let buf = PRINT_BUF.borrow_mut();
         let s = unsafe { core::str::from_utf8_unchecked(&buf[..*len]) };
-        sys_puts(s);
+        sink(s);
         *len = 0;
     }
 }

@@ -4,10 +4,10 @@
 //!   - 顶部 `MARGIN` 起为「历史区」, 显示已提交的行, 可通过 ↑/↓ 回滚查看。
 //!   - 底部固定一行「输入行」, 用于当前正在编辑/打印的行, 带可见光标。
 //!
-//! 字体: ASCII 用 `font.rs` 的 8x16 位图; 其余字符 (汉字 / 全角标点 / 杂项符号) 用
-//! `unicode.rs` 查 `cjk.bin` 的 8x16 / 16x16 点阵。行缓冲存的是 **UTF-8 字节**,
-//! 排版按**显示列**算 (汉字 16x16 占 2 列), 故 `CUR_POS` / `CUR_COL` 是字节下标,
-//! 显示位置一律经 `unicode::str_width` 折算。
+//! 字体: ASCII 用 `font.rs` 的 8x16 位图; 其余字符 (汉字 / 全角标点 / 杂项符号) 内核
+//! **已不带字库** (G3c 起字库归用户态 `gfx_srv`), 一律画空心豆腐块占位。行缓冲存的是
+//! **UTF-8 字节**, 排版按**显示列**算 (汉字 16x16 占 2 列), 故 `CUR_POS` / `CUR_COL` 是
+//! 字节下标, 显示位置一律经 `unicode::str_width` 折算。
 
 pub mod bg;
 pub mod font;
@@ -544,7 +544,13 @@ fn cur_hist_len() -> usize {
 // ---------------------------------------------------------------------------
 
 /// 从历史 + 输入行重绘整个文本区, 并在光标位置画下划线。
+///
+/// 显示已被用户态接管 (`SYS_FB_TAKEOVER`) 时整个重绘是**空操作** —— 输入行的编辑与
+/// 提交仍照常进行 (见 [`term_put`]), 只是不再由内核画到帧缓冲 (屏幕归 `gfx_srv`)。
 fn redraw() {
+    if is_taken_over() {
+        return;
+    }
     unsafe {
         // 用背景渐变擦除内容区 (而非纯色), 以便背景图在每次重绘后保持。
         bg_fill_rect(0, MARGIN, FB.width(), FB.height() - MARGIN);
@@ -597,6 +603,9 @@ fn redraw() {
 /// 整个文本区背景并重画所有历史行, 在未缓存的 MMIO 帧缓冲上代价很高 (逐键卡顿)。
 /// 仅在光标始终位于输入行 (`CUR_ROW == 0` 且未发生换行提交) 时使用。
 fn redraw_input_line() {
+    if is_taken_over() {
+        return;
+    }
     let iy = input_y();
     bg_fill_rect(0, iy, unsafe { FB.width() }, LINE_HEIGHT);
     draw_input_line();
@@ -672,9 +681,6 @@ fn char_cells(bytes: &[u8], pos: usize) -> u32 {
 
 /// 键盘 ↑: 光标上移一行; 光标已在可视区顶部时再触发向上滚动
 pub fn scroll_view_up() {
-    if is_taken_over() {
-        return;
-    }
     unsafe {
         if CUR_ROW < cur_row_max() {
             CUR_ROW += 1;
@@ -694,9 +700,6 @@ pub fn scroll_view_up() {
 
 /// 键盘 ↓: 光标下移一行; 光标已回到输入行时再触发向下滚动 (恢复 live)
 pub fn scroll_view_down() {
-    if is_taken_over() {
-        return;
-    }
     unsafe {
         if CUR_ROW > 0 {
             CUR_ROW -= 1;
@@ -867,9 +870,9 @@ pub fn print_logo() {
 ///
 /// 光标在历史区 (CUR_ROW > 0) 时, 字符直接插入到该历史行光标处, 不跳回输入行。
 pub fn term_put(c: u8) {
-    if is_taken_over() {
-        return; // 显示已交给用户态: 内核不再编辑/重绘 (输入由图形侧后续接管)
-    }
+    // 显示交给用户态后 (§G1) 内核不再画屏, 但**编辑与提交必须照旧执行**: 回车要把输入行
+    // 推进队列并唤醒 `SYS_READLINE`, 否则用户态服务永远收不到命令 (表现为终端卡死)。
+    // 只是重绘被禁用 (见 `redraw` / `redraw_input_line`)。
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -986,9 +989,6 @@ fn insert_hist_char(c: u8) {
 ///
 /// 光标在历史区时删除该历史行光标前字符, 不跳回输入行。
 pub fn term_backspace() {
-    if is_taken_over() {
-        return;
-    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -1053,9 +1053,6 @@ fn backspace_hist_char() {
 
 /// 光标左移
 pub fn term_left() {
-    if is_taken_over() {
-        return;
-    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
@@ -1091,9 +1088,6 @@ pub fn term_left() {
 
 /// 光标右移
 pub fn term_right() {
-    if is_taken_over() {
-        return;
-    }
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 

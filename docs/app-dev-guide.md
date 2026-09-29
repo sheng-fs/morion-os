@@ -202,7 +202,7 @@ sys_cap_send(peer_domain, CAP_KIND_SEND_TO, mfs_domain);  // 对方从此可直�
 
 | 编号 | 封装 | 参数 | 返回 | 说明 |
 | --- | --- | --- | --- | --- |
-| 4 | `sys_puts(s)` | `rdi=ptr, rsi=len` | — | 打印字符串。传的是 **UTF-8 字节**：ASCII 按 8x16 单格、汉字/全角标点按 16x16 双格渲染（字库 `video/cjk.bin`，缺字形画空心豆腐块） |
+| 4 | `sys_puts(s)` | `rdi=ptr, rsi=len` | — | 打印字符串（UTF-8 字节）。**G3c 后内核终端不再带字库**：ASCII 按 8x16 单格、其余字符画空心豆腐块（占 2 格）—— 真正的汉字渲染在用户态 `gfx_srv`；要往屏幕控制台上屏见 `libmorion::screen_mirror_on()`（G3b）。COM1 串口始终是原样 UTF-8 |
 | 15 | `sys_scroll_up()` | — | 1 | 光标上移 / 到顶滚动历史 |
 | 16 | `sys_scroll_down()` | — | 1 | 光标下移 / 到底滚动历史 |
 | 17 | `sys_backspace()` | — | 1 | 删除输入行光标前一个字符 |
@@ -636,7 +636,7 @@ payload = { capability_id: u32, request_len: u32, response_cap: u64, _pad }   //
 | 能力系统（能力槽 + 能力句柄） | ✅ 已就绪 | `SYS_CAP_ISSUE/LOOKUP/DROP`（29/30/31）；**能力随 IPC 传递** `SYS_HANDLE_SEND`/`SYS_CAP_SEND`（32/33，句柄移交为移动、能力委派为复制且无放大）；见第 6 节 |
 | IPC 与共享内存 | ✅ 已就绪 | `sys_call` / `sys_reply` / `sys_alloc_page` / `sys_share_page`；见第 4、5 节 |
 | 文件系统统一接口 libvfs | ✅ 已就绪 | `open/read/readdir/stat/close` + 挂载路由；可作为首批 AI 能力的底座 |
-| 图形接口 libgfx（G2） | ✅ 已就绪 | `libmorion::gfx`：`Surface`（`sys_alloc_page` + `sys_share_page` 共享给 `gfx_srv`）+ `fill_screen/screen_rect/blit`；需 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`；文本渲染见 [roadmap-gfx.md](roadmap-gfx.md) G3 |
+| 图形接口 libgfx（G2 / G3a） | ✅ 已就绪 | `libmorion::gfx`：`Surface`（`sys_alloc_page` + `sys_share_page` 共享给 `gfx_srv`）+ `fill_screen/screen_rect/blit`；**文本终端** `print/clear_screen/move_cursor/cursor`（UTF-8、汉字按 2 列排版、自动换行/滚动，文本经共享页传）；需 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`；surface 合成见 [roadmap-gfx.md](roadmap-gfx.md) G4 |
 | 用户态 JSON 序列化 / 解析 | ⏳ 缺失 | 当前 `#![no_std]` 且无 `alloc`；需先补一个最小的 `no_std` JSON 解析器与分配器 |
 | `#[ai_capability]` 过程宏 / 构建脚本 | ⏳ 缺失 | 宿主侧代码生成，不依赖目标端 `no_std` |
 | 能力注册 / 发现服务 | ⏳ 缺失 | 需新增用户态域；索引可先用内存表，后续换持久化 |

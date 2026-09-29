@@ -39,6 +39,8 @@ pub mod ext2_srv;
 #[cfg(feature = "svc-fat32_srv")]
 pub mod fat32_srv;
 #[cfg(feature = "svc-gfx_srv")]
+pub mod gfx;
+#[cfg(feature = "svc-gfx_srv")]
 pub mod gfx_srv;
 #[cfg(feature = "svc-init")]
 pub mod init;

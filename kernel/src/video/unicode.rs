@@ -1,52 +1,20 @@
-//! UTF-8 解码 + 点阵字形查表 (`cjk.bin`) —— 让终端能显示汉字等非 ASCII 字符
+//! UTF-8 解码 + 最小 ASCII 文本绘制 (G3c)
 //!
-//! 数据由 [`scripts/gen-cjk-font.py`](../../../scripts/gen-cjk-font.py) 从 GNU Unifont
-//! (OFL-1.1) 生成：GB2312 全集 ∪ 仓库里出现过的非 ASCII 字符，共约 7500 字，
-//! 定长 37 字节记录、按码点升序，故此处二分查找即可。**宽度随字形一起存**
-//! （1 = 8x16 窄字形占 1 格，2 = 16x16 宽字形占 2 格），所以排版列数不必再维护
-//! 一张 East Asian Width 表 —— 字库里有就信字库，没有（豆腐块）才按东亚宽度粗判。
+//! 汉字/全角点阵 (`cjk.bin`, ≈276 KB) 与东亚宽度排版**已搬到用户态的 `gfx_srv`**
+//! (见 `user/srv/src/gfx/`)：屏幕上的汉字现在由用户态画，内核不再携带字库 ——
+//! 内核镜像因此瘦掉约 276 KB。`scripts/gen-cjk-font.py` 的产物也只进用户态那份。
+//!
+//! 内核这边只保留「gfx 接管前那几秒 + panic 屏」够用的最小能力：
+//! - ASCII (`0x20..=0x7E`) 走 [`super::font`] 的 8x16 字模；
+//! - 非 ASCII 一律画**空心豆腐块**，宽度按东亚宽度粗判（汉字类 2 格），
+//!   于是列表 / 排版列数仍然对得上，只是看不出是哪几个字；
+//! - UTF-8 边界推进 (`decode` / `prev_index` / `next_index`) 保持原样 ——
+//!   退格与光标左右移因此不会把多字节字符切成半个。
+//!
+//! **COM1 串口输出全程不受影响**：`print` 直接把 UTF-8 字节写串口，不经过本模块。
 
 use super::font;
 use super::framebuffer::Framebuffer;
-
-/// 字库二进制（`scripts/gen-cjk-font.py` 生成，随仓库提交；构建不依赖网络/Python）。
-static GLYPHS: &[u8] = include_bytes!("cjk.bin");
-
-/// 记录长度（字节）；码点 4 + 宽度 1 + 16 行 × u16 = 37。
-const RECORD: usize = 37;
-
-/// 字形：宽度（字符格数）与 16 行位图（每行 u16 大端，bit15 为最左像素）。
-pub struct Glyph {
-    pub width: u32,
-    pub rows: &'static [u8],
-}
-
-/// 按码点查字形（二分查找）。
-pub fn glyph(cp: u32) -> Option<Glyph> {
-    let count = GLYPHS.len() / RECORD;
-    let (mut lo, mut hi) = (0usize, count);
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let off = mid * RECORD;
-        let key = u32::from_be_bytes([
-            GLYPHS[off],
-            GLYPHS[off + 1],
-            GLYPHS[off + 2],
-            GLYPHS[off + 3],
-        ]);
-        match key.cmp(&cp) {
-            core::cmp::Ordering::Equal => {
-                return Some(Glyph {
-                    width: GLYPHS[off + 4] as u32,
-                    rows: &GLYPHS[off + 5..off + RECORD],
-                })
-            }
-            core::cmp::Ordering::Less => lo = mid + 1,
-            core::cmp::Ordering::Greater => hi = mid,
-        }
-    }
-    None
-}
 
 /// 解码 UTF-8 的下一个字符：返回 (码点, 该字符占的字节数)。
 ///
@@ -106,8 +74,8 @@ pub fn prev_index(bytes: &[u8], i: usize) -> usize {
 
 /// 字符占的显示列数。
 ///
-/// 字库里有字形就信字库（GB2312 里的 `·` 是窄的、全角 `，` 是宽的，各自都对）；
-/// 没有字形（会画成豆腐块）时按东亚宽度粗判宽窄，让占位不至于错位。
+/// 内核已无字库，非 ASCII 只能按**东亚宽度**粗判宽窄（汉字类 2 格、其余 1 格）——
+/// 与用户态 `gfx_srv` 的口径一致，接管前后列数不会突变。
 pub fn width(cp: u32) -> u32 {
     if (0x20..=0x7E).contains(&cp) {
         return 1;
@@ -115,15 +83,10 @@ pub fn width(cp: u32) -> u32 {
     if cp < 0x20 || cp == 0x7F {
         return 0; // 控制字符: 不可见, 由终端按语义处理（如 '\n'）或忽略
     }
-    match glyph(cp) {
-        Some(g) => g.width,
-        None => {
-            if east_asian_wide(cp) {
-                2
-            } else {
-                1
-            }
-        }
+    if east_asian_wide(cp) {
+        2
+    } else {
+        1
     }
 }
 
@@ -139,42 +102,25 @@ pub fn str_width(bytes: &[u8]) -> u32 {
     w
 }
 
-/// 画一个码点（ASCII 走原有 8x16 字体）。返回是否命中字库（`false` = 画了豆腐块）。
-pub fn draw(fb: &mut Framebuffer, x: u32, y: u32, cp: u32, color: u32) -> bool {
+/// 画一个码点：ASCII 走 8x16 字模，非 ASCII 画**空心豆腐块**（内核已不带字库）。
+pub fn draw(fb: &mut Framebuffer, x: u32, y: u32, cp: u32, color: u32) {
     if (0x20..=0x7E).contains(&cp) {
         font::draw_char(fb, x, y, cp as u8, color);
-        return true;
+        return;
     }
-    match glyph(cp) {
-        Some(g) => {
-            for row in 0..16u32 {
-                let r = (row as usize) * 2;
-                let bits = ((g.rows[r] as u16) << 8) | g.rows[r + 1] as u16;
-                for col in 0..g.width * 8 {
-                    if bits & (0x8000u16 >> col) != 0 {
-                        fb.pixel(x + col, y + row, color);
-                    }
-                }
-            }
-            true
-        }
-        None => {
-            // 豆腐块: 空心方框, 明确表示「有这个字符, 但字库缺字形」。
-            let (w, h) = (width(cp) * font::CHAR_WIDTH, font::CHAR_HEIGHT);
-            for col in 1..w.saturating_sub(1) {
-                fb.pixel(x + col, y + 1, color);
-                fb.pixel(x + col, y + h - 2, color);
-            }
-            for row in 1..h.saturating_sub(1) {
-                fb.pixel(x + 1, y + row, color);
-                fb.pixel(x + w - 2, y + row, color);
-            }
-            false
-        }
+    let w = width(cp).max(1) * font::CHAR_WIDTH;
+    let h = font::CHAR_HEIGHT;
+    for col in 1..w.saturating_sub(1) {
+        fb.pixel(x + col, y + 1, color);
+        fb.pixel(x + col, y + h - 2, color);
+    }
+    for row in 1..h.saturating_sub(1) {
+        fb.pixel(x + 1, y + row, color);
+        fb.pixel(x + w - 2, y + row, color);
     }
 }
 
-/// 东亚宽度粗判（仅用于「字库里没有字形」的豆腐块占位；有字形时不查这里）。
+/// 东亚宽度粗判（只影响非 ASCII 占几格；字库不在内核里了）。
 fn east_asian_wide(cp: u32) -> bool {
     matches!(cp,
         0x1100..=0x115F
@@ -193,4 +139,43 @@ fn east_asian_wide(cp: u32) -> bool {
         | 0x1F300..=0x1F64F
         | 0x1F900..=0x1F9FF
         | 0x20000..=0x3FFFD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 宽度口径: ASCII 1 格、控制字符 0 格、汉字/全角标点 2 格、窄符号 1 格。
+    /// 这些值与用户态 `gfx_srv` 的排版列数一致 —— 接管前后不能突变。
+    #[test]
+    fn width_matches_user_space_columns() {
+        assert_eq!(width(b'A' as u32), 1);
+        assert_eq!(width(b'\n' as u32), 0);
+        assert_eq!(width('中' as u32), 2);
+        assert_eq!(width('，' as u32), 2); // 全角标点 U+FF0C
+        assert_eq!(width('·' as u32), 1); // 窄间隔点 U+00B7
+    }
+
+    /// 三字节 UTF-8 解码 + 混排列数: "A中B" 共 1 + 2 + 1 = 4 列。
+    #[test]
+    fn str_width_counts_display_columns() {
+        let s = "A中B".as_bytes();
+        let (cp, n) = decode(s, 1);
+        assert_eq!((cp, n), ('中' as u32, 3));
+        assert_eq!(str_width(s), 4);
+    }
+
+    /// 退格 / 左移按字符边界回退, 不会切进多字节字符中间。
+    #[test]
+    fn prev_index_stops_at_char_boundary() {
+        let s = "A中".as_bytes();
+        assert_eq!(prev_index(s, s.len()), 1);
+        assert_eq!(next_index(s, 1), s.len());
+    }
+
+    /// 截断的多字节序列按 U+FFFD 处理且只前进 1 字节 (不能让坏字节卡住整行)。
+    #[test]
+    fn truncated_sequence_advances_one_byte() {
+        assert_eq!(decode(&[0xE4, 0xB8], 0), (0xFFFD, 1));
+    }
 }

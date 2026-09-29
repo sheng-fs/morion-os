@@ -3302,7 +3302,65 @@ pub fn run() {
         return;
     }
 
+    // GT-1 (G3a): 文本渲染外移 —— 服务内终端按显示列排版, 逐像素写后回读校验。
+    if gt1_text_rendering().is_none() {
+        return;
+    }
+
     println("app: SELFTEST DONE");
+}
+
+/// GT-1 取证 (G3a 图形子系统): 文本渲染搬到用户态后的端到端验证。
+///
+/// 清屏 → 写 ASCII → 写汉字, 每步都用 `SYS_CALL` 问 `gfx_srv` 的光标位置来断言**排版列数**:
+/// `"GT-1 "` 是 5 个 ASCII 字符 = 5 列; `"汉字宽字符"` 是 5 个汉字 × 2 列 = 10 列, 故光标应落在
+/// 第 15 列。列数由**服务端字库的宽度表**算出, 所以这条断言同时证明了 UTF-8 解码、宽窄混排与
+/// 光标推进; 而"真的画到帧缓冲上了"由服务端**逐像素写后回读**保证 (`GFX_OP_TEXT` 回 1 才算过)。
+fn gt1_text_rendering() -> Option<()> {
+    if !morion::gfx::clear_screen() {
+        println("app: GT1 clear_screen FAILED");
+        return None;
+    }
+    if morion::gfx::cursor() != Some((0, 0)) {
+        println("app: GT1 cursor after clear isn't (0,0)");
+        return None;
+    }
+    if !morion::gfx::print("GT-1 ") {
+        println("app: GT1 print ascii FAILED");
+        return None;
+    }
+    if morion::gfx::cursor() != Some((5, 0)) {
+        println("app: GT1 ascii advance isn't 5 cols (ansi 8x16?)");
+        return None;
+    }
+    if !morion::gfx::print("汉字宽字符") {
+        println("app: GT1 print cjk FAILED");
+        return None;
+    }
+    if morion::gfx::cursor() != Some((15, 0)) {
+        println("app: GT1 cjk advance isn't 10 cols (16x16 wide glyphs?)");
+        return None;
+    }
+    // 换行 + 混排一行, 然后跳到第 20 行再写一行 —— 顺带把屏幕留成"人眼可核对"的样子。
+    if !morion::gfx::print("\n服务内终端: 光标 / 换行 / 宽窄混排\n") {
+        println("app: GT1 print mixed line FAILED");
+        return None;
+    }
+    if !morion::gfx::move_cursor(0, 20) {
+        println("app: GT1 move_cursor(0,20) FAILED");
+        return None;
+    }
+    if !morion::gfx::print("GT-1 OK: ascii 5 cols, cjk 10 cols, cursor moved") {
+        println("app: GT1 print at moved cursor FAILED");
+        return None;
+    }
+    // 越界定位必须被**拒** (服务端不夹取): 若被接受, 说明边界检查是假的。
+    if morion::gfx::move_cursor(9999, 9999) {
+        println("app: GT1 out-of-range move_cursor was accepted");
+        return None;
+    }
+    println("app: GT1 text console OK (layout cols verified, framebuffer pixel readback matched)");
+    Some(())
 }
 
 /// GS-1 取证 (G2 图形子系统): 屏幕级原语 + 客户端共享表面。

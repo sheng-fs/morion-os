@@ -395,8 +395,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();
     video::println("");
-    // 中文渲染自检: 汉字是 16x16 点阵、占 2 个字符格 (字库见 video/cjk.bin),
-    // 与 8x16 的 ASCII 混排 —— 这一行同时验证「三字节 UTF-8 解码 + 双宽度排版」。
+    // 接管前的窗口自检: 内核终端现在只认 ASCII, 这一行里的汉字会画成**豆腐块**
+    // (串口里仍是原样 UTF-8)。它验证的仍是「三字节 UTF-8 解码 + 双宽度排版」——
+    // 豆腐块占 2 列, 列数与用户态 gfx_srv 的口径一致。
     video::println("MorionOS 微内核 · 中文渲染就绪：汉字、全角标点、双宽度混排。");
     video::println("");
 

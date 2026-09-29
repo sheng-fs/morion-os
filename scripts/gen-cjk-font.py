@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成终端点阵字库 `kernel/src/video/cjk.bin`（汉字 / 全角标点 / 非 ASCII 窄字形）。
+"""生成终端点阵字库 `user/srv/src/gfx/cjk.bin`（汉字 / 全角标点 / 非 ASCII 窄字形）。
 
 ## 为什么需要它
 
@@ -171,9 +171,9 @@ def build_records(charset, glyphs):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="生成内核终端点阵字库 cjk.bin")
+    ap = argparse.ArgumentParser(description="生成 gfx_srv 终端点阵字库 cjk.bin")
     ap.add_argument("--hex", help="Unifont hex 路径（默认用 build/font-cache 下的缓存）")
-    ap.add_argument("--out", default=os.path.join(REPO, "kernel/src/video/cjk.bin"))
+    ap.add_argument("--out", default=os.path.join(REPO, "user/srv/src/gfx/cjk.bin"))
     ap.add_argument("--download", action="store_true", help="先下载 Unifont hex")
     args = ap.parse_args()
 

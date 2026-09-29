@@ -117,6 +117,11 @@ pub const SYS_FB_MAP: u64 = 45;
 /// 宣告本域**接管**显示: 之后内核终端不再写帧缓冲, 输出只保留 COM1 —— 屏幕交给用户态。
 /// 成功返回 1。需 `Capability::Fb`。幂等。
 pub const SYS_FB_TAKEOVER: u64 = 46;
+/// 显示是否已交用户态 (`SYS_FB_TAKEOVER` 曾成功): 返回 1 / 0。**无能力要求**。
+///
+/// 给「要把输出镜像到用户态屏幕控制台」的客户端用: 接管之前镜像只会把字写进没人看的帧缓冲,
+/// 而 `SYS_CALL` 到图形服务要等它进请求循环 —— 先问这一句就不必白等。
+pub const SYS_CONSOLE_READY: u64 = 47;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -760,6 +765,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::video::take_over();
             1
         }
+        SYS_CONSOLE_READY => crate::video::is_taken_over() as u64,
         SYS_DOMAIN_ALIVE => {
             // 该域是否**还有存活任务** (监督者巡检原语)。
             (crate::domain::is_alive(a1) && crate::scheduler::live_tasks(a1) > 0) as u64

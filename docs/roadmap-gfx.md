@@ -28,7 +28,7 @@
 | 项 | 现状 |
 | --- | --- |
 | 线性帧缓冲 | 引导器经 `BootInfo.fb_addr/width/height/stride/bpp` 交出 GOP 帧缓冲；内核以**恒等映射**（前 4 GiB 2 MiB 大页）直接写 BGRA 像素（[framebuffer.rs](../kernel/src/video/framebuffer.rs)） |
-| 内核终端 | [video/mod.rs](../kernel/src/video/mod.rs)：~1075 行「历史区 + 固定输入行 + 光标」文本终端；ASCII 走 [font.rs](../kernel/src/video/font.rs)，汉字/全角走 [unicode.rs](../kernel/src/video/unicode.rs) + [cjk.bin](../kernel/src/video/cjk.bin)（≈276 KB） |
+| 内核终端 | [video/mod.rs](../kernel/src/video/mod.rs)：~1075 行「历史区 + 固定输入行 + 光标」文本终端；ASCII 走 [font.rs](../kernel/src/video/font.rs)，汉字/全角走 [unicode.rs](../kernel/src/video/unicode.rs) + `cjk.bin`（≈276 KB，**现已搬至用户态 `gfx_srv`**，见 G3c） |
 | 帧缓冲保留 | [frame_allocator::init](../kernel/src/memory/frame_allocator.rs) 已把 fb 物理区间标为占用，不会被当空闲帧分出去 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO`(21)：把设备 BAR 映射进用户域（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`，[paging::map_mmio](../kernel/src/memory/paging.rs)） |
 | 输出旁路 | 所有内核输出已镜像到 **COM1**（[video/mod.rs serial_*](../kernel/src/video/mod.rs)），headless 回归（`scripts/fs-regress.sh`）依赖它 |
@@ -76,13 +76,34 @@
 - **端到端取证（关键）**：`GFX_OP_BLIT` 在拷完后**回读帧缓冲**抽 5 个点与表面比对，全部相等才回 `1` —— 于是「真的画上去了」在**无显示器**时也可断言（本机 `screendump` 取不到内容，见 G1）。
 - **自测 GS-1**（app）：`ping` → `fill_screen` + `screen_rect` → 建 160×120 表面画四条竖直色带 → 客户端侧回读 → `blit` 到 (16,16)（服务端回读校验）→ 打印 `app: GS1 gfx primitives + shared surface OK (blit verified on framebuffer)`。
 - **能力**：app / shell 各授予 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`。
+- **视觉确认（已完成）**：在带真实显示前端的 QEMU（GTK 窗口 + `-serial file:`）里肉眼核对，屏上正是 GS-1 该有的画面 —— 近黑底 + 左上 `#404060` 矩形 + (16,16) 处 160×120 的红/绿/蓝/黄四条竖色带。G1 里「`screendump` 取到占位表面」的结论只适用于 `-display none` 那套无头截图路径，窗口路径是正常的。
 
-### G3 — 文本渲染外移
+### G3a — 服务内终端 + 文本渲染 ✅ 已完成
 
-- 把 `font.rs` / `unicode.rs` / `cjk.bin` 移到用户态（放 `gfx_srv` 或一个共享 crate），`gfx_srv` 提供 `GFX_TEXT`（含宽窄混排、按显示列排版）。
-- 内核保留**最小 ASCII 字库**，仅服务 panic 与「gfx 未接手」窗口。
-- shell 的输出改走 gfx（经 libmorion::gfx），串口 sink 保留（D6）。
-- **自测 GS-2**：屏幕出现指定中英文文本；与内核旧终端在内容上等价。
+- **字库搬家**：[`font.rs`](../../user/srv/src/gfx/font.rs)（ASCII 8×16 字模表）、[`glyphs.rs`](../../user/srv/src/gfx/glyphs.rs)（UTF-8 解码 + 字形二分查找 + 显示宽度）、[`cjk.bin`](../../user/srv/src/gfx/cjk.bin)（≈276 KB 汉字点阵，`git mv` 进服务）都归 `gfx_srv`；新增 [`gfx/mod.rs`](../../user/srv/src/gfx/mod.rs)（`Fb` 帧缓冲视图，可复制）与 [`gfx/term.rs`](../../user/srv/src/gfx/term.rs)（终端状态）。
+- **分工**：`glyphs` 只回答「某字的第 (row,col) 位亮不亮」，**不碰帧缓冲**；`term` 负责按**显示列**排版（ASCII 1 格、汉字/全角 2 格，宽度取自字库记录）、自动换行、到底滚动、清屏、`\r`/`\t`。
+- **落笔即校验**：终端每画一个字符，都对整格**逐像素**「算出应显示的颜色 → 写入 → 立即读回比对」；任一处不一致就回 0。于是「字真的画到帧缓冲上了」在无显示器时可断言，且帧缓冲映射一旦失效会立刻在回复值里暴露（不再有"静静画到空气里"）。
+- **协议（客户端 [`libmorion::gfx`](../../user/libmorion/src/gfx.rs)）**：`GFX_OP_TEXT`（`buf` = 文本页、`w` = 字节数，写字节数上限 4096）、`GFX_OP_CLEAR`、`GFX_OP_MOVE`（列/行，越界**拒**而不夹取）、`GFX_OP_QUERY`（回 `行<<32 | 列`）。文本经**共享页**传（本域窗口内 +1 MiB 处一页，按域 id 错开），不塞 IPC payload —— 一行可能很长，且 UTF-8 一个字节不一定一列。
+- **内核侧**：G3a 时终端与 `unicode.rs` 暂时保留（G3c 才删），`cjk.bin` 改指用户态那份 —— 一份数据，避免两处漂移；**G3c 已把内核侧那份引用与 CJK 渲染一并删掉**（见下）。`scripts/gen-cjk-font.py --out` 默认输出同步改到 `user/srv/src/gfx/cjk.bin`。
+- **自测 GT-1**（app）：`clear_screen` → 断言光标 `(0,0)` → 写 `"GT-1 "` → 断言光标列 = **5**（5 个 ASCII × 1 列）→ 写 `"汉字宽字符"` → 断言列 = **15**（5 个汉字 × 2 列）→ 混排一行 + `move_cursor(0,20)` 再写一行 → 断言越界 `move_cursor(9999,9999)` 被**拒** → `app: GT1 text console OK (layout cols verified, framebuffer pixel readback matched)`。列数断言同时证明 UTF-8 解码、宽窄混排与光标推进。
+- **视觉确认**：`gfx_srv` 接管后用服务内终端清屏并写横幅，屏上第一行字完全是用户态画的。
+
+### G3b — shell 输出上屏 ✅ 已完成
+
+- **内核**：新增 `SYS_CONSOLE_READY(47)`（无能力要求）—— 回答「显示是否已交用户态」（读 `video::FB_TAKEN_OVER`）。客户端有了它就不必用一次 `SYS_CALL` 去白等图形服务。
+- **运行库**：`libmorion::syscall` 里把打印的唯一出口收成 `sink()`（`SYS_PUTS` + 可选镜像），加 `screen_mirror_on()` 开关；[`gfx::print`](../../user/libmorion/src/gfx.rs) 作为镜像目标。**镜像按进程 opt-in**：只有 shell 打开，自测那种成千上万条打印的路径不受影响（每条多一次 IPC 往返不划算）。
+- **shell**：[shell.rs](../../user/srv/src/shell.rs) 启动时有界等待（上限 `CONSOLE_WAIT_MS = 1000`，到点就退回"只写串口"）→ 确认 `SYS_CONSOLE_READY` 且 `gfx_srv` 有活任务 → 开镜像。于是 shell 的横幅、中文欢迎语、每条命令输出都**同时**进串口（内核终端）与屏幕控制台。
+- **盲测自证**：开镜像后立刻用 `GFX_OP_QUERY` 问服务端光标，`row > 0` 就打印 `shell: screen console mirror OK (gfx_srv cursor advanced)`（这句走 `sys_puts`，只进串口，不占屏幕）—— 没有显示器也能证明"shell 的输出真的写进了 gfx_srv 的终端"。
+- **输入仍可用**：接管只关掉内核的**重绘**（[`redraw`](../../kernel/src/video/mod.rs) / `redraw_input_line` 在接管后为空操作），`term_put` / 退格 / 左右移的**编辑与回车提交照旧执行** —— 否则回车不会把输入行推进队列，阻塞在 `SYS_READLINE` 的 shell 将永远收不到命令（表现为「终端卡死」）。这是接管初期踩过的坑。
+- **已知限制（归 G4）**：内核终端负责的**输入行回显**还没外移，故在屏幕上打字看不见（提示符与命令输出看得见；打字仍能提交、命令仍能执行）。屏幕控制台也不做行级保护 —— 目前只有 shell 一个镜像客户端，暂不会互相顶掉。
+
+### G3c — 内核卸字库、终端降为 ASCII + 豆腐块 ✅ 已完成
+
+- **删了什么**：`unicode.rs` 里的 `cjk.bin` `include_bytes!`（275983 字节）、定长记录/二分查表（`Glyph` / `glyph`）、以及「有字形就按字形宽度排版」那条路径 —— 内核不再携带任何汉字点阵。
+- **留了什么**（接管前那几秒 + panic 屏够用即可）：UTF-8 `decode` / `prev_index` / `next_index`（退格与左右移**不会切开多字节字符**）、`width` / `str_width`（改按**东亚宽度**粗判：ASCII 1 格、汉字类 2 格，与用户态口径一致）、`draw`（ASCII 走 8x16 字模，其余画**空心豆腐块**，宽度仍按 2 格占位）。
+- **实测收益**：内核 ELF `347376 → 70504` 字节（**−276872，约 −80%**）；`cjk.bin` 只剩用户态那一份（`user/srv/src/gfx/cjk.bin`）。
+- **代价（已知且接受）**：`gfx_srv` 接管**之前**那几秒，屏上内核日志里的中文是豆腐块；panic 屏上的中文同理。**COM1 串口全程不变**（`print` 直接写 UTF-8 字节，不经本模块），故 headless 回归与判据完全不受影响。
+- **单测**：`video/unicode.rs` 加 4 条 host 单测（宽度口径 / 混排列数 / 字符边界 / 截断序列），内核单测 16 → **20**。
 
 ### G4（可选后续）— 控制台 / 窗口服务化
 
@@ -95,8 +116,10 @@
 
 1. **G1 帧缓冲授权 + 起屏**（本批第一步，最小闭环）：建域 + 授权 + `gfx_srv` 清屏画图 + 交接开关 + 回归。
 2. **G2 原语 + 共享面 + 客户端库**：`GFX_FILL/RECT/BLIT` + `libmorion::gfx` + 自测 GS-1。
-3. **G3 文本外移**：字库/排版搬家 + `GFX_TEXT` + shell 走 gfx + 自测 GS-2；视实测决定是否上 write-combining（D2）。
-4. **G4（可选）控制台/窗口服务化**：输入行与合成外移，内核降为 panic-only。
+3. **G3a 服务内终端**（✅ 已完成）：字库/排版搬进 `gfx_srv` + `GFX_TEXT/CLEAR/MOVE/QUERY` + 自测 GT-1。
+4. **G3b shell 输出上屏**（✅ 已完成）：`SYS_CONSOLE_READY(47)` + `libmorion` 打印镜像 + shell 开镜像与串口自证。
+5. **G3c 内核减重**（✅ 已完成）：卸掉内核侧字库（−276 KB），终端降为 ASCII + 豆腐块；视实测决定是否上 write-combining（D2）。
+6. **G4（可选）控制台/窗口服务化**：输入行与合成外移，内核降为 panic-only。
 
 ---
 
