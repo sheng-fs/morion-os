@@ -548,19 +548,37 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_PORT_IN8 => {
             // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            // 能力门禁: 端口 I/O 直接操作硬件控制器, 任何域都可以读写是严重的安全缺口 ——
+            // 可导致数据泄露、设备状态破坏、甚至通过写某些端口触发不可预期的硬件行为。
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo) {
+                return 0;
+            }
             let port = a1 as u16;
             unsafe { Port::<u8>::new(port).read() as u64 }
         }
         SYS_PORT_IN16 => {
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo) {
+                return 0;
+            }
             let port = a1 as u16;
             unsafe { Port::<u16>::new(port).read() as u64 }
         }
         SYS_PORT_OUT8 => {
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo) {
+                return 0;
+            }
             let port = a1 as u16;
             unsafe { Port::<u8>::new(port).write(a2 as u8) };
             0
         }
         SYS_PORT_OUT16 => {
+            let domain = crate::scheduler::current_domain();
+            if !crate::cap::has(domain, crate::cap::Capability::PortIo) {
+                return 0;
+            }
             let port = a1 as u16;
             unsafe { Port::<u16>::new(port).write(a2 as u16) };
             0
@@ -625,6 +643,32 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            //
+            // 信任边界: 必须校验 a1 指向用户空间且 a2 在合理范围内, 否则恶意用户态可
+            // 传入内核地址读取内核内存 (信息泄露) 或未映射地址触发内核崩溃。
+            const MAX_PUTS_LEN: u64 = 4096;
+            if a2 == 0 || a2 > MAX_PUTS_LEN {
+                return 0;
+            }
+            if !crate::memory::paging::is_user_address(a1) {
+                return 0;
+            }
+            let end = match a1.checked_add(a2 - 1) {
+                Some(e) => e,
+                None => return 0,
+            };
+            if !crate::memory::paging::is_user_address(end) {
+                return 0;
+            }
+            // 逐页确认全部已映射, 防止内核态缺页 (缺页处理器此刻可能无法正确回退)。
+            let domain = crate::scheduler::current_domain();
+            let mut page = a1 & !0xFFF;
+            while page <= end {
+                if crate::memory::paging::resolve_user_page(domain, page).is_none() {
+                    return 0;
+                }
+                page += 4096;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
             let s = unsafe { core::str::from_utf8_unchecked(slice) };
             crate::video::print(s);

@@ -391,9 +391,10 @@ pub const CAP_KIND_SEND_TO: u64 = 0;
 pub const CAP_KIND_MAP_INTO: u64 = 1;
 pub const CAP_KIND_IRQ: u64 = 2;
 pub const CAP_KIND_MMIO: u64 = 3;
-/// `Spawn` / `Fb` 无参数, `arg` 被忽略 (与内核 `CAP_KIND_*` 一致)。
+/// `Spawn` / `Fb` / `PortIo` 无参数, `arg` 被忽略 (与内核 `CAP_KIND_*` 一致)。
 pub const CAP_KIND_SPAWN: u64 = 4;
 pub const CAP_KIND_FB: u64 = 5;
+pub const CAP_KIND_PORT_IO: u64 = 6;
 
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 `to`, 成功返回 1。
 ///

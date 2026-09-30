@@ -342,6 +342,11 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
     video::println("[OK] IPC + capability + pager initialized (16 domains)");
 
+    // block_domain 需要端口 I/O 能力 (IDE PIO 降级模式: 无 NVMe 控制器时回退到 PIO)。
+    // NVMe 模式下走 MMIO + IRQ, 不使用 PortIo; 但同一服务域需要在两种模式间切换,
+    // 因此无论 NVMe 是否存在都授予这一能力。
+    cap::grant(block_domain, cap::Capability::PortIo);
+
     // 探测 NVMe 控制器并配置 block 域 (文件系统阶段 1: NVMe 块设备后端)。
     // 找到则配置 MSI-X、映射 BAR0/队列/DMA 并授权 Mmio/Irq; 否则降级 (magic=0),
     // block 回退 IDE PIO。

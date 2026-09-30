@@ -30,6 +30,12 @@ pub enum Capability {
     /// 无参数 —— 该能力本身就是"可以造进程"这张凭证。与其它能力一样默认不授予,
     /// 由信任方显式给（引导期给 shell / 自测域）。
     Spawn,
+    /// 执行 x86 `in`/`out` 端口 I/O 指令的能力 (`SYS_PORT_IN*` / `SYS_PORT_OUT*`)。
+    ///
+    /// 无参数 —— 端口 I/O 是 x86 特有的硬件访问通路, 与 MMIO (内存映射 I/O) 不同:
+    /// MMIO 按「设备 BAR 物理基址」逐页授权, 而端口 I/O 覆盖整个 0x0000-0xFFFF 端口空间,
+    /// 不值得按端口号细分。默认不授予, 只给块服务 (IDE PIO 模式) 等确有需要的驱动域。
+    PortIo,
 }
 
 /// 每域能力槽数量。
@@ -45,6 +51,8 @@ pub const CAP_KIND_MMIO: u64 = 3;
 pub const CAP_KIND_SPAWN: u64 = 4;
 /// `Fb` 无参数（帧缓冲全局唯一），`arg` 同样被忽略。
 pub const CAP_KIND_FB: u64 = 5;
+/// `PortIo` 无参数（覆盖整个 x86 端口空间），`arg` 忽略。
+pub const CAP_KIND_PORT_IO: u64 = 6;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -60,6 +68,7 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
         CAP_KIND_SPAWN => Some(Capability::Spawn),
         CAP_KIND_FB => Some(Capability::Fb),
+        CAP_KIND_PORT_IO => Some(Capability::PortIo),
         _ => None,
     }
 }
