@@ -7,7 +7,8 @@
 //! 特性 → 读 MAC → 建 RX/TX virtqueue（环落在内核交出的**连续 DMA 块**里）→ 投 RX 缓冲 →
 //! `DRIVER_OK` → 收帧；MSI-X 表在 BAR1，内核把它另映射给本域（`msix_table_vaddr`），
 //! 驱动写表项 + 注册向量，**中断驱动**收 RX（无中断则回落轮询）。
-//! **N3**：发 ARP 请求 → 收应答（端到端取证）。
+//! **N3**：发广播 ARP 请求问网关 MAC → 收应答（`NET1 virtio-net up, MAC=…, ARP reply OK`，
+//! 端到端取证，同时验证 TX/RX 与中断链路）。
 //!
 //! 内核侧只交出"BAR + DMA 块 + 配置空间只读通道"，设备协议全在本域 —— 这正是 D1/N 的目的。
 
@@ -105,6 +106,15 @@ const BUF_SZ: u64 = 2048;
 const DMA_PAGES: u64 = 8;
 /// 中断模式下 `SYS_IRQ_WAIT` 的超时（毫秒）：超时即回落重扫 used 环，兼顾延迟与兜底。
 const IRQ_WAIT_MS: u64 = 200;
+/// TX 缓冲页（发 ARP 用；排在 RX 缓冲之后的空闲页）。
+const TX_BUF_PAGE: u64 = 6;
+/// virtio-net 包头长度：**modern（`VIRTIO_F_VERSION_1`）恒为 12 字节**
+/// （`num_buffers` 字段总是存在；只有 legacy 且未协商 `MRG_RXBUF` 时才是 10）。
+const VNET_HDR_LEN: u64 = 12;
+/// 自测地址（QEMU user-net 约定：`10.0.2.0/24`，guest `10.0.2.15`，网关 `10.0.2.2`）。
+const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+const GW_IP: [u8; 4] = [10, 0, 2, 2];
+
 /// 一个 ring 页内的子偏移。
 const OFF_AVAIL: u64 = 0x100;
 const OFF_USED: u64 = 0x200;
@@ -134,6 +144,9 @@ struct Caps {
 // 易失 MMIO 读写
 // ===========================================================================
 
+fn rd8(a: u64) -> u8 {
+    unsafe { core::ptr::read_volatile(a as *const u8) }
+}
 fn rd16(a: u64) -> u16 {
     unsafe { core::ptr::read_volatile(a as *const u16) }
 }
@@ -256,6 +269,109 @@ fn notify(c: &Caps, qindex: u16, notify_off: u16) {
     wr16(addr, qindex);
 }
 
+/// 网络序（大端）读 16 位。
+fn be16(a: u64) -> u16 {
+    ((rd8(a) as u16) << 8) | rd8(a + 1) as u16
+}
+
+/// 把一页 DMA 内存清零（环的初始状态：`avail.idx = 0` 等；分配器不保证新帧为 0）。
+fn zero_page(va: u64) {
+    let mut off = 0;
+    while off < PAGE {
+        unsafe { core::ptr::write_volatile((va + off) as *mut u8, 0) };
+        off += 1;
+    }
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+fn put_byte_hex(b: u8) {
+    let d = [HEX[(b >> 4) as usize], HEX[(b & 0xf) as usize]];
+    print(unsafe { core::str::from_utf8_unchecked(&d) });
+}
+/// 按 `aa:bb:cc:dd:ee:ff` 打印 MAC（`mac` 低字节 = 首字节，与 device cfg 读出的一致）。
+fn print_mac(mac: u64) {
+    let mut i = 0;
+    while i < 6 {
+        if i > 0 {
+            print(":");
+        }
+        put_byte_hex(((mac >> (8 * i)) & 0xff) as u8);
+        i += 1;
+    }
+}
+
+/// 在 TX 缓冲里拼一个**广播 ARP 请求**（问 `GW_IP` 的 MAC），返回整帧长度（含 10 字节包头）。
+fn arp_build(buf_va: u64, our_mac: u64) -> u64 {
+    let mut mac = [0u8; 6];
+    let mut i = 0u64;
+    while i < 6 {
+        mac[i as usize] = ((our_mac >> (8 * i)) & 0xff) as u8;
+        i += 1;
+    }
+    // 包头 10 字节清零（无 offload：flags/gso 全 0）。
+    let mut k = 0u64;
+    while k < VNET_HDR_LEN {
+        unsafe { core::ptr::write_volatile((buf_va + k) as *mut u8, 0) };
+        k += 1;
+    }
+    // 以太头：目的 = 广播，源 = 本机 MAC，类型 = 0x0806 (ARP)。
+    let f = buf_va + VNET_HDR_LEN;
+    let mut j = 0u64;
+    while j < 6 {
+        unsafe { core::ptr::write_volatile((f + j) as *mut u8, 0xff) };
+        unsafe { core::ptr::write_volatile((f + 6 + j) as *mut u8, mac[j as usize]) };
+        j += 1;
+    }
+    unsafe {
+        core::ptr::write_volatile((f + 12) as *mut u8, 0x08);
+        core::ptr::write_volatile((f + 13) as *mut u8, 0x06);
+    }
+    // ARP 报文（28 字节）：Ethernet/IPv4，oper=1 (request)，sha/spa = 本机，tpa = 网关。
+    let a = f + 14;
+    let arp: [u8; 28] = [
+        0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3], 0, 0, 0, 0, 0, 0, GW_IP[0], GW_IP[1], GW_IP[2],
+        GW_IP[3],
+    ];
+    let mut m = 0u64;
+    while m < 28 {
+        unsafe { core::ptr::write_volatile((a + m) as *mut u8, arp[m as usize]) };
+        m += 1;
+    }
+    VNET_HDR_LEN + 42
+}
+
+/// 把描述符 0 指向 TX 缓冲并挂上 TX avail 环、敲门铃（本驱动只发单描述符包）。
+fn tx_submit(tx: &Vq, c: &Caps, buf_pa: u64, len: u64) {
+    wr64(tx.desc, buf_pa);
+    wr32(tx.desc + 8, len as u32);
+    wr16(tx.desc + 12, 0); // 设备只读，无 NEXT
+    wr16(tx.desc + 14, 0);
+    let idx = rd16(tx.avail + 2);
+    let slot = (idx as u64) % (tx.size as u64);
+    wr16(tx.avail + 4 + slot * 2, 0);
+    fence();
+    wr16(tx.avail + 2, idx.wrapping_add(1));
+    fence();
+    notify(c, 1, tx.notify_off);
+}
+
+/// 收到的帧是否是网关对 `GW_IP` 的 ARP **应答**（跳过 10 字节 virtio 包头后看以太头/ARP）。
+fn is_gw_arp_reply(buf_va: u64, len: u64) -> bool {
+    if len < VNET_HDR_LEN + 42 {
+        return false;
+    }
+    let eth = buf_va + VNET_HDR_LEN;
+    if be16(eth + 12) != 0x0806 {
+        return false;
+    }
+    let arp = eth + 14;
+    if be16(arp + 6) != 0x0002 {
+        return false; // oper = reply
+    }
+    [rd8(arp + 14), rd8(arp + 15), rd8(arp + 16), rd8(arp + 17)] == GW_IP
+}
+
 /// 配置一个 virtqueue：设置大小、MSI-X 向量下标与三个环的**物理**地址并使之生效。
 ///
 /// `msix_index` 是 MSI-X **表项下标**（`VIRTIO_MSI_NO_VECTOR` = 不给这个队列中断）。
@@ -357,6 +473,10 @@ pub fn run() {
     print_u64(caps.notify_mult as u64);
     println("");
 
+    // 环的初始状态：清零 RX/TX ring 页（分配器不保证新帧为 0，`avail.idx` 必须是 0）。
+    zero_page(g.dma_vaddr + RX_RING_PAGE * PAGE);
+    zero_page(g.dma_vaddr + TX_RING_PAGE * PAGE);
+
     // 1. 复位：写 0 到 device_status，等设备确认（modern 规定 0 = 复位）。
     set_status(&caps, 0);
     let mut spins = 0u32;
@@ -416,7 +536,7 @@ pub fn run() {
         g.dma_paddr + RX_RING_PAGE * PAGE + OFF_AVAIL,
         g.dma_paddr + RX_RING_PAGE * PAGE + OFF_USED,
     );
-    let (tx_size, _tx_noff) = setup_queue(
+    let (tx_size, tx_noff) = setup_queue(
         &caps,
         1,
         Q_SIZE,
@@ -431,6 +551,7 @@ pub fn run() {
         idle();
     }
     let rx = make_vq(&g, RX_RING_PAGE, rx_size, rx_noff);
+    let tx = make_vq(&g, TX_RING_PAGE, tx_size, tx_noff);
 
     print("net: virtio-net up MAC=");
     print_hex(mac);
@@ -488,10 +609,21 @@ pub fn run() {
     );
     println("net: DRIVER_OK, RX buffers posted");
 
+    // 10.5 N3 自测：发一个广播 ARP 请求问网关 MAC（QEMU user-net 会应答）——
+    //      应答回来即证明「TX 通路 + RX 通路 + 中断/轮询」整条链路通。
+    let tx_buf_va = g.dma_vaddr + TX_BUF_PAGE * PAGE;
+    let tx_buf_pa = g.dma_paddr + TX_BUF_PAGE * PAGE;
+    let flen = arp_build(tx_buf_va, mac);
+    tx_submit(&tx, &caps, tx_buf_pa, flen);
+    print("net: ARP request sent for 10.0.2.2 (gateway), frame len=");
+    print_u64(flen);
+    println("");
+
     // 11. 收帧：有中断走中断（快路径 poll + 阻塞 wait，超时回落重扫），否则轮询。
     let mut last_used: u16 = 0;
     let mut rx_frames: u64 = 0;
     let mut irq_hits: u64 = 0;
+    let mut arp_ok = false;
     loop {
         let used_idx = rd16(rx.used + 2);
         let mut drained = 0u32;
@@ -499,9 +631,19 @@ pub fn run() {
             let slot = (last_used as u64) % (rx_size as u64);
             let e = rx.used + 4 + slot * 8;
             let id = rd32(e) as u16;
-            let _len = rd32(e + 4);
+            let len = rd32(e + 4) as u64;
             rx_frames += 1;
             drained += 1;
+            // 先看内容（补投前），命中网关 ARP 应答即打自测标记。
+            if !arp_ok {
+                let buf_va = g.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
+                if is_gw_arp_reply(buf_va, len) {
+                    arp_ok = true;
+                    print("NET1 virtio-net up, MAC=");
+                    print_mac(mac);
+                    println(", ARP reply OK");
+                }
+            }
             // 把同一个描述符补投回 avail 环，缓冲可被复用。
             let ring_slot = (avail_idx as u64) % (rx_size as u64);
             wr16(rx.avail + 4 + ring_slot * 2, id);

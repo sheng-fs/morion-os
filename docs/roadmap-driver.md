@@ -150,9 +150,14 @@
 - 取证：`net: MSI-X prepared vectors=0x53..0x54 table_bar=1 table_vaddr=0x8000840000`、
   `net: MSI-X enabled vectors=0x53..0x54`；NVMe 仍 `irq_cmds=28672 poll_cmds=0`。
 
-#### N3 — 自测（端到端取证）
-- 发一帧 **ARP 请求**（问 QEMU user-net 网关的 MAC）→ 等 **ARP 应答** → 断言收到了长度/类型
-  正确的回帧；串口打 `app:` marker（如 `NET1 virtio-net up, MAC=…, ARP reply OK`）。
+#### N3 — 自测（端到端取证）✅ 已完成
+- `net_srv` 起来后**自己**发一帧**广播 ARP 请求**（问 QEMU user-net 网关 `10.0.2.2` 的 MAC，
+  源 `10.0.2.15`）→ 主循环收帧 → 校验是以太类型 `0x0806`、oper=`reply`、发送方 IP = 网关 →
+  打自测标记 `NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`。这条链路同时验证了
+  **TX（描述符 + avail + 门铃）→ 设备发包 → slirp 应答 → RX（used 环）**整条通路。
+- **踩到的坑**：virtio-net 包头长度对 **modern**（`VIRTIO_F_VERSION_1`）设备恒为 **12 字节**
+  （`num_buffers` 总在；只有 legacy 且未协商 `MRG_RXBUF` 才是 10）。起初按 10 拼包，设备**已发出**
+  （`tx_used=1`）但 slirp 因解包错位丢弃、无应答；改成 12 后立刻收到应答。
 - 驱动起来后即由 `init` 监督（域 16），与其它服务一致。
 
 ### D2 — LibDevice 双形态
@@ -200,7 +205,7 @@
 2. **N0 域表扩容**（✅ 已完成）：`BOOT_DOMAINS` 16 → 17 + boot 侧服务表同步 + `net_srv` 骨架。
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
-5. **N3 网络自测**：ARP 请求 → 应答取证（`NET1`）。
+5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice 双形态**：抽 `libdevice` crate，`block_srv` 改为服务形态消费者。
 7. **D3 virtio-blk**：用通用路径加第二个驱动 + 自测（含 D1b 的运行期 `SYS_DEVICE_*`）。
 8. **D0（可选）I/O 端口能力**。
@@ -222,7 +227,7 @@
 | N1 | 内核找到 virtio-net 并把 `DeviceGrant` 交给域 16：日志有 `[OK] virtio-net modern BAR4=…` 与 `net: device grant …`；全量回归不退化 —— ✅ |
 | N2a | net_srv 读到 MAC、RX/TX virtqueue 建好、`DRIVER_OK`，并能取到帧 —— ✅ `net: virtio-net up MAC=… rx=8 tx=8`、`net: rx frames=1` |
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
-| N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=…, ARP reply OK`） |
+| N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
