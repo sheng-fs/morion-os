@@ -19,6 +19,15 @@ pub enum Capability {
     Irq(u8),
     /// 把指定物理基址 (页对齐) 的 MMIO 区域映射进本域的能力。
     Mmio(u64),
+    /// 访问 I/O 端口区间 `[base, base + len)` 的能力（`SYS_PORT_IN8/IN16/OUT8/OUT16`，D0）。
+    ///
+    /// 端口是**纯平坦地址空间**（没有 MMIO 那种页对齐的"页基址"），故按**半开区间**授权：
+    /// 一次授权覆盖一段连续端口（IDE 的 `0x1F0..0x1F8`、CMOS RTC 的 `0x70..0x72`），
+    /// 而不是像 `Mmio` 那样一页一条 —— 否则 IDE 的 8 个寄存器要占 8 个能力槽。
+    ///
+    /// 与 `Mmio` 同样是**默认不授予**的资源凭证：此前端口 syscall 是**无门禁**的，
+    /// 任何域都能读写任意端口（D0 之前的真实缺口）。
+    IoPort(u16, u16),
     /// 访问**帧缓冲**的能力（`SYS_FB_INFO` / `SYS_FB_MAP` / `SYS_FB_TAKEOVER`）。
     ///
     /// 无参数 —— 帧缓冲是全局唯一资源。与 `Mmio` 的区别：MMIO 能力按「页对齐物理基址」
@@ -45,6 +54,9 @@ pub const CAP_KIND_MMIO: u64 = 3;
 pub const CAP_KIND_SPAWN: u64 = 4;
 /// `Fb` 无参数（帧缓冲全局唯一），`arg` 同样被忽略。
 pub const CAP_KIND_FB: u64 = 5;
+/// `IoPort` 是**二维**的 (base, len)，而 `SYS_CAP_SEND` 只有一个 `arg`，故编码成
+/// `(base << 16) | len`（各占 16 位）。
+pub const CAP_KIND_IO_PORT: u64 = 6;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -60,6 +72,17 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         CAP_KIND_MMIO if arg & 0xFFF == 0 => Some(Capability::Mmio(arg)),
         CAP_KIND_SPAWN => Some(Capability::Spawn),
         CAP_KIND_FB => Some(Capability::Fb),
+        // `IoPort`: `(base << 16) | len`。要求 len != 0、base/len 各占 16 位，
+        // 且 `base + len <= 0x1_0000`（区间不越过端口空间末尾，否则永远匹配不上）。
+        CAP_KIND_IO_PORT if arg >> 32 == 0 && arg & 0xFFFF != 0 => {
+            let base = (arg >> 16) as u16;
+            let len = (arg & 0xFFFF) as u16;
+            if base as u64 + len as u64 <= 0x1_0000 {
+                Some(Capability::IoPort(base, len))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -183,6 +206,27 @@ pub fn handle_drop(domain: u64, handle: u64) -> bool {
 pub fn has(domain: u64, cap: Capability) -> bool {
     let table = CAP_TABLE.lock();
     table[domain as usize].contains(&Some(cap))
+}
+
+/// 域 `domain` 是否持有**覆盖 I/O 端口 `port`** 的能力（D0）。
+///
+/// 与 [`has`] 的**精确匹配**不同：`IoPort` 是区间能力，端口落进任一已授权区间
+/// `[base, base + len)` 即放行。这是 `SYS_PORT_*` 的门禁判据。
+pub fn has_port(domain: u64, port: u16) -> bool {
+    let table = CAP_TABLE.lock();
+    table.get(domain as usize).is_some_and(|slots| {
+        slots.iter().any(|slot| match slot {
+            Some(Capability::IoPort(base, len)) => port_in_range(*base, *len, port),
+            _ => false,
+        })
+    })
+}
+
+/// `port` 是否落在半开区间 `[base, base + len)`（`IoPort` 的匹配判据）。
+///
+/// 纯函数（不碰全局表、不关中断），故可直接单测。
+fn port_in_range(base: u16, len: u16, port: u16) -> bool {
+    port >= base && (port as u32) < base as u32 + len as u32
 }
 
 /// 把 `from` 域句柄槽 `handle` 里的对象标识**移入** `to` 域的空槽,
@@ -347,5 +391,26 @@ mod tests {
         add_domain(1);
         assert!(!has(1, Capability::Spawn));
         assert!(HANDLE_TABLE.lock()[1].iter().all(|slot| slot.is_none()));
+    }
+
+    /// D0: `IoPort` 是**半开区间** `[base, base + len)`；`decode` 用 `(base << 16) | len`
+    /// 编码，对 `len = 0` / 区间越界 / base 超 16 位一律拒绝。
+    ///
+    /// 只测两个纯函数（不碰全局表），避免与上面那条用例在并行单测里互相清表。
+    #[test]
+    fn io_port_range_and_encoding() {
+        assert!(port_in_range(0x1F0, 8, 0x1F0)); // 下界含
+        assert!(port_in_range(0x1F0, 8, 0x1F7)); // 上界 - 1 含
+        assert!(!port_in_range(0x1F0, 8, 0x1F8)); // 上界不含（半开）
+        assert!(!port_in_range(0x1F0, 8, 0x1EF));
+        assert!(!port_in_range(0x70, 2, 0x72));
+
+        assert_eq!(
+            decode(CAP_KIND_IO_PORT, (0x70 << 16) | 2),
+            Some(Capability::IoPort(0x70, 2))
+        );
+        assert_eq!(decode(CAP_KIND_IO_PORT, 0), None); // len = 0
+        assert_eq!(decode(CAP_KIND_IO_PORT, (0xFFFF << 16) | 2), None); // 区间越界
+        assert_eq!(decode(CAP_KIND_IO_PORT, 1 << 32), None); // base 超 16 位
     }
 }

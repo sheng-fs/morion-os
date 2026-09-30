@@ -348,6 +348,14 @@ pub fn sys_port_in8(port: u16) -> u8 {
     unsafe { syscall(SYS_PORT_IN8, port as u64, 0, 0) as u8 }
 }
 
+/// 从 I/O 端口 `port` 读一个字节的**原始返回值**（D0）。
+///
+/// 与 [`sys_port_in8`] 的区别: 不截断成 `u8` —— 无覆盖该端口的 `IoPort` 能力时内核回
+/// `u64::MAX`（端口读只可能是 `0..=0xFF`），自测据此断言"端口门禁生效"。
+pub fn sys_port_in8_raw(port: u16) -> u64 {
+    unsafe { syscall(SYS_PORT_IN8, port as u64, 0, 0) }
+}
+
 /// 从 I/O 端口 `port` 读一个 16 位字。
 pub fn sys_port_in16(port: u16) -> u16 {
     unsafe { syscall(SYS_PORT_IN16, port as u64, 0, 0) as u16 }
@@ -410,6 +418,8 @@ pub const CAP_KIND_MMIO: u64 = 3;
 /// `Spawn` / `Fb` 无参数, `arg` 被忽略 (与内核 `CAP_KIND_*` 一致)。
 pub const CAP_KIND_SPAWN: u64 = 4;
 pub const CAP_KIND_FB: u64 = 5;
+/// `IoPort` (D0): `arg = (base << 16) | len`。
+pub const CAP_KIND_IO_PORT: u64 = 6;
 
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 `to`, 成功返回 1。
 ///

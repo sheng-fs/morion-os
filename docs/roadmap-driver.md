@@ -79,9 +79,11 @@
 
 ## 4. 设计要点
 
-### D0 — I/O 端口能力（可选，低优先）
-- `Capability::IoPort(base, len)` + `SYS_IO_IN(port, width)` / `SYS_IO_OUT(port, width, val)`。
-- 与 `Mmio` 同构：启动期静态授权，运行期逐次校验端口落在授权区间内。
+### D0 — I/O 端口能力 ✅ 已完成
+- `Capability::IoPort(base, len)` + 复用既有的 `SYS_PORT_IN8/IN16/OUT8/OUT16`（22–25，此前**无门禁**）。
+- 与 `Mmio` 同构：启动期静态授权；区别是端口是**纯平坦地址空间**，故按**半开区间** `[base, base+len)` 匹配（`cap::has_port`），而不是像 `Mmio` 那样逐页。
+- 引导期按需授权：`block_srv` `0x1F0..0x1F8`（IDE PIO 回退路径）、`mfs_srv` / `exfat_srv` `0x70..0x72`（CMOS RTC 时间戳）；被拒返回 `u64::MAX`。
+- 取证：`app: D0 port capability gate OK (ungranted I/O port denied)`（app 无 `IoPort`，读 `0x71` 被拒）+ 内核单测（区间半开 / 编码越界拒绝）。
 
 ### D1 — 通用设备授权 ✅ 已完成（boot 路径；运行期 syscall 路径见 D1b）
 - **内核**：把 `nvme.rs` 的设备专属逻辑抽成通用原语 —— 已落地为 [`kernel/src/device.rs`](../kernel/src/device.rs)（**`nvme.rs` 已删除**）：
@@ -223,7 +225,7 @@
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
-8. **D0（可选）I/O 端口能力**。
+8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
 9. **E1 IOMMU (VT-d)**：DMAR + 重映射域 + 越界 DMA 拒绝取证。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
 11. **E3 示例飞地**：直通接管设备，零陷落 + 隔离取证。
@@ -245,6 +247,7 @@
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |
+| D0 | I/O 端口 syscall 加 `IoPort` 门禁：未授权域读写端口被拒，`block_srv` / `mfs_srv` / `exfat_srv` 照常 —— ✅ `app: D0 port capability gate OK (ungranted I/O port denied)`；FS-13/FS-16 仍写得出时间戳（两处授权放行）；内核单测 24/24 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |

@@ -168,6 +168,14 @@ pub fn run() {
     if gs2_gfx_srv_restart().is_none() {
         return;
     }
+    // D0: I/O 端口能力门禁 —— 本域 (app) 未持任何 `IoPort` 能力, 读 CMOS 数据口必须被拒
+    // (内核回 `u64::MAX`; 端口读只可能是 0..=0xFF, 不会与真实值混淆)。反面证据在回归里:
+    // mfs_srv / exfat_srv 仍能写时间戳, 说明持有 0x70..0x72 的域照常放行。
+    if sys_port_in8_raw(0x71) == u64::MAX {
+        println("app: D0 port capability gate OK (ungranted I/O port denied)");
+    } else {
+        println("app: D0 port capability gate FAILED (read a port without IoPort)");
+    }
 
     // 1. open -> read -> close: 读整个文件。
     let fd = vfs::open("/hello.txt");

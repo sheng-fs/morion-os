@@ -337,6 +337,13 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(shell_domain, cap::Capability::MapInto(gfx_domain));
     // 授权: app 可直接给 echo 发控制消息 —— E3c 自测 FS-29 里让 echo 退出, 再看 init 重启它。
     cap::grant(app_domain, cap::Capability::SendTo(echo_domain));
+    // 授权: **I/O 端口区间** (D0) —— 端口 syscall 此前是**无门禁**的 (任何域都能读写任意端口),
+    // 现按"半开区间"授权, 只有真正需要的域拿到自己那一段:
+    //   - block_srv: IDE PIO 数据/命令寄存器 0x1F0..0x1F8 (NVMe 不可用时的回退路径);
+    //   - mfs_srv / exfat_srv: CMOS RTC 索引/数据口 0x70/0x71 (写节点时间戳)。
+    cap::grant(block_domain, cap::Capability::IoPort(0x1F0, 8));
+    cap::grant(mfs_domain, cap::Capability::IoPort(0x70, 2));
+    cap::grant(exfat_domain, cap::Capability::IoPort(0x70, 2));
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
     // 服务自己的暂存页, 不需要共享缓冲, 故只给 SendTo。
     cap::grant(shell_domain, cap::Capability::SendTo(block_domain));

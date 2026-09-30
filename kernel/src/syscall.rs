@@ -563,22 +563,40 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_PORT_IN8 => {
             // 从 I/O 端口 a1 读一个字节 (供用户态设备驱动, 如 IDE PIO)。
+            // D0 门禁: 需持有覆盖该端口的 `IoPort` 能力; 被拒返回 `u64::MAX`
+            // (端口读只可能是 0..=0xFF, 故该哨兵不会与真实值混淆)。
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).read() as u64 }
+            if crate::cap::has_port(crate::scheduler::current_domain(), port) {
+                unsafe { Port::<u8>::new(port).read() as u64 }
+            } else {
+                u64::MAX
+            }
         }
         SYS_PORT_IN16 => {
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).read() as u64 }
+            if crate::cap::has_port(crate::scheduler::current_domain(), port) {
+                unsafe { Port::<u16>::new(port).read() as u64 }
+            } else {
+                u64::MAX
+            }
         }
         SYS_PORT_OUT8 => {
             let port = a1 as u16;
-            unsafe { Port::<u8>::new(port).write(a2 as u8) };
-            0
+            if crate::cap::has_port(crate::scheduler::current_domain(), port) {
+                unsafe { Port::<u8>::new(port).write(a2 as u8) };
+                0
+            } else {
+                u64::MAX
+            }
         }
         SYS_PORT_OUT16 => {
             let port = a1 as u16;
-            unsafe { Port::<u16>::new(port).write(a2 as u16) };
-            0
+            if crate::cap::has_port(crate::scheduler::current_domain(), port) {
+                unsafe { Port::<u16>::new(port).write(a2 as u16) };
+                0
+            } else {
+                u64::MAX
+            }
         }
         SYS_VIRT_TO_PHYS => {
             // 把当前域用户虚拟地址 `a1` 反查为物理地址 (供 NVMe 等 DMA 驱动填 PRP)。
