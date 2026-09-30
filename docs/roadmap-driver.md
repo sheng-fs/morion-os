@@ -36,13 +36,13 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | 只有 **2 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码） |
+| 用户态驱动 | **4 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
 | 域 / 能力 | `SYS_SPAWN_ELF(37)` / `SYS_SPAWN_ELF_AT(41)` / `SYS_SPAWN_ELF_MODULE(43)` / `SYS_DOMAIN_*` / `SYS_FRAME_FREE(40)`；能力系统**可随 IPC 传递**（移交句柄 + 委派） |
 | 设备保留帧 | [frame_allocator::pin_range](../kernel/src/memory/frame_allocator.rs)（G6 引入）：登记"任何路径不得释放"的保留区间 |
-| 服务自愈 | `init` 监督 10 个服务；「同域重启」`restart_in_place` 可用 |
+| 服务自愈 | `init` 监督 11 个服务（含 `net_srv`）；「同域重启」`restart_in_place` 可用（`block_srv` / `virtio_blk_srv` 因内核侧设备映射未登记为保留而暂不监督） |
 
 **缺口**
 
@@ -50,13 +50,13 @@
 - **没有通用 DMA 池原语**：内核直接 `frame_allocator` 分配物理连续帧、写进设备配置结构交出去；用户驱动没有"申请物理连续 DMA 缓冲"的正规通道。
 - **没有 I/O 端口通道**：无 `SYS_IO_IN/OUT`，无 I/O 端口能力 —— 纯 port-mapped 设备（如部分旧网卡/串口）无从下手。
 - **没有设备注册表 / 资源描述标准**：设备命名、BAR 资源、IRQ 的"标准化描述"不存在。
-- **域号已用满**（N0 已扩）：`domain::BOOT_DOMAINS` 原为 16，0..15 全部分配（block=5 / fat32=6 /
-  app=7 / shell=8 / mount=9 / tmpfs=10 / mfs=11 / ext2=12 / exfat=13 / init=14 / gfx=15）。已扩到
-  **17** 给 `net_srv`(16) 腾号（各表是 `Vec` 且按需增长，机制上可行；**boot 侧 `SERVICE_FILES`/
-  模块表已同步**）。再加驱动时继续按需扩。
-- **没有网络驱动**：无网卡驱动、无 PCI 网络类设备查找、无 virtqueue。
+- **域号扩容**（N0 / D3 已做）：`domain::BOOT_DOMAINS` 原为 16，0..15 全部分配（block=5 / fat32=6 /
+  app=7 / shell=8 / mount=9 / tmpfs=10 / mfs=11 / ext2=12 / exfat=13 / init=14 / gfx=15）。**N0** 扩到
+  **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号（各表是 `Vec` 且按需增长，
+  机制上可行；**boot 侧 `SERVICE_FILES`/模块表已同步**）。再加驱动时继续按需扩。
+- **没有网络驱动**（N0–N3 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）。
 - **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**。
-- **没有 LibDevice**：驱动核心逻辑与"服务/直通"运行时未分离。
+- **没有 LibDevice**（D2 已解决首批）：`user/libdevice` 抽出 `grant`/`mmio`/`msix`，三个驱动共用；设备**语义**（vring 等）留 D2b 去重。
 - **没有飞地管理器**、没有 `create_enclave` 之类的内核原语。
 - **没有版本串 / 没有无图形界面构建开关**。
 
@@ -91,8 +91,9 @@
   - `main.rs` 里 NVMe 只剩一条**声明式需求**（`bar_pages: 4 / dma_pages: 7 / msix_vectors: 3`）。
 - **用户态**：[`block_srv`](../user/srv/src/block_srv.rs) 读通用描述后**自行推导队列布局**（`DMA_OFF_*` 页偏移）—— 设备专属知识回到驱动域。
 - **验证**：纯重构，行为零变化 —— 全量 FS 回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds=28672 poll_cmds=0`（MSI 向量段仍 `0x50..0x52`）。
-- **D1b（待做）**：把授权从"boot 期内核代做"变成**运行期 syscall**（`SYS_DEVICE_INFO/GRANT`）—— 这是 virtio-blk 与飞地（E2）真正"不改内核"的前提。
+- **D1b（待做）**：把授权从"boot 期内核代做"变成**运行期 syscall**（`SYS_DEVICE_INFO/GRANT`）。
   - 原计划：`SYS_DEVICE_INFO(pci_addr)` → 回 `vendor/device/class`、各 BAR 的 `(base, len, is_mmio)`、MSI-X 能力位置；`SYS_DEVICE_GRANT(pci_addr, want_irq, want_msix_vectors)` → 建立设备域绑定、回**资源描述结构**。
+  - **现状（D3 起）**：`virtio_blk_srv` 仍走 **boot 期声明式**路径 —— 内核只多了一个按类查找器（`pci::find_virtio_blk`）**与一行声明**（`device::grant`），**没有**任何设备专属逻辑；真正"运行期申请、内核零改动"（飞地 E2 的前提）仍待 D1b。
 
 ### N — 网络驱动（virtio-net，本批主线，**最先做**）
 
@@ -167,13 +168,19 @@
 - **服务形态**：`block_srv`（NVMe）与 `net_srv`（virtio-net）都已链接它 —— 各自删掉重复的
   `DeviceGrant` 镜像 / MMIO 函数 / MSI-X 表项写入，成为纯消费者（服务协议仍在各自进程里）。
 - **直通形态**：飞地应用链接同一个库，运行时直接 MMIO/DMA（E3）。
-- **D2b（待做）**：把设备**语义**（NVMe 队列/协议状态机、virtio vring）也抽成 `libdevice::nvme`
-  / `libdevice::virtio` —— 等有第二个消费者（D3 virtio-blk / E3）时再做，避免过早设计接口。
+- **D2b（待做；D3 已完成 → 现在可做）**：把设备**语义**（NVMe 队列/协议状态机、virtio vring）也抽成 `libdevice::nvme`
+  / `libdevice::virtio` —— `net_srv` 与 `virtio_blk_srv` 已各带一份 vring 代码，公共面可对照着抽（NVMe 侧仍等 E3 飞地消费者）。
 
-### D3 — 第二个真实驱动：virtio-blk（**排在网络之后**）
-- 目的：验证 **D1 通用路径**（新驱动不改内核）+ 给回归加一条独立可自动化的块设备取证。
-- QEMU 原生支持（`-drive if=virtio` / `-device virtio-blk-pci`），virtio 规范简单（legacy/modern 二选一，先 modern）。
-- 自测：挂一块 virtio-blk 盘 → 读第一扇区签名 / 写读回校验 → 串口 marker。
+### D3 — 第二个真实驱动：virtio-blk ✅ 已完成
+- 目的：验证 **D1 通用路径**（内核里没有块设备专属逻辑，只多一个按类查找器 + 一行声明）+ 给回归加一条独立可自动化的块设备取证。
+- QEMU 原生支持（`-device virtio-blk-pci`），走 **virtio-modern**（与 `net_srv` 同款 PCI transport）。
+- 落地：
+  - 内核：`pci::find_virtio_blk`（class `0x01` + vendor `1AF4` + device `1042`/`1001` → BAR4）、`BOOT_DOMAINS` 17 → **18**、`main.rs` 建域 17 + 一行 `device::grant`（`label: "vblk"`, `dma_pages: 8`, `msix_vectors: 2`）。**未加任何 virtio-blk 协议代码**。
+  - 驱动 [`virtio_blk_srv`](../user/srv/src/virtio_blk_srv.rs)（域 17，**self-contained**）：`SYS_DEVICE_CONFIG_READ` 自解析能力 → 复位 → 协商（只接 `VIRTIO_F_VERSION_1`）→ 读容量 → 建**单个**请求队列 → MSI-X（表在 BAR1，表项 0 → 向量 `0x55`）→ `DRIVER_OK`。设备语义 = **三段式描述符链**（header 16B / data 512B / status 1B）。
+  - 自测：读扇区 0 校验宿主预写签名 + 写扇区 1 读回校验 → `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`。
+  - QEMU（`make run-nvme` 与 `scripts/fs-regress.sh`）：加 `-device virtio-blk-pci,drive=vblk0`，测试盘 `build/vblk.img`（1 MiB）扇区 0 由宿主预写已知签名。
+- **踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。
+- **注**：设备语义（vring）在 `net_srv` 与 `virtio_blk_srv` 里**各有一份**，二者的公共面已可对照 —— **D2b** 即去重进 `libdevice::virtio`。
 
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
@@ -211,7 +218,7 @@
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；设备语义（NVMe 队列 / vring）留 D2b。
-7. **D3 virtio-blk**：用通用路径加第二个驱动 + 自测（含 D1b 的运行期 `SYS_DEVICE_*`）。
+7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
 8. **D0（可选）I/O 端口能力**。
 9. **E1 IOMMU (VT-d)**：DMAR + 重映射域 + 越界 DMA 拒绝取证。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
@@ -232,7 +239,7 @@
 | N2a | net_srv 读到 MAC、RX/TX virtqueue 建好、`DRIVER_OK`，并能取到帧 —— ✅ `net: virtio-net up MAC=… rx=8 tx=8`、`net: rx frames=1` |
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
-| D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 |
+| D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |

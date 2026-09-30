@@ -45,7 +45,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -95,6 +95,11 @@ SPARE_MIB     ?= 16
 # 免得把「解析既有分区表」的用例与「改写分区表」的用例搅在一块。
 PT_IMG        ?= $(OUT_DIR)/pt.img
 PT_MIB        ?= 64
+# virtio-blk 测试盘 (驱动路线 D3): 空白 raw, **扇区 0 预写已知签名** —— 第二个真实驱动
+# virtio_blk_srv (域 17) 起来后读扇区 0 校验签名、写扇区 1 再读回, 打 `VBLK1` marker。
+# 盘内容必须确定 (签名是自测判据), 故每次重建而非增量。
+VBLK_IMG      ?= $(OUT_DIR)/vblk.img
+VBLK_MIB      ?= 1
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -299,8 +304,9 @@ run-nokvm: iso
 #   nsid=5 -> $(EXFAT_IMG) (exFAT 读写, 挂载 /usb, 宿主 mkfs.exfat 预格式化)
 #   nsid=6 -> $(SPARE_IMG) (空白盘, 供 `mkfs.mfs` 自测: 格式化后作额外卷挂到 /usb<卷号>)
 #   nsid=7 -> $(PT_IMG)    (空白盘, 供 `part.*` 自测: 建/删 GPT 与 MBR 分区)
+#   另挂一台 virtio-blk ($(VBLK_IMG)) 给域 17 的 virtio_blk_srv (驱动路线 D3) 做块设备自测。
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG)
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG)
 	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
 	$(QEMU) \
 		-machine q35 \
@@ -324,6 +330,8 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device nvme-ns,drive=nvme0n7,bus=nvme0,nsid=7 \
 		-netdev user,id=n0 \
 		-device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
+		-drive file=$(VBLK_IMG),if=none,id=vblk0,format=raw \
+		-device virtio-blk-pci,drive=vblk0 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
@@ -341,6 +349,14 @@ $(SPARE_IMG):
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(SPARE_IMG) bs=1M count=$(SPARE_MIB) status=none
 	@echo "  ✓ 空白盘: $(SPARE_IMG)"
+
+# virtio-blk 测试盘: 空白 raw + 扇区 0 写入已知签名 (供域 17 的 D3 自测读回校验)。
+$(VBLK_IMG):
+	@echo "==> 创建 virtio-blk 测试盘 ($(VBLK_MIB)MiB, 扇区 0 = 签名, 供 D3 自测)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(VBLK_IMG) bs=1M count=$(VBLK_MIB) status=none
+	printf 'MORION-VBLK-TST!' | dd of=$(VBLK_IMG) bs=512 count=1 conv=notrunc,sync status=none
+	@echo "  ✓ virtio-blk 盘: $(VBLK_IMG)"
 
 # MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
 $(MFS_IMG):

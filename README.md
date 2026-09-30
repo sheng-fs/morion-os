@@ -237,10 +237,11 @@
 │           ├── exfat_srv.rs  #     域 13 exFAT 读写
 │           ├── init.rs       #     域 14 监督者 (巡检服务域, 退出后用内存镜像原地重启)
 │           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端)
-│           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N1 已受权, 驱动本体在 N2)
+│           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N3: MSI-X 中断 + ARP 自测)
+│           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     17 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     18 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -364,7 +365,8 @@
 
 ### 阶段四 — 网络与安全（未开始）
 
-- [ ] **网卡驱动（virtio-net）—— 先做**（`net_srv` + 通用设备授权，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N0–N3）
+- [x] **网卡驱动（virtio-net）**（`net_srv` 域 16 + 通用设备授权，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N0–N3：virtio-modern bring-up + MSI-X 中断收帧 + ARP 端到端自测）
+- [x] **第二个真实驱动（virtio-blk）**（`virtio_blk_srv` 域 17，仍走通用设备授权、内核无设备专属逻辑：D3 —— 读签名 / 写读回自测）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎
 
 ### 阶段五 — GUI 与生态（未开始）

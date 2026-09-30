@@ -143,6 +143,25 @@ pub fn find_net(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
+/// 在枚举结果中查找 **virtio-blk** (存储控制器 class `01`, vendor `1AF4`, device `1042`/`1001`),
+/// 返回其 PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
+///
+/// 与 [`find_net`] 同款: 只认 virtio, 只走 modern (MMIO) 路径 —— 新驱动因此仍不改内核设备逻辑。
+pub fn find_virtio_blk(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x01 || d.vendor != 0x1AF4 {
+            continue;
+        }
+        if d.device != 0x1042 && d.device != 0x1001 {
+            continue;
+        }
+        if let Some(bar4) = read_bar(d.bus, d.dev, d.func, 4) {
+            return Some((d.bus, d.dev, d.func, bar4));
+        }
+    }
+    None
+}
+
 /// 读取设备第 `index` 根 BAR (`0..=5`) 的物理基址; `None` = 该 BAR 不存在或为 I/O 空间
 /// (本内核只驱动 MMIO 设备)。
 pub fn read_bar(bus: u8, dev: u8, func: u8, index: u8) -> Option<u64> {

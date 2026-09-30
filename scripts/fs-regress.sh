@@ -30,6 +30,10 @@ dd if=/dev/zero of="$OUT_DIR/spare.img" bs=1M count="${SPARE_MIB:-16}" status=no
 # 分区表测试盘同理: FS-26 会建/删分区表, 保留上一轮的 GPT/MBR 会让「在空白盘上建表」
 # 这条路径没被走到 (FS-26 自己也会先 wipe 一次, 但重置镜像让起点更干净)。
 dd if=/dev/zero of="$OUT_DIR/pt.img" bs=1M count="${PT_MIB:-64}" status=none
+# virtio-blk 测试盘 (驱动路线 D3): 每轮重建 —— 扇区 0 写**已知签名**, 供域 17 的
+# virtio_blk_srv 自测「读扇区 0 校验签名 + 写扇区 1 读回」。盘内容必须确定 (签名是判据)。
+dd if=/dev/zero of="$OUT_DIR/vblk.img" bs=1M count="${VBLK_MIB:-1}" status=none
+printf 'MORION-VBLK-TST!' | dd of="$OUT_DIR/vblk.img" bs=512 count=1 conv=notrunc,sync status=none
 
 # FAT32 卷 (nvme.img) 是**持久卷**, 脚本一直沿用既有的那份 (它同时被交互式验证用)。
 # 但可执行文件加载 (FS-27 / shell `run`) 需要卷根目录里有 hello.mex —— 就地补进去,
@@ -91,6 +95,8 @@ $QEMU \
   -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -drive file="$OUT_DIR/pt.img",if=none,id=n7,format=raw -device nvme-ns,drive=n7,bus=nvme0,nsid=7 \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
+  -drive file="$OUT_DIR/vblk.img",if=none,id=vblk0,format=raw \
+  -device virtio-blk-pci,drive=vblk0 \
   -display none -monitor none -serial file:"$log" -no-reboot ${accel} ${QEMU_EXTRA:-} \
   >/dev/null 2>&1 &
 pid=$!
@@ -132,6 +138,13 @@ if command -v sgdisk >/dev/null 2>&1; then
 else
   echo "  (无 sgdisk, 跳过宿主校验)"
 fi
+# 驱动路线 D3: 第二个真实驱动 virtio-blk 的端到端取证 —— 域 17 的 virtio_blk_srv 起来后
+# 读扇区 0 校验宿主预写的签名 + 写扇区 1 读回校验, 打 `VBLK1` marker。缺 marker (或 sig/rw
+# 不是 ok) 即判失败: 这条链路覆盖描述符链 + avail/used 环 + MSI-X 中断整条通路。
+vblk_bad=0
+echo "== virtio-blk 驱动自测 (D3) =="
+grep -nE 'vblk:|VBLK1' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'VBLK1 virtio-blk OK.*sig=ok.*rw=ok' "$log" 2>/dev/null || vblk_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
@@ -140,4 +153,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ]

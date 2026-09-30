@@ -9,9 +9,9 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：16 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c) 与图形服务 `gfx_srv` (G1) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：18 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与两个设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
-| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) —— `block_srv` 与 `net_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
+| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) —— `block_srv` / `net_srv` / `virtio_blk_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -245,7 +245,7 @@ UEFI 固件
 - `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
 - `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
 - `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
-- `is_boot(id)` / `BOOT_DOMAINS = 17`（**白名单**：引导期服务域 `0..16` 退出时不自动销毁；它们的槽位始终被占用，故「id < 17 即引导域」是稳定不变量。**N0** 由 16 扩到 17，给 `net_srv`(16) 腾号）
+- `is_boot(id)` / `BOOT_DOMAINS = 18`（**白名单**：引导期服务域 `0..17` 退出时不自动销毁；它们的槽位始终被占用，故「id < 18 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
 - `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
 - **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
@@ -381,14 +381,16 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `msix`：`write_table_entry(grant, entry, vector)` —— 写 MSI-X 表项（表所在 BAR 由内核非缓存映射；
   配置空间写仍留在内核，写完后调 `SYS_MSIX_ENABLE`）。
 
-> 设备**语义**（队列环、协议状态机）暂不在此：它们随具体驱动走，等第二个消费者（D3 virtio-blk /
-> E3 飞地）出现再抽进 `libdevice::virtio` / `libdevice::nvme`，避免过早设计不合适的接口。
+> 设备**语义**（队列环、协议状态机）暂不在此：它们随具体驱动走。**D3** 已经出现第二个
+> virtio 消费者（[`virtio_blk_srv`](../../user/srv/src/virtio_blk_srv.rs)，与 `net_srv` 各带一份
+> vring 代码）—— 二者的公共面由此可对照着抽，**D2b** 即把它们去重进 `libdevice::virtio`
+> （NVMe 队列/协议状态机仍等 E3 飞地消费者）。
 
 ### 文件服务与挂载层（用户态）
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv`（共 17 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv`（共 18 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 服务监督者 init（E3c）
 
@@ -396,7 +398,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 - **巡检**：每 40 ms 对一批长期驻留的服务域问一次 `SYS_DOMAIN_ALIVE`（不设内核回调 —— 内核只需要机制，不需要认识"服务"这个用户态概念）。
 - **重启（两个镜像来源）**：发现某个域没有存活任务，**先试引导模块内存镜像**（`SYS_SPAWN_ELF_MODULE(43)`，内核按域号从 E3b 的模块表取，**不依赖磁盘**）；不可用时再回退到 FAT32 根卷的 `/system/services/<name>.elf`（`SYS_SPAWN_ELF_AT(41)`）。两条路都**原地**拉起 —— 域号不变，故 libvfs 里写死的 `FAT32_DOMAIN=6` 那类 ABI 全部照旧；日志会打印来源（`, from memory)` / `, from disk)`）。
-- **监督范围**：`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv / mfs_srv / ext2_srv / exfat_srv / gfx_srv`（10 个）。内存镜像这条路让**文件服务本身**（fat32/mfs）也可被重启，解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。**gfx_srv(15) 于 G6 纳入**（原与 block_srv 同理被排除）：前提是 ① 帧缓冲已登记为内核保留区间（`frame_allocator::pin_range`），`domain::reset` 不再误放显存；② 客户端在服务重启后**重建共享会话**（`morion::gfx` 重发 `SYS_SHARE_PAGE`）且 `ipc::call` 不再永久挂起 —— 见本文件「图形服务 gfx_srv」的 G6 段与 [roadmap-gfx.md](roadmap-gfx.md)。仍刻意不含：**block_srv(5)**（内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些物理帧还给帧分配器 —— 帧缓冲那类保留帧现在挡住了，但 NVMe 的**内核侧映射**还未登记，纳入前仍要先做这件事）与**按设计会正常退出**的 sender / receiver / app / shell（监督它们等于无休止重启）。
+- **监督范围**：`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv / mfs_srv / ext2_srv / exfat_srv / gfx_srv / net_srv`（11 个）。内存镜像这条路让**文件服务本身**（fat32/mfs）也可被重启，解掉"读盘要靠文件服务、文件服务死了没法自救"的鸡生蛋问题。**gfx_srv(15) 于 G6 纳入**（原与 block_srv 同理被排除）：前提是 ① 帧缓冲已登记为内核保留区间（`frame_allocator::pin_range`），`domain::reset` 不再误放显存；② 客户端在服务重启后**重建共享会话**（`morion::gfx` 重发 `SYS_SHARE_PAGE`）且 `ipc::call` 不再永久挂起 —— 见本文件「图形服务 gfx_srv」的 G6 段与 [roadmap-gfx.md](roadmap-gfx.md)。仍刻意不含：**block_srv(5)**（内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些物理帧还给帧分配器 —— 帧缓冲那类保留帧现在挡住了，但 NVMe 的**内核侧映射**还未登记，纳入前仍要先做这件事）、**virtio_blk_srv(17)**（与 block_srv 同理：内核经 `device::grant` 为它映射了 BAR 窗口 + 连续 DMA 帧，这些映射/帧未登记为保留，`reset` 会误回收；驱动本身长驻不退出，无需监督）与**按设计会正常退出**的 sender / receiver / app / shell（监督它们等于无休止重启）。
 - **自测 FS-29**（[user/srv/src/app.rs](../../user/srv/src/app.rs)）：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言域 3 一度"没有存活任务" → 等 init 拉起来 → 断言**域号仍是 3**、能正常回显（`call` 得 `tag+1`）、存活域数不变。
 - **注意**：`SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 只允许"重启"（目标无存活任务），不允许"抢占"；重启用的是 `domain::reset`（清用户地址空间、保留域与它的分页器/能力注册），不是 `domain::destroy`（那会把域号一起交还）。
 - **libvfs 路由**：每个路径操作先经 `mount_lookup(path)` 向 `mount_srv` 查询，回复打包为 `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 挂载点前缀长度`（**M1b** 起含卷编码：0 = 该服务的默认卷，否则 = 卷号 + 1）；`route()` 去掉挂载前缀得到子路径，并把**卷编码写进请求 tag 的高 32 位**（tag 正文仍是 4 字节 ASCII，服务端用 `vfs::tag_body` 剥掉高位 —— 路径类请求因此天然带上目标卷，不必给每个请求结构体加字段）。
@@ -583,3 +585,4 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 62 | **驱动路线 N2b：`net_srv` MSI-X 中断化**：让 D1 的通用授权支持"**MSI-X 表不在设备 BAR 上**"—— `setup_msix` 按 MSI-X 能力的 `BIR` 用 `pci::read_bar` 读出那根 BAR，非缓存地映射到新窗口 **`DEVICE_MSIX_VADDR`**（`USER_BASE + 0x84_0000`，`device.rs`），把窗口基址写进**新增的** `DeviceGrant.msix_table_vaddr`（表与设备 BAR 同根时 = `bar_vaddr`，故 NVMe 行为不变）。[`net_srv`](../../user/srv/src/net_srv.rs)：写 MSI-X 表项（RX→表项 0、TX→表项 1，用 `msix_table_vaddr + msix_table_offset`）→ 设 `queue_msix_vector` → `sys_register_irq` 两条向量 → `SYS_MSIX_ENABLE` → 收帧走**中断**（`SYS_IRQ_POLL` 快路径 + `SYS_IRQ_WAIT` 阻塞，200 ms 超时回落重扫 used 环）；掩码按 `向量段基址 - MSI_VECTOR_BASE`（libmorion 新常量 `0x50`）整体左移 —— **向量段按设备分配**，NVMe 占 `0x50..0x52`、net 占 `0x53..0x54`。**取证**：`net: MSI-X prepared vectors=0x53..0x54 table_bar=1 table_vaddr=0x8000840000`、`dev: MSI-X enabled`、`net: MSI-X enabled vectors=0x53..0x54`；NVMe 完成路径不受影响（`irq_cmds=28672 poll_cmds=0`）；全量回归全绿 | ✅ |
 | 63 | **驱动路线 N3：`net_srv` ARP 端到端自测**：`net_srv` 起来后自发一帧**广播 ARP 请求**（问 QEMU user-net 网关 `10.0.2.2` 的 MAC，源 `10.0.2.15`）→ 主循环收帧 → 校验以太类型 `0x0806` + oper=`reply` + 发送方 IP=网关 → 打 `NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`（同时验证 **TX（描述符 + avail + 门铃）→ 设备发包 → slirp 应答 → RX（used 环）**整条通路）。**踩到的坑**：virtio-net 包头长度对 **modern**（`VIRTIO_F_VERSION_1`）设备恒为 **12 字节**（`num_buffers` 总在；只有 legacy 未协商 `MRG_RXBUF` 才是 10）—— 按 10 拼包时设备**已发出**（`tx_used=1`）但 slirp 解包错位丢帧、无应答，改 12 后立刻收到应答。全量回归仍全绿 | ✅ |
 | 64 | **驱动路线 D2：抽 `libdevice` 公共库（首批：驱动底座）**：新增 crate [`user/libdevice`](../../user/libdevice)（`#![no_std]`，零依赖），把"与我是服务还是飞地应用无关"的底座集中：`grant`（**唯一来源**的 `DeviceGrant` + `DEVICE_CFG_VADDR`/`DEVICE_GRANT_MAGIC` + `load()/is_valid()/page()`）、`mmio`（`rd8/16/32/64`、`wr8/16/32/64`、`fence()`）、`msix`（`write_table_entry`）。`block_srv`（NVMe）与 `net_srv`（virtio-net）**改为消费者**：各自删掉重复的 `DeviceGrant` 镜像、MMIO 读写函数、MSI-X 表项写入；`block_srv` 的 MSI-X 表基址改用 `DeviceGrant.msix_table_vaddr`（NVMe 表在 BAR0，值等于 `bar_vaddr`，行为不变）。workspace `members` / `user/srv` 依赖 / `Makefile` 的 `SRV_SRC` 同步。**验证**：全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found。**注**：设备**语义**（NVMe 队列/协议状态机、virtio vring）留到有第二个消费者时再抽（D2b / 随 D3） | ✅ |
+| 65 | **驱动路线 D3：第二个真实驱动 `virtio_blk_srv`**：用 D1 的**通用设备授权**驱动一台**新类型**设备（virtio-blk），全程**不改内核设备逻辑**。内核侧：`arch/pci.rs` 加 `find_virtio_blk`（存储控制器 class `0x01` + vendor `1AF4` + device `1042`/`1001` → **BAR4**）、`domain::BOOT_DOMAINS` 17 → **18**、`main.rs` 建域 17 并加一条声明式 `device::grant`（`bar_pages: 4 / dma_pages: 8 / msix_vectors: 2 / label: "vblk"`）；引导器 `SERVICE_FILES` / `Makefile` `SRV_NAMES` / `morion-srv` feature+`[[bin]]` / `lib.rs` 同步。驱动 [`virtio_blk_srv.rs`](../../user/srv/src/virtio_blk_srv.rs)（**self-contained**，与 `net_srv` 同款 virtio-modern：通过 `SYS_DEVICE_CONFIG_READ` 自解析能力 → 复位 → 协商（只接 `VIRTIO_F_VERSION_1`）→ 读 device cfg 取**容量** → 建**单个**请求队列（环在通用 DMA 块里）→ MSI-X 中断化（表在 BAR1，表项 0 → 向量 `0x55`）→ `DRIVER_OK`）。设备语义 = **三段式描述符链** `header(16B 设备只读) → data(512B，读时设备可写) → status(1B 设备可写)`；同步等完成（`used.idx` 变化，中断走 poll+wait 快路径、超时兜底）。**自测**：读扇区 0 校验宿主预写签名 + 写扇区 1 读回校验 → `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`。QEMU（`make run-nvme` 与 `scripts/fs-regress.sh`）加 `-drive …id=vblk0 -device virtio-blk-pci,drive=vblk0`，盘（`build/vblk.img`，1 MiB）扇区 0 预写签名（`dd … conv=notrunc,sync`）。**踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 只报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。**验证**：`[OK] 18 service ELFs loaded` + `[OK] virtio-blk modern BAR4=…` + `vblk: MSI-X enabled vector=0x55` + `VBLK1 … sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found。**注**：D2b（vring 去重进 `libdevice::virtio`）现已有两个消费者，可做 | ✅ |

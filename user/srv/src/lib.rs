@@ -62,3 +62,5 @@ pub mod sender;
 pub mod shell;
 #[cfg(feature = "svc-tmpfs_srv")]
 pub mod tmpfs_srv;
+#[cfg(feature = "svc-virtio_blk_srv")]
+pub mod virtio_blk_srv;

@@ -228,10 +228,12 @@ pub extern "C" fn kernel_main() -> ! {
     let gfx_domain = domain::create();
     // 域 16 — net_srv (网络驱动, 驱动路线 N0): 通用设备授权把 virtio-net 交给它 (N1/N2)。
     let net_domain = domain::create();
+    // 域 17 — virtio_blk_srv (块设备驱动, 驱动路线 D3): 同样走通用设备授权, 内核无设备专属逻辑。
+    let blk2_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
-    // 否则访问新域 (如 16 号 net_srv) 会越界 panic。
+    // 否则访问新域 (如 17 号 virtio_blk_srv) 会越界 panic。
     let boot_domains = domain::BOOT_DOMAINS as usize;
     ipc::init(boot_domains);
     cap::init(boot_domains);
@@ -400,6 +402,31 @@ pub extern "C" fn kernel_main() -> ! {
         None => {
             device::grant_empty(net_domain);
             video::println("[OK] no virtio-net controller, net_srv idle");
+        }
+    }
+
+    // 探测 virtio-blk 并通用地授权给域 17（驱动路线 D3: 第二个真实驱动, 仍不改内核设备逻辑）。
+    // virtio-blk 的 modern 配置同样在 BAR4（MSI-X 表在 BAR1）。DMA 8 页: 请求队列环 + 请求/数据缓冲。
+    match arch::pci::find_virtio_blk(&pci_devices) {
+        Some((bus, dev, func, bar4)) => {
+            device::grant(device::GrantRequest {
+                domain: blk2_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar4,
+                bar_pages: 4,
+                dma_pages: 8,
+                msix_vectors: 2,
+                label: "vblk",
+            });
+            video::print("[OK] virtio-blk modern BAR4=0x");
+            video::print_hex(bar4);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(blk2_domain);
+            video::println("[OK] no virtio-blk controller, virtio_blk_srv idle");
         }
     }
 

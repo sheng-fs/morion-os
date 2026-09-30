@@ -42,6 +42,7 @@ default = [
     "svc-init",
     "svc-gfx_srv",
     "svc-net_srv",
+    "svc-virtio_blk_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -60,6 +61,7 @@ svc-exfat_srv = []
 svc-init = []
 svc-gfx_srv = []
 svc-net_srv = []
+svc-virtio_blk_srv = []
 
 [[bin]]
 name = "sender"
@@ -145,6 +147,11 @@ required-features = ["svc-gfx_srv"]
 name = "net_srv"
 path = "src/bin/net_srv.rs"
 required-features = ["svc-net_srv"]
+
+[[bin]]
+name = "virtio_blk_srv"
+path = "src/bin/virtio_blk_srv.rs"
+required-features = ["svc-virtio_blk_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。
