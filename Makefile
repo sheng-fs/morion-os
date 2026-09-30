@@ -166,7 +166,7 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/lib
 
 # 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
 # (内核 `SERVICE_ELFS` 按名 include_bytes!)。用 stamp 让"多产物一次构建"只跑一遍。
-SRV_SRC := $(shell find user/srv user/libmorion -type f 2>/dev/null) user/linker.ld
+SRV_SRC := $(shell find user/srv user/libmorion user/libdevice -type f 2>/dev/null) user/linker.ld
 $(SRV_STAMP): $(SRV_SRC)
 	@echo "==> 构建用户态服务 (E2b: 14 个独立 ELF)..."
 	$(MKDIR) $(SRV_DIR)

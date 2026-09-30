@@ -166,7 +166,7 @@
 ### 当前实际结构
 
 > 项目为 Rust workspace（根 `Cargo.toml`），当前包含 `boot`、`kernel`、`user/srv`、`user/libmorion`、
-> `user/hello`、`kernel_test` 等 crate。内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
+> `user/libdevice`、`user/hello`、`kernel_test` 等 crate。内核之外的全部系统服务（块设备 / 文件系统 / 挂载 / Shell / 键盘驱动等）
 > 都是**各自独立的用户态程序**（`user/srv` 里一个服务一个 `[[bin]]` → 一份独立 ELF），由**引导器
 > 在启动期从 ESP（`EFI/morion/services/`）读入**、经 `BootInfo` 模块表交给内核，内核再把它们
 > 逐个载入各自固定域（E2b：不再是"一份扁平二进制按域 id 分流"；E3b：服务也不再进内核镜像）。
@@ -219,8 +219,9 @@
 │       ├── syscall.rs        #   系统调用入口与编号表
 │       ├── lib.rs
 │       └── main.rs
-├── user/                     # 用户态: 运行库 + 服务程序
+├── user/                     # 用户态: 运行库 + 驱动公共库 + 服务程序
 │   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / libgfx / 入口样板
+│   ├── libdevice/            #   设备驱动公共库 (crate `libdevice`, D2): 设备授权描述 / MMIO 原语 / MSI-X 表
 │   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
 │   └── srv/                  #   系统服务 (crate `morion-srv`): 每个服务一个 [[bin]] → 一份独立 ELF
 │       └── src/

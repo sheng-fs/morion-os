@@ -12,35 +12,10 @@
 //!
 //! 内核侧只交出"BAR + DMA 块 + 配置空间只读通道"，设备协议全在本域 —— 这正是 D1/N 的目的。
 
-use crate::common::USER_DATA_BASE;
+use libdevice::grant::DeviceGrant;
+use libdevice::mmio::{fence, rd16, rd32, rd8, wr16, wr32, wr64, wr8};
+use libdevice::msix;
 use morion::syscall::*;
-
-/// 内核映射到本域的**通用设备授权描述**虚拟地址（见 kernel/src/device.rs, 属 USER_DATA_BASE 区）。
-const DEVICE_CFG_VADDR: u64 = USER_DATA_BASE + 0x1_0000;
-/// 描述结构 magic 校验值（与内核 `device::DEVICE_GRANT_MAGIC` 一致）。
-const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131;
-
-/// 内核写入、用户态读取的**通用设备授权描述**（与 kernel/src/device.rs 布局完全一致）。
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-struct DeviceGrant {
-    magic: u64,
-    bar_paddr: u64,
-    bar_vaddr: u64,
-    bar_bytes: u64,
-    dma_paddr: u64,
-    dma_vaddr: u64,
-    dma_bytes: u64,
-    msix_vector_base: u32,
-    msix_vector_count: u32,
-    msix_table_offset: u32,
-    msix_msg_addr: u32,
-    page_size: u32,
-    _reserved: u32,
-    /// MSI-X 表所在 BAR 映射到本域的虚拟地址（表在该 BAR 的 `msix_table_offset` 处）。
-    msix_table_vaddr: u64,
-}
 
 // ===========================================================================
 // virtio-modern（PCI transport）常量
@@ -141,32 +116,8 @@ struct Caps {
 }
 
 // ===========================================================================
-// 易失 MMIO 读写
+// 易失 MMIO 读写：统一来自 libdevice（D2），本驱动不再自带一份
 // ===========================================================================
-
-fn rd8(a: u64) -> u8 {
-    unsafe { core::ptr::read_volatile(a as *const u8) }
-}
-fn rd16(a: u64) -> u16 {
-    unsafe { core::ptr::read_volatile(a as *const u16) }
-}
-fn rd32(a: u64) -> u32 {
-    unsafe { core::ptr::read_volatile(a as *const u32) }
-}
-fn wr16(a: u64, v: u16) {
-    unsafe { core::ptr::write_volatile(a as *mut u16, v) }
-}
-fn wr32(a: u64, v: u32) {
-    unsafe { core::ptr::write_volatile(a as *mut u32, v) }
-}
-fn wr64(a: u64, v: u64) {
-    unsafe { core::ptr::write_volatile(a as *mut u64, v) }
-}
-
-/// 提交内存写序（写入 avail 之后、通知设备之前）。x86 本就是 TSO，这里只为挡住编译器重排。
-fn fence() {
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
 
 // ===========================================================================
 // PCI 配置空间（只读，经过内核窄接口 `SYS_DEVICE_CONFIG_READ`）
@@ -237,7 +188,7 @@ fn discover_caps(bar_vaddr: u64) -> Option<Caps> {
 // ===========================================================================
 
 fn c_r8(c: &Caps, off: u64) -> u8 {
-    unsafe { core::ptr::read_volatile((c.common + off) as *const u8) }
+    rd8(c.common + off)
 }
 fn c_r16(c: &Caps, off: u64) -> u16 {
     rd16(c.common + off)
@@ -246,7 +197,7 @@ fn c_r32(c: &Caps, off: u64) -> u32 {
     rd32(c.common + off)
 }
 fn c_w8(c: &Caps, off: u64, v: u8) {
-    unsafe { core::ptr::write_volatile((c.common + off) as *mut u8, v) }
+    wr8(c.common + off, v);
 }
 fn c_w16(c: &Caps, off: u64, v: u16) {
     wr16(c.common + off, v)
@@ -278,7 +229,7 @@ fn be16(a: u64) -> u16 {
 fn zero_page(va: u64) {
     let mut off = 0;
     while off < PAGE {
-        unsafe { core::ptr::write_volatile((va + off) as *mut u8, 0) };
+        wr8(va + off, 0);
         off += 1;
     }
 }
@@ -300,7 +251,7 @@ fn print_mac(mac: u64) {
     }
 }
 
-/// 在 TX 缓冲里拼一个**广播 ARP 请求**（问 `GW_IP` 的 MAC），返回整帧长度（含 10 字节包头）。
+/// 在 TX 缓冲里拼一个**广播 ARP 请求**（问 `GW_IP` 的 MAC），返回整帧长度（含 12 字节包头）。
 fn arp_build(buf_va: u64, our_mac: u64) -> u64 {
     let mut mac = [0u8; 6];
     let mut i = 0u64;
@@ -308,24 +259,22 @@ fn arp_build(buf_va: u64, our_mac: u64) -> u64 {
         mac[i as usize] = ((our_mac >> (8 * i)) & 0xff) as u8;
         i += 1;
     }
-    // 包头 10 字节清零（无 offload：flags/gso 全 0）。
+    // 包头 12 字节清零（无 offload：flags/gso 全 0）。
     let mut k = 0u64;
     while k < VNET_HDR_LEN {
-        unsafe { core::ptr::write_volatile((buf_va + k) as *mut u8, 0) };
+        wr8(buf_va + k, 0);
         k += 1;
     }
     // 以太头：目的 = 广播，源 = 本机 MAC，类型 = 0x0806 (ARP)。
     let f = buf_va + VNET_HDR_LEN;
     let mut j = 0u64;
     while j < 6 {
-        unsafe { core::ptr::write_volatile((f + j) as *mut u8, 0xff) };
-        unsafe { core::ptr::write_volatile((f + 6 + j) as *mut u8, mac[j as usize]) };
+        wr8(f + j, 0xff);
+        wr8(f + 6 + j, mac[j as usize]);
         j += 1;
     }
-    unsafe {
-        core::ptr::write_volatile((f + 12) as *mut u8, 0x08);
-        core::ptr::write_volatile((f + 13) as *mut u8, 0x06);
-    }
+    wr8(f + 12, 0x08);
+    wr8(f + 13, 0x06);
     // ARP 报文（28 字节）：Ethernet/IPv4，oper=1 (request)，sha/spa = 本机，tpa = 网关。
     let a = f + 14;
     let arp: [u8; 28] = [
@@ -335,7 +284,7 @@ fn arp_build(buf_va: u64, our_mac: u64) -> u64 {
     ];
     let mut m = 0u64;
     while m < 28 {
-        unsafe { core::ptr::write_volatile((a + m) as *mut u8, arp[m as usize]) };
+        wr8(a + m, arp[m as usize]);
         m += 1;
     }
     VNET_HDR_LEN + 42
@@ -400,20 +349,6 @@ fn setup_queue(
     (size, c_r16(c, C_Q_NOTIFY_OFF))
 }
 
-/// 写一条 MSI-X 表项：消息地址 + 数据（= 中断向量号）+ 不屏蔽。
-///
-/// 表在**内核额外映射给本域的那根 BAR** 上（N2b：virtio-net 的表在 BAR1，窗口基址来自
-/// `DeviceGrant.msix_table_vaddr`）—— 内核到不了这个 BAR，故配置空间写留在内核、表由驱动写。
-fn write_msix_entry(g: &DeviceGrant, entry: u16, vector: u16) {
-    let p = (g.msix_table_vaddr + g.msix_table_offset as u64 + entry as u64 * 16) as *mut u32;
-    unsafe {
-        core::ptr::write_volatile(p, g.msix_msg_addr); // 消息地址 (低 32 位)
-        core::ptr::write_volatile(p.add(1), 0); // 消息地址 (高 32 位); 物理目的模式恒 0
-        core::ptr::write_volatile(p.add(2), vector as u32); // 消息数据 = 中断向量
-        core::ptr::write_volatile(p.add(3), 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
-    }
-}
-
 /// 建一个 virtqueue 的坐标（环都排在 `dma_vaddr` 的 `ring_page` 那页）。
 fn make_vq(g: &DeviceGrant, ring_page: u64, size: u16, notify_off: u16) -> Vq {
     let page_va = g.dma_vaddr + ring_page * PAGE;
@@ -446,8 +381,8 @@ fn idle() -> ! {
 
 /// 域 16 — net_srv：virtio-net modern 驱动（N2）。
 pub fn run() {
-    let g = unsafe { core::ptr::read_volatile(DEVICE_CFG_VADDR as *const DeviceGrant) };
-    if g.magic != DEVICE_GRANT_MAGIC {
+    let g = DeviceGrant::load();
+    if !g.is_valid() {
         println("net: no device grant (no virtio-net), idle");
         idle();
     }
@@ -568,8 +503,8 @@ pub fn run() {
     let mut irq_vectors: u64 = 0;
     let mut irq_mask: u64 = 0;
     if want_irq {
-        write_msix_entry(&g, 0, irq_base);
-        write_msix_entry(&g, 1, irq_base + 1);
+        msix::write_table_entry(&g, 0, irq_base as u64);
+        msix::write_table_entry(&g, 1, (irq_base + 1) as u64);
         let r0 = sys_register_irq(irq_base as u64);
         let r1 = sys_register_irq((irq_base + 1) as u64);
         if sys_msix_enable() == 1 && r0 == 1 && r1 == 1 {

@@ -149,3 +149,5 @@ required-features = ["svc-net_srv"]
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。
 morion = { path = "../libmorion" }
+# 设备驱动公共库 (D2): 通用设备授权描述 / MMIO 原语 / MSI-X 表。
+libdevice = { path = "../libdevice" }

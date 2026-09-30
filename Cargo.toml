@@ -14,6 +14,8 @@ members = [
     "kernel_test",
     # 用户态运行库 (libmorion): 所有用户程序共用的 syscall 封装 / 打印 / libvfs / 入口样板。
     "user/libmorion",
+    # 用户态设备驱动公共库 (LibDevice, D2): 通用设备授权描述 / MMIO 原语 / MSI-X 表。
+    "user/libdevice",
     # 可执行文件加载的演示程序 (E1): 独立 crate → 独立 ELF, 由 SYS_SPAWN_ELF 运行时载入。
     "user/hello",
     # 用户态系统服务 (E2b): 14 个服务各自独立 crate → 各自独立 ELF。

@@ -11,6 +11,7 @@
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
 | `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：16 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c) 与图形服务 `gfx_srv` (G1) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
+| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) —— `block_srv` 与 `net_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -359,6 +360,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - 库**不传链接参数**：`-T user/linker.ld` 与 `-nostdlib` 由每个程序的 `build.rs` 声明。
 
 `exec::spawn_file(path)` 的链路：`vfs::open` → 分块读进本域内存 → `SYS_SPAWN_ELF`。
+
 两个实现细节值得记：
 
 1. **经一页"中转页"而不是直接读进暂存区**：文件服务是把数据写进调用方指定的那一页（同地址共享），
@@ -367,6 +369,20 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 2. **对同一 (页, 域) 只能 `share_page` 一次**（重复映射会撞内核 `map_user_page` 的
    `PageAlreadyMapped` panic），故用一张按域 id 置位的位图记住已共享过谁；`sys_alloc_page`
    同理要用 `sys_virt_to_phys != 0` 先判断"已映射"，否则第二次 `run` 会 panic。
+
+### 用户态设备驱动公共库 libdevice（[user/libdevice](../../user/libdevice)，D2）
+
+驱动**不感知自己被谁包裹**的那部分底座：服务形态（`block_srv` 对外暴露 IPC）与直通形态
+（飞地应用直接 MMIO/DMA）都链接它。当前三个模块：
+
+- `grant`：`DeviceGrant`（与内核 `device.rs` 逐字段对齐的 `#[repr(C)]` 结构）+ `DEVICE_CFG_VADDR`
+  / `DEVICE_GRANT_MAGIC` + `DeviceGrant::load()` / `is_valid()` / `page()` —— 各驱动不再各抄一份。
+- `mmio`：`rd8/16/32/64`、`wr8/16/32/64`（易失 MMIO/DMA 读写）+ `fence()`（写序栅栏）。
+- `msix`：`write_table_entry(grant, entry, vector)` —— 写 MSI-X 表项（表所在 BAR 由内核非缓存映射；
+  配置空间写仍留在内核，写完后调 `SYS_MSIX_ENABLE`）。
+
+> 设备**语义**（队列环、协议状态机）暂不在此：它们随具体驱动走，等第二个消费者（D3 virtio-blk /
+> E3 飞地）出现再抽进 `libdevice::virtio` / `libdevice::nvme`，避免过早设计不合适的接口。
 
 ### 文件服务与挂载层（用户态）
 
@@ -566,3 +582,4 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 61 | **驱动路线 N2a：`net_srv` virtio-net bring-up + 轮询取帧**：新增内核窄接口 **`SYS_DEVICE_CONFIG_READ(50)`** + `device::config_read`：内核按 `domain → bus/dev/func` 绑定表（`grant` 时登记）只放行"读**自己那台**设备"的配置空间 dword，驱动据此**自行解析** virtio PCI 能力（common/notify/ISR/device 四个区域都在内核交给的 BAR 里；notify 另读 `notify_off_multiplier`），内核因此**不必懂 virtio 协议**。[`net_srv`](../../user/srv/src/net_srv.rs)：复位（写 0 等确认）→ `ACKNOWLEDGE|DRIVER` → 读设备特性并只接子集（必须 `VIRTIO_F_VERSION_1`，另取 `VIRTIO_NET_F_MAC`）→ `FEATURES_OK`（回读校验）→ 读 device cfg 取 **MAC** → 建 RX(0)/TX(1) virtqueue（desc/avail/used 三环排在内核交出的**连续 DMA 块**里，深度 8，环地址写**物理**地址）→ 投满 RX 缓冲 → `DRIVER_OK` → 轮询 used 环取帧 + 补投 + 统计。**取证**：`net: virtio-net up MAC=563412005452 num_queues=3 rx=8 tx=8`、`net: DRIVER_OK, RX buffers posted`，且回归里**真的收到帧**（`net: rx frames=1`）；全量回归不退化（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`17 service ELFs`、`irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found）。**缺口（→ N2b）**：MSI-X 表在 BAR1，尚未中断化（现降级轮询） | ✅ |
 | 62 | **驱动路线 N2b：`net_srv` MSI-X 中断化**：让 D1 的通用授权支持"**MSI-X 表不在设备 BAR 上**"—— `setup_msix` 按 MSI-X 能力的 `BIR` 用 `pci::read_bar` 读出那根 BAR，非缓存地映射到新窗口 **`DEVICE_MSIX_VADDR`**（`USER_BASE + 0x84_0000`，`device.rs`），把窗口基址写进**新增的** `DeviceGrant.msix_table_vaddr`（表与设备 BAR 同根时 = `bar_vaddr`，故 NVMe 行为不变）。[`net_srv`](../../user/srv/src/net_srv.rs)：写 MSI-X 表项（RX→表项 0、TX→表项 1，用 `msix_table_vaddr + msix_table_offset`）→ 设 `queue_msix_vector` → `sys_register_irq` 两条向量 → `SYS_MSIX_ENABLE` → 收帧走**中断**（`SYS_IRQ_POLL` 快路径 + `SYS_IRQ_WAIT` 阻塞，200 ms 超时回落重扫 used 环）；掩码按 `向量段基址 - MSI_VECTOR_BASE`（libmorion 新常量 `0x50`）整体左移 —— **向量段按设备分配**，NVMe 占 `0x50..0x52`、net 占 `0x53..0x54`。**取证**：`net: MSI-X prepared vectors=0x53..0x54 table_bar=1 table_vaddr=0x8000840000`、`dev: MSI-X enabled`、`net: MSI-X enabled vectors=0x53..0x54`；NVMe 完成路径不受影响（`irq_cmds=28672 poll_cmds=0`）；全量回归全绿 | ✅ |
 | 63 | **驱动路线 N3：`net_srv` ARP 端到端自测**：`net_srv` 起来后自发一帧**广播 ARP 请求**（问 QEMU user-net 网关 `10.0.2.2` 的 MAC，源 `10.0.2.15`）→ 主循环收帧 → 校验以太类型 `0x0806` + oper=`reply` + 发送方 IP=网关 → 打 `NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`（同时验证 **TX（描述符 + avail + 门铃）→ 设备发包 → slirp 应答 → RX（used 环）**整条通路）。**踩到的坑**：virtio-net 包头长度对 **modern**（`VIRTIO_F_VERSION_1`）设备恒为 **12 字节**（`num_buffers` 总在；只有 legacy 未协商 `MRG_RXBUF` 才是 10）—— 按 10 拼包时设备**已发出**（`tx_used=1`）但 slirp 解包错位丢帧、无应答，改 12 后立刻收到应答。全量回归仍全绿 | ✅ |
+| 64 | **驱动路线 D2：抽 `libdevice` 公共库（首批：驱动底座）**：新增 crate [`user/libdevice`](../../user/libdevice)（`#![no_std]`，零依赖），把"与我是服务还是飞地应用无关"的底座集中：`grant`（**唯一来源**的 `DeviceGrant` + `DEVICE_CFG_VADDR`/`DEVICE_GRANT_MAGIC` + `load()/is_valid()/page()`）、`mmio`（`rd8/16/32/64`、`wr8/16/32/64`、`fence()`）、`msix`（`write_table_entry`）。`block_srv`（NVMe）与 `net_srv`（virtio-net）**改为消费者**：各自删掉重复的 `DeviceGrant` 镜像、MMIO 读写函数、MSI-X 表项写入；`block_srv` 的 MSI-X 表基址改用 `DeviceGrant.msix_table_vaddr`（NVMe 表在 BAR0，值等于 `bar_vaddr`，行为不变）。workspace `members` / `user/srv` 依赖 / `Makefile` 的 `SRV_SRC` 同步。**验证**：全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found。**注**：设备**语义**（NVMe 队列/协议状态机、virtio vring）留到有第二个消费者时再抽（D2b / 随 D3） | ✅ |

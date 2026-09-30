@@ -1,0 +1,11 @@
+[package]
+name = "libdevice"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 用户态设备驱动公共库 (LibDevice): 通用设备授权描述 / MMIO 原语 / MSI-X 表"
+
+[lib]
+name = "libdevice"
+path = "src/lib.rs"

@@ -160,11 +160,15 @@
   （`tx_used=1`）但 slirp 因解包错位丢弃、无应答；改成 12 后立刻收到应答。
 - 驱动起来后即由 `init` 监督（域 16），与其它服务一致。
 
-### D2 — LibDevice 双形态
-- 新 crate `user/libdevice/`：把驱动核心（寄存器定义、队列环、协议状态机）做成**不依赖"我在服务进程还是应用里"**的库。
-- **服务形态**：`block_srv` 链接它，对外暴露 IPC 协议（现状）。
-- **直通形态**：飞地应用链接它，运行时直接 MMIO/DMA（E3）。
-- 先拿 NVMe 把两种形态都跑通，再抽 virtio-blk。
+### D2 — LibDevice 双形态 ✅ 首批已完成（驱动底座）
+- 新 crate [`user/libdevice/`](../../user/libdevice)（`#![no_std]`，零依赖）：把**与"我在服务进程
+  还是飞地应用"无关**的底座集中 —— `grant`（唯一来源的 `DeviceGrant` + 地址/magic + `load/is_valid/page`）、
+  `mmio`（易失读写原语 + `fence`）、`msix`（表项写入）。
+- **服务形态**：`block_srv`（NVMe）与 `net_srv`（virtio-net）都已链接它 —— 各自删掉重复的
+  `DeviceGrant` 镜像 / MMIO 函数 / MSI-X 表项写入，成为纯消费者（服务协议仍在各自进程里）。
+- **直通形态**：飞地应用链接同一个库，运行时直接 MMIO/DMA（E3）。
+- **D2b（待做）**：把设备**语义**（NVMe 队列/协议状态机、virtio vring）也抽成 `libdevice::nvme`
+  / `libdevice::virtio` —— 等有第二个消费者（D3 virtio-blk / E3）时再做，避免过早设计接口。
 
 ### D3 — 第二个真实驱动：virtio-blk（**排在网络之后**）
 - 目的：验证 **D1 通用路径**（新驱动不改内核）+ 给回归加一条独立可自动化的块设备取证。
@@ -206,7 +210,7 @@
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
-6. **D2 LibDevice 双形态**：抽 `libdevice` crate，`block_srv` 改为服务形态消费者。
+6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；设备语义（NVMe 队列 / vring）留 D2b。
 7. **D3 virtio-blk**：用通用路径加第二个驱动 + 自测（含 D1b 的运行期 `SYS_DEVICE_*`）。
 8. **D0（可选）I/O 端口能力**。
 9. **E1 IOMMU (VT-d)**：DMAR + 重映射域 + 越界 DMA 拒绝取证。

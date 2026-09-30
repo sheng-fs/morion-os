@@ -1,37 +1,11 @@
 use crate::common::*;
+use libdevice::grant::DeviceGrant;
+use libdevice::mmio::{rd32, rd64, wr32, wr64};
 use morion::syscall::*;
 
 // ===========================================================================
 // 域 5 — NVMe 块设备驱动服务 (文件系统阶段 1)
 // ===========================================================================
-
-/// 内核映射到本域的**通用设备授权描述**虚拟地址 (见 kernel/src/device.rs, 属 USER_DATA_BASE 区)。
-const DEVICE_CFG_VADDR: u64 = USER_DATA_BASE + 0x1_0000;
-/// 描述结构 magic 校验值 (与内核 `device::DEVICE_GRANT_MAGIC` 一致)。
-const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131;
-
-/// 内核写入、用户态读取的**通用设备授权描述** (与 kernel/src/device.rs 布局完全一致)。
-///
-/// D1 起内核不再知道 NVMe 的事: 它只交出"BAR + DMA 块 + MSI-X 参数", 队列怎么排、协议怎么走
-/// 全由驱动决定 —— 这就是"加新驱动不必改内核"的前提。
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-struct DeviceGrant {
-    magic: u64,
-    bar_paddr: u64,
-    bar_vaddr: u64,
-    bar_bytes: u64,
-    dma_paddr: u64,
-    dma_vaddr: u64,
-    dma_bytes: u64,
-    msix_vector_base: u32,
-    msix_vector_count: u32,
-    msix_table_offset: u32,
-    msix_msg_addr: u32,
-    page_size: u32,
-    _reserved: u32,
-}
 
 /// 页大小 (字节)。
 const PAGE: u64 = 4096;
@@ -81,8 +55,10 @@ struct NvmeConfig {
     /// 完成队列 `i` 用向量 `msix_vector + i`, 也对应掩码里的位 `i` —— 于是「哪条队列
     /// 完成了」既能从 `SYS_IRQ_WAIT` 返回的向量号看出来, 也能直接从队列下标对上。
     msix_vector: u32,
-    /// MSI-X 表相对 BAR0 的字节偏移 (表在 BAR0 内, 已随 BAR0 映射到本域)。
+    /// MSI-X 表相对**其所在 BAR** 的字节偏移。
     msix_table_offset: u32,
+    /// MSI-X 表所在 BAR 映射到本域的虚拟地址 (NVMe 的表在 BAR0, 故等于 `mmio_vaddr`)。
+    msix_table_vaddr: u64,
     /// MSI-X 中断消息地址 (低 32 位; 物理目的模式, 高 32 位恒 0)。
     msix_addr: u32,
     /// 内核分配的 MSI-X 向量条数 (0 = 未启用)。
@@ -119,6 +95,7 @@ fn config_from_grant(g: &DeviceGrant) -> NvmeConfig {
         page_size: g.page_size,
         msix_vector: g.msix_vector_base,
         msix_table_offset: g.msix_table_offset,
+        msix_table_vaddr: g.msix_table_vaddr,
         msix_addr: g.msix_msg_addr,
         msix_vector_count: g.msix_vector_count,
     }
@@ -209,37 +186,21 @@ struct Cqe {
     sf: u16,  // bytes 14-15: status field, bit0 = phase, bit1.. = status code
 }
 
-/// 易失 MMIO 读/写 (寄存器映射为非缓存, 必须用 volatile)。
-fn rd32(addr: u64) -> u32 {
-    unsafe { core::ptr::read_volatile(addr as *const u32) }
-}
-fn rd64(addr: u64) -> u64 {
-    unsafe { core::ptr::read_volatile(addr as *const u64) }
-}
-fn wr32(addr: u64, val: u32) {
-    unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
-}
-fn wr64(addr: u64, val: u64) {
-    unsafe { core::ptr::write_volatile(addr as *mut u64, val) }
-}
+// 易失 MMIO 读/写 (`rd32` / `rd64` / `wr32` / `wr64`) 统一来自 libdevice (D2)。
 
 /// 写 MSI-X 表项 `entry`: 消息地址 + 数据 (= 向量) + 清屏蔽位。
 ///
 /// 完成队列 `i` 用表项 `i` 与向量 `msix_vector + i` —— 表项下标与 `Create I/O CQ` 里的
 /// IV 字段必须对上, 于是「哪条队列完成」直接由投递的向量区分 (阶段 40 多向量)。
 ///
-/// 表在 BAR0 内 (已非缓存地映射到本域), 由**本驱动**写: 那个 BAR 由固件分配在 4 GiB
-/// 以上, 内核自己的地址空间到不了它, 而按微内核分工设备 MMIO 本就属于驱动。
-/// 内核负责的是写完之后打开 MSI-X (配置空间) 与 LAPIC/向量段。
+/// 表所在 BAR 已由内核非缓存地映射给本域 (`msix_table_vaddr`; NVMe 的表在 BAR0, 故与
+/// `mmio_vaddr` 相同), 由**本驱动**写。内核负责的是写完之后打开 MSI-X (配置空间) 与 LAPIC/向量段。
 fn write_msix_table_entry(cfg: &NvmeConfig, entry: usize, vector: u64) {
-    let base = cfg.mmio_vaddr + cfg.msix_table_offset as u64 + entry as u64 * 16;
-    let p = base as *mut u32;
-    unsafe {
-        core::ptr::write_volatile(p, cfg.msix_addr); // 消息地址 (低 32 位)
-        core::ptr::write_volatile(p.add(1), 0); // 消息地址 (高 32 位); 物理目的模式恒 0
-        core::ptr::write_volatile(p.add(2), vector as u32); // 消息数据 = 中断向量
-        core::ptr::write_volatile(p.add(3), 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
-    }
+    let base = cfg.msix_table_vaddr + cfg.msix_table_offset as u64 + entry as u64 * 16;
+    wr32(base, cfg.msix_addr); // 消息地址 (低 32 位)
+    wr32(base + 4, 0); // 消息地址 (高 32 位); 物理目的模式恒 0
+    wr32(base + 8, vector as u32); // 消息数据 = 中断向量
+    wr32(base + 12, 0); // 向量控制: bit0=1 屏蔽 → 0 = 不屏蔽
     print("nvme: MSI-X table[");
     print_u64(entry as u64);
     print("] programmed addr=0x");
@@ -709,8 +670,8 @@ fn nvme_ns_sectors_of(nsid: u32) -> u32 {
 fn nvme_main() {
     // 读通用设备授权描述 (内核已映射到本域)。magic 不对 = 内核没授权 (无控制器), 优雅退出;
     // DMA 块不够本驱动排 7 页也当作没授权 —— 布局由本驱动决定, 故这里也要自己验。
-    let g = unsafe { core::ptr::read_volatile(DEVICE_CFG_VADDR as *const DeviceGrant) };
-    if g.magic != DEVICE_GRANT_MAGIC {
+    let g = DeviceGrant::load();
+    if !g.is_valid() {
         println("nvme: no device grant, aborting");
         return;
     }
@@ -2479,8 +2440,9 @@ fn nvme_part_create(
 /// 接收 `BlockReq` (op/lba/count/buf), 读扇区写入调用方共享的缓冲页,
 /// 回复状态 tag (1=成功, 0=失败)。数据经共享页零拷贝回传, IPC 仅传控制信息。
 pub fn run() {
-    let magic = unsafe { core::ptr::read_volatile(DEVICE_CFG_VADDR as *const u64) };
-    if magic == DEVICE_GRANT_MAGIC {
+    let magic =
+        unsafe { core::ptr::read_volatile(libdevice::grant::DEVICE_CFG_VADDR as *const u64) };
+    if magic == libdevice::grant::DEVICE_GRANT_MAGIC {
         nvme_main();
     } else {
         ide_block_main();
