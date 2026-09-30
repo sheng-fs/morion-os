@@ -11,7 +11,7 @@
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
 | `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：18 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与两个设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
-| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) —— `block_srv` / `net_srv` / `virtio_blk_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
+| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -370,21 +370,25 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
    `PageAlreadyMapped` panic），故用一张按域 id 置位的位图记住已共享过谁；`sys_alloc_page`
    同理要用 `sys_virt_to_phys != 0` 先判断"已映射"，否则第二次 `run` 会 panic。
 
-### 用户态设备驱动公共库 libdevice（[user/libdevice](../../user/libdevice)，D2）
+### 用户态设备驱动公共库 libdevice（[user/libdevice](../../user/libdevice)，D2 / D2b）
 
 驱动**不感知自己被谁包裹**的那部分底座：服务形态（`block_srv` 对外暴露 IPC）与直通形态
-（飞地应用直接 MMIO/DMA）都链接它。当前三个模块：
+（飞地应用直接 MMIO/DMA）都链接它。当前四个模块：
 
 - `grant`：`DeviceGrant`（与内核 `device.rs` 逐字段对齐的 `#[repr(C)]` 结构）+ `DEVICE_CFG_VADDR`
   / `DEVICE_GRANT_MAGIC` + `DeviceGrant::load()` / `is_valid()` / `page()` —— 各驱动不再各抄一份。
 - `mmio`：`rd8/16/32/64`、`wr8/16/32/64`（易失 MMIO/DMA 读写）+ `fence()`（写序栅栏）。
 - `msix`：`write_table_entry(grant, entry, vector)` —— 写 MSI-X 表项（表所在 BAR 由内核非缓存映射；
   配置空间写仍留在内核，写完后调 `SYS_MSIX_ENABLE`）。
+- `virtio`（**D2b**）：virtio **modern（PCI transport）传输层 + vring 原语** —— `discover_caps`
+  （遍历能力链表解出 common/notify/ISR/device 四个区域）、`Caps`（common cfg 寄存器读写 + `reset`/
+  `negotiate`/`failed`/`driver_ok`/`notify`/`read_isr`/`set_config_msix`）、`zero_page`、`setup_queue`、
+  `Vq`（`set_desc`/`avail_push`/`kick`/`used_idx`/`used_elem`）。`net_srv` 与 `virtio_blk_srv` 共用。
+  `discover_caps` 把「读 PCI 配置空间」做成**参数**（`Fn(u32) -> u32`）而非依赖 `morion`，本库因此
+  仍是**零依赖** —— 飞地直通形态（E3）原样复用。
 
-> 设备**语义**（队列环、协议状态机）暂不在此：它们随具体驱动走。**D3** 已经出现第二个
-> virtio 消费者（[`virtio_blk_srv`](../../user/srv/src/virtio_blk_srv.rs)，与 `net_srv` 各带一份
-> vring 代码）—— 二者的公共面由此可对照着抽，**D2b** 即把它们去重进 `libdevice::virtio`
-> （NVMe 队列/协议状态机仍等 E3 飞地消费者）。
+> 只抽「**所有 virtio 设备都一样**」的那层；**设备语义**（网卡的包头/ARP、块设备的请求链）仍在
+> 各自驱动里。NVMe 的队列/协议状态机也仍未抽（等 E3 飞地这个第二消费者，避免过早设计接口）。
 
 ### 文件服务与挂载层（用户态）
 
@@ -585,4 +589,5 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 62 | **驱动路线 N2b：`net_srv` MSI-X 中断化**：让 D1 的通用授权支持"**MSI-X 表不在设备 BAR 上**"—— `setup_msix` 按 MSI-X 能力的 `BIR` 用 `pci::read_bar` 读出那根 BAR，非缓存地映射到新窗口 **`DEVICE_MSIX_VADDR`**（`USER_BASE + 0x84_0000`，`device.rs`），把窗口基址写进**新增的** `DeviceGrant.msix_table_vaddr`（表与设备 BAR 同根时 = `bar_vaddr`，故 NVMe 行为不变）。[`net_srv`](../../user/srv/src/net_srv.rs)：写 MSI-X 表项（RX→表项 0、TX→表项 1，用 `msix_table_vaddr + msix_table_offset`）→ 设 `queue_msix_vector` → `sys_register_irq` 两条向量 → `SYS_MSIX_ENABLE` → 收帧走**中断**（`SYS_IRQ_POLL` 快路径 + `SYS_IRQ_WAIT` 阻塞，200 ms 超时回落重扫 used 环）；掩码按 `向量段基址 - MSI_VECTOR_BASE`（libmorion 新常量 `0x50`）整体左移 —— **向量段按设备分配**，NVMe 占 `0x50..0x52`、net 占 `0x53..0x54`。**取证**：`net: MSI-X prepared vectors=0x53..0x54 table_bar=1 table_vaddr=0x8000840000`、`dev: MSI-X enabled`、`net: MSI-X enabled vectors=0x53..0x54`；NVMe 完成路径不受影响（`irq_cmds=28672 poll_cmds=0`）；全量回归全绿 | ✅ |
 | 63 | **驱动路线 N3：`net_srv` ARP 端到端自测**：`net_srv` 起来后自发一帧**广播 ARP 请求**（问 QEMU user-net 网关 `10.0.2.2` 的 MAC，源 `10.0.2.15`）→ 主循环收帧 → 校验以太类型 `0x0806` + oper=`reply` + 发送方 IP=网关 → 打 `NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`（同时验证 **TX（描述符 + avail + 门铃）→ 设备发包 → slirp 应答 → RX（used 环）**整条通路）。**踩到的坑**：virtio-net 包头长度对 **modern**（`VIRTIO_F_VERSION_1`）设备恒为 **12 字节**（`num_buffers` 总在；只有 legacy 未协商 `MRG_RXBUF` 才是 10）—— 按 10 拼包时设备**已发出**（`tx_used=1`）但 slirp 解包错位丢帧、无应答，改 12 后立刻收到应答。全量回归仍全绿 | ✅ |
 | 64 | **驱动路线 D2：抽 `libdevice` 公共库（首批：驱动底座）**：新增 crate [`user/libdevice`](../../user/libdevice)（`#![no_std]`，零依赖），把"与我是服务还是飞地应用无关"的底座集中：`grant`（**唯一来源**的 `DeviceGrant` + `DEVICE_CFG_VADDR`/`DEVICE_GRANT_MAGIC` + `load()/is_valid()/page()`）、`mmio`（`rd8/16/32/64`、`wr8/16/32/64`、`fence()`）、`msix`（`write_table_entry`）。`block_srv`（NVMe）与 `net_srv`（virtio-net）**改为消费者**：各自删掉重复的 `DeviceGrant` 镜像、MMIO 读写函数、MSI-X 表项写入；`block_srv` 的 MSI-X 表基址改用 `DeviceGrant.msix_table_vaddr`（NVMe 表在 BAR0，值等于 `bar_vaddr`，行为不变）。workspace `members` / `user/srv` 依赖 / `Makefile` 的 `SRV_SRC` 同步。**验证**：全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found。**注**：设备**语义**（NVMe 队列/协议状态机、virtio vring）留到有第二个消费者时再抽（D2b / 随 D3） | ✅ |
-| 65 | **驱动路线 D3：第二个真实驱动 `virtio_blk_srv`**：用 D1 的**通用设备授权**驱动一台**新类型**设备（virtio-blk），全程**不改内核设备逻辑**。内核侧：`arch/pci.rs` 加 `find_virtio_blk`（存储控制器 class `0x01` + vendor `1AF4` + device `1042`/`1001` → **BAR4**）、`domain::BOOT_DOMAINS` 17 → **18**、`main.rs` 建域 17 并加一条声明式 `device::grant`（`bar_pages: 4 / dma_pages: 8 / msix_vectors: 2 / label: "vblk"`）；引导器 `SERVICE_FILES` / `Makefile` `SRV_NAMES` / `morion-srv` feature+`[[bin]]` / `lib.rs` 同步。驱动 [`virtio_blk_srv.rs`](../../user/srv/src/virtio_blk_srv.rs)（**self-contained**，与 `net_srv` 同款 virtio-modern：通过 `SYS_DEVICE_CONFIG_READ` 自解析能力 → 复位 → 协商（只接 `VIRTIO_F_VERSION_1`）→ 读 device cfg 取**容量** → 建**单个**请求队列（环在通用 DMA 块里）→ MSI-X 中断化（表在 BAR1，表项 0 → 向量 `0x55`）→ `DRIVER_OK`）。设备语义 = **三段式描述符链** `header(16B 设备只读) → data(512B，读时设备可写) → status(1B 设备可写)`；同步等完成（`used.idx` 变化，中断走 poll+wait 快路径、超时兜底）。**自测**：读扇区 0 校验宿主预写签名 + 写扇区 1 读回校验 → `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`。QEMU（`make run-nvme` 与 `scripts/fs-regress.sh`）加 `-drive …id=vblk0 -device virtio-blk-pci,drive=vblk0`，盘（`build/vblk.img`，1 MiB）扇区 0 预写签名（`dd … conv=notrunc,sync`）。**踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 只报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。**验证**：`[OK] 18 service ELFs loaded` + `[OK] virtio-blk modern BAR4=…` + `vblk: MSI-X enabled vector=0x55` + `VBLK1 … sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found。**注**：D2b（vring 去重进 `libdevice::virtio`）现已有两个消费者，可做 | ✅ |
+| 65 | **驱动路线 D3：第二个真实驱动 `virtio_blk_srv`**：用 D1 的**通用设备授权**驱动一台**新类型**设备（virtio-blk），全程**不改内核设备逻辑**。内核侧：`arch/pci.rs` 加 `find_virtio_blk`（存储控制器 class `0x01` + vendor `1AF4` + device `1042`/`1001` → **BAR4**）、`domain::BOOT_DOMAINS` 17 → **18**、`main.rs` 建域 17 并加一条声明式 `device::grant`（`bar_pages: 4 / dma_pages: 8 / msix_vectors: 2 / label: "vblk"`）；引导器 `SERVICE_FILES` / `Makefile` `SRV_NAMES` / `morion-srv` feature+`[[bin]]` / `lib.rs` 同步。驱动 [`virtio_blk_srv.rs`](../../user/srv/src/virtio_blk_srv.rs)（**self-contained**，与 `net_srv` 同款 virtio-modern：通过 `SYS_DEVICE_CONFIG_READ` 自解析能力 → 复位 → 协商（只接 `VIRTIO_F_VERSION_1`）→ 读 device cfg 取**容量** → 建**单个**请求队列（环在通用 DMA 块里）→ MSI-X 中断化（表在 BAR1，表项 0 → 向量 `0x55`）→ `DRIVER_OK`）。设备语义 = **三段式描述符链** `header(16B 设备只读) → data(512B，读时设备可写) → status(1B 设备可写)`；同步等完成（`used.idx` 变化，中断走 poll+wait 快路径、超时兜底）。**自测**：读扇区 0 校验宿主预写签名 + 写扇区 1 读回校验 → `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`。QEMU（`make run-nvme` 与 `scripts/fs-regress.sh`）加 `-drive …id=vblk0 -device virtio-blk-pci,drive=vblk0`，盘（`build/vblk.img`，1 MiB）扇区 0 预写签名（`dd … conv=notrunc,sync`）。**踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 只报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。**验证**：`[OK] 18 service ELFs loaded` + `[OK] virtio-blk modern BAR4=…` + `vblk: MSI-X enabled vector=0x55` + `VBLK1 … sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found | ✅ |
+| 66 | **驱动路线 D2b：vring / virtio 传输层去重进 `libdevice::virtio`**：D2 只抽了底座（`grant`/`mmio`/`msix`），设备**语义**留到"有第二个消费者"再做 —— D3 带来了第二个 virtio 消费者（`net_srv` + `virtio_blk_srv` 各带一份 vring 代码），公共面自此可对照着抽。新增 [`libdevice/src/virtio.rs`](../../user/libdevice/src/virtio.rs)：`discover_caps`（能力链表 → common/notify/ISR/device 四区域）、`Caps`（common cfg 读写 + `reset`/`negotiate`/`failed`/`driver_ok`/`notify`/`read_isr`/`set_config_msix`）、`NegError`、`zero_page`、`setup_queue`、`Vq`（`set_desc`/`avail_push`/`kick`/`used_idx`/`used_elem`），以及常量（能力/`ST_*`/`C_*`/`DESC_F_*`/`NO_VECTOR`/`PAGE`）。两个驱动各删掉约 150 行重复（能力解析 / common cfg 访问 / 队列配置 / 环操作），只剩**设备语义**（网卡：包头长度 + ARP 报文 + 收帧回收；块设备：三段式请求链）。`discover_caps` 把「读 PCI 配置空间」做成参数 `Fn(u32) -> u32`（驱动传 `sys_device_config_read` 的闭包），`libdevice` 因此**保持零依赖**（飞地直通形态 E3 原样复用）。**行为零变化**：`net: virtio-net up MAC=… rx=8 tx=8` + `NET1 … ARP reply OK`、`VBLK1 virtio-blk OK, cap=2048, sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found | ✅ |

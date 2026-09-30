@@ -168,8 +168,12 @@
 - **服务形态**：`block_srv`（NVMe）与 `net_srv`（virtio-net）都已链接它 —— 各自删掉重复的
   `DeviceGrant` 镜像 / MMIO 函数 / MSI-X 表项写入，成为纯消费者（服务协议仍在各自进程里）。
 - **直通形态**：飞地应用链接同一个库，运行时直接 MMIO/DMA（E3）。
-- **D2b（待做；D3 已完成 → 现在可做）**：把设备**语义**（NVMe 队列/协议状态机、virtio vring）也抽成 `libdevice::nvme`
-  / `libdevice::virtio` —— `net_srv` 与 `virtio_blk_srv` 已各带一份 vring 代码，公共面可对照着抽（NVMe 侧仍等 E3 飞地消费者）。
+- **D2b（✅ 已完成）**：把设备**语义**里「所有 virtio 设备都一样」的那层抽成 [`libdevice::virtio`](../user/libdevice/src/virtio.rs)
+  —— `discover_caps` / `Caps`（common cfg + `reset`/`negotiate`/`driver_ok`/`notify`/`read_isr`）/ `setup_queue` /
+  `Vq`（`set_desc`/`avail_push`/`kick`/`used_idx`/`used_elem`）/ `zero_page` + 常量。`net_srv` 与 `virtio_blk_srv`
+  各删约 150 行重复，只剩**设备语义**（网卡：包头 + ARP；块设备：三段式请求链）。`discover_caps` 把
+  「读 PCI 配置空间」做成参数，`libdevice` 保持**零依赖**（飞地直通形态 E3 原样复用）。行为零变化（回归全绿）。
+  NVMe 的队列/协议状态机**仍未抽**（等 E3 飞地这个第二消费者）。
 
 ### D3 — 第二个真实驱动：virtio-blk ✅ 已完成
 - 目的：验证 **D1 通用路径**（内核里没有块设备专属逻辑，只多一个按类查找器 + 一行声明）+ 给回归加一条独立可自动化的块设备取证。
@@ -217,7 +221,7 @@
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
-6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；设备语义（NVMe 队列 / vring）留 D2b。
+6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
 8. **D0（可选）I/O 端口能力**。
 9. **E1 IOMMU (VT-d)**：DMAR + 重映射域 + 越界 DMA 拒绝取证。
@@ -240,6 +244,7 @@
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
+| D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |

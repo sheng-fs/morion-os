@@ -221,7 +221,7 @@
 │       └── main.rs
 ├── user/                     # 用户态: 运行库 + 驱动公共库 + 服务程序
 │   ├── libmorion/            #   运行库 (crate `morion`): syscall / 打印 / libvfs / libgfx / 入口样板
-│   ├── libdevice/            #   设备驱动公共库 (crate `libdevice`, D2): 设备授权描述 / MMIO 原语 / MSI-X 表
+│   ├── libdevice/            #   设备驱动公共库 (crate `libdevice`, D2/D2b): 设备授权 / MMIO / MSI-X / virtio 传输层+vring
 │   ├── hello/                #   演示: **独立 ELF 程序** (由 SYS_SPAWN_ELF 运行时载入)
 │   └── srv/                  #   系统服务 (crate `morion-srv`): 每个服务一个 [[bin]] → 一份独立 ELF
 │       └── src/
