@@ -361,7 +361,7 @@
 
 ### 阶段三 — 性能飞地（未开始）
 
-- [ ] IOMMU 直通、LibDevice 直通驱动库、飞地管理器
+- [ ] IOMMU 直通（**E1a 已做**：ACPI DMAR 探测 + DRHD 取证，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)）、LibDevice 直通驱动库、飞地管理器
 
 ### 阶段四 — 网络与安全（未开始）
 

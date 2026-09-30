@@ -181,6 +181,41 @@ pub extern "C" fn kernel_main() -> ! {
     }
 
     // ============================================================
+    //  阶段 4.6: ACPI / IOMMU (DMAR) 探测 —— E1a
+    // ============================================================
+    video::println("");
+    video::println("Stage 4.6: ACPI / IOMMU (DMAR)");
+    let dmar = arch::acpi::probe_dmar();
+    if !dmar.found {
+        // 固件没给 DMAR（如 QEMU 未开 intel-iommu）—— 不是错误：IOMMU 不存在时 DMA 就是直通
+        // 物理地址，整条驱动路线照常。
+        video::println("[OK] no ACPI DMAR (no IOMMU), VT-d disabled");
+    } else {
+        video::print("[OK] ACPI DMAR found: len=");
+        video::print_u64(dmar.table_len as u64);
+        video::print(" aw=");
+        video::print_u64(dmar.host_address_width as u64);
+        video::print(" drhd=");
+        video::print_u64(dmar.drhd_count as u64);
+        video::print(" rmrr=");
+        video::print_u64(dmar.rmrr_count as u64);
+        video::print(" checksum=");
+        video::println(if dmar.checksum_ok { "ok" } else { "BAD" });
+        if dmar.drhd_count > 0 {
+            let d = dmar.first_drhd;
+            video::print("[OK]   DRHD[0] base=0x");
+            video::print_hex(d.reg_base);
+            video::print(" segment=");
+            video::print_u64(d.segment as u64);
+            video::print(" include_pci_all=");
+            video::print(if d.include_all { "yes" } else { "no" });
+            video::print(" scopes=");
+            video::print_u64(d.scope_count as u64);
+            video::println("");
+        }
+    }
+
+    // ============================================================
     //  阶段十: 用户态运行库 + 可加载用户程序
     // ============================================================
     video::println("");

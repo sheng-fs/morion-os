@@ -55,7 +55,7 @@
   **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号（各表是 `Vec` 且按需增长，
   机制上可行；**boot 侧 `SERVICE_FILES`/模块表已同步**）。再加驱动时继续按需扩。
 - **没有网络驱动**（N0–N3 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）。
-- **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**。
+- **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码，E1a 只加了**探测**）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**（重映射域与拒绝取证 = E1b/E1c）。
 - **没有 LibDevice**（D2 已解决首批）：`user/libdevice` 抽出 `grant`/`mmio`/`msix`，三个驱动共用；设备**语义**（vring 等）留 D2b 去重。
 - **没有飞地管理器**、没有 `create_enclave` 之类的内核原语。
 - **没有版本串 / 没有无图形界面构建开关**。
@@ -191,8 +191,23 @@
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
 - 与 D1 结合：`SYS_DEVICE_GRANT` 在飞地场景下把设备的 DMA 权限绑到一个 **IOVA 窗口**（只映射飞地自己的缓冲），其余一律**拒绝**。
-- 取证：让飞地故意对**未映射**地址发 DMA → 观察 IOMMU 报错（QEMU `-machine q35,intel-iommu=on` 可复现），且系统**不受影响**。
+- 取证：让飞地故意对**未映射**地址发 DMA → 观察 IOMMU 报错（QEMU 需 `-device intel-iommu`），且系统**不受影响**。
 - ⚠️ 与内核恒等映射的关系：内核自身 DMA（如 NVMe bring-up 早期）要保持可翻译，需明确哪些域**绕过**或**放行**。
+
+分三步（每步独立可回归）：
+
+#### E1a — ACPI DMAR 探测 ✅ 已完成
+- **RSDP 来源**：引导器在 `exit_boot_services` **之前**从 UEFI 配置表取（优先 `ACPI2_GUID` → 带 XSDT 指针，退 `ACPI_GUID`），经 `BootInfo.rsdp_addr` 交给内核（布局 version 3 → 4，`BOOT_VERSION` 配套校验）。内核此前**完全不碰 ACPI**，这是第一条 ACPI 路径。
+- **[`kernel/src/arch/acpi.rs`](../kernel/src/arch/acpi.rs)**：`probe_dmar() -> DmarSummary` —— RSDP 20 字节自校验和 → XSDT（每项 8B）/ RSDT（每项 4B）逐项找 `DMAR` → 解析重映射结构（DRHD 的 `flags`/`segment`/`reg_base` + 设备范围计数、RMRR 计数）。所有物理访问前过 `is_identity_mapped`；畸形表只降级、不 panic。
+- **踩到的坑**：DMAR 表体在 ACPI 表头后还有 12 字节（`Host Address Width` + `Flags` + `Reserved`），重映射结构从偏移 **48** 起而非 36 —— 按 36 解析会把 `Host Address Width` 当成 `type`，现象是"表找到了但 `drhd=0 rmrr=0`"。
+- **取证**：无 IOMMU → `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`（优雅降级）；开了 → `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 rmrr=0 checksum=ok` + `DRHD[0] base=0xFED90000 segment=0 include_pci_all=no scopes=8`。纯函数单测（合成表 + 畸形表）24 → 26。
+- **注**：本机 QEMU 已 11.x，`-machine intel-iommu=on` 属性**已移除**，须 `-machine q35 -device intel-iommu`。
+
+#### E1b — 重映射域（待做）
+- 按 DRHD 的 `reg_base` 映射 IOMMU 寄存器块（需要 D1 式的 BAR/MMIO 授权 + 非缓存映射），建**根表 + 上下文表**，给一台设备建 DMA 重映射域并打开翻译（`GCMD.TE`）。QEMU 用 `-device intel-iommu` 复现。
+
+#### E1c — 越界 DMA 拒绝取证（待做）
+- 把设备的 DMA 权限绑到 **IOVA 窗口**；飞地故意访问未映射地址 → 观察 IOMMU 报错（fault 寄存器 + 系统不受影响）。这里要定"**谁绕过翻译**"：默认方案是**阶段一内核/既有驱动仍走恒等映射的物理地址 DMA**（对它们按恒等翻译放行），只有飞地的 DMA 走真正的 IOVA 窗口 —— 这样现有 NVMe / virtio 回归行为零变化。
 
 ### E2 — 飞地管理器 `enclave-mgr`
 - 唯一持 `SYS_ENCLAVE_*` 的特权服务（D6）。
@@ -226,7 +241,7 @@
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
-9. **E1 IOMMU (VT-d)**：DMAR + 重映射域 + 越界 DMA 拒绝取证。
+9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD，取证已入回归）+ 重映射域（E1b）+ 越界 DMA 拒绝取证（E1c）。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
 11. **E3 示例飞地**：直通接管设备，零陷落 + 隔离取证。
 12. **V1 版本串** + **V2 无图形版本收口**（CHANGELOG + tag）。
@@ -249,6 +264,7 @@
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |
 | D0 | I/O 端口 syscall 加 `IoPort` 门禁：未授权域读写端口被拒，`block_srv` / `mfs_srv` / `exfat_srv` 照常 —— ✅ `app: D0 port capability gate OK (ungranted I/O port denied)`；FS-13/FS-16 仍写得出时间戳（两处授权放行）；内核单测 24/24 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
+| E1a | 内核能找到 DMAR 并报出 DRHD/设备范围；固件无 IOMMU 时优雅降级 —— ✅ `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 checksum=ok` + `DRHD[0] base=0xFED90000 scopes=8`（`-device intel-iommu`）；无 IOMMU 时 `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`，全量回归零变化；内核单测 26/26 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |
 

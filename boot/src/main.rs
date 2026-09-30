@@ -938,7 +938,7 @@ static KERNEL_ELF: &[u8] = include_bytes!("../loader/morion-kernel.elf");
 #[repr(C)]
 struct BootInfo {
     magic: u32,   // 0x4D4F5249 = "MORI"
-    version: u32, // 3
+    version: u32, // 4
     fb_addr: u64, // 帧缓冲物理地址
     fb_width: u32,
     fb_height: u32,
@@ -951,6 +951,8 @@ struct BootInfo {
     svc_addr: u64,       // 服务模块表物理地址
     svc_count: u64,      // 服务模块条目数
     svc_entry_size: u64, // 单个模块条目字节数
+    // --- ACPI (E1a): RSDP 物理地址, 内核据此走 XSDT/RSDT → DMAR (IOMMU) ---
+    rsdp_addr: u64, // 0 = 固件没提供
 }
 
 // ============================================================
@@ -1172,6 +1174,25 @@ fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64) {
     (table, modules.len() as u64)
 }
 
+/// 从 UEFI 配置表里取 **ACPI RSDP** 的物理地址（E1a）。
+///
+/// 优先 ACPI 2.0+（`ACPI2_GUID`：RSDP 里带 XSDT 指针，才能拿到 DMAR 这类 64 位表）；
+/// 退而求其次用 ACPI 1.0（`ACPI_GUID`）。必须在 `exit_boot_services` **之前**调用 ——
+/// 之后配置表就失效了。固件没提供则返回 0（内核打"无 DMAR"并优雅降级）。
+fn find_rsdp(st: &SystemTable<Boot>) -> u64 {
+    use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
+    let mut legacy = 0u64;
+    for e in st.config_table() {
+        if e.guid == ACPI2_GUID {
+            return e.address as u64;
+        }
+        if e.guid == ACPI_GUID && legacy == 0 {
+            legacy = e.address as u64;
+        }
+    }
+    legacy
+}
+
 fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
     // ELF 校验 — 如果不是真正的 ELF (缺少魔数 / 长度不足)，
     // 显示提示后循环休眠，不要破坏内存。
@@ -1205,10 +1226,16 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
     );
     let (svc_addr, svc_count) = load_service_modules(st.boot_services(), fb);
 
+    // ACPI RSDP (E1a): 必须在 `exit_boot_services` 之前读 UEFI 配置表。
+    let rsdp_addr = find_rsdp(&st);
+    if rsdp_addr != 0 {
+        draw_text(fb, "ACPI RSDP found", 40, 56, Color::rgb(0xCC, 0xCC, 0xCC));
+    }
+
     // 设置 Boot Info 到 0x7000
     let boot_info = BootInfo {
         magic: 0x4D4F5249, // "MORI"
-        version: 3,
+        version: 4,
         fb_addr: fb.base as u64,
         fb_width: fb.w,
         fb_height: fb.h,
@@ -1220,6 +1247,7 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
         svc_addr,
         svc_count,
         svc_entry_size: core::mem::size_of::<ServiceModule>() as u64,
+        rsdp_addr,
     };
     unsafe {
         let ptr = 0x7000 as *mut BootInfo;

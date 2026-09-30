@@ -43,11 +43,14 @@ UEFI 固件
 | --- | --- | --- |
 | `BOOT_INFO_ADDR` | `0x7000` | BootInfo 物理地址 |
 | `BOOT_MAGIC` | `0x4D4F5249` | "MORI" 魔数 |
+| `BOOT_VERSION` | `4` | BootInfo 布局版本（3 = 加服务模块表，4 = 加 RSDP，E1a） |
 | 内核加载地址 | `0x100000` | linker.ld `ENTRY(_start)` |
 
-`BootInfo` 字段：`magic, version, fb_addr, fb_width, fb_height, fb_stride, fb_bpp, mmap_addr, mmap_entry_count, mmap_entry_size, svc_addr, svc_count, svc_entry_size`。
+`BootInfo` 字段：`magic, version, fb_addr, fb_width, fb_height, fb_stride, fb_bpp, mmap_addr, mmap_entry_count, mmap_entry_size, svc_addr, svc_count, svc_entry_size, rsdp_addr`。
 
-**服务模块表（E3b）**：`svc_addr` 指向一张 `ServiceModule { domain, addr, len }` 数组（引导器放在 `LOADER_DATA` 页里），内核经 `BootInfo::service_modules()` 取用 —— `svc_entry_size` 是布局校验（两个独立编译的产物，字段不一致就判为不可用）。这是 16 个引导期服务的镜像来源（不再是内核 `include_bytes!`）。
+**服务模块表（E3b）**：`svc_addr` 指向一张 `ServiceModule { domain, addr, len }` 数组（引导器放在 `LOADER_DATA` 页里），内核经 `BootInfo::service_modules()` 取用 —— `svc_entry_size` 是布局校验（两个独立编译的产物，字段不一致就判为不可用）。这是 18 个引导期服务的镜像来源（不再是内核 `include_bytes!`）。
+
+**布局版本（E1a）**：`version` 与 `BOOT_VERSION` 配套 —— 新增字段后按旧布局读会读到垃圾，故 `BootInfo::rsdp_addr()` 在 `version < BOOT_VERSION` 时一律返回 0（"该字段不可用"），调用方据此降级。历史：3 = 加服务模块表，4 = 加 RSDP。
 
 ### 分页 / 地址空间（[kernel/src/memory/paging.rs](../../kernel/src/memory/paging.rs)）
 
@@ -347,6 +350,16 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `LVT0`(base+0x350) 必须是「投递模式 ExtINT + 不屏蔽」：LAPIC 一旦使能，8259A 的 PIC 中断改由 LINT0 以 ExtINT 透传，KVM 正是据此判断「PIC 中断还要不要投」（`kvm_apic_accept_pic_intr`），LVT0 被屏蔽则时钟/键盘立刻失效。故只在它不满足时改写，从不覆盖固件已设好的值。
 - `eoi()`：MSI 向量处理器结束时写 `base+0xB0`；ExtINT 透传来的中断不经 LAPIC 的 ISR，仍由 `pic::send_eoi()` 收尾。
 
+### ACPI / DMAR 探测（[kernel/src/arch/acpi.rs](../../kernel/src/arch/acpi.rs)，E1a）
+
+内核此前**完全不碰 ACPI**（LAPIC / PCI 都走固定的经典地址与配置端口）。E1a 引入第一条 ACPI 路径：**RSDP → XSDT/RSDT → DMAR**（Intel VT-d 能力表），为 E1b/E1c 建 DMA 重映射域取证。
+
+- **RSDP 来源**：引导器在 `exit_boot_services` **之前**从 UEFI 配置表取（优先 `ACPI2_GUID` —— 带 XSDT 指针，退 `ACPI_GUID`），经 `BootInfo.rsdp_addr`（version 4）交给内核 —— 之后配置表就失效了。
+- **解析**：`probe_dmar() -> DmarSummary`。RSDP 前 20 字节自校验和；`revision >= 2` 走 XSDT（每项 8 字节），否则 RSDT（每项 4 字节）；逐项比签名找 `DMAR`。
+- **DMAR 体**：固定部分 **48 字节**（ACPI 表头 36 + `Host Address Width` 1 + `Flags` 1 + `Reserved` 10），之后是重映射结构（`type u16 / length u16 / …`）：0=DRHD、1=RMRR、2=ATSR、3=SATC。DRHD 专属头 16 字节（`flags` bit0 = `INCLUDE_PCI_ALL` / `segment` / `reg_base`），其后每 8 字节一个设备范围条目。⚠️ 结构从 **48** 起而非 36 —— 漏掉那 12 字节会把 `Host Address Width` 当成 `type`，表现为"表找到了但 DRHD/RMRR 全 0"。
+- **安全**：所有物理访问前过 `paging::is_identity_mapped`（RSDP/XSDT/DMAR 都在低 4 GiB）；ACPI 页是 `ACPI_RECLAIM`，不在帧分配器空闲池 → 读到的切片可当 `'static`（与 `service_modules` 同理）。畸形表只降级、不 panic；纯函数 `parse_dmar` / `checksum_ok` 有单测（合成表 + 畸形表）。
+- **取证**：固件无 `intel-iommu` → `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`；`-device intel-iommu` → `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 rmrr=0 checksum=ok` + `[OK]   DRHD[0] base=0x00000000FED90000 segment=0 include_pci_all=no scopes=8`。
+
 ### 用户态运行库 libmorion（[user/libmorion](../../user/libmorion)）
 
 所有用户程序共用的"运行时"（crate 名 `morion`），相当于 crt0 + libc 的最小子集：
@@ -593,3 +606,4 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 65 | **驱动路线 D3：第二个真实驱动 `virtio_blk_srv`**：用 D1 的**通用设备授权**驱动一台**新类型**设备（virtio-blk），全程**不改内核设备逻辑**。内核侧：`arch/pci.rs` 加 `find_virtio_blk`（存储控制器 class `0x01` + vendor `1AF4` + device `1042`/`1001` → **BAR4**）、`domain::BOOT_DOMAINS` 17 → **18**、`main.rs` 建域 17 并加一条声明式 `device::grant`（`bar_pages: 4 / dma_pages: 8 / msix_vectors: 2 / label: "vblk"`）；引导器 `SERVICE_FILES` / `Makefile` `SRV_NAMES` / `morion-srv` feature+`[[bin]]` / `lib.rs` 同步。驱动 [`virtio_blk_srv.rs`](../../user/srv/src/virtio_blk_srv.rs)（**self-contained**，与 `net_srv` 同款 virtio-modern：通过 `SYS_DEVICE_CONFIG_READ` 自解析能力 → 复位 → 协商（只接 `VIRTIO_F_VERSION_1`）→ 读 device cfg 取**容量** → 建**单个**请求队列（环在通用 DMA 块里）→ MSI-X 中断化（表在 BAR1，表项 0 → 向量 `0x55`）→ `DRIVER_OK`）。设备语义 = **三段式描述符链** `header(16B 设备只读) → data(512B，读时设备可写) → status(1B 设备可写)`；同步等完成（`used.idx` 变化，中断走 poll+wait 快路径、超时兜底）。**自测**：读扇区 0 校验宿主预写签名 + 写扇区 1 读回校验 → `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`。QEMU（`make run-nvme` 与 `scripts/fs-regress.sh`）加 `-drive …id=vblk0 -device virtio-blk-pci,drive=vblk0`，盘（`build/vblk.img`，1 MiB）扇区 0 预写签名（`dd … conv=notrunc,sync`）。**踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 只报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。**验证**：`[OK] 18 service ELFs loaded` + `[OK] virtio-blk modern BAR4=…` + `vblk: MSI-X enabled vector=0x55` + `VBLK1 … sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`NET1 … ARP reply OK`、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found | ✅ |
 | 66 | **驱动路线 D2b：vring / virtio 传输层去重进 `libdevice::virtio`**：D2 只抽了底座（`grant`/`mmio`/`msix`），设备**语义**留到"有第二个消费者"再做 —— D3 带来了第二个 virtio 消费者（`net_srv` + `virtio_blk_srv` 各带一份 vring 代码），公共面自此可对照着抽。新增 [`libdevice/src/virtio.rs`](../../user/libdevice/src/virtio.rs)：`discover_caps`（能力链表 → common/notify/ISR/device 四区域）、`Caps`（common cfg 读写 + `reset`/`negotiate`/`failed`/`driver_ok`/`notify`/`read_isr`/`set_config_msix`）、`NegError`、`zero_page`、`setup_queue`、`Vq`（`set_desc`/`avail_push`/`kick`/`used_idx`/`used_elem`），以及常量（能力/`ST_*`/`C_*`/`DESC_F_*`/`NO_VECTOR`/`PAGE`）。两个驱动各删掉约 150 行重复（能力解析 / common cfg 访问 / 队列配置 / 环操作），只剩**设备语义**（网卡：包头长度 + ARP 报文 + 收帧回收；块设备：三段式请求链）。`discover_caps` 把「读 PCI 配置空间」做成参数 `Fn(u32) -> u32`（驱动传 `sys_device_config_read` 的闭包），`libdevice` 因此**保持零依赖**（飞地直通形态 E3 原样复用）。**行为零变化**：`net: virtio-net up MAC=… rx=8 tx=8` + `NET1 … ARP reply OK`、`VBLK1 virtio-blk OK, cap=2048, sig=ok, rw=ok`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、NVMe `irq_cmds=28672 poll_cmds=0`、宿主 `sgdisk -v` No problems found | ✅ |
 | 67 | **驱动路线 D0：I/O 端口能力**：端口 syscall（`SYS_PORT_IN8/IN16/OUT8/OUT16`，22–25）此前**无门禁** —— 任何域都能读写任意 I/O 端口（真实缺口：能直接操作键盘控制器、CMOS、PIC 等）。本轮加 `Capability::IoPort(u16 base, u16 len)`：端口是**纯平坦地址空间**（没有 MMIO 那种页基址），故按**半开区间**授权而不是逐页（否则 IDE 的 8 个寄存器要占 8 个能力槽）；匹配用新增的 `cap::has_port(domain, port)`（区间匹配，与 `has` 的精确匹配不同）。四个 syscall 臂加门禁，**被拒返回 `u64::MAX`**（端口读只可能是 `0..=0xFF` / `0..=0xFFFF`，故哨兵不与真实值混淆）。`decode` 加 `kind 6 = CAP_KIND_IO_PORT`，`arg = (base << 16) | len`（要求 `len != 0` 且区间不越界）。引导期按需授权：`block_srv` `0x1F0..0x1F8`（IDE PIO 回退路径）、`mfs_srv` / `exfat_srv` `0x70..0x72`（CMOS RTC 写时间戳）。libmorion 加 `sys_port_in8_raw`（不截断，供自测断言被拒）。**自测**：app（无 `IoPort`）读 CMOS 数据口 `0x71` 必须被拒 → `app: D0 port capability gate OK (ungranted I/O port denied)`；内核单测加 1 条（区间半开 + 编码/越界拒绝，23 → 24）。**验证**：全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、NVMe `irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found；FS-13/FS-16 仍写得出节点时间戳 = 两处 `IoPort` 授权确实放行 | ✅ |
+| 68 | **驱动路线 E1a：ACPI DMAR 探测**：内核此前**完全不碰 ACPI**，这是第一条 ACPI 路径 —— `RSDP → XSDT/RSDT → DMAR`（Intel VT-d 能力表，给 E1b/E1c 建重映射域用）。引导器在 `exit_boot_services` **之前**从 UEFI 配置表取 RSDP（优先 `ACPI2_GUID` 带 XSDT，退 `ACPI_GUID`），经 `BootInfo.rsdp_addr` 交给内核（布局 **version 3 → 4**，`BOOT_VERSION` 配套校验；`version < 4` 时该字段按"不可用"返回 0）。新增 [`kernel/src/arch/acpi.rs`](../../kernel/src/arch/acpi.rs)：`probe_dmar() -> DmarSummary`（RSDP 20 字节自校验和 → XSDT/RSDT 逐项找 `DMAR` → 解析重映射结构），全部物理访问前过 `is_identity_mapped`，畸形表只降级不 panic；纯函数 `parse_dmar`/`checksum_ok` 加 2 条单测（合成表 + 畸形表，24 → 26）。**踩到的坑**：DMAR 表体在 ACPI 表头后还有 12 字节（`Host Address Width` + `Flags` + `Reserved`），重映射结构从偏移 **48** 起而非 36 —— 按 36 解析会把 `Host Address Width` 当成 `type`，现象是"表找到了但 `drhd=0 rmrr=0`"。**取证**：无 IOMMU → `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`（优雅降级）；`-machine q35 -device intel-iommu` → `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 rmrr=0 checksum=ok` + `[OK]   DRHD[0] base=0x00000000FED90000 segment=0 include_pci_all=no scopes=8`。**注**：本机 QEMU 已是 11.x，`-machine intel-iommu=on` 属性**已被移除**，须用 `-device intel-iommu`。**验证**：全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、NVMe `irq_cmds=28672 poll_cmds=0`、`sgdisk` No problems found（无 IOMMU 时行为零变化） | ✅ |

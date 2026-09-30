@@ -32,9 +32,23 @@ pub struct BootInfo {
     pub svc_addr: u64,         // 服务模块表物理地址 (0 = 无)
     pub svc_count: u64,        // 服务模块条目数
     pub svc_entry_size: u64,   // 单个模块条目字节数
+    /// **ACPI RSDP** 的物理地址（E1a）。0 = 固件未提供 / 引导器版本过旧。
+    pub rsdp_addr: u64,
 }
 
 impl BootInfo {
+    /// **ACPI RSDP** 的物理地址（E1a）。
+    ///
+    /// 引导器版本低于 [`BOOT_VERSION`] 时返回 0（那个版本还没有这个字段，按新布局读旧内存
+    /// 会读到 `svc_entry_size` 之后的垃圾）—— 调用方据此打"无 DMAR"并优雅降级。
+    pub fn rsdp_addr(&self) -> u64 {
+        if self.version >= BOOT_VERSION {
+            self.rsdp_addr
+        } else {
+            0
+        }
+    }
+
     /// 引导期服务模块表（E3b）。
     ///
     /// 引导器未提供（旧引导器 / 构建没有把服务放进 ESP）时返回 `None` —— 调用方据此
@@ -66,6 +80,13 @@ pub const BOOT_INFO_ADDR: usize = 0x7000;
 
 /// 有效 Boot Info 的魔数 "MORI"
 pub const BOOT_MAGIC: u32 = 0x4D4F5249;
+
+/// 当前 `BootInfo` 布局版本（与 boot/src/main.rs 写入的 `version` 同步）。
+///
+/// 布局一变就 +1：内核与引导器是**两个独立编译**的产物，版本不一致时对新增字段按"不可用"
+/// 处理（见 [`BootInfo::rsdp_addr`]），而不是按新布局去读旧内存。历史：3 = 加服务模块表，
+/// 4 = 加 RSDP。
+pub const BOOT_VERSION: u32 = 4;
 
 /// UEFI 内存描述符 (EFI_MEMORY_DESCRIPTOR, 40 字节)
 ///
