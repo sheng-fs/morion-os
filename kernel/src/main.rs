@@ -53,6 +53,8 @@ extern "C" fn task_idle() {
     loop {
         x86_64::instructions::hlt();
         scheduler::yield_now();
+        // E1c 取证: 越界 DMA 由用户态驱动发起, 内核没有别的周期钩子 —— 空闲任务是那个观察点。
+        arch::iommu::poll_faults();
     }
 }
 

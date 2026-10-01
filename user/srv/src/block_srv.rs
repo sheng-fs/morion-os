@@ -455,6 +455,18 @@ const NVME_MAX_SECTORS: u16 = 256;
 /// 与 `VOL_SCRATCH_VADDR` 同理: 必须落在所有共享缓冲段之上 (见该常量处的地址分区表)。
 const PRP_LIST_VADDR: u64 = 0x0000_0080_0016_1000;
 
+/// E1c 越界 DMA 探针的 PRP: **窗口外第一个地址**。
+///
+/// 内核 VT-d 侧 (`kernel/src/arch/iommu.rs` 的 `TARGET_WINDOW_LIMIT`) 只允许本设备 DMA 到
+/// 窗口 `[0, 3 GiB)` —— 这个数字必须与它保持一致 (本驱动是用户域, 够不到内核常量)。
+/// 注意它同时必须 **< 4 GiB**: 本机 QEMU 的 intel-iommu 不翻译 ≥ 4 GiB 的 IOVA。
+const IOMMU_PROBE_IOVA: u64 = 3 * (1 << 30);
+/// 探针完成等待的自旋上限: 每次迭代读一次 CSTS 逼 QEMU 主循环跑起来。
+///
+/// 探针的完成与否**不影响任何东西** (它故意指向窗口外), 故上限取得很小 —— 正常情况下
+/// 设备几个迭代内就会 post CQE, 只有"越界 DMA 让设备彻底不回应"时才会跑满。
+const NVME_IOMMU_PROBE_SPINS: u32 = 50_000;
+
 /// 当前提交所用的 I/O 队列下标 (由 `io_select_queue` 在每次请求开始时轮转设定)。
 ///
 /// 串行提交下同一时刻只有一条命令在飞, 故一份就够; 引入并发 (多条在飞) 时才需要
@@ -965,6 +977,67 @@ fn nvme_main() {
     vol_print_table();
     // 启动期完成路径证据: 卷扫描已经真的发起过块 I/O, 这行说明它们走的是哪条路径。
     nvme_stats_print("nvme: after volume scan ");
+
+    // 11. E1c 自测: 越界 DMA 探针。
+    //
+    // 内核 VT-d 侧只允许本设备 DMA 到窗口 `[0, 3 GiB)`（见 `kernel/src/arch/iommu.rs` 的
+    // `TARGET_WINDOW_LIMIT`）；这里**故意**把一条 NVM 读的 PRP1 指到 **3 GiB 整** —— 恰好是
+    // 窗口外第一个地址。开了 IOMMU 时这次**设备发起**的 DMA 会被拒绝（QEMU 侧
+    // `vtd_iommu_translate: detected translation failure`；内核侧 FSTS/FRCD 留下记录，
+    // 由空闲任务转印到内核日志）；没开 IOMMU 时该物理地址在 QEMU q35 上不属于任何内存区，
+    // 写入被丢弃 → 系统同样不受影响，故探针可以**无条件**跑，不需要先问内核要什么标志。
+    //
+    // 两个刻意的实现选择:
+    //   ① 走**轮询**而不是 `submit_wait` —— 一次故意的失败绝不能让中断模式粘性回退成轮询
+    //      (那会让验收口径 `poll_cmds = 0` 失效)，也不计入 `nvme: stats` 的命令计数；
+    //   ② 放在**卷扫描之后** —— 此后本驱动只用 I/O 队列，探针若让某条命令不再回来，
+    //      也只影响探针自己用掉的那个槽位，不会连累已经跑完的启动流程。
+    {
+        // 走 I/O 队列 0 提交一条 **1 个扇区的读**, 数据落点 PRP1 指到窗口外。
+        // 选 NVM Read 而不是 Admin Identify: 卷扫描一路都在用同一条读路径, 它**确定**会
+        // 让设备去 PRP1 取数 —— 这正是一次设备发起的 DMA。
+        let (isq_doorbell_probe, icq_doorbell_probe) = io_q_doorbells(mmio, stride, 0);
+        let (sq_probe, cq_probe) = io_q_vaddrs(&cfg, 0);
+        let mut probe = Sqe::zero();
+        probe.opcode = OP_READ;
+        probe.cid = 0x0F; // 与初始化阶段已用的 cid 1..4 / 0x100+ 错开
+        probe.nsid = 1;
+        probe.prp1 = IOMMU_PROBE_IOVA;
+        probe.cdw10 = 0; // SLBA = 0
+        probe.cdw12 = 0; // NLB-1 = 0 → 1 个扇区 (512 B)
+        let qd = cfg.io_qdepth as u32;
+        let idx = (io_tail[0] % qd) as u64;
+        unsafe {
+            core::ptr::write_volatile((sq_probe + idx * 64) as *mut Sqe, probe);
+        }
+        io_tail[0] = (io_tail[0] + 1) % qd;
+        wr32(isq_doorbell_probe, io_tail[0]);
+
+        let mut outcome = "no-completion";
+        let mut spins = 0u32;
+        while spins < NVME_IOMMU_PROBE_SPINS {
+            // 读一次 MMIO 逼 QEMU 主循环运行, 设备才有机会处理这条命令。
+            let _ = rd32(mmio + REG_CSTS);
+            if let Some(ok) = try_complete(
+                cq_probe,
+                icq_doorbell_probe,
+                qd,
+                &probe,
+                &mut io_head[0],
+                &mut io_phase[0],
+            ) {
+                outcome = if ok { "ok" } else { "cqe-error" };
+                break;
+            }
+            spins += 1;
+        }
+        print("IOMMU1 out-of-window DMA probe: prp=0x");
+        print_hex(IOMMU_PROBE_IOVA);
+        print(" window=[0,0x");
+        print_hex(IOMMU_PROBE_IOVA);
+        print(") probe=");
+        println(outcome);
+    }
 
     loop {
         let mut msg = Message {
