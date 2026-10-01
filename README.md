@@ -48,7 +48,7 @@
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2/N3 驱动已跑通（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK` / **MSI-X 中断驱动收帧**，并自发 ARP 请求收到网关应答 `NET1 … ARP reply OK`）。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力，MSI-X 表在别的 BAR 上时内核按 `BIR` 另映射给驱动 |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
-| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
+| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，接管后内核终端不再写屏（输出只留 COM1）。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功（自测 GS-1，已肉眼确认画面）。**G3a** 文本渲染外移：字库（ASCII 8×16 + 汉字 16×16 `cjk.bin` ≈276 KB）与终端状态（光标/换行/滚动/清屏，按**显示列**排版）从内核搬到 [`gfx/`](./user/srv/src/gfx/)，新协议 `GFX_OP_TEXT/CLEAR/MOVE/QUERY`，落笔**逐像素写后回读**校验（自测 GT-1 断言 ASCII 5 列 / 汉字 10 列）。**G3b** shell 输出上屏：新增 `SYS_CONSOLE_READY(47)`，`libmorion` 的打印出口 `sink()` 支持按进程**镜像**一份到屏幕控制台（只有 shell 开），shell 的横幅/中文欢迎语/命令输出同时进串口与屏幕。**G3c** 内核卸掉汉字字库（−276 KB，内核 ELF 347 KB → 69 KB），终端降为 ASCII + 豆腐块，汉字渲染只在用户态。**G4** 输入搬出内核：新增 `SYS_KEY_PUSH(48)/SYS_KEY_READ(49)` 键字节队列（内核只做搬运），行编辑/回显落客户端库 `morion::console::readline`，内核侧输入机件全部删除、终端降为只输出。**G6** 服务自愈：`ipc::call` 不再永久挂起（超时 + 目标无存活任务即失败）+ 帧缓冲登记内核保留区间 + 重启丢弃目标邮箱旧请求 + 客户端重建共享会话 + `gfx_srv` 纳入 init 监督（自测 GS-2）。内核文本控制台仅剩引导期与 panic 输出 |
 | 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
@@ -58,6 +58,21 @@
 > 应用开发（含 AI 可调用能力）见 [docs/app-dev-guide.md](./docs/app-dev-guide.md)；
 > 文件系统路线见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)；
 > 驱动与飞地路线见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)。
+
+---
+
+## 版本
+
+当前版本 **`0.4.0`**；对外发布的无图形变体打 tag **`v0.4.0-nogui`**。
+
+- 版本常量的**唯一来源**是内核 [`kernel/src/version.rs`](./kernel/src/version.rs)（`SYSTEM_NAME` / `VERSION` /
+  `MACHINE` / `VARIANT` / `BUILD`），经系统调用 `SYS_UNAME(51)` 报给用户态 —— shell 的 `uname` / `version`
+  命令就是读它（构建号 = 构建时的 git 短哈希，由 `Makefile` 注入）。
+- 两种构建变体：
+  - **常规（带图形）**：`make ...`；shell 的输出额外**镜像**一份到 `gfx_srv` 的屏幕控制台。
+  - **无图形**：`make NOGUI=1 ...`；shell 不开屏幕镜像（输入/回显走串口），release 串报告 `0.4.0-nogui`，
+    产物落在 `build/nogui/`。其余服务与全量回归口径不变。
+- 变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
@@ -361,12 +376,13 @@
 
 ### 阶段三 — 性能飞地（未开始）
 
-- [ ] IOMMU 直通（**E1a 已做**：ACPI DMAR 探测 + DRHD 取证；**E1b 已做**：建根表/上下文表 + 恒等二级页表并打开 `GCMD.TE`，全量回归在 `-device intel-iommu` 下全绿；E1c 越界拒绝待做，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)）、LibDevice 直通驱动库、飞地管理器
+- [ ] IOMMU 直通（**E1a 已做**：ACPI DMAR 探测 + DRHD 取证；**E1b 已做**：建根表/上下文表 + 恒等二级页表并打开 `GCMD.TE`；**E1c 已做**：目标设备（NVMe）窗口收到 `[0, 3 GiB)`，设备发起的窗口外 DMA 被 IOMMU 拒绝并留证，全量回归在 `-device intel-iommu` 下全绿，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)）、LibDevice 直通驱动库、飞地管理器
 
 ### 阶段四 — 网络与安全（未开始）
 
 - [x] **网卡驱动（virtio-net）**（`net_srv` 域 16 + 通用设备授权，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N0–N3：virtio-modern bring-up + MSI-X 中断收帧 + ARP 端到端自测）
 - [x] **第二个真实驱动（virtio-blk）**（`virtio_blk_srv` 域 17，仍走通用设备授权、内核无设备专属逻辑：D3 —— 读签名 / 写读回自测）
+- [x] **运行期设备授权（D1b）**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` + `Mmio` 能力门禁；NVMe / `net_srv` / `virtio_blk_srv` 经运行期 syscall 取得 `DeviceGrant`，行为零变化，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 D1b）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎
 
 ### 阶段五 — GUI 与生态（未开始）

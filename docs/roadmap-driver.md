@@ -93,9 +93,12 @@
   - `main.rs` 里 NVMe 只剩一条**声明式需求**（`bar_pages: 4 / dma_pages: 7 / msix_vectors: 3`）。
 - **用户态**：[`block_srv`](../user/srv/src/block_srv.rs) 读通用描述后**自行推导队列布局**（`DMA_OFF_*` 页偏移）—— 设备专属知识回到驱动域。
 - **验证**：纯重构，行为零变化 —— 全量 FS 回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds=28672 poll_cmds=0`（MSI 向量段仍 `0x50..0x52`）。
-- **D1b（待做）**：把授权从"boot 期内核代做"变成**运行期 syscall**（`SYS_DEVICE_INFO/GRANT`）。
-  - 原计划：`SYS_DEVICE_INFO(pci_addr)` → 回 `vendor/device/class`、各 BAR 的 `(base, len, is_mmio)`、MSI-X 能力位置；`SYS_DEVICE_GRANT(pci_addr, want_irq, want_msix_vectors)` → 建立设备域绑定、回**资源描述结构**。
-  - **现状（D3 起）**：`virtio_blk_srv` 仍走 **boot 期声明式**路径 —— 内核只多了一个按类查找器（`pci::find_virtio_blk`）**与一行声明**（`device::grant`），**没有**任何设备专属逻辑；真正"运行期申请、内核零改动"（飞地 E2 的前提）仍待 D1b。
+- **D1b ✅ 已完成**：把授权从"boot 期内核代做"变成**运行期 syscall**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT`，号 52/53）。
+  - `SYS_DEVICE_INFO(a1)` → 回打包的 `vendor/device/class`（`vendor<<48 | device<<32 | class24`）；`a1 = u64::MAX` 表示"本域设备"，否则按 `pci_addr`（`bus<<16 | dev<<8 | func`）精确匹配；无设备 / 不属于本域返回 `0`。
+  - `SYS_DEVICE_GRANT(a1)` → 定位本域设备 → **能力门禁**（须持有该设备 BAR 的 `Mmio` 凭证，由 `grant()` 一并签发；被拒时内核日志 `dev: device grant denied (no Mmio capability)`）→ 幂等确认描述页 `magic` 后返回描述页虚拟地址（`DeviceGrant`），无设备 / 被拒返回 `0`。
+  - **资源仍在 boot 期由声明式 `grant()` 一次性备好**（域号是 ABI 且域在 boot 期即建好，运行期重复分配会与既有映射冲突）；运行期 syscall 提供的是**申请 + 门禁 + 幂等确认**的完整语义，`main.rs` 的 `device::grant` 声明**不变**。
+  - 用户侧 `user/libdevice/src/grant.rs` 的 `DeviceGrant::load()` 改为发 `SYS_DEVICE_GRANT` 后读回描述（libdevice 仍**零依赖**：本地编号 + 裸 `syscall` 指令）。**三个驱动（`block_srv` NVMe / `net_srv` / `virtio_blk_srv`）共用这一个入口，因此零改动即完成迁移**。
+  - 验证：纯行为等价 —— 全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds` 且 `poll_cmds = 0`、`NET1 … ARP reply OK`、`VBLK1 … sig=ok, rw=ok` 与改造前逐字一致；内核单测新增 3 条（`pci_addr` 编解码边界 / 设备选择 / INFO 打包）。
 
 ### N — 网络驱动（virtio-net，本批主线，**最先做**）
 
@@ -210,8 +213,18 @@
 - **取证**（`make run-nvme IOMMU=1`，或 `IOMMU=1 OUT_DIR=build bash scripts/fs-regress.sh`）：`[OK] VT-d: IOMMU reg=0xFED90000 ver=1.0 sagaw=0x6 ecap=0xF02` + `[OK] VT-d: remap ON root=0x686000 ctx_buses=1 translated=8 (iova=identity 4GiB, aw=39) gsts=0xC0000000`（`TE=1` + `RTPS=1` 回读确认）；`-device intel-iommu` 下全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`），**QEMU 侧零 VT-d 故障**；无 IOMMU 时 `init` 直接返回、行为零变化；内核单测 26 → 29。
 - **注**：本机 QEMU 11.x 有已知缺陷把 `ECAP.PT` 错放进 `CAP`（实测 `ecap=0x0F02`，bit 6 = 0）—— 本步不依赖 pass-through 能力，故不受影响。
 
-#### E1c — 越界 DMA 拒绝取证（待做）
-- 把设备的 DMA 权限绑到 **IOVA 窗口**；飞地故意访问未映射地址 → 观察 IOMMU 报错（fault 寄存器 + 系统不受影响）。这里要定"**谁绕过翻译**"：默认方案是**阶段一内核/既有驱动仍走恒等映射的物理地址 DMA**（对它们按恒等翻译放行），只有飞地的 DMA 走真正的 IOVA 窗口 —— 这样现有 NVMe / virtio 回归行为零变化。
+#### E1c — 受限 IOVA 窗口 + 越界 DMA 拒绝取证 ✅ 已完成
+- **受限窗口**：[`kernel/src/arch/iommu.rs`](../kernel/src/arch/iommu.rs) 把允许的 IOVA 集合写成一条**显式窗口**：其余设备仍是 `[0, 4 GiB)` 恒等（行为零变化），**目标设备（NVMe）单列一张更小的窗口表 `[0, 3 GiB)`** —— 窗口外一律**不建叶项**，设备发起的越界 DMA 一定查表失败。那张表是 E2/E3 把飞地那台设备窗口继续收小的**唯一落点**，不会波及其它设备。
+- **目标为什么只能是 NVMe**：virtio 默认绕过 IOMMU（见 E1b 的坑），只有 NVMe 真走查表。
+- **触发方式（设备发起，不是 CPU）**：`block_srv` 在**卷扫描之后**提交一条 **1 扇区 NVMe 读，PRP1 指到窗口外第一个地址**（3 GiB 整）。选 NVM 读而不是 Admin Identify —— 卷扫描一路都在走同一条读路径，它确定会让设备去取 PRP。探针是**有界轮询**、不碰中断模式、不计入 `nvme: stats`，所以既不会把验收口径 `poll_cmds = 0` 打掉，也不改变命令计数。
+- **取证（内核侧）**：越界 DMA 由用户态驱动在启动阶段发起，而内核没有任何周期性钩子 → 由**空闲任务**（`task_idle` 的 `hlt` 循环，`main.rs` 加一行）调用 `poll_faults()` 读故障寄存器并打印。
+  - **寄存器口径（易错，两处实测教训）**：① `FEDATA`/`FEADDR`/`FEUADDR`（0x3C/0x40/0x44）是**故障事件（MSI）的配置**、**不含**故障内容，SID/原因/地址在 **FRCD**（`0xB0 + 16*i`）；② 本机 QEMU 只置 `FSTS.PPF`（bit 1）而**不置** `FRI`（bit 0），所以"有没有故障"必须按 `FSTS != 0` 判；③ 该 QEMU 只在故障中断**可投递**时才写 FRCD，我们没给 IOMMU 设备开 MSI，故内核日志里 FRCD 为 0 —— 那一侧证据取 QEMU 自己的日志行。
+  - **窗口边界必须 < 4 GiB**：该 QEMU 的 `intel-iommu` 只翻译 < 4 GiB 的 IOVA，**恰好 4 GiB 的 PRP 会直接落到系统地址空间**（实测：既无 `vtd_iommu_translate` 日志、也不产生 FSTS 故障记录）。所以窗口取 3 GiB 而不是 4 GiB。
+- **取证（`make run-nvme IOMMU=1`，或 `IOMMU=1 OUT_DIR=build bash scripts/fs-regress.sh`）**：
+  - 内核日志：`[OK] VT-d: remap ON … target=0x10/win=0xc0000000 …` + `IOMMU1 out-of-window DMA probe: prp=0xc0000000 window=[0,0xc0000000) probe=ok` + `[OK] VT-d: DMA refused target-sid=0x10 fsts=0x2 fectl=0x0 frcd[0]=0x0 (FRCD 未写: 故障中断未投递)`。
+  - QEMU stderr（脚本把 stderr 丢掉，手测时 `2>file` 才看得到）：`vtd_iova_to_sspte: detected sspte permission error (iova=0xc0000000, level=0x3, sspte=0x0, write=1, …)` + `vtd_iommu_translate: detected translation failure (dev=00:02:00, iova=0xc0000000)`。
+  - **系统不受影响**：同一次运行里卷表照常、FS 自测与全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`）；无 IOMMU 时窗口代码整段不执行、行为零变化（探针照跑，落到 q35 上不属于任何内存区的地址，写入被丢弃）。
+  - 内核单测 29 → 31（窗口边界/页数、故障记录解码）。
 
 ### E2 — 飞地管理器 `enclave-mgr`
 - 唯一持 `SYS_ENCLAVE_*` 的特权服务（D6）。
@@ -224,14 +237,22 @@
   2. **IOMMU 隔离**：错误 DMA 被拒且不伤系统；
   3. 与普通路径**行为一致**（同一 LibDevice，两种形态）。
 
-### V1 — 版本串
-- `SYS_UNAME`（或复用既有信息接口）返回系统名/版本/构建号；shell `uname` / `version`。
-- 版本常量单一来源（内核 + README 同步）。
+### V1 — 版本串 ✅ 已完成
+- `SYS_UNAME(51)`（号与转发臂见 3.0 接线层）返回系统名 / release / 构建号：写回调用方缓冲并返回长度，
+  内核侧实现在 [`kernel/src/version.rs`](../kernel/src/version.rs)，用户态封装 `morion::syscall::sys_uname`，
+  shell 加 `uname` / `version`。
+- 版本常量**单一来源** = `version.rs`（`SYSTEM_NAME` / `VERSION` / `MACHINE` / `VARIANT` / `BUILD`），
+  README 的「版本」段与 CHANGELOG 与之保持一致。
+- 取证：shell `uname` → `MorionOS 0.4.0 x86_64`、`version` → `MorionOS v0.4.0 (build <git短哈希>)`。
 
 ### V2 — 无图形界面版本收口
-- 构建开关：`gfx_srv` 不启、shell 不开屏幕镜像（D8）—— 其余服务与回归口径不变。
-- CHANGELOG + README「版本」段 + **打 tag `v0.4.0-nogui`**。
-- 验收即"全量 FS 回归 + 驱动自测 + 飞地取证"全绿。
+- 构建开关：`make NOGUI=1 ...` 注入编译期环境变量 `MORION_NOGUI`（内核 `version.rs` 与用户态
+  `morion::syscall::NOGUI` 同一约定）—— release 串带 `-nogui`，**shell 不开屏幕镜像**、输入/回显退回串口。
+- ⚠️ 与 D8 原文的差异（有意）：`gfx_srv` **仍照常加载**（boot 的服务表写死 18 项、init 又监督域 15；
+  真正"不启"要动 boot/kernel/init 的公共文件，且会让「18 个服务 ELF」判据变 17）。故本步只关
+  **屏幕镜像**这条用户可见的图形路径 —— 其余服务与**全量回归口径不变**。
+- CHANGELOG（新建）+ README「版本」段 + **打 tag `v0.4.0-nogui`**。
+- 验收即"全量 FS 回归 + 驱动自测"全绿（含 `NOGUI=1` 变体回归）。
 
 ---
 
@@ -243,12 +264,12 @@
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
-7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
+7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
-9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD）+ 重映射域（✅ **E1b**：全设备 `translated + 恒等`，打开 `GCMD.TE`，`-device intel-iommu` 下全量回归全绿）+ 越界 DMA 拒绝取证（E1c，待做）。
+9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD）+ 重映射域（✅ **E1b**：全设备 `translated + 恒等`，打开 `GCMD.TE`）+ 受限 IOVA 窗口与越界 DMA 拒绝取证（✅ **E1c**：目标设备窗口收到 3 GiB，设备发起的窗口外 DMA 被拒并留证）。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
 11. **E3 示例飞地**：直通接管设备，零陷落 + 隔离取证。
-12. **V1 版本串** + **V2 无图形版本收口**（CHANGELOG + tag）。
+12. **V1 版本串**（✅ 已完成：`SYS_UNAME(51)` + shell `uname`/`version`）+ **V2 无图形版本收口**（✅ 已完成：`NOGUI=1` 变体 + CHANGELOG；tag `v0.4.0-nogui` 待打）。
 
 ---
 
@@ -259,6 +280,7 @@
 | 不退化 | `make fmt` / `check` / `clippy` 全 0；内核单测全过；**全量 NVMe FS 回归**仍 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found" |
 | 串口 sink | 任何迁移都不得让关键行从 `-serial file:` 消失（沿用图形的 D6 硬约束） |
 | D1 | `nvme` 驱动走 `SYS_DEVICE_*`，内核里不再有 NVMe 专属结构；块设备自测与全量回归不变 |
+| D1b | 三个驱动（NVMe / net / vblk）经运行期 `SYS_DEVICE_GRANT` 取授权，带 `Mmio` 能力门禁；行为与改造前逐字一致，内核单测覆盖门禁与编码 —— ✅ |
 | N0 | 扩容后全量回归仍全绿（存活域数基线、`SELFTEST DONE`×1、`FAILED`/`PANIC` 0）—— ✅ `[OK] 17 service ELFs loaded` + `[up] net_srv (domain 16)` |
 | N1 | 内核找到 virtio-net 并把 `DeviceGrant` 交给域 16：日志有 `[OK] virtio-net modern BAR4=…` 与 `net: device grant …`；全量回归不退化 —— ✅ |
 | N2a | net_srv 读到 MAC、RX/TX virtqueue 建好、`DRIVER_OK`，并能取到帧 —— ✅ `net: virtio-net up MAC=… rx=8 tx=8`、`net: rx frames=1` |
@@ -270,8 +292,9 @@
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E1a | 内核能找到 DMAR 并报出 DRHD/设备范围；固件无 IOMMU 时优雅降级 —— ✅ `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 checksum=ok` + `DRHD[0] base=0xFED90000 scopes=8`（`-device intel-iommu`）；无 IOMMU 时 `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`，全量回归零变化；内核单测 26/26 |
 | E1b | 打开 VT-d DMA 重映射后全量回归不退化 —— ✅ `[OK] VT-d: remap ON root=0x686000 ctx_buses=1 translated=8 (iova=identity 4GiB, aw=39) gsts=0xC0000000`（`TE=1`+`RTPS=1`）；`-device intel-iommu` 下 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`，QEMU 侧零 VT-d 故障；无 IOMMU 时行为零变化；内核单测 29/29 |
+| E1c | 设备发起的**窗口外 DMA 被 IOMMU 拒绝**并留证，系统与其他域不受影响 —— ✅ 目标设备（NVMe，SID 0x10）窗口 = `[0, 3 GiB)`；`block_srv` 探针把 NVM 读的 PRP1 指到 3 GiB → 内核日志 `IOMMU1 out-of-window DMA probe: prp=0xc0000000 window=[0,0xc0000000) probe=ok` + `[OK] VT-d: DMA refused target-sid=0x10 fsts=0x2 …`，QEMU stderr `vtd_iommu_translate: detected translation failure (dev=00:02:00, iova=0xc0000000)`；同一次运行全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`）；无 IOMMU 时零变化；内核单测 31/31 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
-| V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |
+| V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` —— ✅ `MorionOS v0.4.0-nogui (build …)` + `shell: no-gui build (screen mirror off; serial console only)`；`NOGUI=1` 变体全量回归 `SELFTEST DONE`×1、`FAILED`／`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`（产物落 `build/nogui/`） |
 
 ---
 
