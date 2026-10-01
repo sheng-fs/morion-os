@@ -146,18 +146,29 @@ pub fn run() {
     //
     // `gfx_srv` 是后启动的服务域 (域 15), 帧缓冲要等它接管之后才写得进去, 故在这里**有界等待**
     // 一下; 上限到点就走"没有屏幕"的老路 —— 绝不能因为它没起来就把 shell 卡死。
-    let mut waits = 0u64;
-    while waits < CONSOLE_WAIT_MS && !sys_console_ready() {
-        sys_sleep(1);
-        waits += 1;
-    }
-    let mirrored = sys_console_ready() && sys_domain_alive(morion::gfx::GFX_DOMAIN) != 0;
-    if mirrored {
-        // 镜像走 `SYS_CALL`, 目标域没有活任务时会一直等回复, 故上面先确认它活着。
-        screen_mirror_on();
+    //
+    // V2 无图形变体 (`NOGUI`): 不等控制台、不开屏幕镜像, 输入/回显直接走串口
+    // (G4 的 `readline` 本就只依赖 `SYS_KEY_READ` + `sink`, 不依赖 `gfx_srv`)。
+    let mut mirrored = false;
+    if NOGUI {
+        println("shell: no-gui build (screen mirror off; serial console only)");
+    } else {
+        let mut waits = 0u64;
+        while waits < CONSOLE_WAIT_MS && !sys_console_ready() {
+            sys_sleep(1);
+            waits += 1;
+        }
+        mirrored = sys_console_ready() && sys_domain_alive(morion::gfx::GFX_DOMAIN) != 0;
+        if mirrored {
+            // 镜像走 `SYS_CALL`, 目标域没有活任务时会一直等回复, 故上面先确认它活着。
+            screen_mirror_on();
+        }
     }
 
     println("shell: type 'help' for commands");
+    // V1 取证: 启动即报告版本串 —— 自动化回归无需交互就能在串口日志里读到,
+    // 变体后缀 (`-nogui`) 与构建号也在其中 (交互式 `uname` / `version` 打同一份串)。
+    shell_version();
     // 用户态打印中文: 一份经 `SYS_PUTS` 给内核终端 (内核顺带写 COM1), 开了屏幕镜像再给
     // `gfx_srv` 一份 —— Ring 3 的 UTF-8 一路走到 16x16 点阵字形 (全角标点是双宽度)。
     println("你好，世界！MorionOS 终端支持中文、全角标点与宽窄混排。");
@@ -183,7 +194,8 @@ pub fn run() {
     // G4: **输入完全在用户态** —— 内核只把按键字节搬进队列, 行编辑/回显由
     // `morion::console::readline` 做 (它经 `SYS_KEY_READ` 阻塞, 有键才醒)。
     // 但**没有屏幕控制台就没有回显通道**, 故控制台不可用时如实报错退出。
-    if !mirrored {
+    // 没有屏幕控制台就没有回显通道 —— 但无图形变体走串口, 故它不在此退出。
+    if !mirrored && !NOGUI {
         println("shell: screen console unavailable (gfx_srv) - no input channel");
         return;
     }
@@ -222,6 +234,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("commands:");
             println("  help           show this help");
             println("  echo <text>    print text");
+            println("  uname          print system name / release / machine");
+            println("  version        print version and build");
             println("  pwd            print working directory");
             println("  ls [-l] [path] list directory (-l: long form)");
             println("  cat <file>     print file content");
@@ -254,6 +268,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             );
         }
         "echo" => println(arg),
+        "uname" => shell_uname(),
+        "version" => shell_version(),
         "pwd" => println(st.cwd_str()),
         "ls" => shell_ls(st, if arg.is_empty() { "." } else { arg }),
         "cat" => shell_cat(st, arg),
@@ -297,6 +313,38 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println(cmd);
         }
     }
+}
+
+/// `uname` — 打印内核报告的整行 `MorionOS <release> <machine>`（V1）。
+///
+/// 串由内核 `version.rs` **单一维护**（见 `SYS_UNAME`），shell 只负责显示。
+fn shell_uname() {
+    let mut buf = [0u8; 96];
+    let n = sys_uname(&mut buf, 0);
+    if n == 0 {
+        println("uname: SYS_UNAME failed");
+        return;
+    }
+    println(unsafe { core::str::from_utf8_unchecked(&buf[..n as usize]) });
+}
+
+/// `version` — 打印版本号（含变体后缀）与构建号（V1 / V2）。
+fn shell_version() {
+    let mut buf = [0u8; 96];
+    let n = sys_uname(&mut buf, 1);
+    if n == 0 {
+        println("version: SYS_UNAME failed");
+        return;
+    }
+    print("MorionOS v");
+    print(unsafe { core::str::from_utf8_unchecked(&buf[..n as usize]) });
+    let m = sys_uname(&mut buf, 2);
+    if m > 0 {
+        print(" (build ");
+        print(unsafe { core::str::from_utf8_unchecked(&buf[..m as usize]) });
+        print(")");
+    }
+    println("");
 }
 
 /// `run <path>` — 从文件系统加载一个可执行文件并启动它（E1/E2）。

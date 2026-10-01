@@ -25,6 +25,16 @@ QEMU          := qemu-system-x86_64
 # 注意: 新版 QEMU (11.x) 已移除 `-machine ...,intel-iommu=on` 属性, 须用 `-device intel-iommu`。
 IOMMU         ?=
 IOMMU_ARG     := $(if $(IOMMU),-device intel-iommu,)
+# 版本 / 变体注入 (V1 版本串 + V2 无图形收口) —— 都以**编译期环境变量**交给 rustc:
+#   MORION_BUILD —— git 短哈希 (无 git 时用日期), 供内核 `SYS_UNAME` 报告构建号;
+#   NOGUI=1      —— 无图形变体: release 串带 `-nogui`, shell 不开屏幕镜像。
+# 读它们的唯一来源: kernel/src/version.rs 与 user/libmorion/src/syscall.rs。
+MORION_BUILD  ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d)
+NOGUI         ?=
+export MORION_BUILD
+ifneq ($(NOGUI),)
+export MORION_NOGUI := 1
+endif
 NASM          := nasm
 MKDIR         := mkdir -p
 CP            := cp
@@ -40,7 +50,9 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # ============================================================
 # 输出路径
 # ============================================================
-OUT_DIR       := build
+# 无图形变体 (V2) 用**独立输出子目录** (放在已忽略的 build/ 里), 免得与常规构建的镜像 /
+# 指纹互相污染 —— 切换变体不需要 `make clean` (`NOGUI=1 make iso` → 产物落在 build/nogui/)。
+OUT_DIR       ?= $(if $(NOGUI),build/nogui,build)
 ISO_DIR       := $(OUT_DIR)/iso
 KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)

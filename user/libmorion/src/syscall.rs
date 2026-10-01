@@ -91,6 +91,15 @@ pub const SYS_KEY_PUSH: u64 = 48;
 pub const SYS_KEY_READ: u64 = 49;
 /// 读本域被授权设备的 PCI 配置空间 dword (N2): `rdi = offset` → dword; 无设备返回 `u64::MAX`。
 pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
+/// `SYS_UNAME` (V1 版本串): `(缓冲指针, 缓冲长度, 选择)` → 写入字节数 (不含结尾 NUL), 失败 0。
+///
+/// `选择`: 0 = 整行 `MorionOS <release> <machine>`、1 = release、2 = 构建号。
+pub const SYS_UNAME: u64 = 51;
+
+/// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
+///
+/// 与内核 `version.rs` 的 `IS_NOGUI` 同一约定 —— `shell` 据此决定要不要开屏幕镜像。
+pub const NOGUI: bool = option_env!("MORION_NOGUI").is_some();
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -211,6 +220,13 @@ pub const MSI_VECTOR_BASE: u64 = 0x50;
 /// 内核因此不必懂设备协议。没有绑定设备时返回 `u64::MAX`。
 pub fn sys_device_config_read(offset: u64) -> u64 {
     unsafe { syscall(SYS_DEVICE_CONFIG_READ, offset, 0, 0) }
+}
+
+/// 读系统名/版本/构建号 (V1), 写入 `buf`, 返回写入字节数 (不含结尾 NUL); 失败 0。
+///
+/// `which` 取 [`SYS_UNAME`] 的选择值; 版本常量由内核 `version.rs` **单一维护**。
+pub fn sys_uname(buf: &mut [u8], which: u64) -> u64 {
+    unsafe { syscall(SYS_UNAME, buf.as_ptr() as u64, buf.len() as u64, which) }
 }
 
 /// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回**新域 id** (失败 `u64::MAX`)。
