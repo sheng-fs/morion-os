@@ -28,6 +28,7 @@ pub mod memory;
 pub mod pager;
 pub mod scheduler;
 pub mod syscall;
+pub mod version;
 pub mod video;
 
 /// 停机 CPU (hlt 循环, 永不返回)。

@@ -49,6 +49,9 @@ Thumbs.db
 记事.txt
 docs/# MorionOS*
 
+# 并行开发交接文档（本地临时，不入库）
+/HANDOFF.md
+
 # Trae IDE 本地状态
 .trae/
 

@@ -428,3 +428,19 @@ fn log(label: &str, msg: &str) {
     crate::video::print(label);
     crate::video::println(msg);
 }
+
+// ---------------------------------------------------------------------------
+// 并行开发接线层: 运行期设备授权入口 (D1b)
+// ---------------------------------------------------------------------------
+// 号与转发臂已在 [`crate::syscall`] 备好 (`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT`), 所以 D1b
+// 任务**只改本文件** (+ `user/libdevice`), 不必去碰 `syscall.rs` —— 见仓库根 `HANDOFF.md`。
+
+/// `SYS_DEVICE_INFO` 的处理入口（**D1b 待实现**）：查询本域可用设备；未实现时返回 `0`。
+pub fn syscall_info(_a1: u64, _a2: u64, _a3: u64) -> u64 {
+    0
+}
+
+/// `SYS_DEVICE_GRANT` 的处理入口（**D1b 待实现**）：申请设备并拿到 `DeviceGrant`；未实现时返回 `0`。
+pub fn syscall_grant(_a1: u64, _a2: u64, _a3: u64) -> u64 {
+    0
+}

@@ -130,6 +130,19 @@ pub const SYS_KEY_READ: u64 = 49;
 /// "读自己那台设备"。本域没有被授权设备时返回 `u64::MAX`。
 pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 
+// ---------------------------------------------------------------------------
+// 并行开发接线层: 号段预留
+// ---------------------------------------------------------------------------
+// 下面三个号在 `syscall.rs` 里**只占号 + 转发**, 实现各自落在自己的模块里 —— 这样并行推进
+// 这三条任务时不会同时改同一个文件 (见仓库根 `HANDOFF.md` 第 3/4 节)。
+
+/// **预留** `SYS_UNAME` (V1 版本串): 实现在 [`crate::version`]。
+pub const SYS_UNAME: u64 = 51;
+/// **预留** `SYS_DEVICE_INFO` (D1b 运行期设备授权): 实现在 [`crate::device`]。
+pub const SYS_DEVICE_INFO: u64 = 52;
+/// **预留** `SYS_DEVICE_GRANT` (D1b 运行期设备授权): 实现在 [`crate::device`]。
+pub const SYS_DEVICE_GRANT: u64 = 53;
+
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -796,6 +809,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_DOMAIN_COUNT => crate::domain::alive_count() as u64,
         SYS_FRAME_FREE => crate::memory::frame_allocator::free_frames() as u64,
+        // 并行开发接线层: 三条转发臂, 实现分散在各自模块 (见 HANDOFF.md)。
+        SYS_UNAME => crate::version::handle(a1, a2, a3),
+        SYS_DEVICE_INFO => crate::device::syscall_info(a1, a2, a3),
+        SYS_DEVICE_GRANT => crate::device::syscall_grant(a1, a2, a3),
         _ => 0,
     }
 }
