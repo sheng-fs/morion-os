@@ -203,8 +203,12 @@
 - **取证**：无 IOMMU → `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`（优雅降级）；开了 → `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 rmrr=0 checksum=ok` + `DRHD[0] base=0xFED90000 segment=0 include_pci_all=no scopes=8`。纯函数单测（合成表 + 畸形表）24 → 26。
 - **注**：本机 QEMU 已 11.x，`-machine intel-iommu=on` 属性**已移除**，须 `-machine q35 -device intel-iommu`。
 
-#### E1b — 重映射域（待做）
-- 按 DRHD 的 `reg_base` 映射 IOMMU 寄存器块（需要 D1 式的 BAR/MMIO 授权 + 非缓存映射），建**根表 + 上下文表**，给一台设备建 DMA 重映射域并打开翻译（`GCMD.TE`）。QEMU 用 `-device intel-iommu` 复现。
+#### E1b — 重映射域 ✅ 已完成
+- **[`kernel/src/arch/iommu.rs`](../kernel/src/arch/iommu.rs)**：按 `DRHD[0].reg_base`（QEMU `0xFED90000`，在恒等映射内 → 直接以物理地址当虚拟地址 volatile 访问，同 `apic.rs` 访问 LAPIC）读 `VER/CAP/ECAP` → 选地址宽度（优先 39 位）→ 建**根表**（每总线一项）+ **上下文表**（每总线一张）+ **恒等二级页表**（AW=39 时顶层即 1 GiB 大页级，1 张表覆盖前 4 GiB）→ **每个枚举到的 PCI 功能点**写一条 `translated + 恒等`上下文项 → `RTADDR` → `GCMD.SRTP` → `GCMD.TE`，回读 `GSTS.RTPS/TES` 确认。
+- **口径**：`TE = 1` 后所有设备 DMA 都要查表；阶段一内核与既有驱动仍按物理地址 DMA → 用**恒等翻译**放行（行为零变化），且每个功能点在 IOMMU 里都有明确一项，不留"表里没有就放行"的隐式口子（E1c 换受限窗口的前提）。本步**不需要** pass-through。
+- **踩到的坑（关键）**：上下文项 `TT`（bits 3:2）取值写反 —— 按 Linux/QEMU 口径是 **`0b00` = translated**、`0b01` = Device TLB、`0b10` = pass-through。写成 `0b01` 时 QEMU 直接报 `vtd_ce_type_check: DT specified but not supported`，并把该设备所有 DMA 判成故障（现象 = NVMe `Identify Controller FAILED`）。注意 **virtio 设备默认绕过 IOMMU** —— 所以 `VBLK1` 通过**不代表**翻译生效，只有 NVMe 真正走查表，是这一步的关键证据来源。
+- **取证**（`make run-nvme IOMMU=1`，或 `IOMMU=1 OUT_DIR=build bash scripts/fs-regress.sh`）：`[OK] VT-d: IOMMU reg=0xFED90000 ver=1.0 sagaw=0x6 ecap=0xF02` + `[OK] VT-d: remap ON root=0x686000 ctx_buses=1 translated=8 (iova=identity 4GiB, aw=39) gsts=0xC0000000`（`TE=1` + `RTPS=1` 回读确认）；`-device intel-iommu` 下全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`），**QEMU 侧零 VT-d 故障**；无 IOMMU 时 `init` 直接返回、行为零变化；内核单测 26 → 29。
+- **注**：本机 QEMU 11.x 有已知缺陷把 `ECAP.PT` 错放进 `CAP`（实测 `ecap=0x0F02`，bit 6 = 0）—— 本步不依赖 pass-through 能力，故不受影响。
 
 #### E1c — 越界 DMA 拒绝取证（待做）
 - 把设备的 DMA 权限绑到 **IOVA 窗口**；飞地故意访问未映射地址 → 观察 IOMMU 报错（fault 寄存器 + 系统不受影响）。这里要定"**谁绕过翻译**"：默认方案是**阶段一内核/既有驱动仍走恒等映射的物理地址 DMA**（对它们按恒等翻译放行），只有飞地的 DMA 走真正的 IOVA 窗口 —— 这样现有 NVMe / virtio 回归行为零变化。
@@ -241,7 +245,7 @@
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：走的是 boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）仍待做。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
-9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD，取证已入回归）+ 重映射域（E1b）+ 越界 DMA 拒绝取证（E1c）。
+9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD）+ 重映射域（✅ **E1b**：全设备 `translated + 恒等`，打开 `GCMD.TE`，`-device intel-iommu` 下全量回归全绿）+ 越界 DMA 拒绝取证（E1c，待做）。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
 11. **E3 示例飞地**：直通接管设备，零陷落 + 隔离取证。
 12. **V1 版本串** + **V2 无图形版本收口**（CHANGELOG + tag）。
@@ -265,6 +269,7 @@
 | D0 | I/O 端口 syscall 加 `IoPort` 门禁：未授权域读写端口被拒，`block_srv` / `mfs_srv` / `exfat_srv` 照常 —— ✅ `app: D0 port capability gate OK (ungranted I/O port denied)`；FS-13/FS-16 仍写得出时间戳（两处授权放行）；内核单测 24/24 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E1a | 内核能找到 DMAR 并报出 DRHD/设备范围；固件无 IOMMU 时优雅降级 —— ✅ `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 checksum=ok` + `DRHD[0] base=0xFED90000 scopes=8`（`-device intel-iommu`）；无 IOMMU 时 `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`，全量回归零变化；内核单测 26/26 |
+| E1b | 打开 VT-d DMA 重映射后全量回归不退化 —— ✅ `[OK] VT-d: remap ON root=0x686000 ctx_buses=1 translated=8 (iova=identity 4GiB, aw=39) gsts=0xC0000000`（`TE=1`+`RTPS=1`）；`-device intel-iommu` 下 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`，QEMU 侧零 VT-d 故障；无 IOMMU 时行为零变化；内核单测 29/29 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` |
 

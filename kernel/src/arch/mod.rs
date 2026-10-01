@@ -4,6 +4,7 @@ pub mod acpi;
 pub mod apic;
 pub mod gdt;
 pub mod idt;
+pub mod iommu;
 pub mod keyboard;
 pub mod pci;
 pub mod pic;

@@ -21,6 +21,10 @@
 CARGO         := cargo
 RUSTUP        := rustup
 QEMU          := qemu-system-x86_64
+# 可选: 让 QEMU 暴露 Intel VT-d (IOMMU) —— 校验 E1b 的 DMA 重映射路径。用法: `make run-nvme IOMMU=1`
+# 注意: 新版 QEMU (11.x) 已移除 `-machine ...,intel-iommu=on` 属性, 须用 `-device intel-iommu`。
+IOMMU         ?=
+IOMMU_ARG     := $(if $(IOMMU),-device intel-iommu,)
 NASM          := nasm
 MKDIR         := mkdir -p
 CP            := cp
@@ -310,6 +314,7 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
 	$(QEMU) \
 		-machine q35 \
+		$(IOMMU_ARG) \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-cdrom $(ISO_IMAGE) \

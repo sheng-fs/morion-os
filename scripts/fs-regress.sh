@@ -83,8 +83,16 @@ else
 fi
 timeout_s=${REGRESS_TIMEOUT_S:-600}
 
+# 可选: IOMMU=1 时让 QEMU 暴露 Intel VT-d —— 校验 E1b 的 DMA 重映射路径 (翻译打开后
+# 设备 DMA 仍通)。新版 QEMU (11.x) 已移除 `-machine ...,intel-iommu=on`, 须用 `-device intel-iommu`。
+iommu_arg=""
+if [ -n "${IOMMU:-}" ]; then
+  iommu_arg="-device intel-iommu"
+  echo "== QEMU 暴露 Intel VT-d (IOMMU=1): 校验 E1b DMA 重映射"
+fi
+
 $QEMU \
-  -machine q35 -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
+  -machine q35 ${iommu_arg} -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
   -cdrom "$OUT_DIR/morion-os.iso" \
   -device nvme,serial=MORION,id=nvme0 \
   -drive file="$OUT_DIR/nvme.img",if=none,id=n1,format=raw -device nvme-ns,drive=n1,bus=nvme0,nsid=1 \
