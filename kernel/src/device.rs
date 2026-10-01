@@ -100,10 +100,6 @@ pub fn grant(req: GrantRequest) -> bool {
     let bar_paddr = req.bar_paddr & !(PAGE - 1);
     let dma_pages = req.dma_pages.max(1);
 
-    // 记下"域 → 设备 PCI 位置": 驱动之后用 `SYS_DEVICE_CONFIG_READ` 自行解析能力链表,
-    // 而该 syscall 只放行"读自己那台设备"。
-    bind(req.domain, req.bus, req.dev, req.func);
-
     // 0. MSI-X。必须在写描述结构之前完成: 向量 / 表位置要写进描述。
     let msix = setup_msix(
         req.domain,
@@ -150,6 +146,11 @@ pub fn grant(req: GrantRequest) -> bool {
     unsafe {
         core::ptr::write(cfg_paddr as *mut DeviceGrant, desc);
     }
+
+    // 记下"域 ↔ 已授权设备": 既是 `SYS_DEVICE_CONFIG_READ` 的放行依据 (只放行"读自己
+    // 那台设备"), 也是 D1b 运行期 `SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` 的登记来源
+    // (查询本域设备 / 能力门禁 / 幂等确认)。
+    bind(req.domain, req.bus, req.dev, req.func, bar_paddr, cfg_paddr);
 
     // 4. 映射描述页、BAR 窗口 (非缓存 MMIO) 与 DMA 各页 (数据: RW + NX)。
     paging::map_user_page(
@@ -200,30 +201,39 @@ pub fn grant_empty(domain: u64) {
     );
 }
 
-/// 域 → 已授权设备的 PCI 位置 (供 [`config_read`] 限定"驱动只能读自己那台设备")。
+/// 域 → 已授权设备的登记表 (供 [`config_read`] 与运行期 `SYS_DEVICE_*` 使用)。
 static BINDINGS: spin::Mutex<Vec<DeviceBinding>> = spin::Mutex::new(Vec::new());
 
-/// 一条"域 ↔ 设备"绑定。
+/// 一条"域 ↔ 设备"绑定, 记下运行期 syscall 需要的全部字段。
 struct DeviceBinding {
     domain: u64,
     bus: u8,
     dev: u8,
     func: u8,
+    /// 被授权 BAR 的页对齐物理基址 —— 也是 `SYS_DEVICE_GRANT` 能力门禁的判据
+    /// (`Capability::Mmio(bar_paddr)` 由 [`grant`] 一并签发)。
+    bar_paddr: u64,
+    /// 描述页物理地址 (内核恒等映射, 可直接读其 magic 做幂等确认)。
+    cfg_paddr: u64,
 }
 
-/// 记下某域被授权的设备 PCI 位置 (同一域重新授权时覆盖)。
-fn bind(domain: u64, bus: u8, dev: u8, func: u8) {
+/// 记下某域被授权的设备 (同一域重新授权时覆盖)。
+fn bind(domain: u64, bus: u8, dev: u8, func: u8, bar_paddr: u64, cfg_paddr: u64) {
     let mut bindings = BINDINGS.lock();
     if let Some(e) = bindings.iter_mut().find(|e| e.domain == domain) {
         e.bus = bus;
         e.dev = dev;
         e.func = func;
+        e.bar_paddr = bar_paddr;
+        e.cfg_paddr = cfg_paddr;
     } else {
         bindings.push(DeviceBinding {
             domain,
             bus,
             dev,
             func,
+            bar_paddr,
+            cfg_paddr,
         });
     }
 }
@@ -435,12 +445,136 @@ fn log(label: &str, msg: &str) {
 // 号与转发臂已在 [`crate::syscall`] 备好 (`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT`), 所以 D1b
 // 任务**只改本文件** (+ `user/libdevice`), 不必去碰 `syscall.rs` —— 见仓库根 `HANDOFF.md`。
 
-/// `SYS_DEVICE_INFO` 的处理入口（**D1b 待实现**）：查询本域可用设备；未实现时返回 `0`。
-pub fn syscall_info(_a1: u64, _a2: u64, _a3: u64) -> u64 {
-    0
+/// `SYS_DEVICE_*` 的 `a1` 哨兵: 申请 / 查询**本域**已被绑定的那台设备。
+///
+/// 用 `u64::MAX` 而非 `0` —— `0` 是合法的 `pci_addr` (00:00.0), 不能当哨兵。
+pub const DEVICE_SELF: u64 = u64::MAX;
+
+/// 把 PCI 位置打包成 `SYS_DEVICE_*` 的 `pci_addr`: `bus<<16 | dev<<8 | func`。
+pub const fn pci_addr(bus: u8, dev: u8, func: u8) -> u64 {
+    ((bus as u64) << 16) | ((dev as u64) << 8) | func as u64
 }
 
-/// `SYS_DEVICE_GRANT` 的处理入口（**D1b 待实现**）：申请设备并拿到 `DeviceGrant`；未实现时返回 `0`。
-pub fn syscall_grant(_a1: u64, _a2: u64, _a3: u64) -> u64 {
-    0
+/// 解开 `pci_addr`; `bus/dev/func` 任一超出位宽 (`dev > 31` / `func > 7`) 返回 `None`。
+///
+/// 纯函数 (不碰全局表 / 硬件), 便于单测。
+fn split_pci_addr(a: u64) -> Option<(u8, u8, u8)> {
+    if a >> 24 != 0 {
+        return None;
+    }
+    let bus = ((a >> 16) & 0xFF) as u8;
+    let dev = ((a >> 8) & 0xFF) as u8;
+    let func = (a & 0xFF) as u8;
+    if dev > 31 || func > 7 {
+        return None;
+    }
+    Some((bus, dev, func))
+}
+
+/// `a1` 是否指向 `bus:dev.func` 这台设备 (纯函数, 便于单测)。
+///
+/// `DEVICE_SELF` 恒真; 显式地址必须**精确匹配** —— 域只能认领自己那台设备。
+fn selects(a1: u64, bus: u8, dev: u8, func: u8) -> bool {
+    a1 == DEVICE_SELF || split_pci_addr(a1) == Some((bus, dev, func))
+}
+
+/// 把 `SYS_DEVICE_INFO` 的答复打包进一个 `u64`: `vendor<<48 | device<<32 | class(低 24 位)`。
+///
+/// `class_code` 取 PCI 配置空间 0x08 处 dword 的高三字节 (class : subclass : prog-if)。
+/// 返回 `0` = 无设备 (真实设备 vendor != 0, 且 class 不同时为 0)。
+fn pack_info(vendor: u16, device: u16, class_code: u32) -> u64 {
+    ((vendor as u64) << 48) | ((device as u64) << 32) | (class_code as u64 & 0x00FF_FFFF)
+}
+
+/// `SYS_DEVICE_INFO` 的处理入口（D1b）：查询本域可用设备。
+///
+/// `a1` = [`DEVICE_SELF`] (本域已绑定设备) 或显式 `pci_addr`; 返回打包的
+/// `vendor/device/class` (见 [`pack_info`]), 无设备 / 地址不属于本域返回 `0`。
+pub fn syscall_info(a1: u64, _a2: u64, _a3: u64) -> u64 {
+    let me = crate::scheduler::current_domain();
+    let (bus, dev, func) = {
+        let bindings = BINDINGS.lock();
+        let Some(e) = bindings.iter().find(|e| e.domain == me) else {
+            return 0; // 本域无设备 (boot 期走了 `grant_empty`)。
+        };
+        if !selects(a1, e.bus, e.dev, e.func) {
+            return 0;
+        }
+        (e.bus, e.dev, e.func)
+    };
+
+    let ids = pci::config_read_dword(bus, dev, func, 0x00);
+    if (ids & 0xFFFF) == 0xFFFF {
+        return 0; // 位置空 (设备已消失)。
+    }
+    let class = pci::config_read_dword(bus, dev, func, 0x08);
+    pack_info((ids & 0xFFFF) as u16, (ids >> 16) as u16, class)
+}
+
+/// `SYS_DEVICE_GRANT` 的处理入口（D1b）：申请设备并拿到 `DeviceGrant`。
+///
+/// `a1` = [`DEVICE_SELF`] 或显式 `pci_addr` (`a2`/`a3` 保留); 成功返回描述页在**本域**
+/// 的虚拟地址 ([`DEVICE_CFG_VADDR`]), 无设备 / 被拒返回 `0`。
+///
+/// 资源 (BAR / 连续 DMA 块 / MSI-X / `Mmio` 能力) 在 boot 期由声明式 [`grant`] 一次性备好;
+/// 这里做的是**运行期申请**的完整语义: 定位本域设备 → **能力门禁** (须持有该 BAR 的
+/// `Mmio` 凭证) → 幂等确认描述页确带授权 (`magic` 校验) 后把它交给驱动。域号是 ABI 且域
+/// 在 boot 期即建好, 故不存在"运行期首次分配"路径 (重复分配会与既有映射冲突, 见 HANDOFF 3.3)。
+pub fn syscall_grant(a1: u64, _a2: u64, _a3: u64) -> u64 {
+    let me = crate::scheduler::current_domain();
+    let (bar_paddr, cfg_paddr) = {
+        let bindings = BINDINGS.lock();
+        let Some(e) = bindings.iter().find(|e| e.domain == me) else {
+            return 0; // 本域无设备。
+        };
+        if !selects(a1, e.bus, e.dev, e.func) {
+            return 0; // 申请的不是本域那台设备。
+        }
+        (e.bar_paddr, e.cfg_paddr)
+    };
+
+    // 能力门禁 (参考 `Spawn` / `IoPort`): 只有持有该设备 BAR 的 `Mmio` 凭证的域才准认领
+    // 授权 —— 该凭证由 `grant()` 一并签发, 故合法驱动必过, 其它域拿不到。
+    if !crate::cap::has(me, crate::cap::Capability::Mmio(bar_paddr)) {
+        crate::video::println("dev: device grant denied (no Mmio capability)");
+        return 0;
+    }
+
+    // 描述页必须确实带着授权 (magic 匹配), 否则视为"无设备"。
+    let magic = unsafe { core::ptr::read_volatile(cfg_paddr as *const u64) };
+    if magic != DEVICE_GRANT_MAGIC {
+        return 0;
+    }
+    DEVICE_CFG_VADDR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pci_addr` 编码与 `split_pci_addr` 解码互逆; `bus/dev/func` 位宽越界一律拒绝。
+    #[test]
+    fn pci_addr_roundtrip_and_bounds() {
+        assert_eq!(split_pci_addr(pci_addr(0, 2, 0)), Some((0, 2, 0)));
+        assert_eq!(split_pci_addr(pci_addr(0, 31, 7)), Some((0, 31, 7)));
+        assert_eq!(split_pci_addr(1 << 24), None); // bus 超 8 位
+        assert_eq!(split_pci_addr(32 << 8), None); // dev 超 5 位
+        assert_eq!(split_pci_addr(8), None); // func 超 3 位
+    }
+
+    /// 设备选择: `DEVICE_SELF` 恒选中; 显式地址必须与绑定精确一致 (别的设备不认领)。
+    #[test]
+    fn device_selection() {
+        assert!(selects(DEVICE_SELF, 0, 2, 0));
+        assert!(selects(pci_addr(0, 2, 0), 0, 2, 0));
+        assert!(!selects(pci_addr(0, 3, 0), 0, 2, 0));
+        assert!(!selects(0xDEAD_BEEF, 0, 2, 0)); // 越界编码
+    }
+
+    /// `SYS_DEVICE_INFO` 打包: vendor/device 各占高/中 16 位, class 取低 24 位; 0 = 无设备。
+    #[test]
+    fn info_packing() {
+        assert_eq!(pack_info(0x1AF4, 0x1001, 0x000102), 0x1AF4_1001_0000_0102);
+        assert_eq!(pack_info(0, 0, 0), 0);
+    }
 }
