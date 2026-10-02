@@ -1,6 +1,6 @@
 # Morion OS 文件系统路线图
 
-> 目标：在 QEMU 里跑通「应用 → libvfs → fat32_srv → nvme_srv → NVMe 磁盘」的读文件链路。
+> 目标：在 QEMU 里跑通「应用 → libvfs → fat32_srv → nvme_srv → NVMe 磁盘」的读文件链路（`nvme_srv` 为该服务的旧称，实际服务名与域为 `block_srv`/域 5）。
 > 方向：**NVMe 块设备驱动 + FAT32 文件系统**，均以用户态服务实现（微内核不解析文件系统元数据）。
 
 ---
@@ -23,8 +23,8 @@
 | PCI 枚举 | ✅ 已补齐（阶段 0） | 扫 bus/device/function，找 NVMe 控制器（class `01:08:02`），读 BAR0 |
 | MMIO 映射能力 | ✅ 已补齐（阶段 0） | 新增 `Capability::Mmio` + `map_mmio` syscall，把 BAR0 映射到驱动域 |
 | DMA 物理页 | ✅ 已补齐（阶段 0） | 分配**页对齐、物理连续**的队列与数据缓冲，映射到驱动域 |
-| 块设备能力 | 无 | 新增能力，让 `fat32_srv` 能调用 `nvme_srv` 读写块 |
-| 块设备协议 | 无 | 定义 `read_lba` / `write_lba` IPC 消息格式 |
+| 块设备能力 | ✅ 已补齐（阶段 1/2） | 新增能力，让 `fat32_srv` 能调用 `nvme_srv`（现 `block_srv`，域 5）读写块 |
+| 块设备协议 | ✅ 已补齐（阶段 1/2） | 定义 `read_lba` / `write_lba` IPC 消息格式 |
 | 中断 | ✅ 已补齐（阶段 39） | PIC + **LAPIC/MSI-X**：NVMe 完成走中断驱动，等不到中断则自动回退轮询 |
 
 ---
@@ -95,7 +95,7 @@ qemu-system-x86_64 \
 - [x] app FS-4 自测 + shell 交互验证：`ls /tmp`→`mkdir /tmp/d`→`touch /tmp/d/f.txt`→`ls /tmp/d` 全通，
       `ls /` 仍由 fat32 服务。
 
-### 阶段 C3 — 原创 MorionFS (MFS) 与 ext2 只读兼容
+### 阶段 C3 — 原创 MorionFS (MFS) 与 ext2 只读兼容 ✅ 已完成
 
 - [x] **MFS（原创文件系统）** ✅ 已完成：块设备后端（NVMe 第二 namespace → 独立 `build/mfs.img`，
       默认 64 MiB，空白盘首次挂载自动格式化 —— **M7 起按该卷真实容量定尺寸**，不再写死）。
@@ -144,7 +144,7 @@ app FS-7（ext2 只读：根目录列出 `HELLO.TXT`/`SUBDIR`、读 `HELLO.TXT`/
 shell 交互 `ls /mfs` / `cat /mfs/PERSIST.TXT` / `ls /ext2` / `cat /ext2/HELLO.TXT` 正常；
 日志无 `FAILED`/`PANIC`。
 
-### 阶段 D — 卷层与 MFS v2（进行中）
+### 阶段 D — 卷层与 MFS v2 ✅ 已完成
 
 > 目标：FAT32 只作为**旧设备兼容**保留；把**原创 MorionFS 做成主力文件系统**（支持大文件、空间回收、
 > 长名与元数据），并通过**分区/卷层**兼容更多真实设备文件系统（exFAT 等）。
@@ -1582,7 +1582,7 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
    `run /hello.mex` 均 `new domain 14`（复用）。全量回归 `SELFTEST DONE` ×1、`FAILED`/`PANIC` 0、
    `irq_cmds == cmds` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found"。
 3. ✅ **已完成（服务拆程序）**：新建 `user/srv`（crate `morion-srv`）—— 14 个服务各一个 `[[bin]]`、各一份**独立 ELF**，各模块用 `#[cfg(feature = "svc-<name>")]` 门控（一个 bin 只编自己的服务 + `common`），共享的线协议/块客户端/名字工具抽到 `src/common.rs`。原生单文件 `user/src/main.rs`（17814 行、按域 id 分流）与 `morion-user` crate 已删除。内核改为 `SERVICE_ELFS` 表 + `exec::spawn_elf_at(domain, image)`（不建域/不登记全局表，只映射+起任务），删掉 `load_user_program`/`USER_PROGRAM`；14 份 ELF 经 `include_bytes!` 嵌入，引导期逐个载入各自固定域。每个程序入口打印 `[up] <name> (domain N)`。Makefile：`make user` 构建 `morion-srv` 的 14 个 bin → `build/user/srv/*.elf`，内核依赖该 stamp；`check`/`clippy` 改查 `morion-srv`。
-4. **收口（文档已完成，仅剩提交）**：文档已同步 —— dev-reference 第 45 行（E2b 三步全记）、build/exec/域小节、app-dev-guide（"两种程序"表 + 新增服务步骤 + syscall 路径）、shell-reference、commands.md、README（架构树 + 路线勾选）；全量回归已过（见第 3 步与第 1/2 步证据）。**仅剩 git 提交未做（待授权）**。
+4. **收口（文档已完成并提交）**：文档已同步 —— dev-reference 第 45 行（E2b 三步全记）、build/exec/域小节、app-dev-guide（"两种程序"表 + 新增服务步骤 + syscall 路径）、shell-reference、commands.md、README（架构树 + 路线勾选）；全量回归已过（见第 3 步与第 1/2 步证据）。**已完成并提交**（E3 全程建立在 E2b 之上）。
 
 **验收（沿用现有口径）**
 
@@ -1740,7 +1740,150 @@ E2b 让服务成了「独立程序 + 域可回收」，但服务的**生命周�
 - **NX 与内核映射**：开启 `NXE` 后，未置 NX 的内核映射仍可执行（内核自身 W^X 不在本轮）。
 - **`EFER.NXE` 依赖 CPUID 支持**：不支持则无法强制 W^X，需明确告警（QEMU/真机均支持）。
 
+### S6 MFS 快照 / 回收开成 shell 命令 已完成 ✅
+
+**动机**：快照、回滚、空间回收三件套在协议（`MSNP` / `MSNL` / `MSNR` / `MSGC`）和 `libmorion`
+里早就有了，但**只有自测在用** —— 用户拿不到。MFS 作为主力文件系统，这块能力必须可操作。
+
+**改动**（纯 shell 层，不碰盘上格式、不碰 mfs_srv）：
+- `mfs.snap`：拍快照，回索引；`mfs.snaps`：列快照（经结果页解析 `SNAP_REC_LEN` = 24 字节的
+  `gen / root_itab / ino_hint / alloc_hint` 记录，与 mfs_srv 的写入口径一致）；
+  `mfs.rollback <index>`：回滚（索引越界 / 未挂载都有明确报错）；`mfs.gc`：回收不可达块。
+- 四条命令都作用于**主卷 = `/mfs`**（这些 tag 直接发 mfs_srv，不走挂载层路由），与 `df` 同源；
+  复用 shell 已有的结果页 `SHELL_RESULT_BUF`（已共享给 MFS 域），无需新页。
+- `help` 与 [shell-reference.md](shell-reference.md) 同步更新（逐命令细节含各条失败输出）。
+
+**验证**：`make fmt` / `clippy -D warnings` 全 0；`scripts/fs-regress.sh` 全量回归
+`SELFTEST DONE` 1 次、`FAILED/PANIC` 0 次；真机 U 盘读写脚本 `scripts/usb-rw.sh` 用同一 ISO
+跑通「擦除 → 分区 → mkfs → 写文件 → 重启读回」。
+
+**真盘实测**（2026-10-02，thinkplus 238.5G U 盘 `/dev/sda`，`bash scripts/usb-rw.sh /dev/sda --yes`，退出码 0）：
+
+| 步骤 | 实测 |
+|---|---|
+| `part.wipe 6` | `nsid 6 partition table cleared`，卷表回到整盘 `lba=0 kind=unknown` |
+| `part.create 6 0 mbr` | 新分区 `lba=2048 sectors=500116144` |
+| `mkfs.mfs 6` | `volume 6 formatted, marked primary (serial 1)` |
+| 写文件 | `HELLO.TXT` / `DIR1` / `BIG.BIN`（`truncate 1048576` 成功） |
+| 宿主侧 magic | 分区起点读到 `38 53 46 4d`（MFS8 magic 的小端落盘）✅ |
+| 宿主侧超级块 | 块大小 4096 / 总块数 **33357824** → 卷容量 **130304 MiB（127.25 GiB）**，小于盘容量 244198 MiB → `MFS_MAX_BLOCKS` clamp 生效 ✅ |
+| 二次启动（只读） | 真盘卷自动挂 `/usb6`，读回 `HELLO.TXT size=0` / `DIR1` / `BIG.BIN size=1048576` ✅（大小字段跨重启持久化） |
+| 盘头 sha256 | 测试前 `2daeb1f3…` → 测试后 `0a74e271…`（盘确实被改写） |
+| 失败明细 | 第一次启动 `FAILED/PANIC=0`；第二次仅 `shell: screen console mirror FAILED (gfx_srv cursor not advanced)`（既有无害提示） |
+
+> 真盘边界（本轮踩到）：出厂盘自带 exfat 分区时，`part.wipe` 只清**分区表**、不动数据，残留的
+> exFAT VBR 让**新建的分区**（与旧分区同起点同大小）仍被卷层探测成 `kind=exfat`，而 mfs_srv 的
+> 护栏**正确地**拒绝格式化非空白卷 —— `mkfs.mfs` 因此走不通。脚本的处置是擦除前先在宿主侧
+> **清零盘头 256 MiB**（抹掉旧文件系统签名，这才是「整盘擦除重建」的起点）。
+> 另一条路（**已实现**）是把决定权交回用户：`mkfs.mfs <卷号> --force` —— `MKFS` payload 的
+> 第 2 个字是标志字（`vfs::MKFS_FLAG_FORCE`），护栏默认一个字节都没放宽，只有显式 `--force`
+> 才放行 FAT/exFAT/ext2 卷（服务端先打印 `mfs: mkfs --force: overwriting an existing filesystem`）。
+> 两条路径互不替代：脚本验的是「盘级擦除重建」，`--force` 服务的是「用户明知故犯地覆盖」。
+
+### MFS 健壮性收口（01）—— 三态 magic / 最小 fsck / 显式 sync
+
+> **2026-10-02**：本轮四条并行流之一。任务书见 [plan-fs-streams.md](plan-fs-streams.md) §3「01」。
+> 只改 `mfs_srv` / `vfs` / `shell` / `app` 自测与文档，**不升 magic、不改盘上布局**。
+
+**① 三态 magic（默认保护数据）**：把「未知/更新版 magic → 挂载时自动重新格式化」改成
+**默认拒绝挂载**。新增 `mfs_sb_magic_state(vol)` 直读两份超级块块首 magic 做三态判定：
+
+- **空白卷**（卷首无任何 MFS 系 magic）→ 照旧自动格式化（首次挂载路径**一字未改**）；
+- **MFS 系但修订不匹配本构建**（`MFS0`..`MFS9` 里非 `MFS8`）→ **拒绝挂载 + 明确日志**
+  （打印盘上 magic 字节、期望值、处置建议 `mkfs.mfs <vol>`），**一个字节都不写盘**；
+- **非 MFS 卷** → 维持原有拒绝。
+
+顺带收紧：本构建 `MFS8` 但超级块/位图/inode 表**损坏**时，也从「重格」改为「拒绝重格」
+（重格会毁掉用户数据；这是有意取舍，回归每轮 dd 重置 `mfs.img`，开发期旧镜像先 `mkfs.mfs`）。
+
+**② 最小 fsck（对账，默认只报不修）**：新 tag `MFS_FSCK_TAG = "MFSC"` + shell `mfs.fsck [--repair]`。
+沿**当前根目录树**标记可达 inode（独立 ino 位图窗口 `0x80_0200_0000`，按需铺 32 页），
+并复用 GC 的全根可达标记（含快照）判定泄漏 inode 名下哪些块**真可回收**。回复
+`(泄漏 inode 数 << 32) | 块数`：默认模式=名下可回收块（**不写盘**），`--repair`=实际回收块数
+（清泄漏槽 → `mfs_gc()` 按其可达性安全回收，快照仍引用的历史版本不会被收）。为此把 `mfs_gc`
+拆成 `mfs_gc_mark()` / `mfs_gc_sweep()`（行为不变，mark 结果供 fsck 复用）。
+
+**③ 显式 sync**：新 tag `MFS_SYNC_TAG = "MSYN"` + shell `mfs.sync`，幂等调一次 `mfs_bmp_flush()`，
+回复**落盘后的 gen**。用途：给「崩溃一致性」自测一个可断言的落盘点。
+
+**验证**：`FS-31`（健康卷 fsck 报 0 泄漏、`--repair` 幂等）、`FS-32`（`write → sync → 裸读扇区 0`
+断言盘上超级块 gen == 回复 gen，再重新打开读回内容）；`FS-30`（旧 magic 卷拒绝挂载且盘未变）
+按计划在**宿主侧**用预置镜像 + `sha256` 单独取证并记录（客户机内无法制造旧 magic 卷）。
+
+**门禁**：四道全过 —— `cargo fmt` / `make fmt` / `make check` / `make clippy` 0 warning；
+内核单测 34 passed；`make run-nvme` 构建通过；全量回归 `SELFTEST DONE=1`、`FAILED/PANIC=0`、
+`irq_cmds == cmds`（`poll_cmds=0`）、`sgdisk -v` no problems。回归日志含
+`app: FS31 fsck reconciled (0 leaked inodes; --repair idempotent)` 与
+`app: FS32 sync gen <N> persisted on disk (raw superblock match, readback ok)`。
+（`[OK] 19 service ELFs loaded` 是 03 加域后的数，由 03 维护。）
+
+**FS-30 取证（宿主侧，四条流合并后的收口验证里补做）**：把 `build/mfs.img` 两份超级块的块首
+magic 由 `MFS8` 改成 `MFS7`（`printf '\x37' | dd of=… bs=1 seek=0/seek=4096 conv=notrunc`，
+备份原镜像），再起一次 QEMU：
+
+```
+mfs: refuse to mount: on-disk magic MFS7 (1296454455) != expected MFS8 (1296454456);
+     run 'mkfs.mfs <vol>' to rebuild (data left untouched)
+```
+
+盘 sha256 起机前后**完全一致**（`6a7d12f3…` == `6a7d12f3…`）—— 证明「拒绝挂载」时
+**一个字节都没写盘**。取证后已还原镜像（块首回到 `38 53 46 4d`）。
+
+**已知覆盖缺口（留给 04b/后续）**：FS-31 只在**健康卷**上验"报 0 泄漏 + `--repair` 幂等"，
+`--repair` 真正回收泄漏 inode 的那条路径还没有用例（需要在镜像里人为制造泄漏，
+或加一个受控的调试钩子）。
+
+### 权限与多用户设计（04）—— 设计稿，待实现
+
+> **2026-10-02**：权限强制必须落在文件服务内部（`mfs_srv` 的每个 open/read/write 前），
+> 而 `mfs_srv.rs` 在本轮四条并行流中归 01 独占，故 04 **只交设计 + 接口草案**，实现顺延为 04b。
+> 任务书见 [plan-fs-streams.md](plan-fs-streams.md) §3「04」，设计稿见
+> **[design-permissions.md](design-permissions.md)**。
+
+- 现状边界：`chmod` 只存不判（`mfs_srv.rs:3428-3459`）、`owner` 存创建者域号而非 uid、无 gid；
+  `mode` 唯二用途都是显示。内核侧「能力即句柄」已在 I/O 路径落地，但**没有身份概念**。
+- 设计要点（详见设计稿）：身份用 `(uid, gid)`，两阶段落地（04b 静态「域号 → 凭证」表 → 目标形态认证服务签发）；
+  **uid/gid 放进元数据 `+32` 保留区，不升 magic、不改布局**，`owner` 保留原义，与 01 的 magic 策略零冲突；
+  新增 `MFS_E*` 错误码波段区分 `EACCES`/`EPERM`；能力（内核、对象可达性）在前，权限位（服务内、身份判定）在后且为最终权威。
+- 后续（04b）：`mfs_check_access` + 各检查点接线 + `chown` tag + 客户端错误码映射 + `FS-34..37` 自测；
+  同样等 01 合入后再动 `mfs_srv.rs`。
+
+### 阶段 02 — 块层性能（只读扇区缓存 + 顺序预读）✅ 已完成
+
+**动机**：块服务的每次 `BLOCK_OP_READ` 都真下盘 —— 全链路每请求一跳 IPC（≈1 tick），上层虽各有
+小缓冲却没有块层共享缓存。目标是在**块服务内**做透明加速：四个文件服务一行不改。
+
+**实现**（`user/srv/src/block_srv.rs`）：
+
+- **只读扇区缓存**：行 = 4 KiB（8 扇区，卷内对齐），128 行 = **512 KiB**（私有页，`USER_BASE + 0x30_0000`）；
+  键 = `(卷号, 卷内页号)`，直接映射 + tag 比对；写路径**写穿透 + 按区间失效**，`part.*`/卷表重扫**整表失效**。
+- **只让「单行能装下的小读」（count ≤ 8 扇区）走缓存**：大读保持原有 256 扇区直传路径 —— 否则一条
+  128 KiB 读会被拆成 32 条 4 KiB 命令，反而更慢。容量未知（`sectors == 0`）的卷不缓存（按行读可能越过盘尾）。
+- **顺序预读**：上次读的末尾与本次起点连续（同卷）时，向后预取 2 行（best-effort，失败不影响本次读）。
+- **计数**：每 512 个块请求打印 `blk-cache: hits=… miss=… prefetch=… evict=…`（回归日志可 grep）。
+
+**实测**（同一台机器 `OUT_DIR=build bash scripts/fs-regress.sh`，唯一变量 = 缓存开关）：
+
+| 构建 | 总耗时 | 判定 |
+|---|---|---|
+| before（关闭缓存） | **324 s** | SELFTEST DONE=1，FAILED/PANIC=0 |
+| after（开启缓存） | **258 s** | SELFTEST DONE=1，FAILED/PANIC=0 |
+
+一次完整 after 运行末尾：`hits=12559 miss=3163 prefetch=63 evict=2317`（命中率 ≈ **80%**）；
+`irq_cmds == cmds`、`poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`sgdisk -v build/pt.img` 无问题 ——
+可见语义未变（纯透明加速）。
+
+**说明**：提升主要来自小读命中免去下盘命令与等中断；剩下的大头仍是**每请求一跳 IPC**（与缓存无关），
+这正是 02b（目录索引 + 请求批量化）的动机。before/after 各只跑 1 次，未做多次取平均。
+
+**未做**：不改任何 FS 服务；不做写回（write-back）缓存（不引入掉电一致性）；不新增 opcode。
+
 ### 阶段 4 — 远期
+
+> **2026-10-02 拆分**：本阶段的能力缺口已拆成**四条并行流**（01 健壮性收口 / 02 块层性能 /
+> 03 真机存储驱动 / 04 权限与多用户设计），任务书、文件互斥矩阵与验收口径见
+> [plan-fs-streams.md](plan-fs-streams.md)；并行协作的环境与起步提示词见仓库根 `HANDOFF-FS.md`
+> （本地临时，不入库）。本节下面两条保留为更远期的方向。
 
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。
 - exFAT/NTFS/ISO9660 之外的更多文件系统（读写 ext4、HFS+、UDF）。

@@ -26,7 +26,7 @@
 
 ### 核心理念
 
-- **微内核可信基**：内核仅暴露 10~20 个系统调用（IPC、地址空间映射、保护域管理等），所有传统内核功能均由用户态服务实现。
+- **微内核可信基**：内核只对外暴露「系统调用」这一条边界，文件系统、网络、设备驱动、图形、Shell 等所有传统内核功能一律由用户态服务实现；留在内核里的只有 IPC、地址空间映射、保护域、能力等少数核心原语 —— 即便放进编号 0–53 的整张系统调用表，它们也只占其中一小部分（完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节）。
 - **外核高性能路径**：通过"性能飞地"机制，利用 IOMMU / CHERI 等硬件能力，让游戏、AI 等高性能应用直接操作硬件，实现零内核陷落、零数据拷贝。
 - **能力安全模型**：抛弃传统 UID/GID 权限体系，以能力（Capability）作为唯一访问凭证，从根本上消除"root 可做任何事"的隐患。
 - **Anykernel 双形态驱动**：同一套驱动源码可编译为用户态服务进程（共享场景）或直通库（高性能场景），共享超过 90% 的代码。
@@ -43,14 +43,14 @@
 | 方向 | 状态 | 说明 |
 |------|------|------|
 | 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度（含**带超时阻塞**）、地址空间与按需分页、中断路由（PIC + **LAPIC/MSI-X**，含**阻塞等中断**与**多向量 `wait_any`**）、能力系统（含**能力随 IPC 传递**） |
-| 系统调用接口 | ✅ 约 40 个 | 编号与语义见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
+| 系统调用接口 | ✅ 46 个（编号 0–53） | 内核完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节；面向应用的子集见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2/N3 驱动已跑通（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK` / **MSI-X 中断驱动收帧**，并自发 ARP 请求收到网关应答 `NET1 … ARP reply OK`）。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力，MSI-X 表在别的 BAR 上时内核按 `BIR` 另映射给驱动 |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
-| 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
+| 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**块层只读扇区缓存 + 顺序预读**（4 KiB/行 × 128 行 = 512 KiB，键含卷号、写穿透 + 按区间失效，对上层透明；实测回归命中率 ≈80%，总耗时 324 s → 258 s）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路 |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，接管后内核终端不再写屏（输出只留 COM1）。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功（自测 GS-1，已肉眼确认画面）。**G3a** 文本渲染外移：字库（ASCII 8×16 + 汉字 16×16 `cjk.bin` ≈276 KB）与终端状态（光标/换行/滚动/清屏，按**显示列**排版）从内核搬到 [`gfx/`](./user/srv/src/gfx/)，新协议 `GFX_OP_TEXT/CLEAR/MOVE/QUERY`，落笔**逐像素写后回读**校验（自测 GT-1 断言 ASCII 5 列 / 汉字 10 列）。**G3b** shell 输出上屏：新增 `SYS_CONSOLE_READY(47)`，`libmorion` 的打印出口 `sink()` 支持按进程**镜像**一份到屏幕控制台（只有 shell 开），shell 的横幅/中文欢迎语/命令输出同时进串口与屏幕。**G3c** 内核卸掉汉字字库（−276 KB，内核 ELF 347 KB → 69 KB），终端降为 ASCII + 豆腐块，汉字渲染只在用户态。**G4** 输入搬出内核：新增 `SYS_KEY_PUSH(48)/SYS_KEY_READ(49)` 键字节队列（内核只做搬运），行编辑/回显落客户端库 `morion::console::readline`，内核侧输入机件全部删除、终端降为只输出。**G6** 服务自愈：`ipc::call` 不再永久挂起（超时 + 目标无存活任务即失败）+ 帧缓冲登记内核保留区间 + 重启丢弃目标邮箱旧请求 + 客户端重建共享会话 + `gfx_srv` 纳入 init 监督（自测 GS-2）。内核文本控制台仅剩引导期与 panic 输出 |
-| 网络 / 虚拟化 / 飞地 / 包管理 | ⏳ 未开始 | 设计已确定，尚无实现 |
+| 网络 / 虚拟化 / 飞地 / 包管理 | 🚧 进行中 | **网络**：`net_srv` virtio-net 驱动已跑通并做过 ARP 端到端自测，TCP/IP 协议栈未做；**飞地**：IOMMU/VT-d 硬件隔离已做（E1c 起目标设备窗口受限、越界 DMA 被拒并留证），飞地管理器 E2/E3 未做；**虚拟化与包管理**：设计已定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
 
 > 快速上手：构建与运行命令见 [docs/commands.md](./docs/commands.md)；
@@ -156,7 +156,7 @@
 | 安全/审计服务 | 认证、策略引擎、入侵检测 | ⏳ 规划中 |
 | 飞地管理器 | 飞地生命周期、日志流、迁移与暂停 | ⏳ 规划中 |
 | 包管理器 | Nix 风格声明式构建、原子切换、版本回滚 | ⏳ 规划中 |
-| GUI 服务 | 亚克力半透明风格桌面环境，高度可自定义 | ⏳ 规划中 |
+| GUI 服务 | 亚克力半透明风格桌面环境，高度可自定义（`gfx_srv` 帧缓冲 / 文本控制台 / 绘制原语已实现，桌面环境未开始） | 🚧 进行中 |
 | 音频 / 输入法 / 容器 / 时间 / 电源 / 日志 / 配置服务 | 系统基础支撑 | ⏳ 规划中 |
 | AI 能力注册 / 网关服务 | 应用能力注册与发现、AI 调用鉴权与审计 | 📐 规范已定（见 [app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节） |
 
@@ -254,9 +254,10 @@
 │           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端)
 │           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N3: MSI-X 中断 + ARP 自测)
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
+│           ├── ahci_srv.rs   #     域 18 AHCI/SATA 只读驱动 (D4: 通用授权, IDENTIFY + LBA48 DMA 读自测, 全轮询)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     18 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     19 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -355,6 +356,7 @@
 - [x] **MorionFS 主卷切换**（**S2 补齐**：超级块 `+256` 存**主卷序号**（不升 magic，老卷为 0 = 非主卷）；`mkfs.mfs` 置「现有最大 + 1」并随提交落盘，认领时**序号最大者胜出** —— 于是「最近一次显式格式化过的卷」稳定地是**下次启动**的 `/mfs`，不再由卷表扫描顺序决定；`MKFS` 回复改为盘上回读的序号；新增 FS-24）
 - [x] **MorionFS 只改标记换主卷**（**S2 补齐**：新 tag `MFS_SETPRIMARY_TAG` + shell `mfs.primary <卷号>` —— **不动数据**地把一块**已有数据**的 MFS 卷升为主卷（`mkfs.mfs` 换主卷会擦除，等于删数据）；护栏**只接受已是 MFS 的卷**、没有格式化兜底；与 mkfs 共用同一个只增序号；新增 FS-25）
 - [x] **`df` 空间用量**（shell `df` 报 `/mfs` 的总量 / 已用 / 空闲块与使用率；目前**只有 MorionFS 上报容量**，其余服务不维护块分配，故不列）
+- [x] **MorionFS 健壮性收口**（**01**：① **三态 magic** —— 「未知/更新版 magic → 自动重新格式化」改为**默认拒绝挂载**：空白卷仍自动格式化，属 MFS 系但修订不匹配本构建的卷（更旧/更新）**拒绝挂载且零写盘**并打印盘上/期望 magic 与 `mkfs.mfs` 建议（本构建 `MFS8` 损坏同样拒绝重格）—— 上方 M6 那条「旧盘自动重格」的行为**已被本条取代**；② **最小 fsck** —— 新 tag `MFSC` + shell `mfs.fsck [--repair]`，沿当前根目录树对账「已分配但不可达」的 inode（默认只报不修，`--repair` 才回收，快照仍引用的块不动）；③ **显式 sync** —— 新 tag `MSYN` + shell `mfs.sync`，幂等落盘并回复**盘上 gen**；新增 FS-31/FS-32，FS-30（旧 magic 拒绝挂载 + 宿主 sha256）在宿主侧单独取证）
 - [x] **卷管理收口：写分区表**（**S2 收口**：block_srv 新增建/删/清空/重读分区表与裸读一扇区五个 opcode，**按 nsid 寻址**；GPT 写全「保护性 MBR + 主头/主项数组 + 盘尾备份」并算对头与项数组 CRC32，MBR 建/删也支持；风格按盘自适应、空白盘默认 GPT、起点 1 MiB 对齐、GUID 确定性派生；**只动表不动数据**，删到最后一个就整表清空；改动后立即重扫重建卷表；shell 加 `part.create/del/wipe/reload`；新增 `build/pt.img` + FS-26，含宿主 `sgdisk -v` 跨实现校验）
 - [x] **NVMe 中断化（MSI/MSI-X）**（**S3**：内核补 LAPIC 最小支撑（`IA32_APIC_BASE` / `SVR` / `TPR` / `LVT0`-ExtINT 透传 / `EOI`）+ PCI 能力链表遍历与 MSI-X 定位，IDT 装 MSI 向量段 `0x50..0x5F`；**内核管中断配置**（LAPIC + PCI 配置空间 + 向量段），**驱动写 MSI-X 表**（表在那个 4 GiB 以上、内核到不了的 BAR 里）；中断不投 IPC 而只置「待处理位」（与块请求邮箱混用会打乱 `reply` 路由），驱动用新 syscall `SYS_IRQ_POLL` 取位、`SYS_MSIX_ENABLE` 请内核开 MSI-X；`submit_wait` 改「先等中断再查 CQE」，等不到就**自动回退轮询**。修掉一个隐蔽 bug：`Create I/O CQ` 漏了 **IEN=1**，该队列根本不投中断 —— 轮询看不出来，中断路径会一直等。运行期证据：`nvme: stats … irq_cmds=N poll_cmds=0 irqs=N mode=irq`）
 - [x] **阻塞等中断（等待原语）**（**S4**：调度器补**带超时阻塞**（TCB `wake_deadline` + `block_current_timeout_ms`，`tick()` 到期唤醒），伪等待键 `irq_wait_token(vector)`（**S5 起改为按域取键 + 掩码**）让 `irq::set_pending` 直接**唤醒**等待该向量的驱动域（与 IPC 的域 id 键不重叠，不会误唤醒）；新 syscall `SYS_IRQ_WAIT`（阻塞等向量中断，超时返回 0）；空闲任务改 `hlt(); yield_now();`，被中断唤醒的域立刻接手。驱动 `submit_wait` 因此改为「`SYS_IRQ_POLL` 快路径 → 未命中 `SYS_IRQ_WAIT` 阻塞」，**去掉上一轮「每轮踢一次宿主」的自旋**，等不到中断仍是「轮数 × 超时」看门狗后粘性回退。实测中断路径 `irq_cmds=28672 poll_cmds=0` 零回退、自测 314 s（旧实现 342 s））
@@ -374,15 +376,17 @@
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 网络协议栈
 
-### 阶段三 — 性能飞地（未开始）
+### 阶段三 — 性能飞地（进行中）
 
-- [ ] IOMMU 直通（**E1a 已做**：ACPI DMAR 探测 + DRHD 取证；**E1b 已做**：建根表/上下文表 + 恒等二级页表并打开 `GCMD.TE`；**E1c 已做**：目标设备（NVMe）窗口收到 `[0, 3 GiB)`，设备发起的窗口外 DMA 被 IOMMU 拒绝并留证，全量回归在 `-device intel-iommu` 下全绿，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)）、LibDevice 直通驱动库、飞地管理器
+- [x] **IOMMU 直通**（**E1a** ACPI DMAR 探测 / **E1b** 建根表 + 上下文表 + 恒等二级页表并打开 `GCMD.TE` / **E1c** 目标设备窗口收成 `[0, 3 GiB)`、设备发起的越界 DMA 被 IOMMU 拒绝并留证 —— 均已完成，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md)）
+- [ ] **LibDevice 直通形态与飞地管理器**（E2/E3 待做；公共库 `user/libdevice` 已就位）
 
-### 阶段四 — 网络与安全（未开始）
+### 阶段四 — 网络与安全（进行中）
 
 - [x] **网卡驱动（virtio-net）**（`net_srv` 域 16 + 通用设备授权，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N0–N3：virtio-modern bring-up + MSI-X 中断收帧 + ARP 端到端自测）
 - [x] **第二个真实驱动（virtio-blk）**（`virtio_blk_srv` 域 17，仍走通用设备授权、内核无设备专属逻辑：D3 —— 读签名 / 写读回自测）
 - [x] **运行期设备授权（D1b）**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` + `Mmio` 能力门禁；NVMe / `net_srv` / `virtio_blk_srv` 经运行期 syscall 取得 `DeviceGrant`，行为零变化，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 D1b）
+- [x] **真机存储驱动第一版（AHCI/SATA 只读）**（`ahci_srv` 域 18，仍走通用设备授权、内核无设备专属逻辑：D4 —— `IDENTIFY` + LBA48 DMA 读扇区 0 校验签名；第一版全轮询不申请中断，写路径/接进卷层留后续）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎
 
 ### 阶段五 — GUI 与生态（未开始）

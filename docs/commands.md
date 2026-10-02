@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | `make` | 默认目标，等价 `make iso` | `build/morion-os.iso` |
 | `make kernel` | 仅构建微内核 | `build/kernel/morion-kernel` |
-| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（16 份独立 ELF） |
+| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（18 份独立 ELF） |
 | `make hello` | 仅构建可执行文件加载演示程序 | `build/user/hello.elf` |
 | `make boot` | 仅构建 UEFI 引导器 | `build/boot/morion-boot.efi` |
 | `make iso` | 构建完整可启动 ISO | `build/morion-os.iso` |
@@ -24,7 +24,7 @@
 
 依赖关系（E3b 起）：`iso → kernel, boot, user`。`boot` 需要先 `make kernel` 产出
 `boot/loader/morion-kernel.elf`（引导器把它 `include_bytes!` 嵌进 `morion-boot.efi`）；
-16 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
+18 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
 `exit_boot_services` 之前用 UEFI 文件系统读它们 —— 故**内核不再依赖服务 ELF**；
 同时也放进 **FAT32 根盘的 `/system/services/`**（E3c：监督者 `init` 的**盘上**重启源 —— 重启
 优先用引导模块内存镜像，失败才回退它）。
@@ -40,7 +40,7 @@
 
 ```bash
 make run-nvme QEMU_MEM=4G                    # 内存 (默认 2G)
-make run-nvme MFS_MIB=128                    # MFS 盘大小 MiB (默认 64)
+make run-nvme MFS_MIB=128                    # MFS 盘大小 MiB (默认 256)
 make run-nvme EXFAT_MIB=2048 EXFAT_CLU=32K   # 大 exFAT 卷 (32 KiB 簇, 位图 > 4 KiB) 验证去上限
 make run-nvme NVME_CLU=64                    # fat32 大簇 (32 KiB 簇) 验证写路径
 make iso OUT_DIR=build2                      # 自定义输出目录
@@ -84,7 +84,7 @@ block_srv 启动时会把整张卷表打成 `vol: <卷号> nsid=<n> lba=<n> sect
 | namespace | 后端镜像 | 文件系统 | 挂载点 |
 | --- | --- | --- | --- |
 | `nsid=1` | `build/nvme.img`（宿主机 `mkfs.fat -F 32`） | FAT32 | `/` |
-| `nsid=2` | `build/mfs.img`（纯空白 raw，默认 64 MiB） | MorionFS | `/mfs` |
+| `nsid=2` | `build/mfs.img`（纯空白 raw，默认 256 MiB） | MorionFS | `/mfs` |
 | `nsid=3` | `build/ext2.img`（宿主机 `mke2fs -t ext2`） | ext2（只读） | `/ext2` |
 | `nsid=4` | `build/parts.img`（MBR：FAT32 + ext2 两个分区） | 分区测试盘 | `/usb3`（FAT32 分区）、`/usb4`（ext2 分区） |
 | `nsid=5` | `build/exfat.img`（宿主机 `mkfs.exfat`） | exFAT（读写） | `/usb` |
@@ -155,8 +155,9 @@ qemu-system-x86_64 \
 `build/mfs.img` 由 Makefile 用 `dd` 生成空白盘；超级块由 `mfs_srv` 首次挂载时写入
 （自动格式化），**尺寸按该卷的真实容量取**（M7 起；此前无论卷多大都写死 16 MiB）——
 所以 `MFS_MIB` 变了，格式化出来的文件系统也跟着变。
-**当前格式为 MFS6**（空闲位图 + 空间回收 + 文件间接块 + 变长目录项/长名 +
-节点元数据 + inode 号间接层/硬链接）：盘上是旧格式（`MFS1`…`MFS5` 或未知 magic）时，
+**当前格式为 MFS8**（空闲位图外置 + 空间回收 + 文件间接块/三级间接块（单文件可突破 4 GiB） +
+变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接 + 主卷序号持久化标记）：
+盘上是旧格式（`MFS1`…`MFS7` 或未知 magic）时，
 首次挂载会**自动重新格式化**，旧数据不再保留。**删掉 `build/mfs.img` 即回到全新盘**：
 
 ```bash

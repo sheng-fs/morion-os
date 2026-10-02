@@ -9,9 +9,9 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：18 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与两个设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：19 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4, SATA/AHCI 只读) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
-| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
+| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` / `ahci_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -82,7 +82,8 @@ UEFI 固件
 | 文件服务缓冲页 | `USER_BASE + 0x10_0000` 起 | fat32 的 BPB/目录/FAT/文件缓冲（`..+0x10_4000`）、app 的 `RESULT_BUF`/`WRITE_BUF` 与 shell 的 `SHELL_RESULT_BUF`/`SHELL_WRITE_BUF`（`..+0x10_8000`）、mfs 的 4 个块缓冲（`..+0x10_C000`）、ext2 块缓冲（`..+0x10_10000`） |
 | mfs 元数据缓冲 | `USER_BASE + 0x11_0000` 起 | GC 遍历 / inode 表块缓存 / 索引块 scratch / GC 表块（`..+0x11_4000`，M5b 新增后三页） |
 | exFAT 缓冲 | `USER_BASE + 0x11_4000` 起 | 集群缓冲（按簇大小最多 64 页，`..+0x15_4000`）+ 位图窗口 `+0x15_4000` + upcase 窗口 `+0x15_5000` + 单页暂存 `+0x15_6000`（M6c 起集群缓冲动态分配） |
-| block_srv 私有页 | `USER_BASE + 0x16_0000` 起 | 卷扫描页 `+0x16_0000` + PRP 表页 `+0x16_1000`（M6c；均不共享给任何域） |
+| block_srv 私有页 | `USER_BASE + 0x16_0000` 起 / `+0x30_0000` 起 | 卷扫描页 `+0x16_0000` + PRP 表页 `+0x16_1000`（M6c）；**只读缓存数据页 `+0x30_0000..+0x38_0000`**（128 页 = 512 KiB，块层性能；均不共享给任何域） |
+| mfs 位图头块缓冲 | `USER_BASE + 0x16_2000` | 1 页；**mfs_srv 同址共享给 block_srv** 作整卷读写 DMA 目标 —— block_srv 选缓存地址时必须避开它 |
 | fat32 整簇缓冲 | `USER_BASE + 0x20_0000` 起 | 16 页 = 64 KiB（`FAT32_CLU_VADDR`/`FAT32_CLU_PAGES`，M1b 大簇支持），`dir_buf`/`file_buf` 都别名到它 |
 | ELF 加载中转页 + 暂存区 | `USER_BASE + 0x1F_F000`（中转 1 页）/ `+0x20_0000` 起（暂存，最多 256 页 = 1 MiB） | 运行时可执行文件加载（E1/E2，`morion::exec`）：中转页要**共享给读取的文件服务**（同地址），暂存区只在本域内、**不共享**。⚠️ `+0x20_0000` 与 fat32 的整簇缓冲同址但**不同域**（一个是 fat32 自己的、一个是 shell/app 的），不冲突；也正因如此 `spawn_file` 的调用方不能是文件服务 |
 | 用户栈 | `USER_BASE + 0x3F_9000 .. +0x40_1000` | **8 页（32 KiB），栈顶 `+0x40_1000` 向下增长**。单页不够：VFS 请求/回复在栈上构造 `Message`（96 B payload）并层层调用，app 在最早的几次 VFS 调用就会越过一页栈底，过去靠按需分页静默补页（不可靠） |
@@ -251,7 +252,7 @@ UEFI 固件
 - `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
 - `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
 - `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
-- `is_boot(id)` / `BOOT_DOMAINS = 18`（**白名单**：引导期服务域 `0..17` 退出时不自动销毁；它们的槽位始终被占用，故「id < 18 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号）
+- `is_boot(id)` / `BOOT_DOMAINS = 19`（**白名单**：引导期服务域 `0..18` 退出时不自动销毁；它们的槽位始终被占用，故「id < 19 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号，**D4** 由 18 扩到 19 给 `ahci_srv`(18) 腾号）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
 - `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
 - **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
@@ -411,7 +412,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv`（共 18 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv`（共 19 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 服务监督者 init（E3c）
 
@@ -499,7 +500,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `pit::init()`（100 Hz 定时器）
 - `keyboard::read_scancode()`
 - `apic::init() -> Option<u32>` / `apic::msi_address() -> u32` / `apic::eoi()`（LAPIC 最小支撑，见下）
-- `pci::enumerate()` / `pci::find_nvme()` / `pci::find_net()` / `pci::read_bar(index)` / `pci::read_bar0()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
+- `pci::enumerate()` / `pci::find_nvme()` / `pci::find_net()` / `pci::find_virtio_blk()` / `pci::find_ahci()` / `pci::read_bar(index)` / `pci::read_bar0()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
 - `device::grant(GrantRequest) -> bool` / `device::grant_empty(domain)` / `device::enable_msix()` / `device::config_read(offset) -> Option<u32>`（**D1 通用设备授权**：BAR 映射 + DMA 块分配 + MSI-X 向量段分配 + `Mmio`/`Irq` 能力签发 + 写 `DeviceGrant` 描述；内核**不含**任何设备专属逻辑 —— 原 `nvme::setup` 已并入。`config_read` 是 N2 加的窄接口：把"域→设备"绑定后只放行读自己那台设备的配置空间。**N2b** 起：MSI-X 表若不在设备 BAR 上（如 virtio-net 在 BAR1），内核把那根 BAR 映射到 `DEVICE_MSIX_VADDR`，窗口基址写进 `DeviceGrant.msix_table_vaddr`）
 
 ## 7. 构建 / 测试命令（Makefile）
@@ -507,13 +508,13 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 命令 | 说明 |
 | --- | --- |
 | `make kernel` | 仅构建微内核 |
-| `make user` | 仅构建用户态服务 → `build/user/srv/*.elf`（15 份） |
+| `make user` | 仅构建用户态服务 → `build/user/srv/*.elf`（18 份） |
 | `make hello` | 仅构建可执行文件加载演示程序 → `build/user/hello.elf` |
 | `make boot` | 仅构建引导器 |
 | `make iso` | 构建完整 ISO（`build/morion-os.iso`） |
 | `make run` | QEMU 运行（KVM） |
 | `make run-nokvm` | QEMU 运行（无 KVM） |
-| `make run-nvme` | **文件系统验证主用**：q35 + NVMe 单控制器六 namespace（nsid1 `nvme.img` FAT32 / nsid2 `mfs.img` MorionFS / nsid3 `ext2.img` ext2 只读 / nsid4 `parts.img` MBR 分区测试盘 / nsid5 `exfat.img` exFAT 读写 / nsid6 `spare.img` 空白盘供 `mkfs.mfs` 自测） |
+| `make run-nvme` | **文件系统验证主用**：q35 + NVMe 单控制器**七** namespace（nsid1 `nvme.img` FAT32 / nsid2 `mfs.img` MorionFS / nsid3 `ext2.img` ext2 只读 / nsid4 `parts.img` MBR 分区测试盘 / nsid5 `exfat.img` exFAT 读写 / nsid6 `spare.img` 空白盘供 `mkfs.mfs` 自测 / nsid7 `pt.img` 分区表读写自测盘） |
 | `make run-ide` | IDE PIO 运行（回退验证路径） |
 | `make debug` | QEMU + GDB（`-s -S`） |
 | `make clean` / `check` / `clippy` | 清理 / 检查 / 静态检查 |
@@ -525,8 +526,8 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - 自定义 target：`user/x86_64-morion-user.json`（`code-model=large` + `rustc-abi=softfloat` + `relocation-model=static`），解决用户基址 `0x8000_0000_0000` 超出 32 位重定位范围的问题。
 - 链接脚本：`user/linker.ld`，`ENTRY(_start)`，链接到 `0x8000000000`，`_start` 置于镜像最前端。
 - **E2b 起每个服务是独立程序**：`user/srv`（crate `morion-srv`）里一个服务一个 `[[bin]]`，各模块用 `#[cfg(feature = "svc-<name>")]` 门控 —— 一个 bin 只编自己的服务模块 + `common`。入口 `_start(domain_id)`（libmorion 提供）调各 bin 的 `morion_main`，后者打印 `[up] <name> (domain N)` 后进 `morion_srv::<mod>::run()`。
-- 构建链：`cargo build --target user/x86_64-morion-user.json --package morion-srv --release -Z json-target-spec` → `build/user/srv/<name>.elf`（15 份，各自一份 ELF）。
-- 服务 ELF 的**载体**（E3b 起）：引导器从**自己所在的 ESP**（`efiboot.img`）的 `\EFI\morion\services\<name>.elf` 读入内存 —— 故 Makefile 在生成 ESP 时 `mcopy` 这 15 份进去；内核镜像里**不再有服务副本**（内核体积因此从 ~686 KiB 降到 ~337 KiB）。
+- 构建链：`cargo build --target user/x86_64-morion-user.json --package morion-srv --release -Z json-target-spec` → `build/user/srv/<name>.elf`（18 份，各自一份 ELF）。
+- 服务 ELF 的**载体**（E3b 起）：引导器从**自己所在的 ESP**（`efiboot.img`）的 `\EFI\morion\services\<name>.elf` 读入内存 —— 故 Makefile 在生成 ESP 时 `mcopy` 这 18 份进去；内核镜像里**不再有服务副本**（内核体积因此从 ~686 KiB 降到 ~337 KiB）。
 - **同一批 ELF 还要进 FAT32 根盘**（E3c）：`nvme.img` 的 `/system/services/*.elf` 是监督者 `init` 的**盘上重启源**（E3c 后续起，重启**优先**走引导模块内存镜像，失败才回退它）。两个载体同源（都取自 `build/user/srv/`），任何一处落后都会让"回退重启"拿到旧镜像。
 - 读取方式：优先 `BootServices::get_image_file_system`（"本映像所在的卷"）；El Torito 光盘引导下这条链若解析不出来，退化为枚举所有 `SimpleFileSystem` 卷、用"能否读出第一个服务 ELF"判定。读文件走**裸 `SimpleFileSystem` 协议**（不用 `uefi::fs::FileSystem`：其 `read` 是 `vec![0; file_size]`，异种卷返回离谱大小时会 `capacity overflow` panic），并设 8 MiB 上限。
 - ⚠️ **引导器的全局分配器必须先 `uefi::allocator::init(&mut st)`**：uefi 的 `Allocator` 靠内部静态 `SYSTEM_TABLE` 找 BootServices，`#[entry]` 不代为登记；不初始化就在第一次 `Vec`/`String` 分配时崩（症状是 `#UD`，且引导器默认 panic 处理器只 spin、看不到任何输出）。`exit_boot_services` 前调 `uefi::allocator::exit_boot_services()`。
@@ -590,6 +591,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 45 | **域销毁 / 退出即回收 + 服务拆成独立程序**（**E2b**，三步）：**① 域销毁（地基）** —— 域表改 `Vec<Option<Domain>>` + `slot_for` **复用空槽**（域 id 是各全局表下标，单调增长会越界 `irq::ANY_MASK`），`domain::destroy` 顺序 = 摘域表槽位 → `paging::free_user_space`（遍历 P4[1] 逐页归还 + 回收页表帧）→ 清 `cap/ipc/pager/irq` 按域行 → `scheduler::remove_domain`（摘任务 + 唤醒等它的域）；帧记账规则 = `frame_allocator::release_user_frame`（登记过引用计数的按计数递减、**未登记**的镜像页/栈帧/页表帧视为独占直接归还）；新 syscall `SYS_DOMAIN_DESTROY(38)`（门禁 `Spawn` 且 `pager::of(target)==调用者`）/`SYS_DOMAIN_COUNT(39)`/`SYS_FRAME_FREE(40)`。**② 退出即回收** —— `exit_current` 若为本域最后一个任务则 `domain::request_destroy` **只登记**（不能就地拆自己正在用的栈/页表），由时钟 `tick` 开头 `reclaim_pending` 在别的任务上下文销毁；引导期服务域走白名单（`is_boot`/`BOOT_DOMAINS=14`）永不自动销毁。**③ 服务拆成独立程序** —— 新建 `user/srv`（crate `morion-srv`）：14 个服务各一个 `[[bin]]` → **各一份独立 ELF**，各模块 `#[cfg(feature="svc-<name>")]` 门控（一个 bin 只编自己的服务 + `common`），删掉 17814 行单文件 `user/src/main.rs` 与 `morion-user`；内核改 `SERVICE_ELFS` 表 + `exec::spawn_elf_at(domain, image)`（不建域/不登记全局表）逐个载入**各自固定域**，删 `load_user_program`/`USER_PROGRAM`；每个程序入口打印 `[up] <name> (domain N)`。验证：内核单测 12 项全过；FS-28 `exit-reclaim OK (domain 14 reused 8x, frames stable)`；启动 `[OK] 14 service ELFs loaded (embedded)` + 14 行 `[up]`；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |
 | 46 | **服务生命周期收口 ①：用户页 W^X**（**E3a**）：E1 起就记着的一笔 —— `map_user_page` 原先没有权限参数，所有用户页都可写、可执行。本轮：`elf::parse` 解析 `p_flags` 并**拒绝 `PF_W\|PF_X` 的段**（镜像侧）；`paging` 引入 `UserPagePerm { ReadOnly, ReadWrite, ReadExecute }`，`map_user_page` 带权限参数（`ReadOnly`/`ReadWrite` 置 `NO_EXECUTE`，仅 `ReadExecute` 可执行且绝不置 `WRITABLE`），`paging::init` 开 **`EFER.NXE`**（CPUID 无 NX 时告警并跳过）；`exec::map_image` 改**两遍**（先按「页权限并集」建映射、再拷内容，避免事后改页表项），并集为 W+X 的页**拒绝加载**（不静默降级成 RWX）；`user/linker.ld` 在 `.data` 前 `ALIGN(4096)` —— 否则 `.text/.rodata`(RX) 与 `.data/.bss`(RW) 会落在**同一页**（实测改前 `sender.elf` 三段全挤在 `0x…000..0x7d8`，页级 W^X 不可能满足）。顺带补上 W^X 引入的新失败模式：用户态 `P=1` 保护违例（写只读页 / 执行 NX 页）**终止该任务**，而不是转给分页器（那样会让它去映射一个**已映射**的页 → 内核 `PageAlreadyMapped` panic）。验证：内核单测 15 项（新增 W^X 位不变式、三种权限的期望位、W+X 段被拒）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` 无问题 | ✅ |
 | 47 | **服务生命周期收口 ②：服务移出内核镜像（引导模块）**（**E3b**）：14 份服务 ELF 原先由 `include_bytes!` 嵌进内核（`SERVICE_ELFS`），内核体积随服务数线性膨胀。改为：**引导器**在 `exit_boot_services` 之前用 UEFI 文件系统从**自己所在的 ESP**（`\EFI\morion\services\<name>.elf`）读入镜像，各拷进 `LOADER_DATA` 页（内核帧分配器只放行 `CONVENTIONAL`，故这些帧天然被保留），再把 `ServiceModule { domain, addr, len }` 表经**扩展的 `BootInfo`**（`version 2 → 3`，新增 `svc_addr/svc_count/svc_entry_size`）交给内核；内核删掉 `SERVICE_ELFS`，改遍历 `BootInfo::service_modules()` 并逐个 `exec::spawn_elf_at`（以物理地址给出的镜像先过 `paging::is_identity_mapped`）。构建：内核不再依赖服务 ELF，改由 `iso` 依赖 `$(SRV_STAMP)` 并把 14 份 `mcopy` 进 ESP。**内核 ELF 702200 → 345376 字节（−51%）**。踩到并修掉两个"引导器第一次读文件/分配内存"才会暴露的坑：① 引导器的全局分配器**必须显式 `uefi::allocator::init(&mut st)`**（`#[entry]` 不代为登记；不初始化就在第一次 `Vec`/`String` 分配时 `#UD`）；② `uefi::fs::FileSystem::read` 的 `vec![0; file_size]` 会在异种卷（ISO9660）上 `capacity overflow` panic → 改走**裸 `SimpleFileSystem` 协议**读取 + 8 MiB 上限。顺带把引导期进度与失败原因镜像到 **COM1**（原先只画帧缓冲，headless 下失败表现为"日志停在 BdsDxe"，无从定位）。验证：`[boot] service modules loaded: 14` + `[OK] 14 service ELFs loaded (boot modules)` + `[up]` × 14；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds==cmds` 且 `poll_cmds=0`、宿主 `sgdisk -v` "No problems found" | ✅ |
+| 48 | **服务生命周期收口 ③：`init` 与监督重启（E3c）**：新增域 14 `init`（[`user/srv/src/init.rs`](../../user/srv/src/init.rs) + `svc-init` 门控 + 第 15 个引导模块）与两个 syscall —— `SYS_DOMAIN_ALIVE(42)`（该域是否还有存活任务）与 `SYS_SPAWN_ELF_AT(41)`（在**指定域**里加载并启动：先验镜像 → 目标域须存在且**无存活任务** → `domain::reset` 清用户地址空间 → `scheduler::reap_terminated` 摘已终止任务（不摘会每轮重启漏掉一份 32 KiB 内核栈，迟早占满 `MAX_TASKS`）→ 再映射新镜像，故**域号不变**）。监督者每 40 ms 巡检 `echo` / `kbd` / `mount_srv` / `tmpfs_srv` / `ext2_srv` / `exfat_srv`，实例没了就从 FAT32 根盘 `/system/services/<name>.elf` 读回镜像原地拉起（`BOOT_DOMAINS` 14 → 15）。**自测 FS-29**：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言它一度"没有存活任务" → 等 init 拉起 → 断言**域号仍是 3**、新实例能正常回显、存活域数不变。**取证**：`init: restarted echo (domain 3, total 1)` + `app: FS29 supervisor restart OK`；`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds = 28672` 且 `poll_cmds = 0`、宿主 `sgdisk -v` "No problems found"、启动 `[OK] 15 service ELFs loaded (boot modules)` + `[up]` × 15 | ✅ |
 | 49 | **服务生命周期收口 ④：重启不依赖盘**（**E3c 后续**）：新增 `SYS_SPAWN_ELF_MODULE(43)`（`rdi=域号`）—— 与 `SYS_SPAWN_ELF_AT` 共用同一套「验镜像 → 目标域无存活任务 → `domain::reset` → `reap_terminated` → 起任务」流程（抽成 `restart_in_place`），区别只在镜像来源：内核按域号去 `bootinfo::get().service_modules()`（E3b 交来的 `LOADER_DATA` 镜像）里取，过 `is_identity_mapped` 后映射，**不依赖磁盘**。init 重启**先试内存镜像、失败回退盘**并打印来源；监督集 6 → 9（新增 `pager / fat32_srv / mfs_srv`），于是「读盘要靠文件服务、文件服务死了没法自救」的鸡生蛋问题不复存在；唯一排除 `block_srv`（`domain::reset` 会释放内核为它映射的 NVMe 配置/DMA 帧、甚至把 BAR0 的 MMIO 地址当 RAM 交出）。回归：`init: restarted echo (domain 3, total 1, from memory)` | ✅ |
 | 50 | **图形子系统 G1：帧缓冲用户态化**：把**屏幕**从内核搬到用户态服务 `gfx_srv`（域 15）—— `domain::create()` 增域 + `BOOT_DOMAINS` 15 → 16 + `cap/ipc/pager::init` 16 + `SERVICE_FILES`/`SRV_NAMES` 加 `gfx_srv`；新增无参能力 `Fb`（`CAP_KIND_FB=5`）与三个 syscall：`SYS_FB_INFO(44)`（写回 `FbInfo { addr, width, height, stride, bpp }`）/`SYS_FB_MAP(45)`（把整块帧缓冲按 4 KiB 非缓存页映射进本域，**先整段查重**再映射，避免半途映射与 `PageAlreadyMapped`）/`SYS_FB_TAKEOVER(46)`（宣告接管）。内核 `video` 加 `FB_TAKEN_OVER` 原子标志，置位后内核**不再画帧缓冲**：`print`/`print_logo`/`clear_screen` 直接跳过、`redraw`/`redraw_input_line` 成空操作，`print` 仍写 COM1（headless 回归不受影响）；**输入编辑照旧**（`term_put` 等只跳过重绘，见第 53 行）；`gfx_srv` 取几何 → 映射到 `USER_SPACE_BASE + 1 GiB` → 画测试图案（全屏底色 + 居中色块）→ **回读校验**（四角/中心像素等于写入值）→ 接管 → 重画。顺带把 init 巡检改成**两连击去抖**（连续两轮确认无任务才重启）—— G1 让打印与内存重启都变快，E3c 的 20 ms 轮询方（FS-29）会错过极短的死亡窗口，去抖让死亡状态至少持续一个巡检周期。回归：`gfx: framebuffer 1280x800 stride=1280 phys=0x80000000` + `gfx: 1280x800 text console ready (kernel console detached)` | ✅ |
 | 51 | **图形子系统 G2：绘制原语 + 共享表面 + `libmorion::gfx`**：`gfx_srv` 加请求循环（`sys_recv_msg`/`sys_reply`）与三个原语 `GFX_OP_FILL`/`GFX_OP_RECT`/`GFX_OP_BLIT`（+ `GFX_OP_PING`），循环**在接管之后**才起，故客户端首条请求必然落在屏幕已归用户态之后；新增客户端库 [`user/libmorion/src/gfx.rs`](../../user/libmorion/src/gfx.rs)（协议 `GfxReq`/`GFX_TAG`/`GFX_OP_*` + `Surface` 分配/共享/像素/`rect`/`blit` + 屏幕级 `fill_screen`/`screen_rect`/`ping`）。表面按域 id 错开（`SURFACE_BASE = USER_BASE + 64 MiB`，步长 4 MiB，上限 1 MiB），避免多客户端把表面共享到服务域同一 VA 撞 `PageAlreadyMapped`。**关键取证**：`GFX_OP_BLIT` 拷完**回读帧缓冲**抽 5 点与表面比对，全等才回 1 —— 无显示器也能断言"真画上去了"。引导期给 app/shell 授 `SendTo(gfx_srv)` + `MapInto(gfx_srv)`。自测 **GS-1**（app）：`fill_screen`+`screen_rect` → 160×120 表面四条竖直色带 → 客户端回读 → `blit` 到 (16,16) → `app: GS1 gfx primitives + shared surface OK (blit verified on framebuffer)`。**顺带修掉一个静默坑**：app 的 16 个能力槽被新增的 `SendTo/MapInto(gfx_srv)` 占满，导致其后的 `SendTo(echo)` 授权静默失败（FS-29 报 `send quit to echo FAILED`）—— `CAP_SLOTS` 16 → 32，且 `grant` 槽满时打印 `[WARN] capability table full: grant dropped`，不再无声丢授权 | ✅ |

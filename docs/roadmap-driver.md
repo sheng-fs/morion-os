@@ -36,7 +36,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | **4 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3） |
+| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA 只读**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
@@ -48,17 +48,18 @@
 
 - **设备 bring-up 曾是内核专属**（D1 已解决）：原 `kernel/src/nvme.rs` 写死了"DMA 7 页 / BAR0 4 页 / 3 条 MSI-X / 配置结构 + 约定虚拟地址" —— 加新驱动**必须改内核**。现已抽成通用 [`device.rs`](../kernel/src/device.rs)（`DeviceGrant` + `grant()`），NVMe 只剩一条声明式需求。
 - **没有通用 DMA 池原语**：内核直接 `frame_allocator` 分配物理连续帧、写进设备配置结构交出去；用户驱动没有"申请物理连续 DMA 缓冲"的正规通道。
-- **没有 I/O 端口通道**：无 `SYS_IO_IN/OUT`，无 I/O 端口能力 —— 纯 port-mapped 设备（如部分旧网卡/串口）无从下手。
-- **没有设备注册表 / 资源描述标准**：设备命名、BAR 资源、IRQ 的"标准化描述"不存在。
+- **没有 I/O 端口通道**：无 `SYS_IO_IN/OUT`，无 I/O 端口能力 —— 纯 port-mapped 设备（如部分旧网卡/串口）无从下手。**→ 已由 D0 补上**：`Capability::IoPort(base, len)` + 既有 `SYS_PORT_*`（22–25）门禁。
+- **没有设备注册表 / 资源描述标准**：设备命名、BAR 资源、IRQ 的"标准化描述"不存在。**→ 资源描述标准已由 D1/D1b 补上**：`DeviceGrant` 即标准化描述（BAR + 连续 DMA 块 + MSI-X 参数 + `label` 命名），D1b 又加了域→设备绑定表（`domain → bus/dev/func`）。
 - **域号扩容**（N0 / D3 已做）：`domain::BOOT_DOMAINS` 原为 16，0..15 全部分配（block=5 / fat32=6 /
   app=7 / shell=8 / mount=9 / tmpfs=10 / mfs=11 / ext2=12 / exfat=13 / init=14 / gfx=15）。**N0** 扩到
-  **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号（各表是 `Vec` 且按需增长，
+  **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号、**D4** 扩到 **19** 给
+  `ahci_srv`(18) 腾号（各表是 `Vec` 且按需增长，
   机制上可行；**boot 侧 `SERVICE_FILES`/模块表已同步**）。再加驱动时继续按需扩。
 - **没有网络驱动**（N0–N3 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）。
-- **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码，E1a 只加了**探测**）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**（重映射域与拒绝取证 = E1b/E1c）。
+- **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码，E1a 只加了**探测**）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**（重映射域与拒绝取证 = E1b/E1c）。**→ 已由 E1b 落地**（建根表/上下文表 + 恒等二级页表、打开 `GCMD.TE`）与 **E1c**（目标设备窗口收成 `[0, 3 GiB)`、越界 DMA 被拒并留证）。
 - **没有 LibDevice**（D2 已解决首批）：`user/libdevice` 抽出 `grant`/`mmio`/`msix`，三个驱动共用；设备**语义**（vring 等）留 D2b 去重。
 - **没有飞地管理器**、没有 `create_enclave` 之类的内核原语。
-- **没有版本串 / 没有无图形界面构建开关**。
+- **没有版本串 / 没有无图形界面构建开关**。**→ 已由 V1 落地**（`SYS_UNAME(51)` + shell `uname`/`version`）与 **V2**（`make NOGUI=1`，release 串带 `-nogui`、shell 不开屏幕镜像、产物落 `build/nogui/`）。
 
 ---
 
@@ -191,6 +192,16 @@
 - **踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。
 - **注**：设备语义（vring）在 `net_srv` 与 `virtio_blk_srv` 里**各有一份**，二者的公共面已可对照 —— **D2b** 即去重进 `libdevice::virtio`。
 
+### D4 — 真机存储驱动第一版：`ahci_srv`（SATA/AHCI 只读）✅ 已完成
+- 目的：让真机不再只有 NVMe —— 用同一套通用授权路径加 **AHCI/SATA** 驱动；本轮只做**只读**第一版（写路径、接进块服务卷层、xHCI/USB 都留后续）。
+- 落地：
+  - 内核：`pci::find_ahci`（大容量存储类 `01:06:01` → **BAR5 = ABAR**）、`BOOT_DOMAINS` 18 → **19**、`main.rs` 建域 18 + 一行 `device::grant`（`label: "ahci"`, `bar_pages: 2`, `dma_pages: 6`, **`msix_vectors: 0`**）。
+  - 驱动 [`ahci_srv`](../user/srv/src/ahci_srv.rs)（域 18，**self-contained**，仍走 `DeviceGrant::load()` 的 `SYS_DEVICE_GRANT` 运行期申请）：`GHC.AE` → 遍历 `PI` 选端口（`PxSSTS.DET==3` 且 `PxSIG==0101h`，跳过 ATAPI / 端口倍增器）→ 建命令列表(1 KiB) / Received FIS(256 B) / 命令表(1 KiB) / 数据页（**页对齐**天然满足对齐要求）→ 启动端口 → `IDENTIFY DEVICE(0xEC)` 判类型 / 取容量 → `READ DMA EXT(0x25, LBA48)` 读扇区 0。
+  - **中断策略**：本仓库只有 MSI-X 一条中断通路（无 INTx、无 MSI 非 X），而 AHCI 常态用 INTx/MSI —— 故第一版**全轮询**（`PxCI` / `PxIS`），**不申请向量**（`msix_vectors = 0`），`irq_cmds == cmds` 判据因此保持不变。日后要走中断需先补 MSI/INTx 通路（要动内核中断层，不属本轮）。
+  - 自测：读扇区 0 校验宿主预写签名 → `AHCI1 ahci OK, cap=…, sector0 sig=MORION-AHCI-TST!, sig=ok`。**只读**：只发 IDENTIFY + READ DMA EXT，不发任何写命令，宿主 `sha256sum` 前后一致。
+- QEMU：q35 自带 ICH9 AHCI（`8086:2922`，class `01:06:01`），挂盘 `-drive id=d0,if=none,file=build/ahci.img,format=raw -device ide-hd,drive=d0`；测试盘 `build/ahci.img`（1 MiB）扇区 0 由宿主预写签名（`dd … conv=notrunc,sync`，注意 D3 记过的"漏 `conv=notrunc` 会截断"坑）。回归经 `QEMU_EXTRA` 注入挂盘参数，**不改** `scripts/fs-regress.sh`。
+- **不做（本轮明确排除）**：写路径、接进块服务卷层（`block_srv.rs`，归 02 独占）、热插拔、xHCI/USB、MSI/INTx 通路。
+
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
 - 与 D1 结合：`SYS_DEVICE_GRANT` 在飞地场景下把设备的 DMA 权限绑到一个 **IOVA 窗口**（只映射飞地自己的缓冲），其余一律**拒绝**。
@@ -245,7 +256,7 @@
   README 的「版本」段与 CHANGELOG 与之保持一致。
 - 取证：shell `uname` → `MorionOS 0.4.0 x86_64`、`version` → `MorionOS v0.4.0 (build <git短哈希>)`。
 
-### V2 — 无图形界面版本收口
+### V2 — 无图形界面版本收口 ✅ 已完成
 - 构建开关：`make NOGUI=1 ...` 注入编译期环境变量 `MORION_NOGUI`（内核 `version.rs` 与用户态
   `morion::syscall::NOGUI` 同一约定）—— release 串带 `-nogui`，**shell 不开屏幕镜像**、输入/回显退回串口。
 - ⚠️ 与 D8 原文的差异（有意）：`gfx_srv` **仍照常加载**（boot 的服务表写死 18 项、init 又监督域 15；
@@ -253,6 +264,29 @@
   **屏幕镜像**这条用户可见的图形路径 —— 其余服务与**全量回归口径不变**。
 - CHANGELOG（新建）+ README「版本」段 + **打 tag `v0.4.0-nogui`**。
 - 验收即"全量 FS 回归 + 驱动自测"全绿（含 `NOGUI=1` 变体回归）。
+
+### V3 — 安装盘变体（装机用）✅ 已完成
+- 动机：发行版装机的标准流程是**先用 U 盘启动、再把系统装到本机盘上** —— 那时盘上原有的
+  文件系统（Windows / exFAT / ext2…）正是**要被覆盖**的东西，而 `mkfs.mfs` 的护栏默认拒绝
+  非空白卷。逐条写 `--force` 会把安装脚本写得很脆，且「当前是安装环境」这个事实本该由
+  **镜像变体**表达，而不是由每条命令的开关表达。
+- 构建开关：`make INSTALL=1 iso` 注入编译期环境变量 `MORION_INSTALL`（内核 `version.rs` 的
+  `IS_INSTALL` 与用户态 `morion::syscall::INSTALL_MODE` 同一约定）—— release 串带 `-install`
+  （与 `-nogui` 可组合成 `-nogui-install`），产物落 `build/install/`。
+- 行为差异（**全镜像只有这一处**）：`mfs_srv` 的 `mkfs` 护栏在该变体里对**非空白卷**默认放开，
+  放行时打印 `mfs: mkfs: overwriting an existing filesystem on volume <n> (install image; …)`。
+  日常镜像 `INSTALL_MODE == false`，护栏一字不放宽（`--force` 仍是日常镜像的唯一出口）。
+- 自测口径：FS-22 的「别人的分区必须被拒」两条断言在安装盘里**跳过**并打印 SKIPPED —— 那种
+  镜像下护栏已放开，照旧去调就等于**当场把正在跑的 FAT 根卷格掉**；护栏本身由日常镜像的
+  全量回归守着。「不存在的卷号一律被拒」在任何变体下都保留。
+- 取证：安装盘 `uname` → `MorionOS 0.4.0-install x86_64`；对 exFAT 卷 `mkfs.mfs 5`（**不带**
+  `--force`）成功并在 `/usb5` 挂上新卷；日常镜像同一命令仍被拒。
+- 回归：安装盘 `REGRESS_ISO=build/install/morion-os.iso bash scripts/fs-regress.sh` →
+  `SELFTEST DONE` 1 次、`FAILED/PANIC` 0 次（耗时 324 s，日志里有 `FS22 guard checks SKIPPED`）；
+  日常镜像同口径全绿，且**没有**那行 SKIPPED（护栏断言照旧执行）。
+- 顺带修了回归脚本的一个误判：`shell: screen console mirror FAILED (gfx_srv cursor not advanced)`
+  是启动竞态的无害提示，脚本原先把它当"失败"提前收工（实测 13 秒即退、`SELFTEST DONE` 0），
+  现已在收工判据与失败计数里统一滤掉。
 
 ---
 
@@ -264,7 +298,7 @@
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
-7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。
+7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。**D4** 真机存储驱动第一版 `ahci_srv`（✅ 已完成，域 18，SATA/AHCI 只读，全轮询、不申请中断）。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
 9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD）+ 重映射域（✅ **E1b**：全设备 `translated + 恒等`，打开 `GCMD.TE`）+ 受限 IOVA 窗口与越界 DMA 拒绝取证（✅ **E1c**：目标设备窗口收到 3 GiB，设备发起的窗口外 DMA 被拒并留证）。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。
@@ -287,12 +321,13 @@
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
+| D4 | AHCI/SATA **只读**驱动落地（域 18），仍走通用授权、内核无设备专属逻辑；全轮询、不申请中断 —— ✅ `[OK] 19 service ELFs loaded` + `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`；宿主 `sha256sum build/ahci.img` 运行前后一致（只读；`dd … conv=notrunc` 预写签名）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0（隔离树验证：HEAD + 仅 03 补丁） |
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |
 | D0 | I/O 端口 syscall 加 `IoPort` 门禁：未授权域读写端口被拒，`block_srv` / `mfs_srv` / `exfat_srv` 照常 —— ✅ `app: D0 port capability gate OK (ungranted I/O port denied)`；FS-13/FS-16 仍写得出时间戳（两处授权放行）；内核单测 24/24 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |
 | E1a | 内核能找到 DMAR 并报出 DRHD/设备范围；固件无 IOMMU 时优雅降级 —— ✅ `[OK] ACPI DMAR found: len=128 aw=47 drhd=1 checksum=ok` + `DRHD[0] base=0xFED90000 scopes=8`（`-device intel-iommu`）；无 IOMMU 时 `[OK] no ACPI DMAR (no IOMMU), VT-d disabled`，全量回归零变化；内核单测 26/26 |
 | E1b | 打开 VT-d DMA 重映射后全量回归不退化 —— ✅ `[OK] VT-d: remap ON root=0x686000 ctx_buses=1 translated=8 (iova=identity 4GiB, aw=39) gsts=0xC0000000`（`TE=1`+`RTPS=1`）；`-device intel-iommu` 下 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`，QEMU 侧零 VT-d 故障；无 IOMMU 时行为零变化；内核单测 29/29 |
-| E1c | 设备发起的**窗口外 DMA 被 IOMMU 拒绝**并留证，系统与其他域不受影响 —— ✅ 目标设备（NVMe，SID 0x10）窗口 = `[0, 3 GiB)`；`block_srv` 探针把 NVM 读的 PRP1 指到 3 GiB → 内核日志 `IOMMU1 out-of-window DMA probe: prp=0xc0000000 window=[0,0xc0000000) probe=ok` + `[OK] VT-d: DMA refused target-sid=0x10 fsts=0x2 …`，QEMU stderr `vtd_iommu_translate: detected translation failure (dev=00:02:00, iova=0xc0000000)`；同一次运行全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`）；无 IOMMU 时零变化；内核单测 31/31 |
+| E1c | 设备发起的**窗口外 DMA 被 IOMMU 拒绝**并留证，系统与其他域不受影响 —— ✅ 目标设备（NVMe，SID 0x10）窗口 = `[0, 3 GiB)`；`block_srv` 探针把 NVM 读的 PRP1 指到 3 GiB → 内核日志 `IOMMU1 out-of-window DMA probe: prp=0xc0000000 window=[0,0xc0000000) probe=ok` + `[OK] VT-d: DMA refused target-sid=0x10 fsts=0x2 …`，QEMU stderr `vtd_iommu_translate: detected translation failure (dev=00:02:00, iova=0xc0000000)`；同一次运行全量回归全绿（`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`、`NET1 … ARP reply OK`）；无 IOMMU 时零变化；内核单测 31/31 |
 | E3 | 飞地直通命令成功 + 隔离取证同时成立 |
 | V2 | 无图形构建下全量回归通过；`SYS_UNAME` 报告 `v0.4.0-nogui` —— ✅ `MorionOS v0.4.0-nogui (build …)` + `shell: no-gui build (screen mirror off; serial console only)`；`NOGUI=1` 变体全量回归 `SELFTEST DONE`×1、`FAILED`／`PANIC` 0、`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`、`VBLK1 … sig=ok, rw=ok`（产物落 `build/nogui/`） |
 
