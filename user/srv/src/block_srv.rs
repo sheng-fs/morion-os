@@ -1039,6 +1039,10 @@ fn nvme_main() {
         println(outcome);
     }
 
+    // 11b. 只读缓存初始化: 分配私有数据页并打一行初始计数 (回归据此 grep `blk-cache:`)。
+    blk_cache_init();
+    blk_cache_stats_print();
+
     loop {
         let mut msg = Message {
             from: 0,
@@ -1070,15 +1074,36 @@ fn nvme_main() {
                         continue;
                     }
                 };
-                let opcode = if opcode_low == BLOCK_OP_READ {
-                    OP_READ
-                } else {
-                    OP_WRITE
-                };
+                let is_read = opcode_low == BLOCK_OP_READ;
+                let opcode = if is_read { OP_READ } else { OP_WRITE };
                 let base_lba = vol.start_lba.saturating_add(req.lba as u32);
                 let total = req.count;
                 if total == 0 {
                     sys_reply(0);
+                    continue;
+                }
+                // 小读 (≤ 一行 = 8 扇区) 走只读缓存: 命中直接回数据, 未命中按行读入。
+                // 大读与写保持下面的直传路径 (取舍见缓存段注释)。容量未知 (sectors==0)
+                // 的卷不缓存 —— 按行读可能越过盘尾。
+                if is_read
+                    && unsafe { BLK_CACHE_ON }
+                    && vol.sectors != 0
+                    && total <= BLK_CACHE_SECTORS_PER_LINE
+                {
+                    let (qi, isq_doorbell, icq_doorbell) =
+                        io_select_queue(mmio, stride, &mut io_rr);
+                    let mut io = NvmeIo {
+                        cfg: &cfg,
+                        mmio,
+                        isq: isq_doorbell,
+                        icq: icq_doorbell,
+                        tail: &mut io_tail[qi],
+                        head: &mut io_head[qi],
+                        phase: &mut io_phase[qi],
+                    };
+                    let ok = blk_cache_read(dev, &vol, req.lba, total, req.buf as *mut u8, &mut io);
+                    blk_cache_stats_tick();
+                    sys_reply(if ok { 1 } else { 0 });
                     continue;
                 }
                 // 超过单条命令上限 (256 扇区 = 128 KiB) 的请求按命令上限切分:
@@ -1111,6 +1136,11 @@ fn nvme_main() {
                     }
                     done += chunk as u64;
                 }
+                // 写穿透: 写盘成功后失效被覆盖的缓存行 (不允许脏数据)。
+                if !is_read && ok {
+                    blk_cache_invalidate(dev, req.lba, total);
+                }
+                blk_cache_stats_tick();
                 sys_reply(if ok { 1 } else { 0 });
             }
             BLOCK_OP_LIST_VOLUMES => {
@@ -1175,6 +1205,8 @@ fn nvme_main() {
                         }
                     }
                 };
+                // 分区表/卷表可能已改写 → 整表失效 (卷号是分区表的产物, 索引会变)。
+                blk_cache_flush_all();
                 sys_reply(r);
             }
             _ => {
@@ -1422,6 +1454,9 @@ fn ide_capacity_sectors() -> u32 {
 ///   0x15_6000           exFAT 单页暂存
 ///   0x16_0000           block_srv 卷扫描页 (本页)   ← 必须在 exFAT 预留段之上
 ///   0x16_1000           block_srv PRP 表页
+///   0x16_2000           mfs 位图头块缓冲 (**mfs_srv 同址共享给 block_srv**)
+///   0x20_0000           fat32 簇缓冲 (**fat32_srv 同址共享给 block_srv**)
+///   0x30_0000..0x38_0000 block_srv 只读缓存数据页 (128 页, 私有)
 /// 新增固定地址时务必对照本表 —— 一旦与别人的共享页重叠, 「同地址共享」会因为
 /// 目标域的该地址已被映射而直接触发内核 panic (`map_user_page: PageAlreadyMapped`)。
 const VOL_SCRATCH_VADDR: u64 = 0x0000_0080_0016_0000;
@@ -1867,6 +1902,266 @@ impl NvmeIo<'_> {
     }
     fn write(&mut self, nsid: u32, lba: u32, count: u16, buf: *mut u8) -> bool {
         self.rw(OP_WRITE, nsid, lba, count, buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 只读扇区缓存 + 顺序预读 (块层性能)
+// ---------------------------------------------------------------------------
+//
+// 块请求的大头是「每请求一次 IPC 往返」(≈ 一个时钟 tick), 但同一个扇区被反复读的
+// 下盘开销也是实打实的 —— 上层虽各有小缓冲 (如 MFS 的 inode 表单块缓存), 块层却没有
+// 共享缓存。这里在**块服务内部**加一层只读缓存 + 顺序预读: 对上层完全透明 (四个文件
+// 服务一行不改), 语义不变 (只读; 写路径写穿透 + 失效)。
+//
+// 关键取舍: **只有「单行能装下的小读」(count ≤ 8 扇区) 走缓存**。大读 (如 128 KiB
+// 批量读) 保持原有的 256 扇区直传路径 —— 若强行按 4 KiB 行拆, 一条命令会变成 32 条,
+// 反而更慢。缓存服务的是 inode 表 / 目录项 / 位图这类**重复小读**。
+
+/// 缓存行数 (每行一页 = 8 扇区 = 4 KiB)。128 行 = 512 KiB。
+const BLK_CACHE_LINES: usize = 128;
+/// 编译期开关: false = 完全关闭缓存 (对照构建, 用于 before/after 量化; 不影响正确性)。
+const BLK_CACHE_ENABLE: bool = true;
+/// 每行扇区数 (4 KiB / 512 B)。
+const BLK_CACHE_SECTORS_PER_LINE: u64 = 8;
+/// 每行字节数。
+const BLK_CACHE_LINE_BYTES: usize = 4096;
+/// 缓存数据页的私有虚拟地址基址。
+///
+/// 必须落在本服务既有映射之上 —— 注意 block_srv 域里除了自己的卷扫描页 (0x16_0000)
+/// 与 PRP 表页 (0x16_1000), 还**同址共享**了各文件服务的请求/工作缓冲 (0x10_0000..0x16_2000
+/// 与 fat32 的 0x20_0000), 故这里选 3 MiB 处这一整段空闲区 (128 页 = 512 KiB, 到 0x38_0000
+/// 为止, 低于用户栈 0x40_0000)。这些页是 block_srv **私有**的, 不与任何域共享。
+const BLK_CACHE_VADDR: u64 = 0x0000_0080_0030_0000;
+/// 顺序命中时向后预取的行数。
+const BLK_CACHE_PREFETCH_LINES: u64 = 2;
+/// 计数打印的间隔 (块读写请求数)。
+const BLK_CACHE_STATS_EVERY: u64 = 512;
+
+/// 缓存行标签 (数据在 `BLK_CACHE_VADDR + slot * 4 KiB`)。
+#[derive(Clone, Copy)]
+struct BlkCacheTag {
+    valid: bool,
+    /// 卷号 (键的一部分; 失效按卷隔离)。
+    vol: u32,
+    /// 卷内页号 (= 卷内扇区号 / 8)。
+    page: u64,
+    /// 本行实际有效的扇区数 (卷尾最后一行可能不足 8)。
+    sectors: u8,
+}
+const BLK_CACHE_TAG_EMPTY: BlkCacheTag = BlkCacheTag {
+    valid: false,
+    vol: 0,
+    page: 0,
+    sectors: 0,
+};
+
+static mut BLK_CACHE_TAGS: [BlkCacheTag; BLK_CACHE_LINES] = [BLK_CACHE_TAG_EMPTY; BLK_CACHE_LINES];
+/// 缓存是否可用 (分配失败时置 false, 全链路退回直传)。
+static mut BLK_CACHE_ON: bool = false;
+static mut BLK_CACHE_HITS: u64 = 0;
+static mut BLK_CACHE_MISS: u64 = 0;
+static mut BLK_CACHE_PREFETCH: u64 = 0;
+static mut BLK_CACHE_EVICT: u64 = 0;
+/// 块读写请求计数 (仅用于周期性打印计数行)。
+static mut BLK_CACHE_REQS: u64 = 0;
+/// 顺序预读游标: 上次服务的 (卷号, 期望的下一次起点扇区)。
+static mut BLK_CACHE_SEQ_VOL: u32 = u32::MAX;
+static mut BLK_CACHE_SEQ_NEXT: u64 = 0;
+
+/// 缓存行槽位: 直接映射。`vol` 参与哈希 → 不同卷的同一页不会总撞同一个槽。
+fn blk_cache_slot(vol_id: usize, page: u64) -> usize {
+    ((vol_id.wrapping_mul(0x9E37_79B1)) ^ (page as usize)) % BLK_CACHE_LINES
+}
+
+/// 槽位 `slot` 的数据页地址。
+fn blk_cache_line_ptr(slot: usize) -> *mut u8 {
+    (BLK_CACHE_VADDR + (slot as u64) * BLK_CACHE_LINE_BYTES as u64) as *mut u8
+}
+
+/// 分配缓存数据页; 任一步失败即放弃缓存 (不影响启动)。
+fn blk_cache_init() {
+    if !BLK_CACHE_ENABLE {
+        return;
+    }
+    let mut i = 0usize;
+    while i < BLK_CACHE_LINES {
+        let va = BLK_CACHE_VADDR + (i as u64) * BLK_CACHE_LINE_BYTES as u64;
+        if sys_alloc_page(va) != 1 {
+            println("blk-cache: alloc FAILED, cache disabled");
+            return;
+        }
+        i += 1;
+    }
+    blk_cache_flush_all();
+    unsafe { BLK_CACHE_ON = true };
+}
+
+/// 整表失效 (卷表重建 / 分区表改写后的兜底)。
+fn blk_cache_flush_all() {
+    let mut i = 0usize;
+    while i < BLK_CACHE_LINES {
+        unsafe { BLK_CACHE_TAGS[i] = BLK_CACHE_TAG_EMPTY };
+        i += 1;
+    }
+    unsafe {
+        BLK_CACHE_SEQ_VOL = u32::MAX;
+        BLK_CACHE_SEQ_NEXT = 0;
+    }
+}
+
+/// 失效卷 `vol_id` 内 `[lba, lba+count)` 覆盖到的行 (写穿透后调用)。
+fn blk_cache_invalidate(vol_id: usize, lba: u64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let first = lba / BLK_CACHE_SECTORS_PER_LINE;
+    let last = (lba + count - 1) / BLK_CACHE_SECTORS_PER_LINE;
+    let mut p = first;
+    while p <= last {
+        let slot = blk_cache_slot(vol_id, p);
+        unsafe {
+            let t = BLK_CACHE_TAGS[slot];
+            if t.valid && t.vol == vol_id as u32 && t.page == p {
+                BLK_CACHE_TAGS[slot].valid = false;
+            }
+        }
+        p += 1;
+    }
+}
+
+/// 把卷内第 `page` 行读进槽位 (一次 DMA, ≤ 8 扇区)。成功返回 true。
+///
+/// 不碰 hit/miss/prefetch 计数 (由调用方按用途记账)。
+fn blk_cache_fill(vol_id: usize, vol: &Volume, page: u64, io: &mut NvmeIo) -> bool {
+    let first_sector = page * BLK_CACHE_SECTORS_PER_LINE;
+    // 卷尾裁剪: 已知容量时本行只读到卷尾; 容量未知 (sectors == 0) 时不予缓存。
+    if vol.sectors == 0 || first_sector >= vol.sectors as u64 {
+        return false;
+    }
+    let avail = vol.sectors as u64 - first_sector;
+    let n = avail.min(BLK_CACHE_SECTORS_PER_LINE) as u16;
+    let slot = blk_cache_slot(vol_id, page);
+    if unsafe { BLK_CACHE_TAGS[slot].valid } {
+        unsafe { BLK_CACHE_EVICT += 1 };
+    }
+    let lba = vol.start_lba + first_sector as u32;
+    if !io.read(vol.nsid, lba, n, blk_cache_line_ptr(slot)) {
+        return false;
+    }
+    unsafe {
+        BLK_CACHE_TAGS[slot] = BlkCacheTag {
+            valid: true,
+            vol: vol_id as u32,
+            page,
+            sectors: n as u8,
+        };
+    }
+    true
+}
+
+/// 命中判定 + 命中后返回该行有效扇区数 (未命中返回 None)。
+fn blk_cache_probe(vol_id: usize, page: u64) -> Option<u64> {
+    let slot = blk_cache_slot(vol_id, page);
+    let t = unsafe { BLK_CACHE_TAGS[slot] };
+    if t.valid && t.vol == vol_id as u32 && t.page == page {
+        Some(t.sectors as u64)
+    } else {
+        None
+    }
+}
+
+/// 读卷内 `[lba, lba+count)` (`count` ≤ 8): 命中的行直接 memcpy, 未命中的行先按行读入
+/// 缓存再拷出 —— 于是对上层完全透明 (数据一律经缓存页过一遍)。
+fn blk_cache_read(
+    vol_id: usize,
+    vol: &Volume,
+    lba: u64,
+    count: u64,
+    dst: *mut u8,
+    io: &mut NvmeIo,
+) -> bool {
+    // 顺序判定: 本次起点正好接在上次的末尾 (同卷) 才算顺序访问。
+    let sequential = unsafe { BLK_CACHE_SEQ_VOL == vol_id as u32 && lba == BLK_CACHE_SEQ_NEXT };
+    let mut done: u64 = 0;
+    while done < count {
+        let cur = lba + done;
+        let page = cur / BLK_CACHE_SECTORS_PER_LINE;
+        let off = (cur % BLK_CACHE_SECTORS_PER_LINE) as usize;
+        let slot = blk_cache_slot(vol_id, page);
+        let line_sectors = match blk_cache_probe(vol_id, page) {
+            Some(n) => {
+                unsafe { BLK_CACHE_HITS += 1 };
+                n
+            }
+            None => {
+                unsafe { BLK_CACHE_MISS += 1 };
+                if !blk_cache_fill(vol_id, vol, page, io) {
+                    return false;
+                }
+                unsafe { BLK_CACHE_TAGS[slot].sectors as u64 }
+            }
+        };
+        if (off as u64) >= line_sectors {
+            return false;
+        }
+        let take = (line_sectors - off as u64).min(count - done);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                blk_cache_line_ptr(slot).add(off * NVME_SECTOR_SIZE),
+                dst.add((done as usize) * NVME_SECTOR_SIZE),
+                (take as usize) * NVME_SECTOR_SIZE,
+            );
+        }
+        done += take;
+    }
+    // 顺序预读: 落在顺序流里才向后预取, 且只补**不在缓存里**的行 (best-effort; 失败不影响本次读)。
+    if sequential && vol.sectors != 0 {
+        let last_page = (lba + count - 1) / BLK_CACHE_SECTORS_PER_LINE;
+        let mut k = 1u64;
+        while k <= BLK_CACHE_PREFETCH_LINES {
+            let p = last_page + k;
+            if blk_cache_probe(vol_id, p).is_none() && blk_cache_fill(vol_id, vol, p, io) {
+                unsafe { BLK_CACHE_PREFETCH += 1 };
+            }
+            k += 1;
+        }
+    }
+    unsafe {
+        BLK_CACHE_SEQ_VOL = vol_id as u32;
+        BLK_CACHE_SEQ_NEXT = lba + count;
+    }
+    true
+}
+
+/// 周期性打印缓存计数 (回归日志 grep `blk-cache:` 即判)。
+fn blk_cache_stats_tick() {
+    unsafe {
+        BLK_CACHE_REQS += 1;
+        if !BLK_CACHE_REQS.is_multiple_of(BLK_CACHE_STATS_EVERY) {
+            return;
+        }
+        blk_cache_stats_print();
+    }
+}
+
+/// 打印一行缓存计数。
+fn blk_cache_stats_print() {
+    unsafe {
+        print("blk-cache: hits=");
+        print_u64(BLK_CACHE_HITS);
+        print(" miss=");
+        print_u64(BLK_CACHE_MISS);
+        print(" prefetch=");
+        print_u64(BLK_CACHE_PREFETCH);
+        print(" evict=");
+        print_u64(BLK_CACHE_EVICT);
+        print(" reqs=");
+        print_u64(BLK_CACHE_REQS);
+        print(" lines=");
+        print_u64(BLK_CACHE_LINES as u64);
+        print(" on=");
+        println(if BLK_CACHE_ON { "1" } else { "0" });
     }
 }
 
