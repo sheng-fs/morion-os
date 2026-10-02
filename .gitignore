@@ -51,6 +51,7 @@ docs/# MorionOS*
 
 # 并行开发交接文档（本地临时，不入库）
 /HANDOFF.md
+/HANDOFF-FS.md
 
 # Trae IDE 本地状态
 .trae/

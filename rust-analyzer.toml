@@ -1,0 +1,17 @@
+# Morion OS — rust-analyzer 项目级配置
+#
+# 为什么需要它:
+#   rust-analyzer 默认对工作区跑**宿主 target** 的 `cargo check`。本仓库三个编译目标
+#   互不相同 (kernel: x86_64-unknown-none / boot: x86_64-unknown-uefi / 用户态: 自定义
+#   json target + build-std), 没有单一 target 能覆盖全工作区 —— 宿主 target 下 no_std 的
+#   crate 会在 crate 根 main.rs 上报 `#[panic_handler] required` (内核还多一个
+#   `no global memory allocator found`), Problems 面板因此常年一片"假红"。
+#
+#   这里把"检查"换成 scripts/ra-check.sh: 逐 crate 用正确 target (与 `make check`
+#   一一对应, 另加 kernel_test), 只多 `--message-format=json` 让诊断进编辑器 ——
+#   只去掉误报, 不掩盖真实错误。
+#
+# 说明: 该文件由 rust-analyzer 服务端直接读取 (项目级, 优先级高于 IDE 设置),
+#       改完后 Reload Window (或重启 rust-analyzer) 生效。
+[check]
+overrideCommand = ["bash", "scripts/ra-check.sh"]

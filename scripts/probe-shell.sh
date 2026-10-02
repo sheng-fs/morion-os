@@ -22,16 +22,25 @@ if [ "$#" -lt 1 ]; then
   exit 2
 fi
 
+# 空白盘 (build/spare.img) 每轮重置 —— 与 fs-regress.sh 同一约定 (它启动前也 dd 清零)。
+# 原因: 自测 FS-22 会把这块盘格式化成 MFS 并把**主卷序号**抬到 max+1; 清不掉的话, 下次
+# 启动主卷认领按序号最大者胜 → `/mfs` 变成这块 16 MiB 的 spare, 自测里按「/mfs 是 nsid=2
+# 的 256 MiB 卷」写死的几何断言 (FS21/FS23) 就会误报 FAILED (踩过: 探测日志 FS21 FAILED)。
+dd if=/dev/zero of=build/spare.img bs=1M count=16 status=none
+
 log=${PROBE_LOG:-/tmp/morion-probe.log}
 sock=/tmp/morion-probe.sock
 rm -f "$log" "$sock"
 
 QEMU=${QEMU:-qemu-system-x86_64}
 BIOS=${BIOS:-/usr/share/edk2/x64/OVMF.4m.fd}
+# 镜像路径可换: 变体产物落在 build/<变体>/ 下 (如 build/install/morion-os.iso),
+# 用 PROBE_ISO=... 指过去即可 (磁盘镜像仍用 build/*.img, 变体之间共用测试盘)。
+ISO=${PROBE_ISO:-build/morion-os.iso}
 
 $QEMU \
   -machine q35 -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
-  -cdrom build/morion-os.iso \
+  -cdrom "$ISO" \
   -device nvme,serial=MORION,id=nvme0 \
   -drive file=build/nvme.img,if=none,id=n1,format=raw -device nvme-ns,drive=n1,bus=nvme0,nsid=1 \
   -drive file=build/mfs.img,if=none,id=n2,format=raw -device nvme-ns,drive=n2,bus=nvme0,nsid=2 \

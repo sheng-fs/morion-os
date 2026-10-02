@@ -5,7 +5,9 @@
 #   bash scripts/fs-regress.sh [日志路径]
 #
 # 环境变量: MFS_KEEP=1 保留既有 MFS 卷; REGRESS_TIMEOUT_S 放宽等待上限 (无 KVM 的 CI);
-#           QEMU_EXTRA 追加 QEMU 参数; BIOS 覆盖 OVMF 路径。
+#           QEMU_EXTRA 追加 QEMU 参数; BIOS 覆盖 OVMF 路径;
+#           REGRESS_ISO 指定别的 ISO (镜像变体: 如 REGRESS_ISO=build/install/morion-os.iso
+#           验安装盘 —— 磁盘镜像仍用 $OUT_DIR/*.img, 变体之间共用测试盘)。
 #
 # ⏱️ 有 KVM 时整套约 6 分钟: 约 2 万个块请求, IPC 一跳 ≈ 一个时钟 tick, 故有效吞吐
 # 约 100 请求/s。期间日志会长时间「只有 shell 提示符、没有新行」, 这不是卡死。
@@ -72,6 +74,8 @@ t0=$(date +%s)
 
 QEMU=${QEMU:-qemu-system-x86_64}
 BIOS=${BIOS:-/usr/share/edk2/x64/OVMF.4m.fd}
+# 默认跑本目录构建的镜像; 变体 (如安装盘) 用 REGRESS_ISO 指过去。
+ISO=${REGRESS_ISO:-$OUT_DIR/morion-os.iso}
 
 # 加速: 有 KVM 就用 (-enable-kvm); 没有 (多数 CI runner) 退回 TCG —— 结果一样但要慢
 # 好几倍, 故等待上限用 REGRESS_TIMEOUT_S 放宽 (默认 600 s, 按 KVM 下 ~6 分钟定的)。
@@ -93,7 +97,7 @@ fi
 
 $QEMU \
   -machine q35 ${iommu_arg} -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
-  -cdrom "$OUT_DIR/morion-os.iso" \
+  -cdrom "$ISO" \
   -device nvme,serial=MORION,id=nvme0 \
   -drive file="$OUT_DIR/nvme.img",if=none,id=n1,format=raw -device nvme-ns,drive=n1,bus=nvme0,nsid=1 \
   -drive file="$OUT_DIR/mfs.img",if=none,id=n2,format=raw -device nvme-ns,drive=n2,bus=nvme0,nsid=2 \
@@ -112,7 +116,12 @@ pid=$!
 # 出现结论或失败即提前收工; 否则最多等 timeout_s 秒 (每 5 s 轮询一次)。
 for _ in $(seq 1 $((timeout_s / 5))); do
   sleep 5
-  if grep -qE 'SELFTEST DONE|KERNEL PANIC|FAILED' "$log" 2>/dev/null; then break; fi
+  if grep -qE 'SELFTEST DONE|KERNEL PANIC' "$log" 2>/dev/null; then break; fi
+  # ⚠️ 别拿**任何** FAILED 当收工信号: shell 启动时那句
+  # `shell: screen console mirror FAILED (gfx_srv cursor not advanced)` 是 gfx_srv 尚未就绪时
+  # 的无害竞态提示 (usb-rw.sh 也踩过同一个坑), 它一出现就退出会把整轮误判成失败
+  # (实测: 13 秒即退、SELFTEST DONE 0)。故把这一句滤掉再判。
+  if grep -E 'FAILED' "$log" 2>/dev/null | grep -qv 'screen console mirror FAILED'; then break; fi
   kill -0 "$pid" 2>/dev/null || break
 done
 sleep 3
@@ -120,7 +129,10 @@ kill "$pid" 2>/dev/null
 wait "$pid" 2>/dev/null
 
 done_n=$(grep -c 'SELFTEST DONE' "$log" 2>/dev/null || true)
-fail_n=$(grep -cE 'FAILED|PANIC' "$log" 2>/dev/null || true)
+# 判定用的 FAILED/PANIC 计数同样要滤掉那句无害竞态提示 (理由见上面收工判据), 否则一轮
+# 正常的回归会被它判成败 —— 实测: 整轮只有这一句, 也会让退出码变 1。
+harmless='screen console mirror FAILED'
+fail_n=$(grep -E 'FAILED|PANIC' "$log" 2>/dev/null | grep -cv "$harmless" || true)
 echo "== 日志: $log"
 echo "== 耗时: $(($(date +%s) - t0)) 秒 (出现结论即停, 最长等 ${timeout_s} 秒)"
 echo "== SELFTEST DONE 次数: $done_n"
@@ -159,6 +171,6 @@ echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # FS-28 进一步验证子程序退出后内核**自动回收**该域 (域号复用、空闲帧回到稳态)。
 grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$log" 2>/dev/null || echo "(无)"
 echo "== 失败明细 =="
-grep -nE 'FAILED|PANIC' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
 [ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ]
