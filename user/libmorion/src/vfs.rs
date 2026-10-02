@@ -177,12 +177,19 @@ pub const MFS_SNAPRESTORE_TAG: u64 = 0x4D53_4E52; // "MSNR"
 pub const MFS_GC_TAG: u64 = 0x4D53_4743; // "MSGC"
 /// 查询空间用量: 回复 `(总块数 << 32) | 空闲块数`。
 pub const MFS_STAT_TAG: u64 = 0x4D53_5354; // "MSST"
-/// 在指定卷上创建 MorionFS (**擦除**该卷现有内容): payload = 卷号 (u64 LE)。
+/// 在指定卷上创建 MorionFS (**擦除**该卷现有内容): payload = 卷号 (u64 LE) ++ 标志字 (u64 LE)。
 ///
 /// 与其余 MFS tag 不同, 它**按卷号而不是按路径**寻址 (还没有文件系统时没有路径可走),
 /// 故直接发给 mfs_srv, 不经挂载层路由。
 /// 回复该卷落盘后的**主卷序号** (>0), 失败 `u64::MAX`。
 pub const VFS_MKFS_TAG: u64 = 0x4D4B_4653; // "MKFS"
+
+/// `MKFS` payload 第 2 个字 (偏移 +8) 的位标志: 置 1 = **强制覆盖别人的文件系统**
+/// (FAT / exFAT / ext2)。
+///
+/// 默认 0: 老调用方只发前 8 字节卷号, payload 其余部分是零填充, 于是天然不强制。
+/// 标志单独占一个字 (而不是复用卷号高位), 是为了让卷号始终是一个干净的全宽 u64。
+pub const MKFS_FLAG_FORCE: u64 = 1 << 0;
 
 /// 把**已格式化**的 MFS 卷标记为主卷 (**不动它的数据**): payload = 卷号 (u64 LE)。
 ///
@@ -190,6 +197,13 @@ pub const VFS_MKFS_TAG: u64 = 0x4D4B_4653; // "MKFS"
 /// 一块**已有数据**的卷升为主卷 (mkfs 做不到, 它会擦掉数据)。同样按卷号寻址。
 /// 回复该卷落盘后的**主卷序号** (>0), 失败 `u64::MAX`。
 pub const MFS_SETPRIMARY_TAG: u64 = 0x4D53_5052; // "MSPR"
+/// 最小对账 (fsck, 01): payload = 标志字 (u64 LE, bit0 = `--repair`)。
+///
+/// 回复 `(泄漏 inode 数 << 32) | 块数`: 默认模式块数 = 名下可回收块数 (只报不修);
+/// `--repair` 模式块数 = 本次实际回收块数。失败 `u64::MAX`。
+pub const MFS_FSCK_TAG: u64 = 0x4D46_5343; // "MFSC"
+/// 显式同步 (01): 幂等落盘一次 (刷新位图 + 两份超级块), 回复落盘后的代际 gen; 失败 `u64::MAX`。
+pub const MFS_SYNC_TAG: u64 = 0x4D53_594E; // "MSYN"
 
 /// 把卷 `vol` 标记为 MorionFS **主卷**, 不改变卷上的数据。
 ///
@@ -211,7 +225,25 @@ pub fn mfs_set_primary(vol: u64) -> u64 {
 /// **下次启动** `/mfs` 就认领到它 —— 这就是切换主卷的手段 (本次运行的挂载不变)。
 /// 序号只增不减, 故「最近一次 mkfs 过的卷」总是胜出。
 pub fn mfs_mkfs(vol: u64) -> u64 {
-    sys_call_payload(MFS_DOMAIN, VFS_MKFS_TAG, &vol.to_le_bytes())
+    mfs_mkfs_flags(vol, 0)
+}
+
+/// 同 [`mfs_mkfs`], 但**显式允许覆盖别人的文件系统** (FAT / exFAT / ext2 卷)。
+///
+/// 护栏默认拒绝这类卷 —— 这是「别人的分区绝不吞」的最后一道闸。只有调用方**已经拿到
+/// 用户明确同意**时才该走这里 (shell 的 `mkfs.mfs <卷号> --force`); 它会毁掉卷上原有的
+/// 文件系统。典型场景: 盘上还留着旧文件系统的 VBR (卷层照旧探测成 exfat), 用户在
+/// `part.wipe` + `part.create` 之后就是要在这块盘上建 MFS。
+pub fn mfs_mkfs_force(vol: u64) -> u64 {
+    mfs_mkfs_flags(vol, MKFS_FLAG_FORCE)
+}
+
+/// `MKFS` 的底层打包: payload = `卷号 (u64 LE)` ++ `标志字 (u64 LE)`。见 [`MKFS_FLAG_FORCE`]。
+fn mfs_mkfs_flags(vol: u64, flags: u64) -> u64 {
+    let mut payload = [0u8; 16];
+    payload[..8].copy_from_slice(&vol.to_le_bytes());
+    payload[8..].copy_from_slice(&flags.to_le_bytes());
+    sys_call_payload(MFS_DOMAIN, VFS_MKFS_TAG, &payload)
 }
 
 /// 触发 MorionFS 空间回收 (回收不可达的 COW 旧块), 成功返回回收的块数。
@@ -224,6 +256,22 @@ pub fn mfs_gc() -> u64 {
 /// 查询 MorionFS 空间用量, 返回 `(总块数 << 32) | 空闲块数`, 失败 `u64::MAX`。
 pub fn mfs_stat() -> u64 {
     sys_call_payload(MFS_DOMAIN, MFS_STAT_TAG, &[])
+}
+
+/// 最小对账 (fsck): 默认**只报不修** (`repair = false`, 不写盘), `repair = true` 才回收。
+///
+/// 回复 `(泄漏 inode 数 << 32) | 块数` (非修复模式块数 = 名下可回收块数; 修复模式 =
+/// 实际回收块数); 失败 `u64::MAX`。
+pub fn mfs_fsck(repair: bool) -> u64 {
+    let flags: u64 = if repair { 1 } else { 0 };
+    sys_call_payload(MFS_DOMAIN, MFS_FSCK_TAG, &flags.to_le_bytes())
+}
+
+/// 显式同步: 幂等落盘一次 (刷新位图与两份超级块), 返回落盘后的代际 gen; 失败 `u64::MAX`。
+///
+/// 用途: 给「崩溃一致性」自测一个可断言的落盘点 —— 读到 gen 即证明此刻盘上状态已提交。
+pub fn mfs_sync() -> u64 {
+    sys_call_payload(MFS_DOMAIN, MFS_SYNC_TAG, &[])
 }
 
 /// 快照列表单条记录的字节数 (与 mfs_srv 的 `MFS_SNAP_REC` 一致)：

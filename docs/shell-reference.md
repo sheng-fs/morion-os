@@ -30,6 +30,8 @@ shell: type 'help' for commands
 | --- | --- | --- |
 | `help` | `help` | 打印命令列表与挂载点 |
 | `echo` | `echo <text>` | 原样打印 `<text>`（可含空格） |
+| `uname` | `uname` | 打印内核报告的整行系统标识 `MorionOS <release> <machine>`（如 `MorionOS 0.4.0 x86_64`）；串由内核 [`kernel/src/version.rs`](../../kernel/src/version.rs) 单一维护，经 `SYS_UNAME(51)` 取得；无图形变体（`make NOGUI=1`）下 release 带 `-nogui` 后缀（如 `0.4.0-nogui`） |
+| `version` | `version` | 打印 `MorionOS v<release> (build <构建号>)`，如 `MorionOS v0.4.0 (build 3183f3f)`；`<构建号>` = 构建时 git 短哈希，由 Makefile 注入 |
 | `pwd` | `pwd` | 打印当前工作目录 |
 | `ls` | `ls [path]` | 列目录，默认当前目录 |
 | `cat` | `cat <file>` | 打印文件内容（最多 4096 字节） |
@@ -46,8 +48,14 @@ shell: type 'help' for commands
 | `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间（**跟随**软链接） |
 | `lstat` | `lstat <path>` | 同 `stat`，但作用于**链接自身**（不跟随；悬空链接也能看） |
 | `readlink` | `readlink <link>` | 打印软链接的目标字符串 |
-| `mkfs.mfs` | `mkfs.mfs <vol>` | 在指定卷上创建 MorionFS（**擦除**该卷；只接受空白卷或已有 MFS 卷） |
+| `mkfs.mfs` | `mkfs.mfs <vol> [--force]` | 在指定卷上创建 MorionFS（**擦除**该卷；默认只接受空白卷或已有 MFS 卷，`--force` 才允许覆盖别人的文件系统） |
 | `mfs.primary` | `mfs.primary <vol>` | 把一块已有数据的 MFS 卷换为主卷（**不动数据**；只接受 MFS 卷） |
+| `mfs.snap` | `mfs.snap` | 给主卷 `/mfs` 拍一张 COW 快照（持久化在超级块里，环上限 8 条） |
+| `mfs.snaps` | `mfs.snaps` | 列出现有快照（索引 / 代际 / 根 inode 表块） |
+| `mfs.rollback` | `mfs.rollback <index>` | 把 `/mfs` 退回指定快照（只改根指针，不搬数据） |
+| `mfs.gc` | `mfs.gc` | 回收不可达的 COW 旧块（快照仍引用的块保留） |
+| `mfs.fsck` | `mfs.fsck [--repair]` | 对账「已分配但不可达」的 inode（默认只报不修，`--repair` 才回收） |
+| `mfs.sync` | `mfs.sync` | 把 `/mfs` 显式落盘一次（刷新位图 + 超级块），打印盘上代际 gen |
 | `df` | `df` | 报告 `/mfs`（MorionFS）的空间用量 |
 | `part.create` | `part.create <nsid> <MiB> [mbr]` | 在**整块盘**上建分区（空白盘默认 GPT；`MiB 0` = 用尽剩余空间） |
 | `part.del` | `part.del <nsid> <index>` | 删分区项（**不动数据**；删完最后一个则整张表清空） |
@@ -64,6 +72,8 @@ shell: type 'help' for commands
 commands:
   help           show this help
   echo <text>    print text
+  uname          print system name / release / machine
+  version        print version and build
   pwd            print working directory
   ls [-l] [path] list directory (-l: long form)
   cat <file>     print file content
@@ -80,8 +90,14 @@ commands:
   stat <path>    show metadata (mode / owner / links / times)
   lstat <path>   like stat but on the link itself (no follow)
   readlink <link>  print a symbolic link's target (no follow)
-  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)
+  mkfs.mfs <vol> [--force]  create a MorionFS filesystem on a volume (ERASES it)
   mfs.primary <vol>   mark a MorionFS volume primary (keeps data)
+  mfs.snap       take a MorionFS snapshot (COW root + generation)
+  mfs.snaps      list MorionFS snapshots (index / generation)
+  mfs.rollback <index>  roll the mounted MorionFS back to a snapshot
+  mfs.gc         reclaim unreachable MorionFS blocks (keeps snapshots)
+  mfs.fsck [--repair]  reconcile MFS inodes (report only; --repair reclaims)
+  mfs.sync       flush MorionFS to disk now (prints the on-disk generation)
   df             show MorionFS space usage (/mfs)
   part.create <nsid> <MiB> [mbr]  create a partition (disk-wide, blank = GPT)
   part.del <nsid> <index>  delete a partition entry (keeps data)
@@ -236,7 +252,7 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - 路径不是软链接（或为悬空链接之外的一般失败）：`readlink: not a symbolic link: <link>`。
 - 缺参数：`readlink: missing operand`；路径过长：`readlink: path too long`。
 
-### `mkfs.mfs <vol>`
+### `mkfs.mfs <vol> [--force]`
 
 在**卷号**为 `<vol>` 的卷上写一个全新的 MorionFS 文件系统。**会擦除该卷原有内容。**
 
@@ -245,6 +261,16 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - **护栏在 mfs_srv 里，不在 shell 里**：只接受 `kind=mfs`（重新格式化）或
   `kind=unknown`（未格式化）的卷。FAT / exFAT / ext2 等别人的分区与不存在的卷号一律被拒，
   **绝不自动吞掉**。命令与 FS-22 自测走同一条路径，判定只有一处。
+- `--force` 是护栏的**唯一例外**，且必须显式写出来（`vfs::mfs_mkfs_force`：`MKFS` payload 的
+  第 2 个字置 `MKFS_FLAG_FORCE` 位；不带标志的老调用方那里是零填充，故默认行为一个字都没变）。
+  它存在的原因是**分区表之外的残留**：`part.wipe` 只清分区表、不动数据，旧文件系统的 VBR
+  还在原处，于是 `part.create` 建出的新分区照样被卷层探测成 `exfat`（真盘实测），而
+  「我就是要在这块盘上建 MorionFS」这个意图只有用户能表达。放行时服务端先打印一行
+  `mfs: mkfs: overwriting an existing filesystem on volume <n> (--force; its files are lost)`。
+- **安装盘**构建（`make INSTALL=1 iso`）里，这条护栏对非空白卷**默认放开**（不必写 `--force`，
+  服务端打印的原因改为 `(install image; its files are lost)`）—— 装机天生就是「先 U 盘启动、
+  再把系统装进本机盘」，要覆盖的正是盘上原有的文件系统。日常镜像 `INSTALL_MODE` 为 `false`，
+  行为与本文其余部分完全一致。
 - 成功后：卷上有一个空 MorionFS 根目录；若该卷**不是** MFS 主卷，会立刻挂到 `/usb<卷号>`；
   若就是主卷（`/mfs`），原地重建。
 - **同时把这卷标记为主卷**：超级块里记下「主卷序号 = 现有最大 + 1」，于是**下次启动** `/mfs`
@@ -252,16 +278,26 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
   同一块卷它仍会胜出。本次运行的挂载点不变（换主卷要重启才生效）。
 - 输出：`mkfs.mfs: volume <vol> formatted, marked primary (serial <n>) -> /mfs after next boot;
   other volumes mount at /usb<volume-id>`（`serial` 是**从盘上回读**的序号，即为标记已落盘的证据）；
-  被拒或失败：`mkfs.mfs: refused volume <vol> (not blank, not MFS, or no such volume)`。
-- 缺参数 / 非数字：`mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)`。
-- 相关诊断（服务端打印，属正常护栏证据）：`mfs: mkfs refused (volume holds another filesystem)`、
-  `mfs: mkfs refused (no such volume)`、`mfs: mkfs OK but primary mark missing on disk`（异常）。
+  被拒或失败：`mkfs.mfs: refused volume <vol> (not blank, not MFS, or no such volume)`，未加
+  `--force` 时再补一行 `mkfs.mfs: the volume may hold another filesystem; --force overwrites it`。
+- 缺参数 / 多参数 / 非数字 / 未知开关：
+  `mkfs.mfs: usage: mkfs.mfs <volume-id> [--force]   (see the 'vol:' lines in the boot log)`。
+- 相关诊断（服务端打印，属正常护栏证据）：`mfs: mkfs refused (volume holds another filesystem;
+  --force overwrites it)`、`mfs: mkfs refused (no such volume)`、
+  `mfs: mkfs: overwriting an existing filesystem on volume <n> (--force; …)`（`--force` 生效）或
+  `… (install image; …)`（安装盘默认放行）、
+  `mfs: mkfs OK but primary mark missing on disk`（异常）。
 
 > 典型用法（真盘上「新买一块盘」）：启动日志里找到目标卷的 `vol:` 行（例如
 > `vol: 6 nsid=6 lba=0 sectors=32768 kind=unknown`），敲 `mkfs.mfs 6`，然后
 > `ls /usb6` / `touch /usb6/T.TXT`。此后这台机器重启，`/mfs` 就落在卷 6 上。
 > 想切回去，用 `mfs.primary 1`（**不动数据**）；只有在确实想重建卷 1 时才用
 > `mkfs.mfs 1`（那会**擦除**卷上的文件）。
+
+> 盘上留着**旧文件系统**时（`part.wipe` 之后仍被探测成 `exfat`），确认这块盘就是要建
+> MorionFS 后用 `mkfs.mfs <卷号> --force` 覆盖它。另一条路是先在宿主侧清零盘头
+> （`scripts/usb-rw.sh` 就是这么做的：它验证的是「盘级擦除重建」这条路，与「用户显式覆盖」
+> 是两条独立路径）。
 
 > ⚠️ 主卷标记是**持久**的：跑过自测的镜像上，`spare.img` 会被 FS-22/FS-24/FS-25 格成 MFS
 > 并逐步升到更高序号 —— 再次 `make run-nvme` 而不重置镜像时，`/mfs` 就落在那块 16 MiB 的
@@ -284,6 +320,53 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - 缺参数 / 非数字：`mfs.primary: usage: mfs.primary <volume-id>   (see the 'vol:' lines in the boot log)`。
 - 相关诊断（服务端打印）：`mfs: set-primary refused (no such volume)`、
   `mfs: set-primary refused (not a MorionFS volume)`、`mfs: set-primary OK but primary mark missing on disk`（异常）。
+
+### `mfs.snap` / `mfs.snaps` / `mfs.rollback <index>` / `mfs.gc`
+
+MorionFS 的**快照与空间回收**四件套（此前只有自测在用，现已开成 shell 命令）。
+四条命令都作用于**主卷 = `/mfs`** —— 与 `df` 同源（这些 tag 直接发给 mfs_srv，不带路径、
+也不经挂载层路由，故不看 `cwd`，也不能对 `/usb<卷号>` 上的额外 MFS 卷下手）。
+
+- `mfs.snap`：记录当前根 inode 表 + 代际 + 分配游标，回复新快照索引。输出
+  `mfs.snap: snapshot <idx> taken -> ...`（后半句提示用 `mfs.rollback <index>` 退回）。
+  失败（未挂载）：`mfs.snap: FAILED (MorionFS not mounted?)`；带参数：`mfs.snap: usage: mfs.snap ...`。
+  快照表**持久化在超级块**里、跨启动有效，环上限 **8** 条；写满后**淘汰最旧一条**（索引整体
+  前移一位，旧索引随即失效），而不是报错。
+- `mfs.snaps`：经 `MSNL` 把快照表写进 shell 的结果页再逐条解析，输出形如
+  `mfs.snaps: <n> snapshot(s):` + 每行 `  [<idx>] gen=<代际> root_itab=<块> ino_hint=<n> alloc_hint=<n>`。
+  空表时：`mfs.snaps: no snapshots (take one with 'mfs.snap')`。
+- `mfs.rollback <index>`：把根指针/代际换回快照那一版并落盘（索引镜像同步重载），
+  输出 `mfs.rollback: /mfs rolled back to snapshot <idx> (files now show that snapshot's state)`。
+  失败（索引越界 / 未挂载）：`mfs.rollback: FAILED (no such snapshot index <idx>, or MorionFS unavailable)`；
+  非数字：`mfs.rollback: usage: mfs.rollback <index>   (see 'mfs.snaps')`。
+- `mfs.gc`：以**当前根 + 全部快照**为起点重算可达性，回收不可达的 COW 旧块，输出
+  `mfs.gc: reclaimed <n> block(s) unreachable from the root (snapshot-held blocks kept)`。
+  只要还有快照引用旧版本，那些块就**不会被回收** —— 这正是回滚能一直生效的前提。
+
+> 典型用法：改文件前 `mfs.snap` → 写坏了 `mfs.snaps` 看索引 → `mfs.rollback 0` 退回。
+> 快照只「留旧版本」，占用的空间由被淘汰的快照释放，日常想回收垃圾敲 `mfs.gc`。
+
+### `mfs.fsck [--repair]` / `mfs.sync`
+
+**`mfs.fsck`**：对账 `/mfs` 主卷上「**已分配但不可达**」的 inode 槽（如目录项插入与 inode
+登记之间掉电留下的泄漏）。可达性以**当前根目录树**为准；可回收块数则按 GC 的**全根可达性**
+（含快照）判定 —— 快照仍引用的历史版本不会被算进可回收。
+
+- 默认**只报不修**（不写盘）：`mfs.fsck: <N> leaked inode(s), <M> reclaimable block(s) - report only (rerun with --repair to reclaim)`。
+- `--repair` 才回收：清掉泄漏 inode 槽 + 按可达性安全回收块（快照引用的块保留），输出
+  `mfs.fsck: repaired <N> leaked inode(s), reclaimed <M> block(s)`。
+- 带非法参数：`mfs.fsck: usage: mfs.fsck [--repair]   (default: report only, no writes)`；
+  未挂载 / 失败：`mfs.fsck: FAILED (MorionFS not mounted?)`。
+
+**`mfs.sync`**：把 `/mfs` 显式落盘一次（幂等：刷新位图 + 两份超级块；重复调用只推进代际），
+打印**落盘后**的代际 gen：`mfs.sync: /mfs flushed to disk, generation <gen>`。
+用途是给「崩溃一致性」自测一个可断言的落盘点（回归里 `FS-32` 会用裸读扇区 0 校验盘上 gen
+与回复一致）。带参数：`mfs.sync: usage: mfs.sync   (flush the MorionFS volume at /mfs)`。
+
+> **magic 策略（01 起）**：只有**空白卷**才在首挂时自动格式化。属 MFS 系但修订不匹配本构建
+> 的卷（更旧或更新）在挂载时**被拒绝且零写盘**，日志打印盘上 magic、本构建期望 `MFS8` 与
+> `mkfs.mfs <vol>` 建议；本构建 `MFS8` 但超级块损坏时同样拒绝重格。旧盘要变新格式，必须
+> **显式** `mkfs.mfs <卷号>`（会擦除）。
 
 ### `df`
 

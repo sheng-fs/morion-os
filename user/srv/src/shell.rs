@@ -252,8 +252,16 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  stat <path>    show metadata (mode / owner / links / times)");
             println("  lstat <path>   like stat but on the link itself (no follow)");
             println("  readlink <link>  print a symbolic link's target (no follow)");
-            println("  mkfs.mfs <vol>   create a MorionFS filesystem on a volume (ERASES it)");
+            println(
+                "  mkfs.mfs <vol> [--force]  create a MorionFS filesystem on a volume (ERASES it)",
+            );
             println("  mfs.primary <vol>   mark a MorionFS volume primary (keeps data)");
+            println("  mfs.snap       take a MorionFS snapshot (COW root + generation)");
+            println("  mfs.snaps      list MorionFS snapshots (index / generation)");
+            println("  mfs.rollback <index>  roll the mounted MorionFS back to a snapshot");
+            println("  mfs.gc         reclaim unreachable MorionFS blocks (keeps snapshots)");
+            println("  mfs.fsck [--repair]  reconcile MFS inodes (report only; --repair reclaims)");
+            println("  mfs.sync       flush MorionFS to disk now (prints the on-disk generation)");
             println("  df             show MorionFS space usage (/mfs)");
             println(
                 "  part.create <nsid> <MiB> [mbr]  create a partition (disk-wide, blank = GPT)",
@@ -287,6 +295,12 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "readlink" => shell_readlink(st, arg),
         "mkfs.mfs" => shell_mkfs(arg),
         "mfs.primary" => shell_mfs_primary(arg),
+        "mfs.snap" => shell_mfs_snap(arg),
+        "mfs.snaps" => shell_mfs_snaps(arg),
+        "mfs.rollback" => shell_mfs_rollback(arg),
+        "mfs.gc" => shell_mfs_gc(arg),
+        "mfs.fsck" => shell_mfs_fsck(arg),
+        "mfs.sync" => shell_mfs_sync(arg),
         "df" => shell_df(arg),
         "part.create" => shell_part_create(arg),
         "part.del" => shell_part_delete(arg),
@@ -709,24 +723,42 @@ fn shell_readlink(st: &ShellState, arg: &str) {
     println("");
 }
 
-/// `mkfs.mfs <卷号>` — 在指定卷上创建 MorionFS 文件系统 (**擦除**该卷现有内容)。
+/// `mkfs.mfs <卷号> [--force]` — 在指定卷上创建 MorionFS 文件系统 (**擦除**该卷现有内容)。
 ///
 /// 卷号来自块服务启动时打印的卷表 (`vol: <卷号> nsid=... kind=...`)。护栏不在这里
 /// 而在服务端: mfs_srv 只接受 `kind=mfs` (重新格式化) 或 `kind=unknown` (未格式化)
 /// 的卷, FAT / exFAT / ext2 一律拒绝 —— 命令与自测走同一条路径, 判定只有一处。
+/// `--force` 是唯一的例外, 必须显式写出来才会走 (见 `vfs::mfs_mkfs_force`)。
 ///
 /// 格式化同时把这卷标记为**主卷**: **下次启动** `/mfs` 就是它 (本次运行的挂载不变)。
 fn shell_mkfs(arg: &str) {
-    let vol = match parse_dec(arg) {
+    const USAGE: &str =
+        "mkfs.mfs: usage: mkfs.mfs <volume-id> [--force]   (see the 'vol:' lines in the boot log)";
+    let mut it = arg.split_whitespace();
+    let vol = match it.next().and_then(parse_dec) {
         Some(v) => v,
         None => {
-            println(
-                "mkfs.mfs: usage: mkfs.mfs <volume-id>   (see the 'vol:' lines in the boot log)",
-            );
+            println(USAGE);
             return;
         }
     };
-    let serial = vfs::mfs_mkfs(vol);
+    let force = match it.next() {
+        None => false,
+        Some("--force") => true,
+        Some(_) => {
+            println(USAGE);
+            return;
+        }
+    };
+    if it.next().is_some() {
+        println(USAGE);
+        return;
+    }
+    let serial = if force {
+        vfs::mfs_mkfs_force(vol)
+    } else {
+        vfs::mfs_mkfs(vol)
+    };
     if serial != u64::MAX {
         print("mkfs.mfs: volume ");
         print_u64(vol);
@@ -737,6 +769,10 @@ fn shell_mkfs(arg: &str) {
         print("mkfs.mfs: refused volume ");
         print_u64(vol);
         println(" (not blank, not MFS, or no such volume)");
+        // 安装盘里非空白卷是放行的, 被拒只可能是「卷号不存在」—— 别再把 --force 当建议提。
+        if !force && !INSTALL_MODE {
+            println("mkfs.mfs: the volume may hold another filesystem; --force overwrites it");
+        }
     }
 }
 
@@ -797,6 +833,162 @@ fn shell_df(arg: &str) {
     print(" (");
     print_u64(pct);
     println("% used; 1 block = 4 KiB)");
+}
+
+/// `mfs.snap` — 给 MorionFS **主卷** (即 `/mfs`) 拍一张快照。
+///
+/// 快照是 COW 语义下"留旧版本"的钩子: 拍完之后**即使继续覆盖写**, 被快照引用的旧块也不会
+/// 被 GC 回收, 于是 `mfs.rollback <索引>` 能把整卷 (含全部文件) 退回这一刻的状态。
+/// 快照环跨启动**持久化**在超级块里 (上限 8 条, 满时淘汰最旧一条, 索引整体前移)。
+fn shell_mfs_snap(arg: &str) {
+    if !arg.is_empty() {
+        println("mfs.snap: usage: mfs.snap   (snapshots the MorionFS volume mounted at /mfs)");
+        return;
+    }
+    let idx = vfs::mfs_snapshot();
+    if idx == u64::MAX {
+        println("mfs.snap: FAILED (MorionFS not mounted?)");
+    } else {
+        print("mfs.snap: snapshot ");
+        print_u64(idx);
+        println(" taken -> `mfs.rollback <index>` returns to it");
+    }
+}
+
+/// `mfs.snaps` — 列出主卷上的快照 (索引 / 代际 / 根 inode 表块)。
+fn shell_mfs_snaps(arg: &str) {
+    if !arg.is_empty() {
+        println("mfs.snaps: usage: mfs.snaps");
+        return;
+    }
+    let n = vfs::mfs_snapshot_list(vfs::SHELL_RESULT_BUF);
+    if n == u64::MAX {
+        println("mfs.snaps: FAILED (MorionFS not mounted?)");
+        return;
+    }
+    let count = n as usize / vfs::SNAP_REC_LEN;
+    if count == 0 {
+        println("mfs.snaps: no snapshots (take one with `mfs.snap`)");
+        return;
+    }
+    print("mfs.snaps: ");
+    print_u64(count as u64);
+    println(" snapshot(s):");
+    let base = vfs::SHELL_RESULT_BUF as *const u8;
+    for i in 0..count {
+        // 记录与 mfs_srv / libvfs 一致: gen(u64) / itab(u32) / ino_hint(u32) / alloc_hint(u32)。
+        let rec = unsafe { base.add(i * vfs::SNAP_REC_LEN) };
+        print("  [");
+        print_u64(i as u64);
+        print("] gen=");
+        print_u64(read_u64(rec));
+        print(" root_itab=");
+        print_u64(read_u32(unsafe { rec.add(8) }) as u64);
+        print(" ino_hint=");
+        print_u64(read_u32(unsafe { rec.add(12) }) as u64);
+        print(" alloc_hint=");
+        print_u64(read_u32(unsafe { rec.add(16) }) as u64);
+        println("");
+    }
+}
+
+/// `mfs.rollback <索引>` — 把主卷退回指定快照 (索引见 `mfs.snaps`)。
+///
+/// 只改超级块里的根 inode 表与代际指针, **不搬数据**: 快照之后写的块成为不可达垃圾,
+/// 由 GC 回收。回滚本身也会落盘 (下次启动仍是回滚后的状态)。
+fn shell_mfs_rollback(arg: &str) {
+    let idx = match parse_dec(arg) {
+        Some(v) => v,
+        None => {
+            println("mfs.rollback: usage: mfs.rollback <index>   (see `mfs.snaps`)");
+            return;
+        }
+    };
+    if idx > u32::MAX as u64 {
+        println("mfs.rollback: index out of range");
+        return;
+    }
+    if vfs::mfs_snapshot_restore(idx as u32) == 1 {
+        print("mfs.rollback: /mfs rolled back to snapshot ");
+        print_u64(idx);
+        println(" (files now show that snapshot's state)");
+    } else {
+        print("mfs.rollback: FAILED (no such snapshot index ");
+        print_u64(idx);
+        println(", or MorionFS unavailable)");
+    }
+}
+
+/// `mfs.gc` — 回收主卷上不可达的 COW 旧块 (mark & sweep)。
+///
+/// 可达性以当前根 + 全部快照为起点重算, 故**快照还引用着的旧版本不会被回收** ——
+/// 这也是回滚能一直生效的前提。返回本次回收的块数。
+fn shell_mfs_gc(arg: &str) {
+    if !arg.is_empty() {
+        println("mfs.gc: usage: mfs.gc");
+        return;
+    }
+    let freed = vfs::mfs_gc();
+    if freed == u64::MAX {
+        println("mfs.gc: FAILED (MorionFS not mounted?)");
+    } else {
+        print("mfs.gc: reclaimed ");
+        print_u64(freed);
+        println(" block(s) unreachable from the root (snapshot-held blocks kept)");
+    }
+}
+
+/// `mfs.fsck [--repair]` — 对账 `/mfs` 主卷上「已分配但不可达」的 inode 槽。
+///
+/// 默认**只报不修** (不写盘): 打印泄漏 inode 数与它们名下可回收的块数。
+/// 加 `--repair` 才真正回收 (清槽 + 按可达性安全回收块, 快照仍引用的版本不会被动)。
+fn shell_mfs_fsck(arg: &str) {
+    let repair = match arg {
+        "" => false,
+        "--repair" => true,
+        _ => {
+            println("mfs.fsck: usage: mfs.fsck [--repair]   (default: report only, no writes)");
+            return;
+        }
+    };
+    let r = vfs::mfs_fsck(repair);
+    if r == u64::MAX {
+        println("mfs.fsck: FAILED (MorionFS not mounted?)");
+        return;
+    }
+    let inos = r >> 32;
+    let blocks = r & 0xFFFF_FFFF;
+    if repair {
+        print("mfs.fsck: repaired ");
+        print_u64(inos);
+        print(" leaked inode(s), reclaimed ");
+        print_u64(blocks);
+        println(" block(s)");
+    } else {
+        print("mfs.fsck: ");
+        print_u64(inos);
+        print(" leaked inode(s), ");
+        print_u64(blocks);
+        println(" reclaimable block(s) - report only (rerun with --repair to reclaim)");
+    }
+}
+
+/// `mfs.sync` — 把 `/mfs` 主卷显式落盘一次 (刷新位图与两份超级块), 打印落盘后的代际 gen。
+///
+/// 幂等: 重复调用无副作用 (只推进 gen)。用途是给「崩溃一致性」自测一个可断言的落盘点。
+fn shell_mfs_sync(arg: &str) {
+    if !arg.is_empty() {
+        println("mfs.sync: usage: mfs.sync   (flush the MorionFS volume at /mfs)");
+        return;
+    }
+    let gen = vfs::mfs_sync();
+    if gen == u64::MAX {
+        println("mfs.sync: FAILED (MorionFS not mounted?)");
+    } else {
+        print("mfs.sync: /mfs flushed to disk, generation ");
+        print_u64(gen);
+        println("");
+    }
 }
 
 /// `part.create <nsid> <MiB> [mbr]` — 在盘 `<nsid>` 上建一个 `<MiB>` 的分区 (`0` = 用尽剩余空间)。

@@ -72,6 +72,16 @@ const MFS_MAX_SNAP: usize = 8;
 const MFS_MAGIC_SUPER: u32 = 0x4D46_5338; // "MFS8"
 /// 超级块内的格式版本 (magic 之外的二次校验)。
 const MFS_VERSION: u32 = 8;
+/// 卷首 magic 三态判定的结果 (01 保护数据)。
+///
+/// 与「magic 承载布局修订」的注释配套: 只有**空白卷**才允许自动格式化; 属 MFS 系但
+/// 不匹配本构建的 (更旧 / 更新) 一律**拒绝挂载**, 绝不自动重格 —— 升 magic 会把老盘
+/// 全判成不匹配, 那正是要避免的破坏。
+const MFS_MAGIC_NONE: u8 = 0;
+const MFS_MAGIC_MATCH: u8 = 1;
+const MFS_MAGIC_FAMILY_MISMATCH: u8 = 2;
+/// MFS 系 magic 的高三字节 ("MFS"); 低字节是修订号 ('0'..'9')。
+const MFS_MAGIC_FAMILY_PREFIX: u32 = 0x4D46_5300;
 /// 位图头块 magic: "MFBH"（记录 gen / 总块数 / 位图数据块数 + 各数据块 CRC32）。
 const MFS_MAGIC_BMPHDR: u32 = 0x4D46_4248; // "MFBH"
 /// 目录块 (base 节点或扩展块): ext + 元数据 + 变长条目区。
@@ -322,6 +332,15 @@ const MFS_ITAB_VADDR: u64 = 0x0000_0080_0011_1000;
 const MFS_ITABX_VADDR: u64 = 0x0000_0080_0011_2000;
 /// GC 遍历时翻译 ino 用的表块缓冲页 (GC 的主体缓冲在 `MFS_GC_VADDR`, 两个不能共用)。
 const MFS_GC_TAB_VADDR: u64 = 0x0000_0080_0011_3000;
+/// fsck 的「可达 inode」位图窗口 (按 **ino** 索引; 只在 fsck 期间按需分配, 服务私有)。
+///
+/// 单独一页起始地址: 可达块用 MARK/SEEN 窗口 (按块号索引), 而 ino 号空间与块号空间
+/// 无关 (ino 可远超总块数), 复用会因窗口按块数定长而漏标 —— 故 fsck 用独立窗口。
+/// 取 0x0200_0000: 排在 SEEN 窗口的最坏增长之外 (1018 页 ≈ 4.17 MiB), 又不碰 gfx 的
+/// `SURFACE_BASE` (0x0400_0000)。
+const MFS_FSCK_VADDR: u64 = 0x0000_0080_0200_0000;
+/// 覆盖 `MFS_INO_MAX` 个 bit 所需的页数。
+const MFS_FSCK_PAGES: u32 = ((MFS_INO_MAX as usize).div_ceil(8)).div_ceil(MFS_BLOCK) as u32;
 
 // MFS7 位图窗口 (页数动态, 见 `mfs_win_ensure`)。
 //
@@ -390,6 +409,8 @@ static mut MFS_FREE_BLOCKS: u32 = 0;
 static mut MFS_BMP_PAGES: u32 = 0;
 static mut MFS_MARK_PAGES: u32 = 0;
 static mut MFS_SEEN_PAGES: u32 = 0;
+/// fsck 的 inode 位图窗口已分配的页数 (只增不缩; fsck 期间按需铺开)。
+static mut MFS_FSCK_MAPPED: u32 = 0;
 /// 位图数据块数 bb (当前卷; 0 = 未挂载)。
 static mut MFS_BMP_DATA_BLOCKS: u32 = 0;
 /// 位图数据块**脏位图**的字节数 (每位对应一个位图数据块)。
@@ -653,6 +674,47 @@ fn mfs_seen_set(b: u32) {
         }
     }
 }
+
+// --- fsck 的可达 inode 位图 (按 ino 索引, 独立窗口) ---
+fn mfs_fsck_byte(i: usize) -> *mut u8 {
+    unsafe { (MFS_FSCK_VADDR as *mut u8).add(i) }
+}
+/// 铺开 fsck 的 inode 位图窗口 (覆盖整个 `MFS_INO_MAX`); 失败返回 false。
+fn mfs_fsck_win_ensure() -> bool {
+    while unsafe { MFS_FSCK_MAPPED } < MFS_FSCK_PAGES {
+        let n = unsafe { MFS_FSCK_MAPPED } as u64;
+        if sys_alloc_page(MFS_FSCK_VADDR + n * MFS_BLOCK as u64) != 1 {
+            return false;
+        }
+        unsafe {
+            MFS_FSCK_MAPPED += 1;
+        }
+    }
+    true
+}
+fn mfs_fsck_get(ino: u32) -> bool {
+    let i = ino as usize;
+    if i >= MFS_INO_MAX as usize {
+        return false;
+    }
+    unsafe { *mfs_fsck_byte(i >> 3) & (1u8 << (i & 7)) != 0 }
+}
+fn mfs_fsck_set(ino: u32) {
+    let i = ino as usize;
+    if i < MFS_INO_MAX as usize {
+        unsafe {
+            *mfs_fsck_byte(i >> 3) |= 1u8 << (i & 7);
+        }
+    }
+}
+fn mfs_fsck_clear_all() {
+    for i in 0..(MFS_INO_MAX as usize).div_ceil(8) {
+        unsafe {
+            *mfs_fsck_byte(i) = 0;
+        }
+    }
+}
+
 fn mfs_stack_slot(i: usize) -> *mut u32 {
     unsafe { core::ptr::addr_of_mut!(MFS_GC_STACK).cast::<u32>().add(i) }
 }
@@ -833,6 +895,24 @@ fn mfs_gc_push(b: u32, total: usize) -> bool {
     true
 }
 
+/// 与 `mfs_gc_push` 相同, 但**只**置「本根已访问」(不污染可达位图) —— fsck 统计某个
+/// 泄漏 inode 名下块时用: 可达位图此时正保存着 GC 的全根标记结果, 不能被覆盖。
+fn mfs_gc_push_seen(b: u32, total: usize) -> bool {
+    if b == 0 || b as usize >= total || mfs_seen_get(b) {
+        return true;
+    }
+    let sp = mfs_gc_sp_get();
+    if sp >= MFS_GC_STACK_MAX {
+        return false;
+    }
+    unsafe {
+        *mfs_stack_slot(sp) = b;
+    }
+    mfs_gc_sp_set(sp + 1);
+    mfs_seen_set(b);
+    true
+}
+
 /// 载入某个可达根的 inode 表索引块到 X 缓冲 (GC 期间该缓冲专供此事), 并标记索引块
 /// 与它引用的所有表块 —— 它们是元数据, 必须视为可达, 否则会被回收后重新分配出去。
 fn mfs_gc_load_itab(itab: u32, total: usize) -> bool {
@@ -878,16 +958,16 @@ fn mfs_gc_ino_block(ino: u32) -> Option<u32> {
     Some(read_u32(mfs_at(tb, MFS_HDR + j * 4)))
 }
 
-/// 空间回收: 从当前根 + 所有快照根出发标记可达块, 其余块释放。
+/// 空间回收 (标记阶段): 从当前根 + 所有快照根出发标记可达块。
 ///
-/// COW 只增不减时, 被新版本取代的旧块会一直占在位图里; 回收的唯一判据是**可达性**
+/// COW 只增不减时, 被新版本取代的旧块会一直占在位图里; 可达性的唯一判据是**从根可达**
 /// —— 快照根同样算根, 因此快照仍引用的历史版本 (含它自己的 inode 表) 不会被回收
-/// (回滚依旧可用)。遍历或写盘失败时不改动位图, 调用方看到的仍是一致的旧位图。
-/// 返回本次回收的块数; 失败返回 `u64::MAX`。
-fn mfs_gc() -> u64 {
+/// (回滚依旧可用)。成功后 `MFS_MARK` 窗口保存完整的可达块集合 (供 fsck 复用)。
+/// 遍历失败返回 false, 不改动位图。
+fn mfs_gc_mark() -> bool {
     let total = unsafe { MFS_TOTAL_BLOCKS } as usize;
     if total == 0 || total > MFS_MAX_BLOCKS as usize {
-        return u64::MAX;
+        return false;
     }
     mfs_mark_clear_all();
     // 元数据区 (超级块 / 位图头 / 位图数据块) 一律视为可达, 绝不回收。
@@ -905,22 +985,27 @@ fn mfs_gc() -> u64 {
     }
     for &(itab, root_ino) in roots.iter().take(sn + 1) {
         if !mfs_gc_load_itab(itab, total) {
-            return u64::MAX;
+            return false;
         }
         // 换根: 清空「本根已访问」, 保证这棵树用**它自己的表**重新展开一遍。
         mfs_seen_clear_all();
         let rblk = match mfs_gc_ino_block(root_ino) {
             Some(b) if b != 0 => b,
-            _ => return u64::MAX,
+            _ => return false,
         };
         if !mfs_gc_push(rblk, total) {
-            return u64::MAX;
+            return false;
         }
         if !mfs_gc_drain(total) {
-            return u64::MAX;
+            return false;
         }
     }
-    // 用标记位图重建空闲位图。
+    true
+}
+
+/// 空间回收 (清扫阶段): 用标记位图重建空闲位图, 落盘并返回本次回收的块数; 失败 `u64::MAX`。
+fn mfs_gc_sweep() -> u64 {
+    let total = unsafe { MFS_TOTAL_BLOCKS } as usize;
     let free_before = unsafe { MFS_FREE_BLOCKS };
     let mut used = 0u32;
     for b in 0..total {
@@ -939,6 +1024,230 @@ fn mfs_gc() -> u64 {
         return u64::MAX;
     }
     (total as u32 - used).saturating_sub(free_before) as u64
+}
+
+/// 空间回收: 标记 (当前根 + 全部快照) 后清扫不可达块。返回回收块数; 失败 `u64::MAX`。
+fn mfs_gc() -> u64 {
+    if !mfs_gc_mark() {
+        return u64::MAX;
+    }
+    mfs_gc_sweep()
+}
+
+/// 最小 fsck: 对账「已分配但不可达」的 inode 槽 (01)。
+///
+/// - 默认**只报不修**: 回复 `(泄漏 inode 数 << 32) | 该名下可回收块数)`; 不写盘。
+/// - `repair` 才回收: 清掉泄漏 inode 的槽, 再让 `mfs_gc()` 按可达性安全回收块
+///   (快照仍引用的历史版本不会被收), 回复 `(泄漏 inode 数 << 32) | 实际回收块数`。
+///
+/// 失败返回 `u64::MAX`。可达性以**当前根目录树**为准 (快照不算当前命名空间的可达性),
+/// 但块的可回收性仍按 GC 的全根可达性判定 —— 二者不可混用。
+fn mfs_fsck(repair: bool) -> u64 {
+    let total = unsafe { MFS_TOTAL_BLOCKS } as usize;
+    if total == 0 || total > MFS_MAX_BLOCKS as usize {
+        return u64::MAX;
+    }
+    if !mfs_fsck_win_ensure() {
+        println("mfs: fsck alloc inode bitmap FAILED");
+        return u64::MAX;
+    }
+    // (1) 沿当前根目录树标记可达 inode。
+    if !mfs_fsck_walk_inos() {
+        println("mfs: fsck walk FAILED");
+        return u64::MAX;
+    }
+    // (2) 标记全部可达块 (含快照) —— 判定泄漏 inode 名下哪些块真可回收。
+    if !mfs_gc_mark() {
+        println("mfs: fsck mark FAILED");
+        return u64::MAX;
+    }
+    // (3) 扫已分配 inode 槽, 找不可达者, 统计其名下「已分配但不可达」的块。
+    let bound = mfs_fsck_scan_bound();
+    let mut leaked_inos = 0u32;
+    let mut leaked_blocks = 0u32;
+    for ino in 1..bound {
+        if ino == MFS_ROOT_INO {
+            continue;
+        }
+        let blk = match mfs_ino_block(ino) {
+            Some(b) => b,
+            None => return u64::MAX,
+        };
+        if blk == 0 || mfs_fsck_get(ino) {
+            continue;
+        }
+        leaked_inos += 1;
+        leaked_blocks = leaked_blocks.saturating_add(mfs_fsck_owned_blocks(blk, total));
+    }
+    if leaked_inos > 0 {
+        print("mfs: fsck leaked inodes=");
+        print_u64(leaked_inos as u64);
+        print(" blocks=");
+        print_u64(leaked_blocks as u64);
+        println(if repair {
+            " (repairing)"
+        } else {
+            " (report only; use --repair to reclaim)"
+        });
+    }
+    if !repair || leaked_inos == 0 {
+        return ((leaked_inos as u64) << 32) | leaked_blocks as u64;
+    }
+    // (4) 修复: 清掉泄漏 inode 的槽, 再让 GC 按其全根可达性回收并落盘。
+    for ino in 1..bound {
+        if ino == MFS_ROOT_INO {
+            continue;
+        }
+        let blk = match mfs_ino_block(ino) {
+            Some(b) => b,
+            None => return u64::MAX,
+        };
+        if blk == 0 || mfs_fsck_get(ino) {
+            continue;
+        }
+        if !mfs_free_ino(ino) {
+            return u64::MAX;
+        }
+    }
+    let freed = mfs_gc();
+    if freed == u64::MAX {
+        return u64::MAX;
+    }
+    ((leaked_inos as u64) << 32) | freed
+}
+
+/// fsck 扫描 inode 槽的上界: 覆盖分配游标与已分配计数, 至少到 root+1, 上限 `MFS_INO_MAX`。
+fn mfs_fsck_scan_bound() -> u32 {
+    let hint = unsafe { MFS_INO_HINT };
+    let cnt = unsafe { MFS_INO_COUNT };
+    hint.max(cnt)
+        .saturating_add(1)
+        .clamp(MFS_ROOT_INO + 1, MFS_INO_MAX)
+}
+
+/// fsck: 从根目录出发, 沿**目录树**标记可达 inode (文件 / 软链接作为叶子, 不展开其内容)。
+///
+/// 复用 GC 的遍历栈与 SEEN 窗口 (此处 SEEN 用于目录块去重与防环)。结构不可信返回 false。
+fn mfs_fsck_walk_inos() -> bool {
+    let total = unsafe { MFS_TOTAL_BLOCKS } as usize;
+    mfs_fsck_clear_all();
+    mfs_fsck_set(MFS_ROOT_INO);
+    mfs_gc_sp_set(0);
+    mfs_seen_clear_all();
+    let root = match mfs_ino_block(MFS_ROOT_INO) {
+        Some(b) if b != 0 => b,
+        _ => return false,
+    };
+    if !mfs_gc_push(root, total) {
+        return false;
+    }
+    let gb = mfs_gc_buf();
+    while mfs_gc_sp_get() > 0 {
+        let sp = mfs_gc_sp_get() - 1;
+        mfs_gc_sp_set(sp);
+        let b = unsafe { *mfs_stack_slot(sp) };
+        if !mfs_read_blk(b, gb) {
+            return false;
+        }
+        if mfs_ok(gb, MFS_MAGIC_DIR) {
+            let end = MFS_HDR + MFS_PAYLOAD;
+            let mut off = MFS_HDR + MFS_DIR_HDR;
+            while off + MFS_DIR_ENT_HDR <= end {
+                if mfs_ent_name_len(gb, off) != 0 {
+                    let child = mfs_ent_ino(gb, off);
+                    if child != 0 && child < MFS_INO_MAX {
+                        mfs_fsck_set(child);
+                        match mfs_ino_block(child) {
+                            Some(cb) if cb != 0 => {
+                                if mfs_node_type(cb) == Some(MFS_TYPE_DIR)
+                                    && !mfs_gc_push(cb, total)
+                                {
+                                    return false;
+                                }
+                            }
+                            Some(_) => {}
+                            None => return false,
+                        }
+                    }
+                }
+                match mfs_ent_step(gb, off) {
+                    Some(n) => off = n,
+                    None => return false,
+                }
+            }
+            if !mfs_gc_push(mfs_dir_ext(gb), total) {
+                return false;
+            }
+        } else if mfs_ok(gb, MFS_MAGIC_DIDX) {
+            for i in 0..MFS_DIR_SLOTS {
+                if !mfs_gc_push(read_u32(mfs_at(gb, MFS_HDR + i * 4)), total) {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// 统计对象块 `blk` (某泄漏 inode 的节点) 及其**自身拥有**的块中, 「已分配且不可达」的数量。
+///
+/// 目录只沿扩展链展开, **不进入子项** (子项归属它们自己的 ino); 文件展开数据/间接块。
+/// 此时 `MFS_MARK` 保存着 GC 的全根可达集 (调用方保证), 故 `!mfs_mark_get` 即真可回收。
+fn mfs_fsck_owned_blocks(blk: u32, total: usize) -> u32 {
+    mfs_seen_clear_all();
+    mfs_gc_sp_set(0);
+    if !mfs_gc_push_seen(blk, total) {
+        return 0;
+    }
+    let gb = mfs_gc_buf();
+    let mut n = 0u32;
+    while mfs_gc_sp_get() > 0 {
+        let sp = mfs_gc_sp_get() - 1;
+        mfs_gc_sp_set(sp);
+        let b = unsafe { *mfs_stack_slot(sp) };
+        if mfs_bmp_get(b) && !mfs_mark_get(b) {
+            n = n.saturating_add(1);
+        }
+        if !mfs_read_blk(b, gb) {
+            continue;
+        }
+        if mfs_ok(gb, MFS_MAGIC_DIR) {
+            if !mfs_gc_push_seen(mfs_dir_ext(gb), total) {
+                return n;
+            }
+        } else if mfs_ok(gb, MFS_MAGIC_DIDX) {
+            for i in 0..MFS_DIR_SLOTS {
+                if !mfs_gc_push_seen(read_u32(mfs_at(gb, MFS_HDR + i * 4)), total) {
+                    return n;
+                }
+            }
+        } else if mfs_ok(gb, MFS_MAGIC_FILE) {
+            for i in 0..MFS_FILE_DIRECT {
+                if !mfs_gc_push_seen(mfs_file_direct(gb, i), total) {
+                    return n;
+                }
+            }
+            if !mfs_gc_push_seen(mfs_file_ind1(gb), total)
+                || !mfs_gc_push_seen(mfs_file_ind2(gb), total)
+                || !mfs_gc_push_seen(mfs_file_ind3(gb), total)
+            {
+                return n;
+            }
+        } else if mfs_ok(gb, MFS_MAGIC_IND)
+            || mfs_ok(gb, MFS_MAGIC_IND2)
+            || mfs_ok(gb, MFS_MAGIC_IND3)
+        {
+            for i in 0..MFS_IND_CAP {
+                if !mfs_gc_push_seen(mfs_ind_slot(gb, i), total) {
+                    return n;
+                }
+            }
+        }
+        // 数据块 / 软链接: 叶子, 无子块。
+    }
+    n
 }
 
 /// 深度优先展开遍历栈: 目录展开其子项 (条目存 ino, 需经当前根的表翻译),
@@ -1163,13 +1472,22 @@ fn mfs_itab_flush() -> bool {
 /// 护栏: 只接受「**已是 MFS**」或「**整盘无文件系统**」的卷 —— FAT / exFAT / ext2
 /// 等别人的分区一律拒绝, 绝不自动吞掉。真盘上卷号认错时, 这里就是最后一道闸。
 ///
+/// 唯一的例外是 `flags` 里的 [`vfs::MKFS_FLAG_FORCE`]: 调用方 (shell 的 `--force`)
+/// 已经拿到用户明确同意, 才放行别人的文件系统。这条路径存在是因为**分区表之外的残留**:
+/// `part.wipe` 只清表不动数据, 旧文件系统的 VBR 还在原处, 于是新分区照样被探测成 exfat
+/// (实测 thinkplus 盘), 而"用户就是要在这块盘上建 MFS"这个意图只有他自己能表达。
+///
+/// 第二个例外是**安装盘** (`make INSTALL=1`, 见 `morion::syscall::INSTALL_MODE`): 装机的本质
+/// 就是「先 U 盘启动、再把系统装进本机盘」, 要覆盖的正是盘上原有的文件系统 —— 那种镜像里
+/// 这条护栏默认放开, 不必逐条 `--force`。日常镜像 `INSTALL_MODE` 为 `false`, 护栏一字不放宽。
+///
 /// **主卷语义**: 格式化会把该卷标记为主卷 (序号 = 现有最大 + 1), 于是**下一次启动**
 /// `/mfs` 就认领到它 —— 这就是「切换主卷」的手段。本次运行的主卷不变: 换主卷是要重启
 /// 才生效的事, 在跑的会话里换挂载点会让所有已打开的路径句柄失效。
 ///
 /// 格式化期间内存态被改写成新卷, 故结束后必须把**原卷**的状态重新载回来; 那里只用
 /// `mfs_load_state` (只载入), 不会因原卷此刻读不出来而把它格式化掉。
-fn mfs_mkfs_volume(vol: u64) -> u64 {
+fn mfs_mkfs_volume(vol: u64, flags: u64) -> u64 {
     let desc = match vol_find_desc(mfs_a(), vol) {
         Some(d) => d,
         None => {
@@ -1177,10 +1495,21 @@ fn mfs_mkfs_volume(vol: u64) -> u64 {
             return u64::MAX;
         }
     };
+    let forced = flags & vfs::MKFS_FLAG_FORCE != 0;
     if desc.kind != VOL_KIND_UNKNOWN && desc.kind != VOL_KIND_MFS {
-        println("mfs: mkfs refused (volume holds another filesystem)");
-        return u64::MAX;
+        if !forced && !INSTALL_MODE {
+            println("mfs: mkfs refused (volume holds another filesystem; --force overwrites it)");
+            return u64::MAX;
+        }
+        print("mfs: mkfs: overwriting an existing filesystem on volume ");
+        print_u64(vol);
+        println(if forced {
+            " (--force; its files are lost)"
+        } else {
+            " (install image; its files are lost)"
+        });
     }
+
     let prev_vol = unsafe { MFS_CUR_VOL };
     let prev_sectors = unsafe { MFS_CUR_SECTORS };
     let serial = mfs_next_primary_serial(mfs_a(), vol);
@@ -1702,11 +2031,79 @@ fn mfs_switch_vol(vol: u64) -> bool {
     mfs_load_state()
 }
 
-/// 挂载: 能载入就载入, 否则格式化 (首次使用 / 旧格式升级)。
+/// 读卷 `vol` 的两份超级块, 按**卷首 magic** 做三态判定 (01 保护数据)。
+///
+/// 返回 `(state, magic)`: `state` ∈ {`MFS_MAGIC_NONE`, `MFS_MAGIC_MATCH`,
+/// `MFS_MAGIC_FAMILY_MISMATCH`}; `magic` 是读到的第一个 MFS 系 magic 原值 (供日志,
+/// 无则 0)。**只读**, 不写盘。
+///
+/// 判定顺序: 任一份是**本构建** magic (`MFS8`) 即判 MATCH (交给 `mfs_load_state` 选
+/// 有效副本); 两份都不是 `MFS8` 但至少一份属 MFS 系 (`MFS0`..`MFS9`) 即判 MISMATCH;
+/// 都不是则 NONE (空白 / 非 MFS)。
+fn mfs_sb_magic_state(vol: u64) -> (u8, u32) {
+    let buf = mfs_a();
+    let mut mismatch = 0u32;
+    for copy in 0..MFS_SB_COPIES {
+        let lba = copy * MFS_SECTORS_PER_BLOCK as u32;
+        if !block_read_dev(vol, lba, MFS_SECTORS_PER_BLOCK, buf) {
+            continue;
+        }
+        let m = read_u32(buf);
+        if m == MFS_MAGIC_SUPER {
+            return (MFS_MAGIC_MATCH, m);
+        }
+        if m & 0xFFFF_FF00 == MFS_MAGIC_FAMILY_PREFIX
+            && (0x30..=0x39).contains(&(m & 0xFF))
+            && mismatch == 0
+        {
+            mismatch = m;
+        }
+    }
+    if mismatch != 0 {
+        (MFS_MAGIC_FAMILY_MISMATCH, mismatch)
+    } else {
+        (MFS_MAGIC_NONE, 0)
+    }
+}
+
+/// 把 4 字节 ASCII magic 按字符打印, 后跟十进制原值 (日志里可读、可 grep)。
+fn mfs_print_magic(m: u32) {
+    let bytes = [(m >> 24) as u8, (m >> 16) as u8, (m >> 8) as u8, m as u8];
+    for &c in bytes.iter() {
+        // magic 约定为 ASCII; 非可打印字节用 '.' 兜底, 免得污染串口日志。
+        let c = if (0x20..0x7F).contains(&c) { c } else { b'.' };
+        let s = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(&c, 1)) };
+        print(s);
+    }
+    print(" (");
+    print_u64(m as u64);
+    print(")");
+}
+
+/// 挂载: 能载入就载入; 只有**空白卷**才自动格式化 (首次使用)。
+///
+/// 01 起不再「载入失败即重格」: 卷首若是 MFS 系 magic (更旧 / 更新的修订, 或本构建
+/// `MFS8` 但已损坏), 一律**拒绝挂载且一个字节都不写盘** —— 旧盘要变成新格式必须显式
+/// `mkfs.mfs`。返回 false 表示拒绝 (调用方放弃本次挂载)。
 fn mfs_mount_or_format() -> bool {
     if mfs_load_state() {
         return true;
     }
+    let (state, magic) = mfs_sb_magic_state(unsafe { MFS_VOL });
+    if state == MFS_MAGIC_FAMILY_MISMATCH {
+        print("mfs: refuse to mount: on-disk magic ");
+        mfs_print_magic(magic);
+        print(" != expected ");
+        mfs_print_magic(MFS_MAGIC_SUPER);
+        println("; run 'mkfs.mfs <vol>' to rebuild (data left untouched)");
+        return false;
+    }
+    if state == MFS_MAGIC_MATCH {
+        // magic 是本构建的, 但超级块 / 位图 / inode 表载入失败 (损坏): 同样拒绝重格。
+        println("mfs: refuse to mount: MFS8 superblock present but unreadable (not reformatting)");
+        return false;
+    }
+    // 空白卷 (卷首无任何 MFS 系 magic): 照旧自动格式化。
     // 自动格式化**不**认领主卷: 主卷标记只由显式 `mkfs.mfs` 设置 (见 `mfs_mkfs_volume`)。
     // 这里清掉可能残留在内存态里的上一卷序号, 免得把别的卷的标记写进这块新盘。
     unsafe {
@@ -3966,10 +4363,26 @@ pub fn run() {
                 let free = unsafe { MFS_FREE_BLOCKS } as u64;
                 sys_reply((total << 32) | free);
             }
+            // 最小 fsck (01): 默认只报不修, payload 标志字 bit0 = 修复。
+            vfs::MFS_FSCK_TAG => {
+                let repair = read_u64(msg.payload.as_ptr()) & 1 != 0;
+                sys_reply(mfs_fsck(repair));
+            }
+            // 显式 sync (01): 幂等落盘一次, 回复落盘后的代际 gen。
+            vfs::MFS_SYNC_TAG => {
+                let r = if mfs_bmp_flush() {
+                    unsafe { MFS_GEN }
+                } else {
+                    u64::MAX
+                };
+                sys_reply(r);
+            }
             // 显式格式化入口 (S2): 在指定卷上建 MFS。按卷号寻址, 不经挂载路由。
+            // payload = 卷号 (偏移 +0) ++ 标志字 (偏移 +8); 只发 8 字节的老调用方那里是 0。
             vfs::VFS_MKFS_TAG => {
                 let vol = read_u64(msg.payload.as_ptr());
-                sys_reply(mfs_mkfs_volume(vol));
+                let flags = read_u64(unsafe { msg.payload.as_ptr().add(8) });
+                sys_reply(mfs_mkfs_volume(vol, flags));
             }
             // 换主卷 (S2 补齐): 只改超级块里的主卷序号, 不动卷上的数据。
             vfs::MFS_SETPRIMARY_TAG => {

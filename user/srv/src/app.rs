@@ -2646,14 +2646,25 @@ pub fn run() {
         }
 
         // (a) 护栏: 别人的分区与不存在的卷号都不允许格式化。
-        if vfs::mfs_mkfs(fat_vol) != u64::MAX {
-            println("app: FS22 mkfs on FAT volume NOT refused FAILED");
-            return;
+        //     ⚠️ 安装盘变体 (`INSTALL=1`) 里护栏对**非空白卷**故意放开 (装机要覆盖的正是盘上
+        //     原有的文件系统) —— 那种镜像下**绝不能**照旧去碰 FAT 卷: 它是正在跑的根文件系统,
+        //     放行就等于当场把自己格掉。故这两条断言只在日常镜像里跑, 护栏本身由日常镜像的
+        //     全量回归守着 (FS-22 的常规断言)。
+        if INSTALL_MODE {
+            println(
+                "app: FS22 guard checks SKIPPED (install image: non-blank volumes are formattable)",
+            );
+        } else {
+            if vfs::mfs_mkfs(fat_vol) != u64::MAX {
+                println("app: FS22 mkfs on FAT volume NOT refused FAILED");
+                return;
+            }
+            if vfs::mfs_mkfs(ext2_vol) != u64::MAX {
+                println("app: FS22 mkfs on ext2 volume NOT refused FAILED");
+                return;
+            }
         }
-        if vfs::mfs_mkfs(ext2_vol) != u64::MAX {
-            println("app: FS22 mkfs on ext2 volume NOT refused FAILED");
-            return;
-        }
+        // 「不存在的卷号」在任何变体里都必须被拒 —— 这一条没有放宽。
         if vfs::mfs_mkfs(4242) != u64::MAX {
             println("app: FS22 mkfs on nonexistent volume NOT refused FAILED");
             return;
@@ -3320,6 +3331,88 @@ pub fn run() {
     // FS-29 (E3c): 监督者原地重启 —— 让 echo (域 3) 退出, init 应在巡检周期内把它拉起来。
     if fs29_supervisor_restart().is_none() {
         return;
+    }
+
+    // 34. FS-31 自测 (01 健壮性收口): 最小 fsck 对账口径的稳定性。
+    //     客户机内无法制造「已分配但不可达」的 inode 泄漏 (那要在目录项插入与 inode 登记
+    //     之间掉电), 故本自测断言**对一份结构一致的卷**: 报泄漏 inode = 0、可回收块 = 0;
+    //     再跑 `--repair` 仍回 0 (不误伤、不改盘) —— 这正是回归里能稳定复现的那半。
+    //     真正「拒绝挂载旧 magic 且盘未变」的端到端取证由 FS-30 在宿主侧单独做。
+    {
+        let r = vfs::mfs_fsck(false);
+        if r == u64::MAX {
+            println("app: FS31 fsck report FAILED");
+            return;
+        }
+        if r != 0 {
+            println("app: FS31 healthy volume reported leaks FAILED");
+            return;
+        }
+        let rr = vfs::mfs_fsck(true);
+        if rr == u64::MAX {
+            println("app: FS31 fsck repair FAILED");
+            return;
+        }
+        if rr != 0 {
+            println("app: FS31 repair not idempotent FAILED");
+            return;
+        }
+        println("app: FS31 fsck reconciled (0 leaked inodes; --repair idempotent)");
+    }
+
+    // 35. FS-32 自测 (01): 显式 `sync` 的落盘断言 —— `write → sync → 读回`, 且 sync
+    //     回复的 gen **就是盘上**超级块里的 gen (裸读扇区 0 校验, 绕开服务内存态)。
+    //     这是「崩溃一致性」自测能断言的落盘点: 回复的 gen 在盘上可独立复算出来。
+    {
+        const F32: &str = "/mfs/FS32SYNC.TXT";
+        vfs::unlink(F32);
+        let fd = vfs::creat(F32);
+        if fd == u64::MAX || vfs::write(fd, 0, b"MFS-SYNC-1") != 10 {
+            println("app: FS32 create/write FAILED");
+            return;
+        }
+        vfs::close(fd);
+
+        let gen = vfs::mfs_sync();
+        if gen == u64::MAX || gen == 0 {
+            println("app: FS32 mfs_sync FAILED");
+            return;
+        }
+        // 主 MFS 卷 = nvme nsid 2 (build/mfs.img 整盘; 与 FS-23 的判据一致)。
+        // 裸读扇区 0 = 超级块副本 A: +0 magic "MFS8", 块头 8 字节后 +24 是 gen(u64)。
+        let raw = vfs::RESULT_BUF as *mut u8;
+        if !block_disk_read(2, 0, raw) {
+            println("app: FS32 raw superblock read FAILED");
+            return;
+        }
+        if read_u32(raw) != 0x4D46_5338 {
+            println("app: FS32 on-disk magic mismatch FAILED");
+            return;
+        }
+        let disk_gen = read_u64(unsafe { raw.add(8 + 24) });
+        if disk_gen != gen {
+            println("app: FS32 on-disk gen != sync reply FAILED");
+            return;
+        }
+        // sync 之后数据仍可读回 (重新打开, 不依赖内存里的 fd)。
+        let fd = vfs::open(F32);
+        if fd == u64::MAX || vfs::read(fd, 0, 10) != 10 {
+            println("app: FS32 reopen/read FAILED");
+            return;
+        }
+        {
+            let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 10) };
+            if got != b"MFS-SYNC-1" {
+                println("app: FS32 readback mismatch FAILED");
+                vfs::close(fd);
+                return;
+            }
+        }
+        vfs::close(fd);
+        vfs::unlink(F32);
+        print("app: FS32 sync gen ");
+        print_u64(gen);
+        println(" persisted on disk (raw superblock match, readback ok)");
     }
 
     println("app: SELFTEST DONE");
