@@ -25,15 +25,22 @@ QEMU          := qemu-system-x86_64
 # 注意: 新版 QEMU (11.x) 已移除 `-machine ...,intel-iommu=on` 属性, 须用 `-device intel-iommu`。
 IOMMU         ?=
 IOMMU_ARG     := $(if $(IOMMU),-device intel-iommu,)
-# 版本 / 变体注入 (V1 版本串 + V2 无图形收口) —— 都以**编译期环境变量**交给 rustc:
+# 版本 / 变体注入 (V1 版本串 + V2 无图形收口 + 安装盘变体) —— 都以**编译期环境变量**交给 rustc:
 #   MORION_BUILD —— git 短哈希 (无 git 时用日期), 供内核 `SYS_UNAME` 报告构建号;
 #   NOGUI=1      —— 无图形变体: release 串带 `-nogui`, shell 不开屏幕镜像。
+#   INSTALL=1    —— 安装盘变体: release 串带 `-install`, 且 `mkfs.mfs` **默认允许格式化非空白卷**
+#                   (发行版装机 = 先 U 盘启动、再把系统装到本机盘上, 那时盘上原有文件系统正是
+#                   要被覆盖的东西; 逐条 `--force` 只会把安装脚本写得很脆)。日常镜像不受影响。
 # 读它们的唯一来源: kernel/src/version.rs 与 user/libmorion/src/syscall.rs。
 MORION_BUILD  ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d)
 NOGUI         ?=
+INSTALL       ?=
 export MORION_BUILD
 ifneq ($(NOGUI),)
 export MORION_NOGUI := 1
+endif
+ifneq ($(INSTALL),)
+export MORION_INSTALL := 1
 endif
 NASM          := nasm
 MKDIR         := mkdir -p
@@ -50,9 +57,10 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # ============================================================
 # 输出路径
 # ============================================================
-# 无图形变体 (V2) 用**独立输出子目录** (放在已忽略的 build/ 里), 免得与常规构建的镜像 /
+# 变体用**独立输出子目录** (放在已忽略的 build/ 里), 免得与常规构建的镜像 /
 # 指纹互相污染 —— 切换变体不需要 `make clean` (`NOGUI=1 make iso` → 产物落在 build/nogui/)。
-OUT_DIR       ?= $(if $(NOGUI),build/nogui,build)
+# 同时置 `INSTALL=1 NOGUI=1` 时优先落 build/install (安装盘大概率还要图形, 该组合很少用)。
+OUT_DIR       ?= $(if $(INSTALL),build/install,$(if $(NOGUI),build/nogui,build))
 ISO_DIR       := $(OUT_DIR)/iso
 KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
@@ -61,7 +69,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built

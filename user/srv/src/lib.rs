@@ -34,6 +34,8 @@ pub fn announce(name: &str, domain_id: u64) {
     print_u64(domain_id);
     println(")");
 }
+#[cfg(feature = "svc-ahci_srv")]
+pub mod ahci_srv;
 #[cfg(feature = "svc-ext2_srv")]
 pub mod ext2_srv;
 #[cfg(feature = "svc-fat32_srv")]

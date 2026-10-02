@@ -20,8 +20,21 @@ pub const MACHINE: &str = "x86_64";
 /// `unexpected_cfgs` 告警（未在 `build.rs` 里声明），而环境变量无此问题。
 pub const IS_NOGUI: bool = option_env!("MORION_NOGUI").is_some();
 
-/// 变体后缀：无图形构建为 `-nogui`，否则为空。
-pub const VARIANT: &str = if IS_NOGUI { "-nogui" } else { "" };
+/// 是否**安装盘**构建：由 `Makefile` 注入的 `MORION_INSTALL` 决定（`make INSTALL=1 iso`）。
+///
+/// 安装盘 = 发行版装机用的启动介质：先从这个 U 盘启动，再把系统装到本机盘上。装机天生就是
+/// 「擦掉盘上原有的东西」，故这一变体里 `mkfs.mfs` 对**非空白卷**的护栏默认放开
+/// （判定在 `mfs_srv`，读的是用户态的 `morion::syscall::INSTALL_MODE`，同一约定）。
+/// 日常镜像一个字节都不放宽 —— 别人的分区仍然绝不自动吞。
+pub const IS_INSTALL: bool = option_env!("MORION_INSTALL").is_some();
+
+/// 变体后缀：无图形 `-nogui` / 安装盘 `-install`；两者都置位时按此顺序拼接。
+pub const VARIANT: &str = match (IS_NOGUI, IS_INSTALL) {
+    (false, false) => "",
+    (true, false) => "-nogui",
+    (false, true) => "-install",
+    (true, true) => "-nogui-install",
+};
 
 /// 构建号：`Makefile` 注入的 `MORION_BUILD`（git 短哈希，无 git 时用日期）；
 /// 直接用 `cargo` 手工构建时缺失，回落为 `dev`。

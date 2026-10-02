@@ -101,6 +101,13 @@ pub const SYS_UNAME: u64 = 51;
 /// 与内核 `version.rs` 的 `IS_NOGUI` 同一约定 —— `shell` 据此决定要不要开屏幕镜像。
 pub const NOGUI: bool = option_env!("MORION_NOGUI").is_some();
 
+/// 本程序是否属于**安装盘**构建: 由 `Makefile` 注入的 `MORION_INSTALL` 决定 (`make INSTALL=1 iso`)。
+///
+/// 与内核 `version.rs` 的 `IS_INSTALL` 同一约定 —— 安装盘要能把系统装进本机盘, 故这一变体里
+/// `mfs_srv` 对**非空白卷**的格式化护栏默认放开 (装机要覆盖的正是盘上原有的文件系统)。
+/// 日常镜像为 `false`, 护栏一字不放宽。
+pub const INSTALL_MODE: bool = option_env!("MORION_INSTALL").is_some();
+
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let ret: u64;

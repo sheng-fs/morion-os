@@ -143,6 +143,23 @@ pub fn find_net(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
+/// 在枚举结果中查找 **AHCI/SATA 控制器** (大容量存储控制器 class `01`, subclass `06`,
+/// prog-if `01` = AHCI 1.0), 返回其 PCI 位置与 **ABAR (BAR5)** 的物理基址。
+///
+/// 只认 AHCI 编程接口 (`01:06:01`): 老式 IDE (prog-if `80`) 与 RAID (`04`) 不在此列。
+/// ABAR 是 MMIO 窗口 (通用主机控制 + 每端口寄存器), 大小通常 8 KiB。
+pub fn find_ahci(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x01 || d.subclass != 0x06 || d.progif != 0x01 {
+            continue;
+        }
+        if let Some(bar5) = read_bar(d.bus, d.dev, d.func, 5) {
+            return Some((d.bus, d.dev, d.func, bar5));
+        }
+    }
+    None
+}
+
 /// 在枚举结果中查找 **virtio-blk** (存储控制器 class `01`, vendor `1AF4`, device `1042`/`1001`),
 /// 返回其 PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
 ///

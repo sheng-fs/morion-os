@@ -276,6 +276,8 @@ pub extern "C" fn kernel_main() -> ! {
     let net_domain = domain::create();
     // 域 17 — virtio_blk_srv (块设备驱动, 驱动路线 D3): 同样走通用设备授权, 内核无设备专属逻辑。
     let blk2_domain = domain::create();
+    // 域 18 — ahci_srv (SATA/AHCI 只读驱动, 驱动路线 D4): 仍走通用设备授权; 第一版全轮询, 不申请中断。
+    let ahci_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -480,6 +482,33 @@ pub extern "C" fn kernel_main() -> ! {
         None => {
             device::grant_empty(blk2_domain);
             video::println("[OK] no virtio-blk controller, virtio_blk_srv idle");
+        }
+    }
+
+    // 探测 AHCI/SATA 控制器并通用地授权给域 18（驱动路线 D4: 真机存储驱动第一版, 只读）。
+    // AHCI 的寄存器窗口在 BAR5 (ABAR, 8 KiB → 2 页); DMA 6 页: 命令列表 + Received FIS +
+    // 命令表 + 数据缓冲。**第一版全轮询** —— 本仓库只有 MSI-X 通路, 而 AHCI 常态用 INTx/MSI,
+    // 故不申请向量 (msix_vectors=0), `irq_cmds == cmds` 判据保持不变。
+    match arch::pci::find_ahci(&pci_devices) {
+        Some((bus, dev, func, bar5)) => {
+            device::grant(device::GrantRequest {
+                domain: ahci_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar5,
+                bar_pages: 2,
+                dma_pages: 6,
+                msix_vectors: 0,
+                label: "ahci",
+            });
+            video::print("[OK] AHCI controller ABAR=0x");
+            video::print_hex(bar5);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(ahci_domain);
+            video::println("[OK] no AHCI controller, ahci_srv idle");
         }
     }
 
