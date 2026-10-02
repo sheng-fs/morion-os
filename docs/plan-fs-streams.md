@@ -261,12 +261,31 @@
   `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`SELFTEST DONE=1`、`FAILED/PANIC=0`（258 s）；
   `build/ahci.img` 的 `sha256` 运行前后一致（**只读**成立）。
 
-**收口时发现的待办（不阻塞合并）**：
+**收口时发现的待办 —— 前两条已在收口后补掉**：
 
-1. `--repair` 真正回收泄漏 inode 的路径**还没有用例**（FS-31 只覆盖健康卷 + 幂等）；
-2. `build/ahci.img`（03 的测试盘）目前靠手工 `dd` 造，Makefile 里没有对应规则 —— 建议照
-   `VBLK_IMG` 加一条，让"怎么再造这块盘"可复现；
+1. ~~`--repair` 真正回收泄漏 inode 的路径还没有用例~~ → ✅ **已补**：新增
+   [scripts/fsck-leak.sh](../../scripts/fsck-leak.sh) —— 宿主侧把 `/mfs/LEAK.TXT` 的目录项改成
+   空槽（`name_len=0` + `ino=0`，**并重算块头 CRC**，否则 `mfs_ok` 不过、fsck 直接放弃遍历），
+   再让客户机报案/回收/复查（三轮启动，复查在**重启之后**）：实测
+   `mfs.fsck: 1 leaked inode(s)` → `mfs.fsck: repaired 1 leaked inode(s), reclaimed 12 block(s)`
+   → 重启后 `mfs.fsck: 0 leaked inode(s)`（`LEAK-RC=0`）。
+   为什么不做成 app 自测：泄漏只出现在两次 COW 提交之间的掉电窗口里，用户态 API 造不出来。
+2. ~~`build/ahci.img` 靠手工 `dd` 造、Makefile 无规则~~ → ✅ **已补**：`Makefile` 新增
+   `AHCI_IMG`/`AHCI_MIB` 与 `$(AHCI_IMG)` 规则（1 MiB + 扇区 0 预写 `MORION-AHCI-TST!`，
+   规则重建的镜像与 03 那份 **sha256 逐字节一致**），并**接进 `make run-nvme` 与
+   `scripts/fs-regress.sh`**（回归判定新增 `AHCI1 … sig=ok` 一条；带判据的全量回归实测 258 s
+   全绿、盘 sha 未变）。
 3. 02b（目录索引 + 请求批量化）、03b（AHCI 接进卷层）、04b（权限强制）按 §2 末尾的排期等前序合入。
 
-**提交状态**：四条流的改动**都还在工作区里没有提交**（最新提交仍是上一轮的 `3183f3f`）——
-文件清单见 `git status`；建议按流拆成独立提交（01/02/03/04 各一条 + 文档/工具类单独一条）。
+**顺带修掉的工具问题**（都在收口这一轮踩到）：`scripts/probe-shell.sh` 原先**漏挂 nsid=7
+（`pt.img`）**，导致自测 FS-26 `part wipe FAILED` 后整套自测停住、`PROBE_WAIT_PATTERN` 白等满
+超时（已补齐 7 个 namespace，并让等待循环在 QEMU 退出时立刻收手）；同时新增
+`PROBE_WAIT_PATTERN`/`PROBE_WAIT_TIMEOUT`（等日志出现某串再注入）与 `PROBE_CMD_GAP`
+（系统忙时按键会丢，需放长条间间隔）两个开关。
+
+**提交状态**：已按"工具类 / 01 / 02 / 03+安装盘 / 文档"拆成 5 条提交落库
+（`b0c8031` 工具 → `fd24690` D4+安装盘 → `bca117a` 01 → `b515d38` 02 → `d49dc88` 文档）；
+本节的收口追加（AHCI 测试盘规则 + 泄漏回收用例）单独一条提交。
+文件级互斥拆分没法做到"每条提交一处改动"：`shell.rs`/`vfs.rs`/`mfs_srv.rs` 里 01 与
+`mkfs.mfs --force` 同行级交织、`Makefile` 里 D4 与安装盘变体交织，故这两处只能合并成一条。
+`HANDOFF-FS.md` 按约定留在本地不入库。

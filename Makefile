@@ -124,6 +124,11 @@ PT_MIB        ?= 64
 # 盘内容必须确定 (签名是自测判据), 故每次重建而非增量。
 VBLK_IMG      ?= $(OUT_DIR)/vblk.img
 VBLK_MIB      ?= 1
+# AHCI/SATA 测试盘 (驱动路线 D4): 空白 raw, **扇区 0 预写已知签名** —— 域 18 的 ahci_srv 起来后
+# 用 IDENTIFY + LBA48 DMA 读扇区 0 校验签名, 打 `AHCI1 ... sig=ok` marker。全程只读; 盘内容
+# 必须确定 (签名是自测判据), 故每次重建而非增量。
+AHCI_IMG      ?= $(OUT_DIR)/ahci.img
+AHCI_MIB      ?= 1
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -329,8 +334,9 @@ run-nokvm: iso
 #   nsid=6 -> $(SPARE_IMG) (空白盘, 供 `mkfs.mfs` 自测: 格式化后作额外卷挂到 /usb<卷号>)
 #   nsid=7 -> $(PT_IMG)    (空白盘, 供 `part.*` 自测: 建/删 GPT 与 MBR 分区)
 #   另挂一台 virtio-blk ($(VBLK_IMG)) 给域 17 的 virtio_blk_srv (驱动路线 D3) 做块设备自测。
+#   再挂一台 AHCI/SATA 盘 ($(AHCI_IMG), q35 自带的 ich9-ahci) 给域 18 的 ahci_srv (D4) 做只读自测。
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG)
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG)
 	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
 	$(QEMU) \
 		-machine q35 \
@@ -357,6 +363,8 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
 		-drive file=$(VBLK_IMG),if=none,id=vblk0,format=raw \
 		-device virtio-blk-pci,drive=vblk0 \
+		-drive file=$(AHCI_IMG),if=none,id=ahci0,format=raw \
+		-device ide-hd,drive=ahci0 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
@@ -382,6 +390,15 @@ $(VBLK_IMG):
 	dd if=/dev/zero of=$(VBLK_IMG) bs=1M count=$(VBLK_MIB) status=none
 	printf 'MORION-VBLK-TST!' | dd of=$(VBLK_IMG) bs=512 count=1 conv=notrunc,sync status=none
 	@echo "  ✓ virtio-blk 盘: $(VBLK_IMG)"
+
+# AHCI/SATA 测试盘: 空白 raw + 扇区 0 写入已知签名 (供域 18 的 D4 自测读回校验)。
+# 挂在 q35 自带的 ich9-ahci 上 (`-device ide-hd`), 驱动全程只读不发写命令。
+$(AHCI_IMG):
+	@echo "==> 创建 AHCI/SATA 测试盘 ($(AHCI_MIB)MiB, 扇区 0 = 签名, 供 D4 自测)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(AHCI_IMG) bs=1M count=$(AHCI_MIB) status=none
+	printf 'MORION-AHCI-TST!' | dd of=$(AHCI_IMG) bs=512 count=1 conv=notrunc,sync status=none
+	@echo "  ✓ AHCI 盘: $(AHCI_IMG)"
 
 # MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
 $(MFS_IMG):

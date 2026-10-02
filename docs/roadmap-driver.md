@@ -199,7 +199,11 @@
   - 驱动 [`ahci_srv`](../user/srv/src/ahci_srv.rs)（域 18，**self-contained**，仍走 `DeviceGrant::load()` 的 `SYS_DEVICE_GRANT` 运行期申请）：`GHC.AE` → 遍历 `PI` 选端口（`PxSSTS.DET==3` 且 `PxSIG==0101h`，跳过 ATAPI / 端口倍增器）→ 建命令列表(1 KiB) / Received FIS(256 B) / 命令表(1 KiB) / 数据页（**页对齐**天然满足对齐要求）→ 启动端口 → `IDENTIFY DEVICE(0xEC)` 判类型 / 取容量 → `READ DMA EXT(0x25, LBA48)` 读扇区 0。
   - **中断策略**：本仓库只有 MSI-X 一条中断通路（无 INTx、无 MSI 非 X），而 AHCI 常态用 INTx/MSI —— 故第一版**全轮询**（`PxCI` / `PxIS`），**不申请向量**（`msix_vectors = 0`），`irq_cmds == cmds` 判据因此保持不变。日后要走中断需先补 MSI/INTx 通路（要动内核中断层，不属本轮）。
   - 自测：读扇区 0 校验宿主预写签名 → `AHCI1 ahci OK, cap=…, sector0 sig=MORION-AHCI-TST!, sig=ok`。**只读**：只发 IDENTIFY + READ DMA EXT，不发任何写命令，宿主 `sha256sum` 前后一致。
-- QEMU：q35 自带 ICH9 AHCI（`8086:2922`，class `01:06:01`），挂盘 `-drive id=d0,if=none,file=build/ahci.img,format=raw -device ide-hd,drive=d0`；测试盘 `build/ahci.img`（1 MiB）扇区 0 由宿主预写签名（`dd … conv=notrunc,sync`，注意 D3 记过的"漏 `conv=notrunc` 会截断"坑）。回归经 `QEMU_EXTRA` 注入挂盘参数，**不改** `scripts/fs-regress.sh`。
+- QEMU：q35 自带 ICH9 AHCI（`8086:2922`，class `01:06:01`）。测试盘由 **Makefile 规则**
+  `$(AHCI_IMG)` 生成（1 MiB，扇区 0 预写 `MORION-AHCI-TST!`，`dd … conv=notrunc,sync` ——
+  注意 D3 记过的"漏 `conv=notrunc` 会截断"坑），**已接进 `make run-nvme` 与 `scripts/fs-regress.sh`**
+  （挂 `-drive file=…ahci.img,if=none,id=ahci0,format=raw -device ide-hd,drive=ahci0`），
+  回归判定里新增 `AHCI1 … sig=ok` 一条；只读的宿主取证见 plan-fs-streams.md §5。
 - **不做（本轮明确排除）**：写路径、接进块服务卷层（`block_srv.rs`，归 02 独占）、热插拔、xHCI/USB、MSI/INTx 通路。
 
 ### E1 — IOMMU (Intel VT-d)
@@ -321,7 +325,7 @@
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
-| D4 | AHCI/SATA **只读**驱动落地（域 18），仍走通用授权、内核无设备专属逻辑；全轮询、不申请中断 —— ✅ `[OK] 19 service ELFs loaded` + `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`；宿主 `sha256sum build/ahci.img` 运行前后一致（只读；`dd … conv=notrunc` 预写签名）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0（隔离树验证：HEAD + 仅 03 补丁） |
+| D4 | AHCI/SATA **只读**驱动落地（域 18），仍走通用授权、内核无设备专属逻辑；全轮询、不申请中断 —— ✅ `[OK] 19 service ELFs loaded` + `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`；宿主 `sha256sum build/ahci.img` 运行前后一致（只读；`dd … conv=notrunc` 预写签名）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0（隔离树验证：HEAD + 仅 03 补丁）；**收口后已把测试盘接进 Makefile 与标准回归**（`AHCI_IMG` 规则 + `scripts/fs-regress.sh` 判定 `AHCI1 … sig=ok`），不再需要手工 `QEMU_EXTRA` | ✅ |
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |
 | D0 | I/O 端口 syscall 加 `IoPort` 门禁：未授权域读写端口被拒，`block_srv` / `mfs_srv` / `exfat_srv` 照常 —— ✅ `app: D0 port capability gate OK (ungranted I/O port denied)`；FS-13/FS-16 仍写得出时间戳（两处授权放行）；内核单测 24/24 |
 | E1 | 飞地越界 DMA 被 IOMMU 拒绝；系统与其他域不受影响 |

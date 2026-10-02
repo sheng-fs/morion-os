@@ -1829,9 +1829,20 @@ mfs: refuse to mount: on-disk magic MFS7 (1296454455) != expected MFS8 (12964544
 盘 sha256 起机前后**完全一致**（`6a7d12f3…` == `6a7d12f3…`）—— 证明「拒绝挂载」时
 **一个字节都没写盘**。取证后已还原镜像（块首回到 `38 53 46 4d`）。
 
-**已知覆盖缺口（留给 04b/后续）**：FS-31 只在**健康卷**上验"报 0 泄漏 + `--repair` 幂等"，
-`--repair` 真正回收泄漏 inode 的那条路径还没有用例（需要在镜像里人为制造泄漏，
-或加一个受控的调试钩子）。
+**覆盖缺口已补（收口后追加）**：FS-31 只在**健康卷**上验"报 0 泄漏 + `--repair` 幂等"，
+`--repair` 真正回收泄漏 inode 的那条路径现由 [scripts/fsck-leak.sh](../../scripts/fsck-leak.sh)
+覆盖 —— 泄漏只出现在"两次 COW 提交之间掉电"的窗口里（`unlink` 摘了目录项还没释放 inode、
+`creat` 登记了 inode 还没插目录项），用户态 API 造不出来，故按 FS-30 的办法在**宿主侧**改镜像：
+把 `/mfs/LEAK.TXT` 的目录项改成空槽（`name_len=0` + `ino=0`，**并重算该块 CRC** —— 否则
+`mfs_ok` 校验不过，`mfs_fsck_walk_inos` 会当场 `return false`）。实测三段证据：
+
+```
+报案 (mfs.fsck)          : mfs.fsck: 1 leaked inode(s)
+回收 (mfs.fsck --repair) : mfs.fsck: repaired 1 leaked inode(s), reclaimed 12 block(s)
+复查 (重启后 mfs.fsck)   : mfs.fsck: 0 leaked inode(s)
+```
+
+复查安排在**另一轮启动**里，因此同时证明修复已落盘。
 
 ### 权限与多用户设计（04）—— 设计稿，待实现
 
