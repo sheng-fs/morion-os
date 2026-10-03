@@ -66,6 +66,33 @@ const POLL_MS: u64 = 40;
 /// 盘上服务目录 (FAT32 根卷)。
 const SERVICE_DIR: &str = "/system/services/";
 
+/// 最小权限策略 (② 能力审计): 高价值凭证的**允许持有者**白名单。
+///
+/// 只钉这四类"独占 / 危险"凭证 —— `SendTo` / `MapInto` / `Irq` 是常规流通能力, 百来条,
+/// 设全局上限只会变成噪音。判据来源: 内核 `main.rs` 引导期 `cap::grant` 的实际签发
+/// (域号见那里的域布局注释)。任何**不在**白名单里的持有都记一次违规。
+const POLICY: [(u64, &[u64]); 4] = [
+    // 造进程: 仅 app(7) / shell(8) / init(14) —— 其余域一概不该有。
+    (CAP_KIND_SPAWN, &[7, 8, 14]),
+    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19)。
+    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19]),
+    // 帧缓冲: 全局唯一凭证, 仅 gfx_srv(15)。
+    (CAP_KIND_FB, &[15]),
+    // I/O 端口: 仅 block(5, IDE PIT) / mfs(11) / exfat(13) (CMOS RTC)。
+    (CAP_KIND_IO_PORT, &[5, 11, 13]),
+];
+
+/// 正向要求: 这些域**必须**持有这些能力 (缺了说明授权遗漏或审计读取失灵)。
+///
+/// 有它"审计通过"才不是空话 —— 若 `SYS_CAP_AUDIT` 读不到任何能力 (门禁拒了 / 编码坏了),
+/// 这几条会立刻把它暴露成 `MISSING`。选 `Spawn` 是因为它**无条件**签发 (不依赖是否探测到
+/// 某台 PCI 设备), 故在任意测试配置下都成立。
+const REQUIRED: [(u64, u64); 3] = [
+    (7, CAP_KIND_SPAWN),  // app
+    (8, CAP_KIND_SPAWN),  // shell
+    (14, CAP_KIND_SPAWN), // init (本域)
+];
+
 /// 每个被监督域「上一轮已发现它没有存活任务」的标记（两连击去抖，见 [`run`]）。
 static mut PENDING: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
 
@@ -81,6 +108,9 @@ pub fn run() {
     println(
         "init: supervising pager/echo/kbd/fat32_srv/mount_srv/tmpfs_srv/mfs_srv/ext2_srv/exfat_srv/gfx_srv/net_srv",
     );
+    // 引导期能力审计 (②): 授权已在内核 `main.rs` 全部签发完毕, 这里按最小权限策略核对一遍,
+    // 把"内核给了谁什么"落成可复核、可回归断言的启动日志 (marker `cap-audit:`)。
+    audit();
     let mut restarts = 0u64;
     loop {
         for (i, &(domain, name)) in SUPERVISED.iter().enumerate() {
@@ -152,4 +182,103 @@ fn service_path<'a>(buf: &'a mut [u8; 64], name: &str) -> &'a str {
     buf[n..n + 4].copy_from_slice(b".elf");
     n += 4;
     unsafe { core::str::from_utf8_unchecked(&buf[..n]) }
+}
+
+// ---------------------------------------------------------------------------
+// 能力审计 / 策略引擎 (②)
+// ---------------------------------------------------------------------------
+
+/// 引导期能力审计: 遍历全部存活域的能力槽, 按 [`POLICY`] / [`REQUIRED`] 核对最小权限。
+///
+/// 由持 `Capability::Spawn` 的监督者调用 (内核 `SYS_CAP_AUDIT` 的门禁)。只读、一次性:
+/// 内核侧授权在 `main.rs` 已全部签发, 这里把它们摊开成启动日志里可复核、可回归断言的一段
+/// (marker `cap-audit:`)。审计不通过只报告、不阻断启动 —— 让系统照常起来, 把问题留在日志。
+fn audit() {
+    let domains = sys_domain_count();
+    let mut caps = 0u64;
+    let mut violations = 0u64;
+    let mut d = 0;
+    while d < domains {
+        let mut slot = 0;
+        loop {
+            let v = sys_cap_audit(d, slot);
+            if v == u64::MAX {
+                break; // 槽越界: 该域槽表到底
+            }
+            if v != 0 {
+                caps += 1;
+                let kind = (v >> 56).wrapping_sub(1);
+                if !holder_allowed(d, kind) {
+                    violations += 1;
+                    print("cap-audit: VIOLATION dom=");
+                    print_u64(d);
+                    print(" cap=");
+                    print(cap_name(kind));
+                    println("");
+                }
+            }
+            slot += 1;
+        }
+        d += 1;
+    }
+    // 正向核对: 该有的能力缺了, 同样是策略被破坏 (也挡住"审计读不到任何能力"的空通过)。
+    for &(dom, kind) in REQUIRED.iter() {
+        if !holds(dom, kind) {
+            violations += 1;
+            print("cap-audit: MISSING dom=");
+            print_u64(dom);
+            print(" cap=");
+            print(cap_name(kind));
+            println("");
+        }
+    }
+    print("cap-audit: domains=");
+    print_u64(domains);
+    print(" caps=");
+    print_u64(caps);
+    print(" violations=");
+    print_u64(violations);
+    println("");
+    if violations == 0 {
+        println("cap-audit: OK (least-privilege policy holds)");
+    } else {
+        println("cap-audit: FAILED (capability policy violated)");
+    }
+}
+
+/// `domain` 是否被允许持有 `kind` 类能力 (不在 [`POLICY`] 里的种类一律放行)。
+fn holder_allowed(domain: u64, kind: u64) -> bool {
+    match POLICY.iter().find(|(k, _)| *k == kind) {
+        Some((_, allow)) => allow.contains(&domain),
+        None => true,
+    }
+}
+
+/// `domain` 是否持有 `kind` 类能力 (任一槽命中即可)。
+fn holds(domain: u64, kind: u64) -> bool {
+    let mut slot = 0;
+    loop {
+        let v = sys_cap_audit(domain, slot);
+        if v == u64::MAX {
+            return false; // 表尾
+        }
+        if v != 0 && (v >> 56).wrapping_sub(1) == kind {
+            return true;
+        }
+        slot += 1;
+    }
+}
+
+/// 能力种类名 (仅用于审计日志); 与内核 `cap::CAP_KIND_*` 一致。
+fn cap_name(kind: u64) -> &'static str {
+    match kind {
+        CAP_KIND_SEND_TO => "SendTo",
+        CAP_KIND_MAP_INTO => "MapInto",
+        CAP_KIND_IRQ => "Irq",
+        CAP_KIND_MMIO => "Mmio",
+        CAP_KIND_SPAWN => "Spawn",
+        CAP_KIND_FB => "Fb",
+        CAP_KIND_IO_PORT => "IoPort",
+        _ => "Unknown",
+    }
 }

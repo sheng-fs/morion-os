@@ -95,6 +95,11 @@ pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 ///
 /// `选择`: 0 = 整行 `MorionOS <release> <machine>`、1 = release、2 = 构建号。
 pub const SYS_UNAME: u64 = 51;
+/// 能力审计 (②): `(目标域, 槽号)` → 打包的能力 / `0`(空槽) / `u64::MAX`(越界, 表尾)。
+///
+/// 需 `Capability::Spawn` (只有监督者该调)。编码: 高 8 位 = `种类 + 1`, 低 56 位 = 参数
+/// (`IoPort` 为 `(base << 16) | len`)。见 [`sys_cap_audit`]。
+pub const SYS_CAP_AUDIT: u64 = 54;
 
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
@@ -450,6 +455,12 @@ pub const CAP_KIND_IO_PORT: u64 = 6;
 /// `kind` 取 `CAP_KIND_*`, `arg` 是该能力的参数 (目标域 id / IRQ 号 / 页对齐 MMIO 基址)。
 pub fn sys_cap_send(to: u64, kind: u64, arg: u64) -> u64 {
     unsafe { syscall(SYS_CAP_SEND, to, kind, arg) }
+}
+
+/// 能力审计 (②): 读域 `domain` 第 `slot` 个能力槽。返回编码见 [`SYS_CAP_AUDIT`]:
+/// 非 0 = 打包的能力, `0` = 空槽, `u64::MAX` = 越界 (表尾)。需 `Capability::Spawn`。
+pub fn sys_cap_audit(domain: u64, slot: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_AUDIT, domain, slot, 0) }
 }
 
 pub fn sys_puts(s: &str) {

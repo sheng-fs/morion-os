@@ -124,7 +124,7 @@ UEFI 固件
 | 4 | `SYS_PUTS` | `rdi=ptr, rsi=len` | 打印用户字符串 |
 | 5 | `SYS_EXIT` | — | 终止当前用户任务（标记 `Terminated`）；若它是所属域的**最后一个**任务且该域非引导域，则登记该域由内核**退出即回收**（见域小节 `request_destroy`） |
 | 6 | `SYS_ALLOC_PAGE` | `rdi=vaddr` | 分配一物理帧映射到本域 `vaddr`，返回 1 成功 / 0 失败 |
-| 7 | `SYS_SHARE_PAGE` | `rdi=vaddr, rsi=to` | 把本域 `vaddr` 的页映射进 `to` 域同地址；需 `Capability::MapInto(to)`，返回 1/0 |
+| 7 | `SYS_SHARE_PAGE` | `rdi=vaddr, rsi=to` | 把本域 `vaddr` 的页映射进 `to` 域同地址；需 `Capability::MapInto(to)`，返回 1/0。**② 起幂等**：若 `to` 域该地址**已映射同一物理帧**（重复共享）直接成功、不重复计引用；若已映射**别的**帧（客户端重启后重新共享）先摘除旧映射并递减其引用计数（归零才释放）再映射新帧 —— 不再撞 `PageAlreadyMapped` panic |
 | 8 | `SYS_UNMAP` | `rdi=vaddr` | 解除本域 `vaddr` 映射并递减引用计数，归零时释放物理帧，返回 1/0 |
 | 9 | `SYS_MAP_ANON` | `rdi=domain, rsi=vaddr` | 分页器：给 `domain` 的 `vaddr` 映射匿名零帧；需 `Capability::MapInto(domain)`，返回 1/0 |
 | 10 | `SYS_PAGE_FAULT_REPLY` | — | 分页器：唤醒最近一次 `SYS_RECV` 到的缺页域（回复目标由内核记录），返回 1/0 |
@@ -165,6 +165,7 @@ UEFI 固件
 | 51 | `SYS_UNAME` | `rdi=缓冲指针, rsi=缓冲长度, rdx=选择` | **报告系统名 / 版本 / 构建号**（V1）：`选择` `0` = 整行 `MorionOS <release> <machine>`、`1` = release（含变体后缀）、`2` = 构建号。拷贝前按 `is_user_address` 校验用户区间并核对长度（同 `SYS_FB_INFO` 口径），返回写入字节数（不含结尾 NUL），失败 `0`。版本常量**唯一来源** = [`kernel/src/version.rs`](../../kernel/src/version.rs) |
 | 52 | `SYS_DEVICE_INFO` | `rdi=设备选择` | **查询本域可用设备**（D1b）：`rdi = u64::MAX` 表示"本域已绑定设备"（`DEVICE_SELF`），否则按 `pci_addr`（bus / dev / func 打包）**精确匹配**；返回打包的 `vendor` / `device` / `class`（一个 `u64`），无设备或不属于本域返回 `0`。实现在 [`device::syscall_info`](../../kernel/src/device.rs) |
 | 53 | `SYS_DEVICE_GRANT` | `rdi=设备选择` | **申请本域设备授权**（D1b）：定位本域设备 → **能力门禁**（须持有该设备 BAR 的 `Mmio` 凭证，否则打印 `dev: device grant denied (no Mmio capability)` 并返回 `0`）→ 幂等确认描述页 `magic` → 返回描述页在本域的虚拟地址（`DEVICE_CFG_VADDR`）。设备资源仍在 boot 期由声明式 `device::grant` 备好。实现在 [`device::syscall_grant`](../../kernel/src/device.rs) |
+| 54 | `SYS_CAP_AUDIT` | `rdi=目标域, rsi=槽号` | **能力审计**（②）：只读地取出 `目标域` 第 `槽号` 个能力槽，供监督者按最小权限策略核对引导期授权。**门禁 `Capability::Spawn`**（只有监督者该调，非持有者返回 `0`）。返回编码：高 8 位 = `种类 + 1`、低 56 位 = 参数（`IoPort` 为 `(base << 16) | len`）；`0` = 空槽，`u64::MAX` = 域/槽越界（**表尾哨兵**，勿与空槽混淆）。编码/打包见 [`cap::pack_audit`](../../kernel/src/cap.rs)，使用方 = `init` 监督者的引导期审计（marker `cap-audit:`） |
 
 ### MSR 配置（`syscall::init()`）
 

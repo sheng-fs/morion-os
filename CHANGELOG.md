@@ -56,6 +56,14 @@
   `USB2 … rw=ok`，分区表重扫后 USB 卷仍保留，`IOMMU=1` 复跑亦通过。首版排掉三坑：输入上下文位偏移
   （Slot 端口号在 DWORD1 bits 23:16、EP 字段全在 DWORD1）、interrupter 的 `ERSTBA=0x10`/`ERDP=0x18`、
   以及把物理地址 `data_pa` 当虚拟地址用。
+- **服务重启重共享 + 引导期能力审计（②）**：两处收口。① `SYS_SHARE_PAGE(7)` 改**幂等 + 异帧重映射** ——
+  目标域该地址已映射**同一帧**直接成功（不重复计引用）；已映射**别的**帧（客户端重启后重新共享）先
+  `unmap` + 递减引用计数（归零才释放）再映射新帧。此前直接 `map_user_page` 会撞 `PageAlreadyMapped`
+  panic，使被监督服务无法重启（缩减磁盘集复现：ext2_srv 挂载失败 → 重启 → 内核 panic；修后同一场景
+  反复重启 81 次零 panic）。② 新增 `SYS_CAP_AUDIT(54)`（持 `Capability::Spawn` 的域只读枚举目标域能力槽：
+  高 8 位 = 种类 + 1、低 56 位 = 参数，`0` = 空槽、`u64::MAX` = 表尾）+ `init` 监督者引导期按**最小权限
+  策略**核对引导授权（`Spawn`/`Mmio`/`Fb`/`IoPort` 持有者白名单 + 正向必需项），启动日志
+  `cap-audit: domains=20 caps=91 violations=0` + `cap-audit: OK`；回归新增判据 `cap-audit: OK`。
 - **块层批量提交 / 等完成（02b-2）**：量化发现耗时主因是**每条 NVMe 命令的完成等待**（16384 条命令
   摊到 258 s ≈ 15.7 ms/条，不是每请求一跳 IPC），故改为「一次下发 K 条命令再统一等完成」。三层：
   ① `block_srv` 的 `nvme_batch_rw` —— 一条 I/O 队列排 k 条 SQE、只敲一次门铃、统一等完成（中断优先、

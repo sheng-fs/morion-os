@@ -142,6 +142,11 @@ pub const SYS_UNAME: u64 = 51;
 pub const SYS_DEVICE_INFO: u64 = 52;
 /// **预留** `SYS_DEVICE_GRANT` (D1b 运行期设备授权): 实现在 [`crate::device`]。
 pub const SYS_DEVICE_GRANT: u64 = 53;
+/// 能力审计 (② `SYS_CAP_AUDIT`): `(目标域, 槽号)` → 打包的能力 / `0`(空槽) / `u64::MAX`(越界)。
+///
+/// 供监督者 (init, 持 `Capability::Spawn`) 按最小权限策略核对引导期的能力授权。编码见
+/// [`crate::cap::pack_audit`]; 非 `Spawn` 持有者一律拒绝 (返回 `0`)。
+pub const SYS_CAP_AUDIT: u64 = 54;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -416,6 +421,21 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             } else {
                 match crate::memory::paging::resolve_user_page(from, a1) {
                     Some(paddr) => {
+                        // 目标域 `a2` 可能已在 `a1` 有映射: 客户端重启后重共享, 或重复
+                        // 共享同一页。若不处理, map_user_page 会撞 PageAlreadyMapped panic。
+                        if let Some(old) = crate::memory::paging::resolve_user_page(a2, a1) {
+                            if old == paddr {
+                                // 已映射同一帧: 幂等成功, 不重复 inc_ref。
+                                return 1;
+                            }
+                            // 异帧: 先摘除旧映射并递减引用计数 (归零才释放), 再映射新帧。
+                            if let Some(u) = crate::memory::paging::unmap_user_page(a2, a1) {
+                                let was_last = crate::memory::frame_allocator::dec_ref(u);
+                                if was_last {
+                                    crate::memory::frame_allocator::free_frame(u);
+                                }
+                            }
+                        }
                         crate::memory::paging::map_user_page(
                             a2,
                             a1,
@@ -813,6 +833,21 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_UNAME => crate::version::handle(a1, a2, a3),
         SYS_DEVICE_INFO => crate::device::syscall_info(a1, a2, a3),
         SYS_DEVICE_GRANT => crate::device::syscall_grant(a1, a2, a3),
+        SYS_CAP_AUDIT => {
+            // 能力审计 (②): 持 `Spawn` 的可信域 (init 监督者) 枚举 `a1` 域第 `a2` 个能力槽,
+            // 供其按最小权限策略核对引导期授权。非 `Spawn` 持有者一律拒绝 (返回 0, 与"空槽"
+            // 同形 —— 该路径不可达, 因为只有 init 会调)。
+            let me = crate::scheduler::current_domain();
+            if !crate::cap::has(me, crate::cap::Capability::Spawn) {
+                0
+            } else {
+                match crate::cap::audit_slot(a1, a2) {
+                    Some(Some(cap)) => crate::cap::pack_audit(cap),
+                    Some(None) => 0,  // 空槽
+                    None => u64::MAX, // 域/槽越界: 审计者据此判定表尾
+                }
+            }
+        }
         _ => 0,
     }
 }

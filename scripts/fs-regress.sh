@@ -196,6 +196,12 @@ grep -nE 'xhci:|USB1|USB2|block: usb volume' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'USB1 xhci OK.*sig=ok' "$log" 2>/dev/null || usb_bad=1
 grep -qE 'block: usb volume attached.*sig=ok' "$log" 2>/dev/null || usb_bad=1
 grep -qE 'USB2 usb volume rw OK.*rw=ok' "$log" 2>/dev/null || usb_bad=1
+# ② 能力审计: init 监督者按最小权限策略核对引导期的能力授权 (Spawn / Mmio / Fb / IoPort)。
+# 判据是 `cap-audit: OK` —— 出现 VIOLATION / MISSING / FAILED 都判失败 (审计本身也读日志)。
+cap_bad=0
+echo "== 能力审计 (② cap-audit) =="
+grep -nE 'cap-audit:' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
@@ -204,4 +210,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ]

@@ -42,7 +42,7 @@ pub enum Capability {
 }
 
 /// 每域能力槽数量。
-const CAP_SLOTS: usize = 32;
+pub const CAP_SLOTS: usize = 32;
 
 /// `SYS_CAP_SEND` 的 `kind` 编码 —— 能力是枚举, 而 syscall 参数只有整数,
 /// 故用 `(kind, arg)` 两段表示 (与用户态 `syscall::CAP_KIND_*` 一致)。
@@ -85,6 +85,24 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
         }
         _ => None,
     }
+}
+
+/// 能力审计编码 (`SYS_CAP_AUDIT`): 把一条能力打包进一个 `u64` ——
+/// 高 8 位存 `种类 + 1`, 低 56 位存参数 (`IoPort` 编成 `(base << 16) | len`)。
+///
+/// `+1` 是刻意的: 空槽约定返回 `0`, 而 `SendTo(0)` 的 `kind = 0`、`arg = 0` 打包后也是
+/// `1 << 56` 而非 `0`, 故「空槽」与任何真实能力都不撞 (纯函数, 便于单测)。
+pub fn pack_audit(cap: Capability) -> u64 {
+    let (kind, arg) = match cap {
+        Capability::SendTo(d) => (CAP_KIND_SEND_TO, d),
+        Capability::MapInto(d) => (CAP_KIND_MAP_INTO, d),
+        Capability::Irq(v) => (CAP_KIND_IRQ, v as u64),
+        Capability::Mmio(p) => (CAP_KIND_MMIO, p),
+        Capability::Spawn => (CAP_KIND_SPAWN, 0),
+        Capability::Fb => (CAP_KIND_FB, 0),
+        Capability::IoPort(base, len) => (CAP_KIND_IO_PORT, ((base as u64) << 16) | len as u64),
+    };
+    ((kind + 1) << 56) | arg
 }
 
 /// 全局能力表: 每个域一个能力槽数组。
@@ -227,6 +245,20 @@ pub fn has_port(domain: u64, port: u16) -> bool {
 /// 纯函数（不碰全局表、不关中断），故可直接单测。
 fn port_in_range(base: u16, len: u16, port: u16) -> bool {
     port >= base && (port as u32) < base as u32 + len as u32
+}
+
+/// 能力审计 (②): 只读地取出域 `domain` 第 `slot` 个能力槽的内容。
+///
+/// 返回 `Some(Some(cap))` = 该槽持有能力; `Some(None)` = 空槽; `None` = 域不存在或槽越界
+/// (审计者据此判定"表尾", 见 `SYS_CAP_AUDIT`)。**不修改任何状态**, 供监督者按最小权限
+/// 策略核对引导期的能力授权。
+pub fn audit_slot(domain: u64, slot: u64) -> Option<Option<Capability>> {
+    let table = CAP_TABLE.lock();
+    let row = table.get(domain as usize)?;
+    // 槽越界必须与"空槽"区分开: 前者返回 `None` (审计者据此判定表尾), 后者是 `Some(None)`。
+    // 若这里用 `.flatten()` 把两者都压成 `None`, 越界会被误报成空槽 -> 审计者扫不到表尾。
+    let cell = row.get(slot as usize)?;
+    Some(*cell)
 }
 
 /// 把 `from` 域句柄槽 `handle` 里的对象标识**移入** `to` 域的空槽,
@@ -412,5 +444,33 @@ mod tests {
         assert_eq!(decode(CAP_KIND_IO_PORT, 0), None); // len = 0
         assert_eq!(decode(CAP_KIND_IO_PORT, (0xFFFF << 16) | 2), None); // 区间越界
         assert_eq!(decode(CAP_KIND_IO_PORT, 1 << 32), None); // base 超 16 位
+    }
+
+    /// 审计编码: 高 8 位是 `种类 + 1`, 低 56 位是参数; `IoPort` 编成 `(base << 16) | len`。
+    /// 关键不变式: 任何真实能力打包后都**非 0** (0 被空槽占用) —— 连 `SendTo(0)` 也不撞 0。
+    #[test]
+    fn audit_pack_encodes_kind_and_arg_without_zero_collision() {
+        assert_eq!(pack_audit(Capability::SendTo(0)), 1 << 56); // 非 0
+        assert_eq!(pack_audit(Capability::SendTo(5)), (1 << 56) | 5);
+        assert_eq!(pack_audit(Capability::MapInto(9)), (2 << 56) | 9);
+        assert_eq!(pack_audit(Capability::Irq(0x21)), (3 << 56) | 0x21);
+        assert_eq!(
+            pack_audit(Capability::Mmio(0x8000_0000)),
+            (4 << 56) | 0x8000_0000
+        );
+        assert_eq!(pack_audit(Capability::Spawn), 5 << 56);
+        assert_eq!(pack_audit(Capability::Fb), 6 << 56);
+        assert_eq!(
+            pack_audit(Capability::IoPort(0x1F0, 8)),
+            (7 << 56) | (0x1F0 << 16) | 8
+        );
+
+        // 解出 `种类 + 1` 与参数后应能还原 (与 `decode` 的 `IoPort` 编码一致)。
+        let packed = pack_audit(Capability::IoPort(0x70, 2));
+        let arg = packed & 0x00FF_FFFF_FFFF_FFFF;
+        assert_eq!(
+            decode(CAP_KIND_IO_PORT, arg),
+            Some(Capability::IoPort(0x70, 2))
+        );
     }
 }
