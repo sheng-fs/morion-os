@@ -512,6 +512,13 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // 授权 (03b): AHCI 盘经 block_srv 的**卷层**对外提供 —— ahci_srv 启动后异步把盘挂进
+    // block_srv (SendTo(block)), block_srv 分配传输暂存页并同址共享给 ahci_srv
+    // (MapInto(ahci)), 之后把读/写经 IPC 转发回 ahci_srv (SendTo(ahci))。
+    cap::grant(block_domain, cap::Capability::SendTo(ahci_domain));
+    cap::grant(block_domain, cap::Capability::MapInto(ahci_domain));
+    cap::grant(ahci_domain, cap::Capability::SendTo(block_domain));
+
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。
     // 域号已按 0..13 建好, 故直接按模块表里的域号载入 —— 每个服务跑自己的 ELF、进自己的

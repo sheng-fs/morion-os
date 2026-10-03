@@ -328,6 +328,12 @@ pub const BLOCK_OP_PART_RELOAD: u8 = 6;
 /// 只给分区诊断/自测用 —— 建完分区后 LBA 0/1 已不属于任何卷 (整盘卷没了、新分区从 2048
 /// 起), 想校验写进去的字节就只能直接按盘读。
 pub const BLOCK_OP_DISK_READ: u8 = 7;
+/// 把一块**非 NVMe** 盘挂进卷层 (后端驱动 → block_srv): `count` = 盘容量 (扇区), 回复无意义。
+///
+/// 目前唯一的发送者是 ahci_srv (域 18): 它自测通过后**异步**通知 block_srv, block_srv
+/// 为它分配一个传输暂存页 (同址共享给 ahci), 登记成一个 AHCI 后端卷, 之后对外的读/写
+/// 都经 block_srv 的卷层转发回 ahci_srv —— 上层文件系统因此完全不必知道盘挂在哪种控制器上。
+pub const BLOCK_OP_ATTACH: u8 = 8;
 
 /// 分区表 / 裸盘请求 (`op & 0xFF` 是 `BLOCK_OP_PART_*` / `BLOCK_OP_DISK_READ` 时按本结构解释)。
 ///

@@ -678,6 +678,136 @@ fn nvme_ns_sectors_of(nsid: u32) -> u32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// AHCI 后端 (03b): 卷层把读/写转发给 ahci_srv, 由它在自己的 DMA 通路上完成
+// ---------------------------------------------------------------------------
+// 分层取舍: AHCI 盘的寄存器时序与命令表排版留在 ahci_srv (它持设备授权); block_srv 只把
+// 它当一个「卷后端」——读写经 IPC 转发, 上层文件系统完全不必知道盘挂在哪种控制器上。
+
+/// AHCI 驱动域号 (与内核 `main.rs` 创建顺序一致)。
+const AHCI_DOMAIN: u64 = 18;
+/// 单笔转发的扇区上限 (= ahci_srv 私有数据页 4096 B / 512)。超出部分由 `ahci_rw` 切分。
+const AHCI_MAX_SECTORS: u64 = 8;
+/// AHCI 传输暂存页: block_srv 自有并**同址共享给 ahci_srv**。
+///
+/// ⚠️ 用户态固定虚拟地址分区 (见 `VOL_SCRATCH_VADDR` 处的说明): 该页紧接 PRP 表页, 在 mfs
+/// 位图块 (0x16_2000) 之上 —— 新增固定地址务必避开别人的共享页 (同址共享撞车会内核 panic)。
+const AHCI_SCRATCH_VADDR: u64 = 0x0000_0080_0016_3000;
+/// 宿主造 AHCI 测试盘时写进扇区 0 的签名 (与 ahci_srv 的 `SIG` 一致)。
+const AHCI_SIG: [u8; 16] = *b"MORION-AHCI-TST!";
+
+/// 经 AHCI 后端读/写 `count` 个扇区; 成功后数据已在 `buf`。
+///
+/// 按 `AHCI_MAX_SECTORS` 切分: 每段一次 IPC (转发给 ahci_srv), 它 DMA 到私有页后与本域
+/// 共享给它的暂存页互拷, 本函数再把暂存页与调用方缓冲互拷。只读缓存 (`blk_cache_*`) 是
+/// NVMe 专属, 这里不走它 (穿透)。
+fn ahci_rw(is_read: bool, lba: u64, count: u64, buf: u64) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let mut done: u64 = 0;
+    while done < count {
+        let chunk = (count - done).min(AHCI_MAX_SECTORS);
+        let n = (chunk * 512) as usize;
+        let off = (done * 512) as usize;
+        // 写: 先把调用方数据拷进暂存页, 再请 ahci 取走; 读: 先请 ahci 送数据, 再拷回调用方。
+        // (顺序不能反 —— 先把 IPC 发出去再拷, ahci 取到的就是上一笔的残留。)
+        if !is_read {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (buf as *const u8).add(off),
+                    AHCI_SCRATCH_VADDR as *mut u8,
+                    n,
+                );
+            }
+        }
+        let req = BlockReq {
+            op: (if is_read {
+                BLOCK_OP_READ
+            } else {
+                BLOCK_OP_WRITE
+            }) as u64,
+            lba: lba + done,
+            count: chunk,
+            buf: AHCI_SCRATCH_VADDR,
+        };
+        let payload = unsafe {
+            core::slice::from_raw_parts(
+                &req as *const BlockReq as *const u8,
+                core::mem::size_of::<BlockReq>(),
+            )
+        };
+        if sys_call_payload(AHCI_DOMAIN, BLOCK_REQ_TAG, payload) != 1 {
+            return false;
+        }
+        if is_read {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    AHCI_SCRATCH_VADDR as *const u8,
+                    (buf as *mut u8).add(off),
+                    n,
+                );
+            }
+        }
+        done += chunk;
+    }
+    true
+}
+
+/// 挂上 AHCI 卷时的取证 (经真实 AHCI 后端): 读扇区 0 校验签名, 签名匹配才做写回读自测。
+///
+/// **安全门**: 只有宿主测试镜像 (扇区 0 带 `AHCI_SIG`) 才做写测试, 避免在真盘上写坏数据。
+fn ahci_attach_selftest(sectors: u32, vol: u64) {
+    let scratch = VOL_SCRATCH_VADDR as *mut u8;
+    // ① 读扇区 0: 确认「卷层 → AHCI 后端 → 磁盘」这条读链路端到端打通。
+    let sig_ok = ahci_rw(true, 0, 1, VOL_SCRATCH_VADDR)
+        && unsafe { core::slice::from_raw_parts(scratch, 16) == &AHCI_SIG[..] };
+    print("block: ahci volume attached (vol=");
+    print_u64(vol);
+    print(", sectors=");
+    print_u64(sectors as u64);
+    print(", sig=");
+    print(if sig_ok { "ok" } else { "BAD" });
+    println(")");
+    if !sig_ok || sectors < 2 {
+        return;
+    }
+
+    // ② 写回读: 图案写到最后一个扇区 (测试镜像的空白区), 再读回逐字节比对。
+    let lba = (sectors - 1) as u64;
+    let mut i = 0usize;
+    while i < 512 {
+        unsafe { core::ptr::write_volatile(scratch.add(i), (i as u8) ^ 0xA5) };
+        i += 1;
+    }
+    let mut status = "ok";
+    if !ahci_rw(false, lba, 1, VOL_SCRATCH_VADDR) {
+        status = "bad(write)";
+    } else {
+        zero_bytes(scratch, 512);
+        if !ahci_rw(true, lba, 1, VOL_SCRATCH_VADDR) {
+            status = "bad(read)";
+        } else {
+            let mut k = 0usize;
+            while k < 512 {
+                if unsafe { *scratch.add(k) } != ((k as u8) ^ 0xA5) {
+                    status = "bad(cmp)";
+                    break;
+                }
+                k += 1;
+            }
+        }
+    }
+    print("AHCI2 ahci volume rw ");
+    print(if status == "ok" { "OK" } else { "BAD" });
+    print(", vol=");
+    print_u64(vol);
+    print(", lba=");
+    print_u64(lba);
+    print(", rw=");
+    println(status);
+}
+
 /// 域 5 — NVMe 驱动服务: 复位控制器 → Admin 队列 → Identify → I/O 队列 → 块服务。
 fn nvme_main() {
     // 读通用设备授权描述 (内核已映射到本域)。magic 不对 = 内核没授权 (无控制器), 优雅退出;
@@ -1075,6 +1205,12 @@ fn nvme_main() {
                     }
                 };
                 let is_read = opcode_low == BLOCK_OP_READ;
+                // AHCI 后端卷: I/O 一律经 IPC 转发给 ahci_srv (不走本域 NVMe 通路, 也不走缓存)。
+                if vol.backend == BACKEND_AHCI {
+                    let ok = ahci_rw(is_read, req.lba, req.count, req.buf);
+                    sys_reply(if ok { 1 } else { 0 });
+                    continue;
+                }
                 let opcode = if is_read { OP_READ } else { OP_WRITE };
                 let base_lba = vol.start_lba.saturating_add(req.lba as u32);
                 let total = req.count;
@@ -1142,6 +1278,22 @@ fn nvme_main() {
                 }
                 blk_cache_stats_tick();
                 sys_reply(if ok { 1 } else { 0 });
+            }
+            // AHCI 驱动把它的盘挂进卷层 (03b): **异步**通知, 故不回覆。
+            // 分配传输暂存页并同址共享给 ahci, 随后回调它做读写校验。
+            BLOCK_OP_ATTACH => {
+                if msg.from != AHCI_DOMAIN || unsafe { AHCI_VOL_COUNT } > 0 {
+                    continue;
+                }
+                if sys_alloc_page(AHCI_SCRATCH_VADDR) != 1
+                    || sys_share_page(AHCI_SCRATCH_VADDR, AHCI_DOMAIN) != 1
+                {
+                    println("block: ahci transfer page alloc/share FAILED");
+                    continue;
+                }
+                vol_push(0, 0, req.count as u32, VOL_KIND_UNKNOWN, BACKEND_AHCI);
+                ahci_attach_selftest(req.count as u32, unsafe { VOL_COUNT as u64 - 1 });
+                continue;
             }
             BLOCK_OP_LIST_VOLUMES => {
                 // 把卷描述符数组写进调用方共享页, 回复卷数。
@@ -1455,6 +1607,7 @@ fn ide_capacity_sectors() -> u32 {
 ///   0x16_0000           block_srv 卷扫描页 (本页)   ← 必须在 exFAT 预留段之上
 ///   0x16_1000           block_srv PRP 表页
 ///   0x16_2000           mfs 位图头块缓冲 (**mfs_srv 同址共享给 block_srv**)
+///   0x16_3000           AHCI 传输暂存页 (**block_srv 同址共享给 ahci_srv**, 03b)
 ///   0x20_0000           fat32 簇缓冲 (**fat32_srv 同址共享给 block_srv**)
 ///   0x30_0000..0x38_0000 block_srv 只读缓存数据页 (128 页, 私有)
 /// 新增固定地址时务必对照本表 —— 一旦与别人的共享页重叠, 「同地址共享」会因为
@@ -1494,16 +1647,33 @@ struct Volume {
     start_lba: u32,
     sectors: u32,
     kind: u32,
+    /// I/O 后端: 读/写经哪条驱动下发 (见 `BACKEND_*`)。NVMe/IDE 走本域自己的通路,
+    /// AHCI 走 `ahci_rw` (IPC 转发给 ahci_srv)。
+    backend: u8,
 }
+/// 卷后端标识。
+const BACKEND_NVME: u8 = 0;
+const BACKEND_AHCI: u8 = 1;
+const BACKEND_IDE: u8 = 2;
 const VOL_EMPTY: Volume = Volume {
     nsid: 0,
     start_lba: 0,
     sectors: 0,
     kind: VOL_KIND_UNKNOWN,
+    backend: BACKEND_NVME,
 };
 static mut VOLUMES: [Volume; VOL_MAX] = [VOL_EMPTY; VOL_MAX];
 static mut VOL_COUNT: usize = 0;
-fn vol_push(nsid: u32, start_lba: u32, sectors: u32, kind: u32) {
+
+/// AHCI 后端卷的备份副本 (上限 `AHCI_MAX`)。
+///
+/// 为什么另存一份: `vol_reset` 会因分区表重扫而整表清零, 但 AHCI 盘不参与 NVMe 分区扫描,
+/// 不该被连带丢掉 —— 重扫后由 `vol_ahci_reattach` 把它们重新挂回表尾。
+const AHCI_MAX: usize = 4;
+static mut AHCI_VOLS: [Volume; AHCI_MAX] = [VOL_EMPTY; AHCI_MAX];
+static mut AHCI_VOL_COUNT: usize = 0;
+
+fn vol_push(nsid: u32, start_lba: u32, sectors: u32, kind: u32, backend: u8) {
     let n = unsafe { VOL_COUNT };
     if n >= VOL_MAX {
         return;
@@ -1514,8 +1684,14 @@ fn vol_push(nsid: u32, start_lba: u32, sectors: u32, kind: u32) {
             start_lba,
             sectors,
             kind,
+            backend,
         };
         VOL_COUNT = n + 1;
+        // AHCI 卷另存一份, 供分区表重扫后重新挂回 (见 `AHCI_VOLS`)。
+        if backend == BACKEND_AHCI && AHCI_VOL_COUNT < AHCI_MAX {
+            AHCI_VOLS[AHCI_VOL_COUNT] = VOLUMES[n];
+            AHCI_VOL_COUNT += 1;
+        }
     }
 }
 
@@ -1533,6 +1709,23 @@ fn vol_reset() {
     }
 }
 
+/// 卷表重建 (NVMe 分区重扫) 后, 把此前挂上的 AHCI 后端卷重新追加到表尾。
+fn vol_ahci_reattach() {
+    let n = unsafe { AHCI_VOL_COUNT };
+    let mut i = 0usize;
+    while i < n {
+        let idx = unsafe { VOL_COUNT };
+        if idx >= VOL_MAX {
+            break;
+        }
+        unsafe {
+            VOLUMES[idx] = AHCI_VOLS[i];
+            VOL_COUNT = idx + 1;
+        }
+        i += 1;
+    }
+}
+
 /// 卷类型的可读名 (与 `VOL_KIND_*` 对应), 仅供卷表打印。
 fn vol_kind_name(kind: u32) -> &'static str {
     match kind {
@@ -1544,7 +1737,16 @@ fn vol_kind_name(kind: u32) -> &'static str {
     }
 }
 
-/// 打印卷表 (每卷一行 `vol: <卷号> nsid=<n> lba=<n> sectors=<n> kind=<名>`)。
+/// 卷后端的可读名 (与 `BACKEND_*` 对应), 仅供卷表打印。
+fn vol_backend_name(backend: u8) -> &'static str {
+    match backend {
+        BACKEND_AHCI => "ahci",
+        BACKEND_IDE => "ide",
+        _ => "nvme",
+    }
+}
+
+/// 打印卷表 (每卷一行 `vol: <卷号> nsid=<n> lba=<n> sectors=<n> kind=<名> backend=<名>`)。
 ///
 /// 启动诊断, 也是 `mkfs.mfs <卷号>` 唯一的信息来源: 卷号由卷层在启动时按扫描顺序
 /// 分配, 不打印出来就只能靠猜。`kind=unknown` 的卷是没格式化的 (可被 mkfs 接受)。
@@ -1565,7 +1767,9 @@ fn vol_print_table() {
         print(" sectors=");
         print_u64(v.sectors as u64);
         print(" kind=");
-        println(vol_kind_name(v.kind));
+        print(vol_kind_name(v.kind));
+        print(" backend=");
+        println(vol_backend_name(v.backend));
         i += 1;
     }
 }
@@ -1729,7 +1933,7 @@ fn vol_scan_gpt(
                     head,
                     phase,
                 );
-                vol_push(nsid, first as u32, sectors, kind);
+                vol_push(nsid, first as u32, sectors, kind, BACKEND_NVME);
             }
         }
         idx += 1;
@@ -1825,7 +2029,7 @@ fn vol_scan_namespace(
             head,
             phase,
         );
-        vol_push(nsid, 0, sectors, kind);
+        vol_push(nsid, 0, sectors, kind, BACKEND_NVME);
         return;
     }
     let mut k = 0usize;
@@ -1843,7 +2047,7 @@ fn vol_scan_namespace(
             head,
             phase,
         );
-        vol_push(nsid, start, count, kind);
+        vol_push(nsid, start, count, kind, BACKEND_NVME);
         k += 1;
     }
 }
@@ -2715,6 +2919,8 @@ fn part_reload_volumes(io: &mut NvmeIo, scratch: *mut u8) -> u64 {
         );
         i += 1;
     }
+    // 分区重扫只覆盖 NVMe 卷; 把此前挂上的 AHCI 后端卷重新追加回表尾。
+    vol_ahci_reattach();
     vol_print_table();
     unsafe { VOL_COUNT as u64 }
 }
@@ -2826,7 +3032,7 @@ fn ide_block_main() {
     // 容量向盘要 (ATA IDENTIFY DEVICE), 不再恒为「未知」—— 从前 `sectors = 0` 会让
     // MFS 首次格式化退回 16 MiB 默认尺寸, 整块 IDE 盘也只用得上一点点。
     let sectors = ide_capacity_sectors();
-    vol_push(0, 0, sectors, VOL_KIND_UNKNOWN);
+    vol_push(0, 0, sectors, VOL_KIND_UNKNOWN, BACKEND_IDE);
     // 卷表 (启动诊断): IDE 回退路径只有一个整盘卷; 问不到容量时 sectors=0。
     vol_print_table();
     loop {

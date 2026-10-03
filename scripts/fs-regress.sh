@@ -171,13 +171,15 @@ vblk_bad=0
 echo "== virtio-blk 驱动自测 (D3) =="
 grep -nE 'vblk:|VBLK1' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'VBLK1 virtio-blk OK.*sig=ok.*rw=ok' "$log" 2>/dev/null || vblk_bad=1
-# 驱动路线 D4: AHCI/SATA **只读**驱动 (域 18) —— IDENTIFY + LBA48 DMA 读扇区 0 校验宿主预写
-# 签名, 打 `AHCI1` marker。缺 marker (或 sig 不是 ok) 即判失败; "全程只读 (盘一字节未变)"
-# 由宿主 sha256 另行取证 (见 docs/plan-fs-streams.md §5)。
+# 驱动路线 D4: AHCI/SATA 驱动 (域 18) —— ① IDENTIFY + LBA48 DMA 读扇区 0 校验宿主预写签名
+# (`AHCI1`); ② 03b 起把盘**挂进 block_srv 的卷层** (`block: ahci volume attached`), 并经卷层
+# 转发做一次写回读自测 (`AHCI2`)。三者缺任一即判失败。
 ahci_bad=0
-echo "== AHCI/SATA 驱动自测 (D4) =="
-grep -nE 'ahci:|AHCI1' "$log" 2>/dev/null || echo "(无)"
+echo "== AHCI/SATA 驱动自测 + 卷层挂载 (D4/03b) =="
+grep -nE 'ahci:|AHCI1|AHCI2|block: ahci volume' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'AHCI1 ahci OK.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
+grep -qE 'block: ahci volume attached.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
+grep -qE 'AHCI2 ahci volume rw OK.*rw=ok' "$log" 2>/dev/null || ahci_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。

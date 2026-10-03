@@ -1,4 +1,4 @@
-//! 域 18 — 真机存储驱动 `ahci_srv`（驱动路线 **D4**：SATA/AHCI，第一版**只读**）。
+//! 域 18 — 真机存储驱动 `ahci_srv`（驱动路线 **D4**：SATA/AHCI）。
 //!
 //! 目的：像 [`crate::virtio_blk_srv`] 一样，拿 D1 的**通用设备授权**（声明式 PCI 查找 +
 //! BAR 映射 + 物理连续 DMA）驱动一台**新类型**设备，全程不改内核设备逻辑。
@@ -7,13 +7,17 @@
 //! Received FIS 都由驱动自己在 DMA 块里排版，且必须满足 **命令表 1 KiB、命令列表 1 KiB、
 //! FIS 256 B** 对齐（页对齐天然满足，见下方页布局）。
 //!
-//! **中断策略**：本仓库目前只有 MSI-X 一条中断通路（无 INTx、无 MSI 非 X），而 AHCI 常态用
-//! INTx/MSI —— 故第一版**全轮询**（`PxCI` / `PxIS`），不申请中断向量（内核声明里
+//! **中断策略**：本仓库目前只有 MSI-X 一条中断通路（无 INTx、无 MSI-X 以外的 MSI），而 AHCI
+//! 常态用 INTx/MSI —— 故**全轮询**（`PxCI` / `PxIS`），不申请中断向量（内核声明里
 //! `msix_vectors = 0`）。日后要走中断，需先补 MSI/INTx 通路（那要动内核中断层，不属本轮）。
 //!
-//! 自测：`IDENTIFY DEVICE` 判类型 / 取容量 → `READ DMA EXT`（LBA48）读扇区 0，校验宿主预写
-//! 的签名（`MORION-AHCI-TST!`）→ 打 `AHCI1 … sig=ok`。**只读**：全程不发写命令。
+//! **协议**（03b：接进块服务卷层）：启动自测（`IDENTIFY` + `READ DMA EXT` 校验宿主预写签名）
+//! 通过后，`BLOCK_OP_ATTACH` **异步**通知 block_srv 把这个盘登记成一个「AHCI 后端卷」；此后
+//! 本驱动进入服务循环，收发 block_srv 转来的读/写请求（`BlockReq`，`count ≤ 8` 扇区 = 一页）。
+//! 每笔 I/O 都自己 DMA 到私有数据页，再与 block_srv 共享进来的暂存页互拷 ——
+//! 上层文件系统完全不必知道这块盘挂在 AHCI 而不是 NVMe 上。
 
+use crate::common::*;
 use libdevice::grant::DeviceGrant;
 use libdevice::mmio::{fence, rd16, rd32, rd8, wr32, wr8};
 use morion::syscall::*;
@@ -65,8 +69,14 @@ const SSTS_DET_PRESENT: u32 = 3;
 const FIS_TYPE_H2D: u8 = 0x27;
 const ATA_IDENTIFY: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
+const ATA_WRITE_DMA_EXT: u8 = 0x35;
+/// `FLUSH CACHE EXT`：把写缓存刷到介质。写请求完成后紧跟一条，保证读回能看到刚写的数据。
+const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 const SECTOR: u32 = 512;
+/// 单笔 I/O 的扇区上限：私有数据页只有一页（见 `DATA_PAGE`），4096 / 512 = 8。
+/// block_srv 会把更大的请求按此上限切分后再发过来。
+const AHCI_MAX_SECTORS: u64 = 8;
 /// 轮询上限（每次让出 1 tick ≈ 10 ms，故上界 ≈ 20 s）。
 const POLL_MAX: u32 = 2000;
 
@@ -159,10 +169,11 @@ impl Ahci {
         wr32(cmd, rd32(cmd) | CMD_ST);
     }
 
-    /// 用命令槽 0 发一条**读方向**命令并**轮询**到完成；成功返回 `true`。
+    /// 用命令槽 0 发一条命令并**轮询**到完成；成功返回 `true`。
     ///
-    /// `cmd`：ATA 命令码；`lba`：LBA48 起始扇区；`sectors`：扇区数；`bytes`：DMA 字节数。
-    fn issue(&self, cmd: u8, lba: u64, sectors: u16, bytes: u32) -> bool {
+    /// `cmd`：ATA 命令码；`lba`：LBA48 起始扇区；`sectors`：扇区数；`bytes`：DMA 字节数
+    /// （`0` = 无数据传输，如 `FLUSH CACHE EXT`，此时不发 PRDT）；`write`：方向位（命令头 W）。
+    fn issue(&self, cmd: u8, lba: u64, sectors: u16, bytes: u32, write: bool) -> bool {
         // 清命令表 CFIS 区（64 B）与命令头槽 0（32 B）。
         let mut i = 0u64;
         while i < 16 {
@@ -194,14 +205,26 @@ impl Ahci {
         wr8(self.ct_va + 14, 0);
         wr8(self.ct_va + 15, 0);
 
-        // PRDT 项 0：DBA(8 B) + reserved(4 B) + DBC(4 B，bit31=0 不中断，值 = 字节数-1)。
-        wr32(self.ct_va + 0x80, (self.data_pa & 0xFFFF_FFFF) as u32);
-        wr32(self.ct_va + 0x84, (self.data_pa >> 32) as u32);
+        // PRDT：有数据传输才建一项 (DBA 8 B + reserved 4 B + DBC 4 B，值 = 字节数-1)。
+        // 无数据命令 (bytes == 0, 如 FLUSH) 时 PRDTL = 0，HBA 不读这一区 (先清零避免残留)。
+        wr32(self.ct_va + 0x80, 0);
+        wr32(self.ct_va + 0x84, 0);
         wr32(self.ct_va + 0x88, 0);
-        wr32(self.ct_va + 0x8C, bytes - 1);
+        wr32(self.ct_va + 0x8C, 0);
+        let prdtl = if bytes == 0 {
+            0u32
+        } else {
+            wr32(self.ct_va + 0x80, (self.data_pa & 0xFFFF_FFFF) as u32);
+            wr32(self.ct_va + 0x84, (self.data_pa >> 32) as u32);
+            wr32(self.ct_va + 0x8C, bytes - 1);
+            1u32
+        };
 
-        // 命令头槽 0：CFL = 5（FIS 20 B / 4）| PRDTL = 1；W=0（读方向）。
-        wr32(self.cl_va, 5u32 | (1u32 << 16));
+        // 命令头槽 0：CFL = 5（FIS 20 B / 4）| PRDTL；W = write（bit6）。
+        wr32(
+            self.cl_va,
+            5u32 | (prdtl << 16) | if write { 1u32 << 6 } else { 0 },
+        );
         wr32(self.cl_va + 0x04, 0); // PRDBC 由 HBA 回写
         wr32(self.cl_va + 0x08, (self.ct_pa & 0xFFFF_FFFF) as u32);
         wr32(self.cl_va + 0x0C, (self.ct_pa >> 32) as u32);
@@ -227,7 +250,83 @@ impl Ahci {
     }
 }
 
-/// 域 18 — ahci_srv：AHCI 只读驱动 + 自测（D4）。
+/// 把一段缓冲拷到另一段（`copy_nonoverlapping`；两段分属不同页，不会重叠）。
+fn copy_buf(dst: u64, src: u64, bytes: usize) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes);
+    }
+}
+
+/// 只在首次读写错误时打一行（避免刷屏：回归里 I/O 很密）。
+static mut RW_ERR_LOGGED: bool = false;
+fn rw_err(msg: &str, lba: u64, count: u64) {
+    unsafe {
+        if RW_ERR_LOGGED {
+            return;
+        }
+        RW_ERR_LOGGED = true;
+    }
+    print("ahci: ");
+    print(msg);
+    print(" lba=");
+    print_u64(lba);
+    print(" n=");
+    print_u64(count);
+    println("");
+}
+
+/// 服务一笔来自 block_srv 的读/写请求。
+///
+/// `lba`：盘内绝对 LBA（卷偏移已由 block_srv 合并）；`count`：扇区数（≤ `AHCI_MAX_SECTORS`）；
+/// `buf`：block_srv 共享进来的暂存页（同址映射到本域）。返回是否成功。
+fn serve_rw(a: &Ahci, write: bool, lba: u64, count: u64, buf: u64) -> bool {
+    if count == 0 || count > AHCI_MAX_SECTORS {
+        return false;
+    }
+    let bytes = (count as u32) * SECTOR;
+    if write {
+        // 暂存页 → 私有数据页 → 盘；随后 FLUSH 保证读回可见。
+        copy_buf(a.data_va, buf, bytes as usize);
+        if !a.issue(ATA_WRITE_DMA_EXT, lba, count as u16, bytes, true) {
+            rw_err("WRITE DMA EXT failed", lba, count);
+            return false;
+        }
+        if !a.issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, true) {
+            rw_err("FLUSH CACHE EXT failed", lba, count);
+            return false;
+        }
+        true
+    } else {
+        if !a.issue(ATA_READ_DMA_EXT, lba, count as u16, bytes, false) {
+            rw_err("READ DMA EXT failed", lba, count);
+            return false;
+        }
+        copy_buf(buf, a.data_va, bytes as usize);
+        true
+    }
+}
+
+/// 异步通知 block_srv「把这块盘挂进卷层」（`BLOCK_OP_ATTACH`，`count` = 容量扇区）。
+///
+/// 用 `send` 而非 `call`：block_srv 收到后会**回调**本驱动做读写校验（经 AHCI 后端），
+/// 若这里同步等回复就会自己把自己锁死（回调无人应答）。故异步通知，随后立即进服务循环。
+fn attach_to_block(cap_sectors: u64) -> bool {
+    let req = BlockReq {
+        op: BLOCK_OP_ATTACH as u64,
+        lba: 0,
+        count: cap_sectors,
+        buf: 0,
+    };
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const BlockReq as *const u8,
+            core::mem::size_of::<BlockReq>(),
+        )
+    };
+    sys_send_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
+}
+
+/// 域 18 — ahci_srv：AHCI 驱动 + 自测（D4）+ 块服务后端（03b）。
 pub fn run() {
     let g = DeviceGrant::load();
     if !g.is_valid() {
@@ -274,7 +373,7 @@ pub fn run() {
     a.start_port();
 
     // IDENTIFY DEVICE：判类型 + 取容量。
-    if !a.issue(ATA_IDENTIFY, 0, 0, SECTOR) {
+    if !a.issue(ATA_IDENTIFY, 0, 0, SECTOR, false) {
         println("ahci: IDENTIFY failed");
         idle();
     }
@@ -293,8 +392,8 @@ pub fn run() {
     print_u64(cap_sectors);
     println("");
 
-    // 自测：以 LBA48 READ DMA EXT 读扇区 0，校验宿主预写签名（全程只读）。
-    if !a.issue(ATA_READ_DMA_EXT, 0, 1, SECTOR) {
+    // 自测：以 LBA48 READ DMA EXT 读扇区 0，校验宿主预写签名。
+    if !a.issue(ATA_READ_DMA_EXT, 0, 1, SECTOR, false) {
         println("ahci: READ DMA EXT sector 0 failed");
         idle();
     }
@@ -309,7 +408,7 @@ pub fn run() {
         i += 1;
     }
 
-    // marker：只读链路（IDENTIFY + LBA48 DMA READ）的端到端取证。
+    // marker：只读链路的端到端取证（IDENTIFY + LBA48 DMA READ）。
     print("AHCI1 ahci OK, cap=");
     print_u64(cap_sectors);
     print(", sector0 sig=");
@@ -318,8 +417,33 @@ pub fn run() {
     print(if sig_ok { "ok" } else { "BAD" });
     println("");
 
-    // 驱动就绪后长驻：与其它常驻服务一致，保持域存活。
+    // 03b：把盘挂进 block_srv 的卷层（异步通知，随后回调做读写校验）。
+    if !attach_to_block(cap_sectors) {
+        println("ahci: attach to block_srv FAILED (send refused), idle");
+        idle();
+    }
+
+    // 服务循环：接收 block_srv 转来的 `BlockReq`（读/写），每笔轮询完成后再回复。
     loop {
-        sys_sleep(1000);
+        let mut msg = Message {
+            from: 0,
+            to: 0,
+            tag: 0,
+            payload: [0; PAYLOAD_LEN],
+        };
+        sys_recv_msg(&mut msg as *mut Message as *mut u8);
+
+        if msg.tag != BLOCK_REQ_TAG {
+            sys_reply(0);
+            continue;
+        }
+        let req: BlockReq =
+            unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
+        let ok = match (req.op & 0xFF) as u8 {
+            BLOCK_OP_READ => serve_rw(&a, false, req.lba, req.count, req.buf),
+            BLOCK_OP_WRITE => serve_rw(&a, true, req.lba, req.count, req.buf),
+            _ => false,
+        };
+        sys_reply(if ok { 1 } else { 0 });
     }
 }
