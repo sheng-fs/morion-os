@@ -36,7 +36,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3b）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层） |
+| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3c）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
@@ -55,7 +55,7 @@
   **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号、**D4** 扩到 **19** 给
   `ahci_srv`(18) 腾号（各表是 `Vec` 且按需增长，
   机制上可行；**boot 侧 `SERVICE_FILES`/模块表已同步**）。再加驱动时继续按需扩。
-- **没有网络驱动**（N0–N3b 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）+ **最小 IPv4 栈**（IPv4 头构造/解析 + ICMP echo 收发 + UDP，端到端 `NET2`）；TCP 未做。
+- **没有网络驱动**（N0–N3c 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）+ **最小 IPv4 栈**（IPv4 头构造/解析 + ICMP echo 收发 + UDP，端到端 `NET2`）+ **DHCP 客户端**（DISCOVER/OFFER/REQUEST/ACK，端到端 `NET3`）；TCP 未做。
 - **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码，E1a 只加了**探测**）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**（重映射域与拒绝取证 = E1b/E1c）。**→ 已由 E1b 落地**（建根表/上下文表 + 恒等二级页表、打开 `GCMD.TE`）与 **E1c**（目标设备窗口收成 `[0, 3 GiB)`、越界 DMA 被拒并留证）。
 - **没有 LibDevice**（D2 已解决首批）：`user/libdevice` 抽出 `grant`/`mmio`/`msix`，三个驱动共用；设备**语义**（vring 等）留 D2b 去重。
 - **没有飞地管理器**、没有 `create_enclave` 之类的内核原语。
@@ -187,6 +187,19 @@
   探针有界收手，超时字段标 `timeout`（绝不静默）。
 - 判据：串口出现上述 `NET2` 行且四段全成立；`NET1 … ARP reply OK` 不变；全量回归不退化。
 - 不做（明确排除）：IP 分片/重组、TCP、DHCP、多网卡、ARP 缓存老化。
+
+#### N3c — DHCP 客户端 ✅ 已完成
+- 目标：在**不新增服务 / 不新增 syscall / 不动公共文件**的前提下，给 `net_srv` 补 DHCP（实现全在
+  [`net_srv.rs`](../user/srv/src/net_srv.rs)）。
+- 做法：以太广播 + IPv4(`0.0.0.0`→`255.255.255.255`) + UDP `68→67` 上跑 `DHCPDISCOVER` → `DHCPOFFER` →
+  `DHCPREQUEST`（option 50 请求 IP + 54 服务端标识）→ `DHCPACK`，解析 `yiaddr` 与 option 1/3/6
+  （掩码 / 路由器 / DNS）；报文补齐到 BOOTP 经典最小 300 字节、`flags` 置广播位（尚未取得 IP，避免
+  服务端为回包发起 ARP）。DHCP 与随后的 ARP **串行复用同一 TX 页**（页 6），不额外占 DMA 页；
+  RX used 环消费游标由 `dhcp_acquire` 与主循环共用。取到租约后把写死的 `10.0.2.15`/`10.0.2.2`
+  换成运行期值（`our_ip()`/`gw_ip()`），失败回落默认值。
+- 取证：`net: DHCPDISCOVER sent (broadcast)` + `net: DHCPOFFER 10.0.2.15 from 10.0.2.2` +
+  `NET3 dhcp OK, ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3`；`NET1`/`NET2` 不变。
+- 不做（明确排除）：租约续约/过期、静态地址、多网卡、DHCPv6。
 
 ### D2 — LibDevice 双形态 ✅ 首批已完成（驱动底座）
 - 新 crate [`user/libdevice/`](../../user/libdevice)（`#![no_std]`，零依赖）：把**与"我在服务进程
@@ -330,7 +343,7 @@
 2. **N0 域表扩容**（✅ 已完成）：`BOOT_DOMAINS` 16 → 17 + boot 侧服务表同步 + `net_srv` 骨架。
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
-5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）；✅ **N3b** 最小 IPv4 栈（IPv4 头 + ICMP echo 收发 + UDP，端到端 `NET2`）。
+5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）；✅ **N3b** 最小 IPv4 栈（IPv4 头 + ICMP echo 收发 + UDP，端到端 `NET2`）；✅ **N3c** DHCP 客户端（DISCOVER/OFFER/REQUEST/ACK，端到端 `NET3`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。**D4** 真机存储驱动 `ahci_srv`（✅ 已完成，域 18，SATA/AHCI，全轮询、不申请中断；03b 起读+写并经 IPC 接进 `block_srv` 卷层）。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
@@ -355,6 +368,7 @@
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
 | N3b | 最小 IPv4 栈（IPv4 头构造/解析 + 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送）—— ✅ `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；`NET1 … ARP reply OK` 不变；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0 |
+| N3c | DHCP 客户端（DISCOVER/OFFER/REQUEST/ACK，option 1/3/6 解析；取租约后运行期换本机/网关地址）—— ✅ `NET3 dhcp OK, ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3`；`NET1`/`NET2` 不变；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0 |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
 | D4 | AHCI/SATA **只读**驱动落地（域 18），仍走通用授权、内核无设备专属逻辑；全轮询、不申请中断 —— ✅ `[OK] 19 service ELFs loaded` + `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`；宿主 `sha256sum build/ahci.img` 运行前后一致（只读；`dd … conv=notrunc` 预写签名）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0（隔离树验证：HEAD + 仅 03 补丁）；**收口后已把测试盘接进 Makefile 与标准回归**（`AHCI_IMG` 规则 + `scripts/fs-regress.sh` 判定 `AHCI1 … sig=ok`），不再需要手工 `QEMU_EXTRA` | ✅ |
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |

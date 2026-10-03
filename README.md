@@ -50,7 +50,7 @@
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**块层只读扇区缓存 + 顺序预读**（4 KiB/行 × 240 行 = 960 KiB，键含卷号、写穿透 + 按区间失效，对上层透明；实测回归命中率 ≈80%）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路；**02b-2**：驱动侧批量提交 + 等完成（`nvme_batch_rw` 一次敲铃发 K 条 SQE 再统一等 K 个 CQE + `BLOCK_OP_BATCH_READ/WRITE` 协议 + MFS 写回 16 页暂存窗）→ 全量回归 258 s → 133 s；**02b-2 续**：完成路径默认轮询（`NVME_POLL_FIRST`）+ 时钟 tick 100→500 Hz → 再降到 **33 s（3.6×）**；**1000 Hz**：修掉启动期 sender/receiver 握手竞态后 tick 500→1000 Hz → **23 s**（较 02b-2 前 258 s 共约 11×） |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，接管后内核终端不再写屏（输出只留 COM1）。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功（自测 GS-1，已肉眼确认画面）。**G3a** 文本渲染外移：字库（ASCII 8×16 + 汉字 16×16 `cjk.bin` ≈276 KB）与终端状态（光标/换行/滚动/清屏，按**显示列**排版）从内核搬到 [`gfx/`](./user/srv/src/gfx/)，新协议 `GFX_OP_TEXT/CLEAR/MOVE/QUERY`，落笔**逐像素写后回读**校验（自测 GT-1 断言 ASCII 5 列 / 汉字 10 列）。**G3b** shell 输出上屏：新增 `SYS_CONSOLE_READY(47)`，`libmorion` 的打印出口 `sink()` 支持按进程**镜像**一份到屏幕控制台（只有 shell 开），shell 的横幅/中文欢迎语/命令输出同时进串口与屏幕。**G3c** 内核卸掉汉字字库（−276 KB，内核 ELF 347 KB → 69 KB），终端降为 ASCII + 豆腐块，汉字渲染只在用户态。**G4** 输入搬出内核：新增 `SYS_KEY_PUSH(48)/SYS_KEY_READ(49)` 键字节队列（内核只做搬运），行编辑/回显落客户端库 `morion::console::readline`，内核侧输入机件全部删除、终端降为只输出。**G6** 服务自愈：`ipc::call` 不再永久挂起（超时 + 目标无存活任务即失败）+ 帧缓冲登记内核保留区间 + 重启丢弃目标邮箱旧请求 + 客户端重建共享会话 + `gfx_srv` 纳入 init 监督（自测 GS-2）。内核文本控制台仅剩引导期与 panic 输出 |
-| 网络 / 虚拟化 / 飞地 / 包管理 | 🚧 进行中 | **网络**：`net_srv` virtio-net 驱动已跑通，做过 ARP + 最小 IPv4 栈（IPv4/ICMP echo/UDP）端到端自测，TCP 未做；**飞地**：IOMMU/VT-d 硬件隔离已做（E1c 起目标设备窗口受限、越界 DMA 被拒并留证），飞地管理器 E2/E3 未做；**虚拟化与包管理**：设计已定，尚无实现 |
+| 网络 / 虚拟化 / 飞地 / 包管理 | 🚧 进行中 | **网络**：`net_srv` virtio-net 驱动已跑通，做过 ARP + 最小 IPv4 栈（IPv4/ICMP echo/UDP）+ DHCP 端到端自测，TCP 未做；**飞地**：IOMMU/VT-d 硬件隔离已做（E1c 起目标设备窗口受限、越界 DMA 被拒并留证），飞地管理器 E2/E3 未做；**虚拟化与包管理**：设计已定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
 
 > 快速上手：构建与运行命令见 [docs/commands.md](./docs/commands.md)；
@@ -252,7 +252,7 @@
 │           ├── exfat_srv.rs  #     域 13 exFAT 读写
 │           ├── init.rs       #     域 14 监督者 (巡检服务域, 退出后用内存镜像原地重启)
 │           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端)
-│           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N3b: MSI-X 中断 + ARP + 最小 IPv4/ICMP/UDP 自测)
+│           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N3c: MSI-X 中断 + ARP + 最小 IPv4/ICMP/UDP + DHCP 自测)
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
 │           ├── ahci_srv.rs   #     域 18 AHCI/SATA 驱动 (D4: 通用授权, 全轮询; 03b: 读+写并经 IPC 接进块服务卷层)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
@@ -388,7 +388,7 @@
 - [x] **运行期设备授权（D1b）**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` + `Mmio` 能力门禁；NVMe / `net_srv` / `virtio_blk_srv` 经运行期 syscall 取得 `DeviceGrant`，行为零变化，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 D1b）
 - [x] **真机存储驱动（AHCI/SATA）**（`ahci_srv` 域 18，仍走通用设备授权、内核无设备专属逻辑：D4 —— `IDENTIFY` + LBA48 DMA 读扇区 0 校验签名，全轮询不申请中断；**03b** —— 自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层，读/写经 IPC 转发（`WRITE DMA EXT` + `FLUSH CACHE EXT`），`block: ahci volume attached … sig=ok` + `AHCI2 … rw=ok`）
 - [x] **权限与多用户（04b）**（MFS 元数据 `+32` 存 uid/gid、不升 magic；`mfs_srv` 内按发起域静态映射身份做 rwx 强制 + `chown` + `MFS_E*` 错误码；`exec::spawn_elf` 给运行期程序授最小文件系统能力，FS-34..37 端到端验证低权（uid 1000）拒绝路径，见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)）
-- [x] **最小 IPv4 协议栈（N3b）**（纯 `net_srv` 内、不加服务不改公共文件：IPv4 头构造/解析 + RFC 1071 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送。端到端 `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；TCP 未做，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N3b）
+- [x] **最小 IPv4 协议栈 + DHCP 客户端（N3b/N3c）**（纯 `net_srv` 内、不加服务不改公共文件：IPv4 头构造/解析 + RFC 1071 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送。端到端 `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；**N3c** DHCP 客户端 DISCOVER/OFFER/REQUEST/ACK，端到端 `NET3 dhcp OK, ip=… mask=… gw=… dns=…`；TCP 未做，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N3b/N3c）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎
 
 ### 阶段五 — GUI 与生态（未开始）

@@ -72,6 +72,13 @@
   （RFC 1071 校验和 + 拒分片）、ICMP echo（发 request 收 reply + 收 request 回 reply）、UDP 构造·发送
   （slirp 对未监听端口回 ICMP 端口不可达作副证据）；IP 帧走独立 TX 页串行复用，网关 MAC 从 ARP 应答取。
   端到端 `NET2 ipv4/icmp OK, …`；TCP / DHCP / 多网卡 / 分片重组未做。
+- **`net_srv` DHCP 客户端（N3c）**：纯 `net_srv` 内（不加服务 / 不改公共文件）—— 以太广播 + IPv4
+  (`0.0.0.0`→`255.255.255.255`) + UDP `68→67` 上跑 `DHCPDISCOVER` → `DHCPOFFER` → `DHCPREQUEST`
+  （option 50 请求 IP + 54 服务端标识）→ `DHCPACK`，解析 `yiaddr` 与掩码 / 路由器 / DNS；报文补齐到
+  BOOTP 最小 300 字节、`flags` 置广播位；DHCP 与随后的 ARP 串行复用同一 TX 页。取到租约后把写死的
+  `10.0.2.15`/`10.0.2.2` 换成运行期值（失败回落）。端到端
+  `NET3 dhcp OK, ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3`；`NET1`/`NET2` 不变。
+  不做：租约续约 / 过期、静态地址、多网卡、DHCPv6。
 - **MFS 元数据读批量化评估（02b-3，结论：不实现）**：量化后 GC 遍历读 = 0、可批的「扇形展开」读仅
   234 / 16384 条命令（<1% 收益），其余是数据依赖的串行链（下一块号依赖上一块读回）；故不做批量化，
   计数插桩已回滚，行为零变化。
@@ -80,8 +87,8 @@
 
 ### 文档
 
-- `docs/dev-reference.md` §9 阶段进度表补齐 **74–85 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
-- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
+- `docs/dev-reference.md` §9 阶段进度表补齐 **74–86 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz / N3c）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
+- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b / N3c 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
 
 ## [0.4.0-nogui] — 2026-10-01
 
