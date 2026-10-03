@@ -38,6 +38,20 @@ pub const CAP_TOKEN: u64 = 0x5A5A_1234_5678_9ABC;
 /// `sender` 通知 `receiver`「新句柄已就绪」的 tag 基数: 低 8 位放句柄索引。
 pub const CAP_HANDLE_TAG: u64 = 0xCA00;
 
+/// sender/receiver 自测的**启动握手** (方案 A): receiver 的「启动时零能力」负例跑完后,
+/// 才允许 sender 委派 `SendTo(3)`。
+///
+/// 动机: 那条负例的前提「receiver 启动时零能力」原本依赖调度顺序 —— sender (域 0) 比
+/// receiver (域 1) 先起跑, 且在 1000 Hz 下「sender 委派」会与「receiver 的负例」赛跑,
+/// 约 18% 的启动里委派抢先 (见 `docs/dev-reference.md` §9 第 83 行)。改成显式握手后,
+/// 顺序由同步而非时间片决定: sender 先发 [`RECV_HANDSHAKE_TAG`] 并阻塞, receiver 跑完
+/// 负例后回 [`RECV_HANDSHAKE_ACK`]。
+///
+/// receiver 在回 ack 时**仍是零能力** —— 内核对 `reply` 不查 `SendTo` (回复目标由内核在
+/// `recv` 时记录), 所以这次握手不削弱「零能力启动」这个前提。
+pub const RECV_HANDSHAKE_TAG: u64 = 0x5243_4853; // "RCHS"
+pub const RECV_HANDSHAKE_ACK: u64 = 0x5243_4854; // "RCHT"
+
 /// echo 的控制消息 (E3c): 收到就退出。
 ///
 /// 让"服务实例崩溃/退出"这件事可以被**从外部触发** —— 监督者 `init` 的巡检与自测 FS-29

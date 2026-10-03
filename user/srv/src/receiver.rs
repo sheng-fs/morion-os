@@ -11,6 +11,18 @@ pub fn run() {
         println("receiver: call echo WITHOUT capability unexpectedly OK FAILED");
     }
 
+    // 启动握手 (方案 A): 负例跑完才允许 sender 委派 `SendTo(3)`。
+    // 内核对 `reply` 不查 SendTo 能力 (回复目标由 `recv` 时记录), 故 receiver 此刻
+    // 仍零能力也能回这条 ack —— 握手不削弱「零能力启动」这个前提。
+    // 缺了它, 「委派」与「本负例」就只靠时间片排序: sender (域 0) 先起跑, 1000 Hz
+    // 下约 18% 的启动会委派抢先 (见 `docs/dev-reference.md` §9 第 83 行)。
+    let tag = sys_recv();
+    if tag != RECV_HANDSHAKE_TAG {
+        println("receiver: startup handshake tag FAILED");
+    } else {
+        sys_reply(RECV_HANDSHAKE_ACK);
+    }
+
     // 等 sender 通知共享页就绪。
     let tag = sys_recv();
     if tag != 777 {

@@ -159,7 +159,9 @@ pub extern "C" fn kernel_main() -> ! {
     arch::pic::init();
     arch::pit::init();
     arch::keyboard::init();
-    video::println("[OK] PIC remapped + PIT timer started (500 Hz)");
+    video::print("[OK] PIC remapped + PIT timer started (");
+    video::print_u64(arch::pit::TARGET_FREQ as u64);
+    video::println(" Hz)");
 
     // ============================================================
     //  阶段 4.5: PCI 枚举 (文件系统阶段 0)

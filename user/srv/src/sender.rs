@@ -4,6 +4,14 @@ use morion::syscall::*;
 /// 域 0 — 发送者: 持有 SendTo(1) + MapInto(1) + SendTo(3) 能力, **不持有** SendTo(2)。
 /// 成功路径保持静默 (避免刷屏), 仅失败时打印。
 pub fn run() {
+    // 启动握手 (方案 A): 先等 receiver 跑完「启动时零能力」负例, 再往下走。
+    // 否则「sender 委派 SendTo(3)」(域 0 先起跑) 会与「receiver 的负例」赛跑,
+    // 1000 Hz 下约 18% 的启动里委派抢先 (见 `docs/dev-reference.md` §9 第 83 行)。
+    // receiver 此刻零能力, 但 `reply` 走内核记录的回复目标, 不需要 SendTo 凭证。
+    if sys_call(1, RECV_HANDSHAKE_TAG) != RECV_HANDSHAKE_ACK {
+        println("sender: receiver startup handshake FAILED");
+    }
+
     // 共享内存演示: 申请一页 → 写入 → 共享给域 1 → IPC 通知。
     let page = SHARED_PAGE;
     if sys_alloc_page(page) != 1 {
