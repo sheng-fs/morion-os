@@ -254,7 +254,7 @@
 │           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端)
 │           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N3: MSI-X 中断 + ARP 自测)
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
-│           ├── ahci_srv.rs   #     域 18 AHCI/SATA 只读驱动 (D4: 通用授权, IDENTIFY + LBA48 DMA 读自测, 全轮询)
+│           ├── ahci_srv.rs   #     域 18 AHCI/SATA 驱动 (D4: 通用授权, 全轮询; 03b: 读+写并经 IPC 接进块服务卷层)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
 │           └── bin/          #     19 个入口 (每个写 morion_main → 对应模块 run())
@@ -386,7 +386,8 @@
 - [x] **网卡驱动（virtio-net）**（`net_srv` 域 16 + 通用设备授权，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N0–N3：virtio-modern bring-up + MSI-X 中断收帧 + ARP 端到端自测）
 - [x] **第二个真实驱动（virtio-blk）**（`virtio_blk_srv` 域 17，仍走通用设备授权、内核无设备专属逻辑：D3 —— 读签名 / 写读回自测）
 - [x] **运行期设备授权（D1b）**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` + `Mmio` 能力门禁；NVMe / `net_srv` / `virtio_blk_srv` 经运行期 syscall 取得 `DeviceGrant`，行为零变化，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 D1b）
-- [x] **真机存储驱动第一版（AHCI/SATA 只读）**（`ahci_srv` 域 18，仍走通用设备授权、内核无设备专属逻辑：D4 —— `IDENTIFY` + LBA48 DMA 读扇区 0 校验签名；第一版全轮询不申请中断，写路径/接进卷层留后续）
+- [x] **真机存储驱动（AHCI/SATA）**（`ahci_srv` 域 18，仍走通用设备授权、内核无设备专属逻辑：D4 —— `IDENTIFY` + LBA48 DMA 读扇区 0 校验签名，全轮询不申请中断；**03b** —— 自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层，读/写经 IPC 转发（`WRITE DMA EXT` + `FLUSH CACHE EXT`），`block: ahci volume attached … sig=ok` + `AHCI2 … rw=ok`）
+- [x] **权限与多用户（04b）**（MFS 元数据 `+32` 存 uid/gid、不升 magic；`mfs_srv` 内按发起域静态映射身份做 rwx 强制 + `chown` + `MFS_E*` 错误码；`exec::spawn_elf` 给运行期程序授最小文件系统能力，FS-34..37 端到端验证低权（uid 1000）拒绝路径，见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎
 
 ### 阶段五 — GUI 与生态（未开始）

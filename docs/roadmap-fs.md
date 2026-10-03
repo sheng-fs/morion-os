@@ -1844,20 +1844,39 @@ mfs: refuse to mount: on-disk magic MFS7 (1296454455) != expected MFS8 (12964544
 
 复查安排在**另一轮启动**里，因此同时证明修复已落盘。
 
-### 权限与多用户设计（04）—— 设计稿，待实现
+### 权限与多用户（04 设计稿 / 04b 实现）✅ 已完成
 
 > **2026-10-02**：权限强制必须落在文件服务内部（`mfs_srv` 的每个 open/read/write 前），
-> 而 `mfs_srv.rs` 在本轮四条并行流中归 01 独占，故 04 **只交设计 + 接口草案**，实现顺延为 04b。
-> 任务书见 [plan-fs-streams.md](plan-fs-streams.md) §3「04」，设计稿见
-> **[design-permissions.md](design-permissions.md)**。
+> 而 `mfs_srv.rs` 在四条并行流里归 01 独占，故 04 只交设计 + 接口草案（见
+> **[design-permissions.md](design-permissions.md)**，任务书 [plan-fs-streams.md](plan-fs-streams.md) §3「04」）；
+> 实现随后由 **04b** 落地（下节）。
 
-- 现状边界：`chmod` 只存不判（`mfs_srv.rs:3428-3459`）、`owner` 存创建者域号而非 uid、无 gid；
-  `mode` 唯二用途都是显示。内核侧「能力即句柄」已在 I/O 路径落地，但**没有身份概念**。
+- 现状边界（04 时）：`chmod` 只存不判、`owner` 存创建者域号而非 uid、无 gid；`mode` 唯二用途都是显示。
+  内核侧「能力即句柄」已在 I/O 路径落地，但**没有身份概念**。
 - 设计要点（详见设计稿）：身份用 `(uid, gid)`，两阶段落地（04b 静态「域号 → 凭证」表 → 目标形态认证服务签发）；
   **uid/gid 放进元数据 `+32` 保留区，不升 magic、不改布局**，`owner` 保留原义，与 01 的 magic 策略零冲突；
   新增 `MFS_E*` 错误码波段区分 `EACCES`/`EPERM`；能力（内核、对象可达性）在前，权限位（服务内、身份判定）在后且为最终权威。
-- 后续（04b）：`mfs_check_access` + 各检查点接线 + `chown` tag + 客户端错误码映射 + `FS-34..37` 自测；
-  同样等 01 合入后再动 `mfs_srv.rs`。
+
+**04b 实现（已完成）**：
+
+- **身份**：`mfs_srv` 内静态表按**发起域** `msg.from` 现算 `Cred` —— `id < BOOT_DOMAINS(19)`（引导期服务域）
+  → `uid 0 / gid 0`；`id >= 19`（运行期新建域）→ `uid 1000 / gid 1000`。请求消息**不携带** uid/gid，
+  防伪造；映射是确定性函数，天然免疫"域号复用继承旧身份"。
+- **落盘**：元数据 `+32 uid / +34 gid`（各 u16），**不升 magic**；`creat`/`mkdir`/`symlink` 写入发起者身份；
+  老盘该处为 0 → 旧文件全归 root（有意取舍，`chown` 或 `mkfs.mfs` 两条处置路径）。
+- **判定**：`mfs_check_access`（uid 0 直通；user→group→other）+ 检查点接入 OPEN/READ/WRITE/READDIR/
+  CREAT/MKDIR/UNLINK/RMDIR/TRUNCATE/RENAME/LINK/SYMLINK/CHMOD/STAT/LSTAT/READLINK 与新增 **CHOWN**；
+  `open` 时判一次并把权限快照记进 `MfsFd`（Unix 语义），路径类操作每次重判；目录语义含 `X` 穿越与 sticky 位。
+- **错误码**：`MFS_E*`（高 16 位 `0xFFFF` 波段）区分 `EACCES`/`EPERM`/`ENOENT`…；客户端在 `vfs.rs` 统一
+  归一化回 `u64::MAX`（保持"失败 = `u64::MAX`"契约，避免大整数错误码被当成功字节数），原始码经
+  `mfs_last_errno()` 读出。
+- **接口**：`MFS_CHOWN_TAG`（"CHOW"）+ `vfs::chown`；`Stat`/`DirEntry` 增 `uid`/`gid`；shell 加
+  `chown <uid>:<gid> <path>`，`ls -l`/`stat` 显示 uid/gid。
+- **内核**：为让**运行期新建域**能访问文件系统（原来 spawn 出来的域零能力、连 `open` 都发不出去），
+  `exec::spawn_elf` 给子域授最小能力面 `SendTo(mount_srv)` / `SendTo(mfs_srv)` / `MapInto(mfs_srv)`。
+- **自测 FS-34..37**：app 以 root 造夹具 → `spawn_file` 一个**新域**里的 `user/hello`（uid 1000）跑用例
+  （`perm.go` 开关控制），hello 把 4 位结果写 `/mfs/pub/perm.result` 由 app 读回断言。
+- **演进项（不在 04b）**：认证服务签发 `Cred`、域销毁时内核通知清凭证表、附加组 / ACL、`setuid` 位。
 
 ### 阶段 02 — 块层性能（只读扇区缓存 + 顺序预读）✅ 已完成
 
@@ -1889,12 +1908,49 @@ mfs: refuse to mount: on-disk magic MFS7 (1296454455) != expected MFS8 (12964544
 
 **未做**：不改任何 FS 服务；不做写回（write-back）缓存（不引入掉电一致性）；不新增 opcode。
 
+**02b 实现 —— 目录项索引缓存（已完成）**
+
+动机：`mfs_dir_lookup` 每次都要读「节点块 + (如有) 索引块 + 逐扩展块」，而每次 `mfs_read_blk` 都是一次到
+`block_srv` 的 IPC（≈1 tick ≈10 ms）；FS-12 那种「200 项目录逐项 open」因此是 O(n²) 次块 IPC。
+
+实现（`user/srv/src/mfs_srv.rs`）：
+
+- 按 `(卷号, 目录 ino)` 把目录条目解析成内存表：首次查找时一次性遍历（节点块 + 索引块 + 各扩展块），
+  存 `name -> (条目所在块, 块内偏移)`；之后查找是**纯内存比对，零 block_srv IPC**。
+- 8 个目录槽 × 8 KiB arena（变长打包 `[blk u32][off u16][name_len u8][name…]`），满则 clock 淘汰；
+  arena 装不下 / 结构可疑的目录标记**不完整**，未命中一律**回退线性扫描** —— 绝不把"没缓存"当"不存在"。
+- 失效：`mfs_itab_set`（唯一改 inode 表槽的漏斗：目录内容改动 / chmod / chown / 删除 / ino 复用）、
+  `mfs_itab_reload`（挂载 / **快照回滚** —— 回滚会整张换 ino→块映射）、`mfs_gc`（搬块）、`mfs_format`，
+  分别让对应目录或整表失效。
+- 计数：每 4096 次查找打印 `mfs-didx: lookups=… hits=… builds=… evict=… entries=…`。
+- 构建期开关 `MFS_DIDX_ENABLED`（默认 `true`）用于 before/after 对照。
+
+实测（同一台机器 `OUT_DIR=build bash scripts/fs-regress.sh`，唯一变量 = 该开关）：
+
+| 构建 | 总耗时 | 判定 |
+|---|---|---|
+| before（关闭） | **274 s** | SELFTEST DONE=1，FAILED/PANIC=0 |
+| after（开启） | **259 s** | SELFTEST DONE=1，FAILED/PANIC=0 |
+
+一次 after 运行：`mfs-didx: lookups=4096 hits=3377 builds=1198 evict=691`（命中率 ≈ **82%**）。
+
+**说明**：提升有限（≈5.5%，before/after 各只跑 1 次、未取平均）—— 标准回归里目录查找只占一小部分，
+**剩下的大头仍是每请求一跳 IPC**（与目录无关），那正是 02b-2（请求批量化）的动机。目录密集的负载
+（FS-12 200 项逐项 open）受益更明显，但它在整轮里占比不高。
+
+**未做（02b-2）**：请求批量化（把"每操作一跳 IPC"降下来）—— 需改协议 / 客户端 / 调用方，另立一轮。
+
+**坑（实现时踩到）**：快照**回滚**（`MFS_SNAPRESTORE`）会把 `MFS_ITAB` 整张换成快照那一版并
+`mfs_itab_reload()`，**不经过 `mfs_itab_set`** —— 第一版只在后者的失效导致 FS-10 的 `unlink` 被误判
+"不存在"（缓存里是回滚前的块偏移）。钩子补进 `mfs_itab_reload` 后修复。这正是"只缓存 (块, 偏移) 就必须
+穷举所有换块路径"的教训。
+
 ### 阶段 4 — 远期
 
 > **2026-10-02 拆分**：本阶段的能力缺口已拆成**四条并行流**（01 健壮性收口 / 02 块层性能 /
 > 03 真机存储驱动 / 04 权限与多用户设计），任务书、文件互斥矩阵与验收口径见
-> [plan-fs-streams.md](plan-fs-streams.md)；并行协作的环境与起步提示词见仓库根 `HANDOFF-FS.md`
-> （本地临时，不入库）。本节下面两条保留为更远期的方向。
+> [plan-fs-streams.md](plan-fs-streams.md)；环境准备、回归门禁与并行协作见
+> [dev-workflow.md](dev-workflow.md)。本节下面两条保留为更远期的方向。
 
 - 卷管理器服务化（把分区/卷元数据从 block_srv 抽出为独立服务）。
 - exFAT/NTFS/ISO9660 之外的更多文件系统（读写 ext4、HFS+、UDF）。

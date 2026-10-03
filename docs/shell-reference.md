@@ -43,7 +43,8 @@ shell: type 'help' for commands
 | `mv` | `mv <src> <dst>` | 重命名 / 移动（同一次请求内跨目录；**不支持跨文件系统**） |
 | `ln` | `ln <file> <new-name>` | 给已有文件再加一个名字（**硬链接**；同文件系统、仅限文件） |
 | `ln -s` | `ln -s <target> <link-name>` | 建**软链接**（M5c；仅 MFS；目标原样存，可悬空） |
-| `chmod` | `chmod <octal-mode> <path>` | 设置权限位（仅 MFS 提供；只存储与显示，**不强制**） |
+| `chmod` | `chmod <octal-mode> <path>` | 设置权限位（仅 MFS；04b 起**参与访问判定**，仅属主或 uid 0 可改） |
+| `chown` | `chown <uid>:<gid> <path>` | 改属主 / 属组（仅 MFS；只有 uid 0 能成功） |
 | `truncate` | `truncate <file> <size>` | 把文件截断/扩展到 `<size>` 字节（扩展为稀疏） |
 | `stat` | `stat <path>` | 打印权限 / 属主 / 链接数 / 大小 / 时间（**跟随**软链接） |
 | `lstat` | `lstat <path>` | 同 `stat`，但作用于**链接自身**（不跟随；悬空链接也能看） |
@@ -85,7 +86,8 @@ commands:
   mv <src> <dst> rename / move (same filesystem)
   ln <src> <dst> hard link an existing file (same filesystem)
   ln -s <target> <name>  symbolic link (target kept verbatim; MFS only)
-  chmod <mode> <path>  set permission bits (octal, display-only)
+  chmod <mode> <path>  set permission bits (octal; enforced since 04b)
+  chown <uid>:<gid> <path>  change owner/group (MFS; uid 0 only)
   truncate <file> <size>  resize a file (sparse on grow)
   stat <path>    show metadata (mode / owner / links / times)
   lstat <path>   like stat but on the link itself (no follow)
@@ -118,10 +120,10 @@ commands:
 ### `ls [-l] [path]`
 
 - 短格式每条目一行：目录 `[DIR]  NAME`，文件 `[FILE] NAME  size=<字节>`。
-- `-l` 长格式：`<类型+权限> owner=<域id> links=<n> size=<宽度8>  <YYYY-MM-DD HH:MM>  NAME`。
+- `-l` 长格式：`<类型+权限> owner=<域id> uid=<uid> gid=<gid> links=<n> size=<宽度8>  <YYYY-MM-DD HH:MM>  NAME`。
   权限串形如 `-rw-r--r--`（目录首位为 `d`）；元数据由文件服务的 `readdir` 一并回传，
   故 `-l` **不产生额外 IPC**。非 MFS 的服务只填默认值（权限按目录/文件给 0755/0644、
-  属主 0、链接数 1、时间 `(unknown)`）。
+  `owner/uid/gid` 0、链接数 1、时间 `(unknown)`）。
 - 名字优先用**长名**（VFAT LFN / ext2 名字 / MFS 名字），没有则回退 8.3 短名。
 - 错误：
   - `ls: path too long` — 拼出的绝对路径超过内部缓冲
@@ -216,8 +218,19 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 - `<octal-mode>` 是八进制权限（如 `644`、`755`、`1777`，低 12 位有效）。
 - 成功打印 `chmod: mode=<十进制> <path>`；非法的 mode：`chmod: bad mode: <mode>`。
 - 失败：`chmod: failed: <path>`。
-- **当前只存储与显示，不做访问判定**（系统还没有多用户概念）。非 MFS 的服务不支持，
-  会返回失败。
+- **04b 起权限位参与访问判定**：仅**节点属主**或 `uid 0` 可改（否则服务回 `EPERM`）。
+  shell 身份受引导期静态表影响 —— 引导期服务域（含 shell 自己）= `uid 0`，故这里的
+  `chmod` 实际总是被放行；低权身份（运行期新建域 = `uid 1000`）才会被拒。
+- 非 MFS 的服务不支持，会返回失败。
+
+### `chown <uid>:<gid> <path>`
+
+- 改文件 / 目录 / 软链接的**属主 uid** 与**属组 gid**（仅 MFS）。
+- 成功打印 `chown: <path> -> <uid>:<gid>`；非法参数：`chown: bad uid` / `chown: bad gid`。
+- 失败：`chown: failed (uid 0 required): <path>` —— 04b 最小实现里**只有 `uid 0`** 能改
+  （演进项：属主可把自己文件的 gid 改到所属组）。
+- 用途：老 MFS8 盘的 `uid/gid` 为 0（旧文件全归 root），把目录/文件 `chown` 给低权用户即可
+  让运行期程序读写；`mkfs.mfs` 是另一条处置路径（重建文件系统）。
 
 ### `truncate <file> <size>`
 
@@ -231,10 +244,11 @@ exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 1
 
 ### `stat <path>`
 
-- 打印 `File / Type / Mode / Owner / Links / Size / Modify / Change` 各行。
+- 打印 `File / Type / Mode / Owner / Uid / Gid / Links / Size / Modify / Change` 各行；
+  `Owner` 是创建者**域号**（诊断用），`Uid`/`Gid` 是访问判定用的属主身份（04b）。
 - 时间格式 `YYYY-MM-DD HH:MM`（UTC，来自 CMOS RTC）；未知时间打印 `(unknown)`。
 - 失败：`stat: cannot stat <path>`。
-- 非 MFS 的服务返回默认值（权限 0755/0644、属主 0、链接数 1、时间未知）。
+- 非 MFS 的服务返回默认值（权限 0755/0644、属主/uid/gid 0、链接数 1、时间未知）。
 - **跟随软链接**：`stat link` 打印的是目标文件的信息。
 
 ### `lstat <path>`

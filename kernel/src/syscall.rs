@@ -134,7 +134,7 @@ pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 // 并行开发接线层: 号段预留
 // ---------------------------------------------------------------------------
 // 下面三个号在 `syscall.rs` 里**只占号 + 转发**, 实现各自落在自己的模块里 —— 这样并行推进
-// 这三条任务时不会同时改同一个文件 (见仓库根 `HANDOFF.md` 第 3/4 节)。
+// 这三条任务时不会同时改同一个文件 (见 docs/dev-workflow.md 的「并行协作」)。
 
 /// **预留** `SYS_UNAME` (V1 版本串): 实现在 [`crate::version`]。
 pub const SYS_UNAME: u64 = 51;
@@ -809,7 +809,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_DOMAIN_COUNT => crate::domain::alive_count() as u64,
         SYS_FRAME_FREE => crate::memory::frame_allocator::free_frames() as u64,
-        // 并行开发接线层: 三条转发臂, 实现分散在各自模块 (见 HANDOFF.md)。
+        // 并行开发接线层: 三条转发臂, 实现分散在各自模块 (见 docs/dev-workflow.md)。
         SYS_UNAME => crate::version::handle(a1, a2, a3),
         SYS_DEVICE_INFO => crate::device::syscall_info(a1, a2, a3),
         SYS_DEVICE_GRANT => crate::device::syscall_grant(a1, a2, a3),

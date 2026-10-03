@@ -1,7 +1,7 @@
 # MFS 权限与多用户——设计与接口草案（04）
 
 > 本文件是**设计稿**，不含实现代码。对应的任务书见 [plan-fs-streams.md](plan-fs-streams.md) §3「04」，
-> 并行协作约定见仓库根 `HANDOFF-FS.md`（本地临时，不入库）。
+> 并行协作约定见 [dev-workflow.md](dev-workflow.md)。
 > 行号锚点基于 2026-10-02 工作区状态，只作定位用；实现（04b）时须重读确认。
 > **本轮（04）一行 Rust 都不改** —— `user/srv/src/mfs_srv.rs` 归流 01 独占。
 

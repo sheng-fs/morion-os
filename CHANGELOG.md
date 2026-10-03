@@ -6,6 +6,53 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 2026-10-02
+
+**文件系统四条并行流 + 驱动 D4 / 安装盘变体 V3 的收口**（承接 `0.4.0-nogui`；版本串仍是 `0.4.0`）。
+记账口径：未发版的改动先记在本 `[Unreleased]` 段，发版时再归档为版本段。
+
+### 新增
+
+- **真机存储驱动（D4）**：新增 `ahci_srv`（域 18，SATA/AHCI **只读**）—— 用通用设备授权驱动一台新类型设备，
+  内核只加 `pci::find_ahci`（class `01:06:01` → BAR5 = ABAR）与一行 `device::grant`；第一版**全轮询**、
+  不申请中断（本仓库只有 MSI-X 一条中断通路，AHCI 常态用 INTx/MSI），`IDENTIFY DEVICE` + LBA48
+  `READ DMA EXT` 读扇区 0 校验签名（`AHCI1 ahci OK, … sig=ok`，只读由宿主 `sha256sum` 取证）。
+- **安装盘变体（V3）**：`make INSTALL=1 iso` —— release 串带 `-install`（可与 `-nogui` 组合），产物落
+  `build/install/`；该变体下 `mkfs.mfs` 对**非空白卷**的护栏默认放开（装机天生要覆盖旧文件系统），
+  日常镜像一字不放宽（`--force` 仍是唯一出口）。
+- **MFS 健壮性收口（文件系统流 01）**：magic 判定改**三态** —— 空白卷才自动格式化；**MFS 系但修订 ≠ 本构建
+  MFS8 → 拒绝挂载 + 打印盘上/期望 magic 与处置建议，且一个字节都不写盘**（宿主 `sha256` 起机前后一致）；
+  新增 `mfs.fsck [--repair]`（可达性只从当前目录树走、默认只报不修）与 `mfs.sync`（幂等落盘 + 回复 gen）；
+  自测 FS-30/31/32，另加 `scripts/fsck-leak.sh` 的 `--repair` 泄漏回收用例。
+- **块层只读缓存 + 顺序预读（文件系统流 02）**：`block_srv` 内 128 行 × 4 KiB 缓存（键 `(卷号, lba)`），
+  写穿透 + 整卷失效，四个文件服务**零改动**（纯透明加速）；命中率 ≈80%、NVMe 命令 28672 → 16384、
+  全量回归 **324 s → 258 s**。
+- **权限与多用户设计稿（文件系统流 04）**：新增 [docs/design-permissions.md](docs/design-permissions.md)
+  （uid/gid 放 MFS 元数据 `+32` 保留区、不升 magic、`MFS_E*` 错误码、能力在前权限在后）。
+- **权限与多用户实现（04b）**：按设计稿在 `mfs_srv` 内落地 uid/gid + rwx 强制 —— `Cred{uid,gid}` 由
+  发起域静态映射（引导期服务域 = `0:0`，运行期新建域 = `1000:1000`）、元数据 `+32 uid / +34 gid` 不改布局、
+  `mfs_check_access` + 全部检查点（含新增 `CHOWN`）、`open` 权限快照进 fd；`MFS_E*` 错误码在客户端归一化回
+  `u64::MAX`（原始码经 `mfs_last_errno()`）；新增 shell `chown <uid>:<gid>` 与 `ls -l`/`stat` 的 uid/gid；
+  `exec::spawn_elf` 给运行期程序授最小文件系统能力面（`SendTo` mount/MFS + `MapInto` MFS）；FS-34..37
+  用运行期新建域（uid 1000）端到端验证低权拒绝路径。
+- **MFS 目录项索引缓存（02b）**：`mfs_srv` 内按 `(卷号, 目录 ino)` 把目录条目解析进内存表
+  （`name -> (块, 块内偏移)`），首次查找一次性遍历、之后纯内存比对 —— 免去每次 `mfs_dir_lookup`
+  的多跳 `block_srv` IPC；8 目录槽 × 8 KiB arena、满则 clock 淘汰、装不下回退线性扫描（绝不误判
+  "不存在"）；失效钩子覆盖 `mfs_itab_set` / `mfs_itab_reload`（挂载与快照回滚）/ `mfs_gc` / `mfs_format`。
+  回归 before 274 s → after 259 s（单次，≈5.5%），`mfs-didx` 命中率 ≈82%。
+- **AHCI 盘接进块服务卷层（03b）**：`ahci_srv` 自测后 `BLOCK_OP_ATTACH` 通知 `block_srv`，把 SATA 盘登记成
+  `backend=ahci` 的卷；`block_srv` 分配一页传输暂存页同址共享给 ahci，读/写按 8 扇区切分经 IPC 转发
+  （`WRITE DMA EXT` + `FLUSH CACHE EXT`），上层文件系统对 AHCI/NVMe 无感；挂载时读扇区 0 校验签名
+  （`block: ahci volume attached … sig=ok`）+ 写回读自测（`AHCI2 … rw=ok`）。内核只加 `block ↔ ahci` 三条
+  能力授权。分区表重扫后 AHCI 卷仍保留。
+- **开发工作流文档**：新增 [docs/dev-workflow.md](docs/dev-workflow.md) —— 环境陷阱 / 回归门禁 / 已知坑清单 /
+  加一个用户态服务的 9 处接线 / 并行协作三铁律；原先散落在本地临时交接文件里的这部分内容沉淀入库。
+
+### 文档
+
+- `docs/dev-reference.md` §9 阶段进度表补齐 **74–81 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b）。
+- `docs/roadmap-driver.md`、`docs/roadmap-fs.md`、`README.md` 状态与勾选同步。
+
 ## [0.4.0-nogui] — 2026-10-01
 
 **驱动 + 性能飞地路线**的首个收口版本；对外发布**无图形**变体（tag `v0.4.0-nogui`）。

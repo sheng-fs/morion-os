@@ -1,6 +1,6 @@
 //! 版本串 —— 收口路线 **V1**。
 //!
-//! 号与转发臂已经备好（[`crate::syscall::SYS_UNAME`]，见仓库根 `HANDOFF.md` 第 3.0 节），
+//! 号与转发臂已经备好（[`crate::syscall::SYS_UNAME`]，见 [dev-workflow.md](../../docs/dev-workflow.md) 的「并行协作」），
 //! 故 V1 只填本文件 + 用户态封装/命令。这里是**版本常量的唯一来源** ——
 //! `README.md` 的「版本」段与 `CHANGELOG.md` 必须与本文件保持一致。
 //!

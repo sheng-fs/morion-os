@@ -36,7 +36,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA 只读**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4） |
+| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
@@ -192,19 +192,24 @@
 - **踩到的坑**：`dd` 写签名时漏 `conv=notrunc` 会把 1 MiB 镜像**截断成 512 字节**（QEMU 报 `cap=1` 扇区）→ 写扇区 1 越界，现象是 `sig=ok` 但 `rw=BAD`。
 - **注**：设备语义（vring）在 `net_srv` 与 `virtio_blk_srv` 里**各有一份**，二者的公共面已可对照 —— **D2b** 即去重进 `libdevice::virtio`。
 
-### D4 — 真机存储驱动第一版：`ahci_srv`（SATA/AHCI 只读）✅ 已完成
-- 目的：让真机不再只有 NVMe —— 用同一套通用授权路径加 **AHCI/SATA** 驱动；本轮只做**只读**第一版（写路径、接进块服务卷层、xHCI/USB 都留后续）。
+### D4 — 真机存储驱动：`ahci_srv`（SATA/AHCI）✅ 已完成（03b：读+写 + 接进卷层）
+- 目的：让真机不再只有 NVMe —— 用同一套通用授权路径加 **AHCI/SATA** 驱动。**03b 起读+写**，并经 IPC 接进 `block_srv` 卷层（`backend=ahci`）；xHCI/USB 留后续（03c）。
 - 落地：
   - 内核：`pci::find_ahci`（大容量存储类 `01:06:01` → **BAR5 = ABAR**）、`BOOT_DOMAINS` 18 → **19**、`main.rs` 建域 18 + 一行 `device::grant`（`label: "ahci"`, `bar_pages: 2`, `dma_pages: 6`, **`msix_vectors: 0`**）。
   - 驱动 [`ahci_srv`](../user/srv/src/ahci_srv.rs)（域 18，**self-contained**，仍走 `DeviceGrant::load()` 的 `SYS_DEVICE_GRANT` 运行期申请）：`GHC.AE` → 遍历 `PI` 选端口（`PxSSTS.DET==3` 且 `PxSIG==0101h`，跳过 ATAPI / 端口倍增器）→ 建命令列表(1 KiB) / Received FIS(256 B) / 命令表(1 KiB) / 数据页（**页对齐**天然满足对齐要求）→ 启动端口 → `IDENTIFY DEVICE(0xEC)` 判类型 / 取容量 → `READ DMA EXT(0x25, LBA48)` 读扇区 0。
   - **中断策略**：本仓库只有 MSI-X 一条中断通路（无 INTx、无 MSI 非 X），而 AHCI 常态用 INTx/MSI —— 故第一版**全轮询**（`PxCI` / `PxIS`），**不申请向量**（`msix_vectors = 0`），`irq_cmds == cmds` 判据因此保持不变。日后要走中断需先补 MSI/INTx 通路（要动内核中断层，不属本轮）。
-  - 自测：读扇区 0 校验宿主预写签名 → `AHCI1 ahci OK, cap=…, sector0 sig=MORION-AHCI-TST!, sig=ok`。**只读**：只发 IDENTIFY + READ DMA EXT，不发任何写命令，宿主 `sha256sum` 前后一致。
+  - 自测：读扇区 0 校验宿主预写签名 → `AHCI1 ahci OK, cap=…, sector0 sig=MORION-AHCI-TST!, sig=ok`。
+- **03b 追加（接进块服务卷层 + 读+写）**：
+  - 命令：自测后 `BLOCK_OP_ATTACH` **异步**通知 `block_srv`（用 `send` 不用 `call` —— `block_srv` 收后要**回调** ahci 校验，同步等回复会自锁）；`block_srv` 分配一页传输暂存页**同址共享**给 ahci，登记成 `backend=ahci` 的卷。
+  - 读/写：`block_srv` 按 8 扇区（一页）切分，`sys_call` 转发；`ahci_srv` 用 `WRITE DMA EXT(0x35)` + `FLUSH CACHE EXT(0xEA)` 在自己的 DMA 通路上完成，数据经共享暂存页互拷。⚠️ **写方向必须先拷数据再发 IPC**（顺序反了 ahci 取到上一笔残留 —— 这正是本轮首次回归 `rw=bad(cmp)` 的根因）。
+  - 取证：`block: ahci volume attached (vol=8, sectors=2048, sig=ok)` + `AHCI2 ahci volume rw OK, vol=8, lba=2047, rw=ok`；卷表末行 `backend=ahci`，且 `PART_RELOAD` 重建卷表后仍在（AHCI 卷另存一份、重扫后挂回表尾）。
+- 授权（03b 新增，仍只是能力签发）：`block_srv → SendTo+MapInto → ahci_srv`、`ahci_srv → SendTo → block_srv`。
 - QEMU：q35 自带 ICH9 AHCI（`8086:2922`，class `01:06:01`）。测试盘由 **Makefile 规则**
   `$(AHCI_IMG)` 生成（1 MiB，扇区 0 预写 `MORION-AHCI-TST!`，`dd … conv=notrunc,sync` ——
   注意 D3 记过的"漏 `conv=notrunc` 会截断"坑），**已接进 `make run-nvme` 与 `scripts/fs-regress.sh`**
   （挂 `-drive file=…ahci.img,if=none,id=ahci0,format=raw -device ide-hd,drive=ahci0`），
-  回归判定里新增 `AHCI1 … sig=ok` 一条；只读的宿主取证见 plan-fs-streams.md §5。
-- **不做（本轮明确排除）**：写路径、接进块服务卷层（`block_srv.rs`，归 02 独占）、热插拔、xHCI/USB、MSI/INTx 通路。
+  回归判定新增 `AHCI1 … sig=ok`、`block: ahci volume attached … sig=ok`、`AHCI2 … rw=ok`。
+- **不做（明确排除）**：热插拔、xHCI/USB（03c）、MSI/INTx 通路。
 
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
@@ -292,6 +297,10 @@
   是启动竞态的无害提示，脚本原先把它当"失败"提前收工（实测 13 秒即退、`SELFTEST DONE` 0），
   现已在收工判据与失败计数里统一滤掉。
 
+### 远期（跨模块，尚未排期）
+- **引导安全链密码库（GmSSL）**：`boot/src/security/` 的国密实现目前部分为桩 —— SM3 映像哈希与 SM2 验签已用 RustCrypto `no_std` 纯 Rust，**TPM 2.0 PCR 测量仍为桩**（待接 `EFI_TCG2_PROTOCOL`）。计划把桩替换为 **GmSSL (C)** 实现，并打通自加密镜像解封与飞地预认证。
+- **独立高精度定时器（hrtimer / TSC，1 ms 精度）**：模仿 Linux `hrtimer` 思路，**不改动全局 100 Hz 调度 tick**，另实现一套基于 APIC/TSC 的独立高精度定时器；普通任务 `sleep` 走普通 tick，游戏 / 多媒体经**新 syscall** 走 hrtimer 做 1 ms 精度等待。取舍：只有需要高精度的任务受影响，其余系统部分不受拖累、功耗可控；调度抢占仍 10 ms 一次，但程序休眠唤醒可做到 1 ms。
+
 ---
 
 ## 5. 执行顺序（每步独立可回归）
@@ -302,7 +311,7 @@
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
 5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
-7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。**D4** 真机存储驱动第一版 `ahci_srv`（✅ 已完成，域 18，SATA/AHCI 只读，全轮询、不申请中断）。
+7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。**D4** 真机存储驱动 `ahci_srv`（✅ 已完成，域 18，SATA/AHCI，全轮询、不申请中断；03b 起读+写并经 IPC 接进 `block_srv` 卷层）。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
 9. **E1 IOMMU (VT-d)**：DMAR 探测（✅ **E1a**：RSDP → XSDT/RSDT → DRHD）+ 重映射域（✅ **E1b**：全设备 `translated + 恒等`，打开 `GCMD.TE`）+ 受限 IOVA 窗口与越界 DMA 拒绝取证（✅ **E1c**：目标设备窗口收到 3 GiB，设备发起的窗口外 DMA 被拒并留证）。
 10. **E2 enclave-mgr**：飞地生命周期 + 日志流 + 审计。

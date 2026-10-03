@@ -443,7 +443,7 @@ fn log(label: &str, msg: &str) {
 // 并行开发接线层: 运行期设备授权入口 (D1b)
 // ---------------------------------------------------------------------------
 // 号与转发臂已在 [`crate::syscall`] 备好 (`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT`), 所以 D1b
-// 任务**只改本文件** (+ `user/libdevice`), 不必去碰 `syscall.rs` —— 见仓库根 `HANDOFF.md`。
+// 任务**只改本文件** (+ `user/libdevice`), 不必去碰 `syscall.rs` —— 见 docs/dev-workflow.md 的「并行协作」。
 
 /// `SYS_DEVICE_*` 的 `a1` 哨兵: 申请 / 查询**本域**已被绑定的那台设备。
 ///
@@ -519,7 +519,7 @@ pub fn syscall_info(a1: u64, _a2: u64, _a3: u64) -> u64 {
 /// 资源 (BAR / 连续 DMA 块 / MSI-X / `Mmio` 能力) 在 boot 期由声明式 [`grant`] 一次性备好;
 /// 这里做的是**运行期申请**的完整语义: 定位本域设备 → **能力门禁** (须持有该 BAR 的
 /// `Mmio` 凭证) → 幂等确认描述页确带授权 (`magic` 校验) 后把它交给驱动。域号是 ABI 且域
-/// 在 boot 期即建好, 故不存在"运行期首次分配"路径 (重复分配会与既有映射冲突, 见 HANDOFF 3.3)。
+/// 在 boot 期即建好, 故不存在"运行期首次分配"路径 (重复分配会与既有映射冲突)。
 pub fn syscall_grant(a1: u64, _a2: u64, _a3: u64) -> u64 {
     let me = crate::scheduler::current_domain();
     let (bar_paddr, cfg_paddr) = {

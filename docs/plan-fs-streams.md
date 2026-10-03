@@ -1,6 +1,6 @@
 # 文件系统下一轮：四条并行流（规划 / 任务书）
 
-> 配套的「交接 + 起步提示词」见仓库根 `HANDOFF-FS.md`（本地临时，不入库）。
+> 环境准备、回归门禁与并行协作约定见 [dev-workflow.md](dev-workflow.md)。
 > 本文是**规划与验收口径**（入库）；每条流的字段都以「可被另一个会话照着做完」为准。
 > 行号基于 2026-10-02 的工作区状态，**会随改动漂移**，只作锚点用。
 
@@ -25,7 +25,7 @@
 |---|---|---|---|---|
 | 01 | 健壮性收口 | 把"未知/新版 magic 自动重格"改成拒绝挂载；补最小对账（fsck）与显式 sync | `mfs_srv` + 新 tag + shell 命令 + FS-30..33 | 第 1 |
 | 02 | 块层性能 | 块服务内加只读缓存 + 顺序预读（对上层**透明**） | `block_srv` + 命中率计数 | 第 2 |
-| 03 | 真机存储驱动 | 新增 `ahci_srv`（SATA/AHCI 只读，含自测），让真机不再只有 NVMe | 新服务域 + 内核 PCI/声明接线 | 第 3 |
+| 03 | 真机存储驱动 | 新增 `ahci_srv`（SATA/AHCI，含自测），让真机不再只有 NVMe | 新服务域 + 内核 PCI/声明接线 | 第 3 |
 | 04 | 权限与多用户 | 本轮只交**设计 + 接口草案**（实现依赖 01 的 `mfs_srv` 地盘） | `docs/design-permissions.md` | 第 4 |
 
 **为什么 04 只做设计**：权限强制必须落在文件服务内部（`mfs_srv` 的每个 open/read/write 前），而 `mfs_srv.rs` 在本轮**归 01 独占**。并行动手、按编号合并，是这份规划的核心取舍（见 §4）。
@@ -33,8 +33,9 @@
 **后续第二轮（不属于本轮，写在这里防丢）**：
 
 - 02b：目录索引（把 `mfs_dir_scan` 的线性扫描换掉）+ 请求批量化（把"每个操作一次 IPC 往返"降下来）—— 要动 `mfs_srv.rs`，等 01 合入。
+  （**目录索引部分已完成**，见 [roadmap-fs.md](roadmap-fs.md) 阶段 02 的「02b 实现」；请求批量化仍待。）
 - 04b：权限强制 + uid/gid + 认证服务对接 —— 同样等 01 合入。
-- 03b：把 AHCI 盘接进块服务卷层（`block_srv.rs` 归 02）。
+- 03b：把 AHCI 盘接进块服务卷层（`block_srv.rs` 归 02）。（**已完成**，见本文件 §03 的「03b」小节。）
 - 03c：xHCI/USB 存储（真机 U 盘启动的真正前置）。
 
 ---
@@ -71,7 +72,7 @@
 
 **验收**
 
-- 门禁四道全过（见 HANDOFF-FS.md §1）；
+- 门禁四道全过（见 [dev-workflow.md](dev-workflow.md) §2）；
 - 新增自测：FS-30 = 用宿主预置的"旧 magic 卷"（或临时改 magic 的镜像）断言**拒绝挂载且盘未变**（宿主 sha256 比对）；FS-31 = 造一个泄漏（`creat` 后手动丢目录项不可行时，用 `mfs.fsck` 对已知镜像报 0 后再 `--repair` 幂等）；FS-32 = `write → mfs.sync → 重挂载读回`，且 sync 回复的 gen 与重挂载后的 gen 一致；
 - 全量回归 `SELFTEST DONE ≥1`、`FAILED/PANIC = 0`。
 
@@ -89,7 +90,7 @@
 | 问题 | 位置 |
 |---|---|
 | 块服务没有缓存：每次 `BLOCK_OP_READ` 都真下盘 | 分派 `user/srv/src/block_srv.rs:1042-1184`（READ 分支）、请求结构 `user/srv/src/common.rs:76-83`、opcode `common.rs:314-330` |
-| 全链路每请求一跳 IPC（≈1 tick = 10 ms），实测 ~100 请求/s | HANDOFF.md §2.1 第 6 条；`docs/roadmap-fs.md:10-12`（FS-12 单例 ~170 s） |
+| 全链路每请求一跳 IPC（≈1 tick = 10 ms），实测 ~100 请求/s | [dev-workflow.md](dev-workflow.md) §1 第 6 条；`docs/roadmap-fs.md:10-12`（FS-12 单例 ~170 s） |
 | 上层各自有小缓存，但块层没有共享缓存/预读 | `mfs_srv.rs:1103`（inode 表单块缓存）、`exfat_srv.rs:1390`（分配游标） |
 
 **目标**
@@ -112,11 +113,11 @@
 
 - 失效必须**按卷隔离**（多卷共用 cache，卷号是键的一部分）；`part.*`/`mkfs.mfs` 这类"整卷改写"操作后必须**整卷失效**。
 - 缓存预算要按页算（内核只给你映射好的页），别申请过大批量连续 DMA。
-- 回归是**串行资源**（见 HANDOFF-FS.md §1 铁律 3），别和 01/03 同时跑。
+- 回归是**串行资源**（见 [dev-workflow.md](dev-workflow.md) 的「并行协作」铁律 3），别和 01/03 同时跑。
 
 ---
 
-### 03 — 真机存储驱动：`ahci_srv`（SATA/AHCI，第一版只读）✅ 已完成
+### 03 — 真机存储驱动：`ahci_srv`（SATA/AHCI）✅ 已完成（03b：读+写 + 接进卷层）
 
 **缺口证据**
 
@@ -136,16 +137,34 @@
 3. **完成后走轮询**（`PxCI`/`PxIS` 轮询），不碰中断（理由见上）；把"若日后要走中断需要补 MSI/INTx 通路"写进文档；
 4. **自测**：读该盘扇区 0，校验宿主预写的签名（照 `VBLK1` 的做法），打 `AHCI1 … sig=ok` marker。
 
-**不做（本轮明确排除）**：3b 接进块服务卷层（`block_srv.rs` 归 02）、写路径、热插拔、xHCI/USB（03c）、MSI/INTx 通路。
+**不做（3a 当时明确排除；其中"接进卷层 + 写路径"已由 03b 补上）**：热插拔、xHCI/USB（03c）、MSI/INTx 通路。
 
-**接线清单（9 处，行号以 HANDOFF-FS.md §3 表为准）**：`user/srv/Cargo.toml`（features + `[[bin]]`）、`user/srv/src/lib.rs`（门控）、`user/srv/src/bin/ahci_srv.rs`（新）、`Makefile`（`SRV_NAMES`）、`boot/src/main.rs`（`SERVICE_FILES` **和它的长度 `18`**）、`kernel/src/domain.rs`（`BOOT_DOMAINS` +1，以及文件头注释与单测）、`kernel/src/main.rs`（建域 + 授权 + 设备声明）、`kernel/src/arch/pci.rs`。
+**03b（已完成）—— 把 AHCI 盘接进块服务卷层（读 + 写）**
+
+3a 只读自测完就常驻等待；03b 让它成为真正的**块后端**：
+
+1. **分层**：`ahci_srv` 自测通过后用 `BLOCK_OP_ATTACH` **异步**通知 `block_srv`（用 `send` 不用 `call`
+   —— `block_srv` 收到后会**回调** ahci 做读写校验，同步等待回复会自锁）；`block_srv` 分配一个传输
+   暂存页并**同址共享**给 ahci，把它登记成 `backend=ahci` 的卷（对外 `BlockReq` 卷号与 NVMe 一致）。
+2. **读/写都经卷层转发**：`block_srv` 按 8 扇区（一页）切分，`sys_call` 请 `ahci_srv` 在自己的 DMA
+   通路上完成（`WRITE DMA EXT` + `FLUSH CACHE EXT`），数据经共享暂存页互拷。上层文件系统完全不必
+   知道盘挂在 AHCI 还是 NVMe。⚠️ **写方向必须先拷数据再发 IPC**（反过来 ahci 取到的是上一笔残留）。
+3. **挂载取证**：读扇区 0 校验签名（`block: ahci volume attached … sig=ok`）；签名匹配（安全门，
+   避免在真盘上写坏数据）才做写回读自测（`AHCI2 … rw=ok`）。
+4. **持久**：分区表重扫（`PART_RELOAD`）会重建 NVMe 卷表，AHCI 卷另存一份并在重扫后重新挂回表尾。
+
+**接线（03b 新增授权）**：`kernel/src/main.rs` —— `block_srv → SendTo+MapInto → ahci_srv`、
+`ahci_srv → SendTo → block_srv`（内核无设备专属逻辑，仍只是能力签发）。
+
+
+**接线清单（9 处，见 [dev-workflow.md](dev-workflow.md) §4）**：`user/srv/Cargo.toml`（features + `[[bin]]`）、`user/srv/src/lib.rs`（门控）、`user/srv/src/bin/ahci_srv.rs`（新）、`Makefile`（`SRV_NAMES`）、`boot/src/main.rs`（`SERVICE_FILES` **和它的长度 `18`**）、`kernel/src/domain.rs`（`BOOT_DOMAINS` +1，以及文件头注释与单测）、`kernel/src/main.rs`（建域 + 授权 + 设备声明）、`kernel/src/arch/pci.rs`。
 
 **验收**
 
 - 门禁四道全过；回归全绿；
-- **判据要更新**（这是本流的"接线副作用"，必须同步到 HANDOFF-FS.md 与 docs）：`[OK] 18 service ELFs loaded` → `19`；`BOOT_DOMAINS` 与域表长度一致；若驱动占用 MSI 向量则 `irq_cmds == cmds` 的口径要重新确认（**建议第一版不申请中断，向量数保持 0，别动这条判据**）；
+- **判据要更新**（这是本流的"接线副作用"，必须同步到 docs）：`[OK] 18 service ELFs loaded` → `19`；`BOOT_DOMAINS` 与域表长度一致；若驱动占用 MSI 向量则 `irq_cmds == cmds` 的口径要重新确认（**建议第一版不申请中断，向量数保持 0，别动这条判据**）；
 - QEMU 验证：q35 自带 AHCI（`ich9-ahci`），挂盘示例 `-drive id=d0,if=none,file=build/ahci.img,format=raw -device ide-hd,drive=d0,bus=ide.0`（具体总线名以 `qemu-system-x86_64 -device ahci,help` 为准），宿主预写签名 → 日志出现 `AHCI1 … sig=ok`；
-- 宿主侧用 `sgdisk -v`/`sha256sum` 证明**只读**（盘内容未变）。
+- 03b 追加判据：`block: ahci volume attached … sig=ok`、`AHCI2 … rw=ok`，且卷表末行出现 `backend=ahci`（03b 起**可写**，不再是"只读、盘内容未变"）。
 
 **风险 / 坑**
 
@@ -214,7 +233,7 @@
 - 03：**不占号** —— 驱动自测像 `virtio_blk_srv` 一样打自己的 marker（`AHCI1 …`）。
 - 04：本轮不占号（04b 时再分配）。
 
-### 4.3 三条铁律（沿用 [HANDOFF.md](HANDOFF.md) §4）
+### 4.3 三条铁律（沿用 [dev-workflow.md](dev-workflow.md) 的「并行协作」）
 
 1. **只改自己的独占文件**；发现必须动公共文件 → 停下来，先跟主会话对齐。
 2. **提交只 `git add` 自己的文件**；**绝不** `git add -A` / `git add .` / `git stash` / `git checkout -- .` / `git reset --hard`。
@@ -230,7 +249,7 @@
 
 - 长期路线图：`docs/roadmap-fs.md`（每条流完成时在**自己小节**标记 ✅）。
 - 驱动线路线图：`docs/roadmap-driver.md`（03 在这里加小节）。
-- 环境与门禁、并行铁律、起步提示词：仓库根 `HANDOFF-FS.md`（本轮）与 `HANDOFF.md`（上一轮，含历史坑清单）。
+- 环境与门禁、并行铁律：[dev-workflow.md](dev-workflow.md)。
 
 ---
 
@@ -242,7 +261,7 @@
 |---|---|---|
 | 01 健壮性 | ✅ 已完成 | `mfs_sb_magic_state` 三态判定（拒绝挂载 + 明确日志）、`MFS_FSCK_TAG="MFSC"` + `mfs.fsck [--repair]`、`MFS_SYNC_TAG="MSYN"` + `mfs.sync`、FS-31/FS-32 自测 |
 | 02 块层性能 | ✅ 已完成 | `block_srv` 只读缓存（128 行 × 4 KiB = 512 KiB）+ 顺序预读 + `blk-cache:` 计数 |
-| 03 真机存储驱动 | ✅ 已完成 | `ahci_srv`（域 18，SATA/AHCI 只读，全轮询）+ `pci::find_ahci`（BAR5=ABAR）+ `BOOT_DOMAINS` 19 |
+| 03 真机存储驱动 | ✅ 已完成（含 03b） | `ahci_srv`（域 18，SATA/AHCI，全轮询）+ `pci::find_ahci`（BAR5=ABAR）+ `BOOT_DOMAINS` 19；03b 起读+写并经 IPC 接进 `block_srv` 卷层（`backend=ahci`） |
 | 04 权限设计 | ✅ 设计稿完成 | [design-permissions.md](design-permissions.md)（uid/gid 放 `+32` 保留区、不升 magic、`MFS_E*` 错误码、能力在前权限在后） |
 
 **合并后复验结果**：
@@ -257,9 +276,12 @@
 - **FS-30 补验**（01 文档里声称"宿主侧取证"但当时未留记录，本次补做）：把 `build/mfs.img`
   两份超级块 magic 改成 `MFS7` → 起机日志 `mfs: refuse to mount: on-disk magic MFS7 … != expected MFS8 …
   (data left untouched)`，且盘 `sha256` **起机前后完全一致**（一个字节都没写盘）。
-- **03 的 AHCI 在合并树上复验**（标准回归不挂 AHCI 盘，故用 `QEMU_EXTRA` 挂 `build/ahci.img` 再跑一轮）：
-  `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`SELFTEST DONE=1`、`FAILED/PANIC=0`（258 s）；
-  `build/ahci.img` 的 `sha256` 运行前后一致（**只读**成立）。
+- **03 的 AHCI 在合并树上复验**：`AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；
+  `SELFTEST DONE=1`、`FAILED/PANIC=0`（258 s）。
+- **03b 复验（AHCI 接进卷层 + 读+写，本轮）**：标准回归已挂 `build/ahci.img`（`-device ide-hd`），
+  日志出现 `block: ahci volume attached (vol=8, sectors=2048, sig=ok)` 与
+  `AHCI2 ahci volume rw OK, vol=8, lba=2047, rw=ok`，卷表末行 `backend=ahci` 在多次
+  `PART_RELOAD` 后仍在；`SELFTEST DONE=1`、`FAILED/PANIC=0`（258 s，exit 0）。
 
 **收口时发现的待办 —— 前两条已在收口后补掉**：
 
@@ -273,9 +295,10 @@
 2. ~~`build/ahci.img` 靠手工 `dd` 造、Makefile 无规则~~ → ✅ **已补**：`Makefile` 新增
    `AHCI_IMG`/`AHCI_MIB` 与 `$(AHCI_IMG)` 规则（1 MiB + 扇区 0 预写 `MORION-AHCI-TST!`，
    规则重建的镜像与 03 那份 **sha256 逐字节一致**），并**接进 `make run-nvme` 与
-   `scripts/fs-regress.sh`**（回归判定新增 `AHCI1 … sig=ok` 一条；带判据的全量回归实测 258 s
-   全绿、盘 sha 未变）。
-3. 02b（目录索引 + 请求批量化）、03b（AHCI 接进卷层）、04b（权限强制）按 §2 末尾的排期等前序合入。
+   `scripts/fs-regress.sh`**（回归判定新增 `AHCI1 … sig=ok`；03b 起再加
+   `block: ahci volume attached … sig=ok` 与 `AHCI2 … rw=ok`；带判据的全量回归实测 258 s 全绿）。
+3. 02b（**目录索引已完成**；请求批量化待）、04b（权限强制，**已完成**）按 §2 末尾的排期等前序合入；
+   **03b（AHCI 接进卷层 + 读+写）本轮已完成**。
 
 **顺带修掉的工具问题**（都在收口这一轮踩到）：`scripts/probe-shell.sh` 原先**漏挂 nsid=7
 （`pt.img`）**，导致自测 FS-26 `part wipe FAILED` 后整套自测停住、`PROBE_WAIT_PATTERN` 白等满
@@ -288,4 +311,4 @@
 本节的收口追加（AHCI 测试盘规则 + 泄漏回收用例）单独一条提交。
 文件级互斥拆分没法做到"每条提交一处改动"：`shell.rs`/`vfs.rs`/`mfs_srv.rs` 里 01 与
 `mkfs.mfs --force` 同行级交织、`Makefile` 里 D4 与安装盘变体交织，故这两处只能合并成一条。
-`HANDOFF-FS.md` 按约定留在本地不入库。
+会话交接类临时文件按约定留在本地不入库（其长期价值部分已沉淀进 [dev-workflow.md](dev-workflow.md)）。
