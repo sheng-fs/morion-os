@@ -14,6 +14,10 @@
 //! UDP 构造/发送（slirp 对未监听端口回 ICMP 端口不可达作副证据）。自测标记 `NET2 ipv4/icmp …`。
 //! **N3c**：DHCP 客户端 —— 广播 DHCPDISCOVER → OFFER → REQUEST → ACK，取得 IP/掩码/网关/DNS，
 //! 替换写死的 `10.0.2.15`/`10.0.2.2`（取不到则回落默认值）。自测标记 `NET3 dhcp …`。
+//! **N4**：最小 TCP —— 头构造/解析（校验和含 12 字节伪首部）、三次握手（SYN → SYN-ACK → ACK）
+//! 与最小 PSH/ACK 数据段；先向 slirp 网关试发 SYN 取真实回应，无稳定对端则用确定性自证
+//! （合成 SYN-ACK → 解析断言 → 生成 ACK/数据 → 复校验和）。自测标记 `NET4 tcp …`。
+//! **ARP 老化**：网关 MAC 进带时间戳的缓存（TTL 约 30s），过期即重新广播 ARP 刷新。
 //!
 //! **D2b**：把「所有 virtio 设备都一样」的传输层（能力解析 / common cfg / 复位协商 / 队列
 //! 配置 / avail·used 环）搬进 [`libdevice::virtio`]，与 `virtio_blk_srv` 共用 —— 本文件因此
@@ -80,6 +84,7 @@ const ETH_IPV4: u16 = 0x0800;
 const ETH_ARP: u16 = 0x0806;
 /// IPv4 协议号。
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
 /// IPv4 默认 TTL。
 const IP_TTL: u8 = 64;
@@ -87,11 +92,26 @@ const IP_TTL: u8 = 64;
 const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP_ECHO_REQ: u8 = 8;
 const ICMP_UNREACH: u8 = 3;
+/// TCP 标志位（本驱动只用到这四个）。
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_PSH: u8 = 0x08;
+const TCP_ACK: u8 = 0x10;
 /// 自测用 ICMP id/seq 与 UDP 端口。
 const TEST_ICMP_ID: u16 = 0x4d4f;
 const TEST_ICMP_SEQ: u16 = 1;
 const TEST_UDP_SPORT: u16 = 0x4d4f;
 const TEST_UDP_DPORT: u16 = 9999;
+/// N4 自测用 TCP 端口（目的取 slirp 上大概率无监听的端口）与客户端初始序号（ISN）。
+const TEST_TCP_SPORT: u16 = 0x4d50;
+const TEST_TCP_DPORT: u16 = 12345;
+const TEST_TCP_ISN: u32 = 0x4d4f_0004;
+/// TCP 通告窗口（任意值，取常见 29200）。
+const TCP_WINDOW: u16 = 0x7210;
+/// N4 对真实对端发起握手后的有界等待（毫秒）。
+const TCP_PEER_TIMEOUT_MS: u64 = 1000;
+/// ARP 缓存 TTL（约 30 秒；无墙钟 syscall，用 RX 循环累计毫秒近似）。
+const ARP_CACHE_TTL_MS: u64 = 30_000;
 /// N3b 自测的有界等待（毫秒）：到点无论结果如何都打 `NET2`，不阻塞保活。
 const NET2_TIMEOUT_MS: u64 = 2000;
 
@@ -104,6 +124,12 @@ fn be16(a: u64) -> u16 {
 fn put_be16(a: u64, v: u16) {
     wr8(a, (v >> 8) as u8);
     wr8(a + 1, (v & 0xff) as u8);
+}
+
+/// 网络序（大端）写 32 位。
+fn put_be32(a: u64, v: u32) {
+    put_be16(a, (v >> 16) as u16);
+    put_be16(a + 2, (v & 0xffff) as u16);
 }
 
 /// Internet 校验和（RFC 1071）：对 `[base, base+len)` 按 16 位字求反码和。
@@ -140,6 +166,56 @@ fn inet_checksum_valid(base: u64, len: u64) -> bool {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     sum as u16 == 0xffff
+}
+
+/// 把 `[base, base+len)` 按 16 位字累加进 `sum`（供带伪首部的传输层校验和复用）。
+fn csum_acc(base: u64, len: u64, sum: u32) -> u32 {
+    let mut s = sum;
+    let mut i = 0u64;
+    while i + 1 < len {
+        s += be16(base + i) as u32;
+        i += 2;
+    }
+    if i < len {
+        s += (rd8(base + i) as u32) << 8;
+    }
+    s
+}
+
+/// 反码和折叠到 16 位（不取反）。
+fn csum_fold(mut s: u32) -> u16 {
+    while (s >> 16) != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    s as u16
+}
+
+/// 伪首部（12 字节：源 IP / 目的 IP / 0 / 协议 / TCP 长度）+ TCP 段的 16 位反码和
+/// （折叠后、未取反）。TCP 校验和 = `!` 它；校验时该和应为 `0xffff`。
+fn tcp_pseudo_sum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: u64, seg_len: u64) -> u16 {
+    let mut ph = [0u8; 12];
+    let mut i = 0u64;
+    while i < 4 {
+        ph[i as usize] = src_ip[i as usize];
+        ph[4 + i as usize] = dst_ip[i as usize];
+        i += 1;
+    }
+    ph[8] = 0;
+    ph[9] = IP_PROTO_TCP;
+    ph[10] = (seg_len >> 8) as u8;
+    ph[11] = seg_len as u8;
+    let pva = ph.as_ptr() as u64;
+    csum_fold(csum_acc(tcp, seg_len, csum_acc(pva, 12, 0)))
+}
+
+/// 计算写入 TCP 头的校验和（调用前须已把校验和字段置 0）。
+fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: u64, seg_len: u64) -> u16 {
+    !tcp_pseudo_sum(src_ip, dst_ip, tcp, seg_len)
+}
+
+/// 校验一段**已含校验和字段**的 TCP 段（伪首部 + 段之和折叠应为 `0xffff`）。
+fn tcp_checksum_valid(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: u64, seg_len: u64) -> bool {
+    tcp_pseudo_sum(src_ip, dst_ip, tcp, seg_len) == 0xffff
 }
 
 /// 把 device cfg 读出的 MAC（低字节 = 首字节）拆成网络序字节数组。
@@ -280,6 +356,193 @@ fn udp_write(ip_payload_va: u64, sport: u16, dport: u16, payload: &[u8]) -> u64 
         i += 1;
     }
     len
+}
+
+// ---------------------------------------------------------------------------
+// N4 — 最小 TCP（头构造/解析 + 伪首部校验和 + 握手/数据段语义）
+// ---------------------------------------------------------------------------
+
+/// 解析出的 TCP 段信息；`payload_off` 是数据在帧内的地址。
+struct TcpSeg {
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload_off: u64,
+    payload_len: u64,
+}
+
+/// 解析 IPv4 报文里的 TCP 段（含 12 字节伪首部校验和校验、data offset 越界拒绝）。
+fn tcp_parse(info: &Ipv4Info) -> Option<TcpSeg> {
+    if info.proto != IP_PROTO_TCP || info.payload_len < 20 {
+        return None;
+    }
+    let tcp = info.payload_off;
+    let doff = (rd8(tcp + 12) >> 4) as u64 * 4;
+    if doff < 20 {
+        return None;
+    }
+    if doff > info.payload_len {
+        return None;
+    }
+    if !tcp_checksum_valid(info.src, info.dst, tcp, info.payload_len) {
+        return None;
+    }
+    Some(TcpSeg {
+        sport: be16(tcp),
+        dport: be16(tcp + 2),
+        seq: be32(tcp + 4),
+        ack: be32(tcp + 8),
+        flags: rd8(tcp + 13),
+        window: be16(tcp + 14),
+        payload_off: tcp + doff,
+        payload_len: info.payload_len - doff,
+    })
+}
+
+/// 便捷：直接解析以太帧（`eth_va` 指向以太头，已跳过 12 字节 virtio 包头）。
+fn tcp_parse_eth(eth_va: u64, eth_len: u64) -> Option<TcpSeg> {
+    let info = ipv4_parse(eth_va, eth_len)?;
+    tcp_parse(&info)
+}
+
+/// 组装一个 TCP 段（以太 + IPv4 + TCP，无选项），返回整帧长度（含 12 字节 virtio 包头）。
+#[allow(clippy::too_many_arguments)]
+fn tcp_build(
+    buf_va: u64,
+    src_mac: u64,
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> u64 {
+    let tcp = ipv4_build_ex(buf_va, src_mac, dst_mac, IP_PROTO_TCP, src_ip, dst_ip);
+    put_be16(tcp, sport);
+    put_be16(tcp + 2, dport);
+    put_be32(tcp + 4, seq);
+    put_be32(tcp + 8, ack);
+    wr8(tcp + 12, 5 << 4); // data offset = 5（20 字节头），reserved/NS = 0
+    wr8(tcp + 13, flags);
+    put_be16(tcp + 14, window);
+    put_be16(tcp + 16, 0); // checksum（回填）
+    put_be16(tcp + 18, 0); // urgent pointer
+    let mut i = 0u64;
+    while i < payload.len() as u64 {
+        wr8(tcp + 20 + i, payload[i as usize]);
+        i += 1;
+    }
+    let seg_len = 20 + payload.len() as u64;
+    put_be16(tcp + 16, tcp_checksum(src_ip, dst_ip, tcp, seg_len));
+    ipv4_finish(buf_va, seg_len)
+}
+
+/// 无对端自证 TCP：合成对端 SYN-ACK → 解析断言字段与校验和 → 生成握手 ACK → 生成最小
+/// PSH/ACK 数据段 → 解析断言载荷逐字节一致；最后篡改一个载荷字节，确认校验和拦截。
+fn tcp_selftest(our_mac: u64, tx_va: u64) -> bool {
+    let peer_mac = [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x02];
+    let us = our_ip();
+    let peer = gw_ip();
+    let isn = TEST_TCP_ISN;
+    let peer_isn: u32 = 0x1234_5678;
+    let eth = tx_va + VNET_HDR_LEN;
+
+    // 1) 合成对端 SYN-ACK（peer → us）：SYN|ACK，ack 应等于 ISN+1。
+    let fl = tcp_build(
+        tx_va,
+        our_mac,
+        peer_mac,
+        peer,
+        us,
+        TEST_TCP_DPORT,
+        TEST_TCP_SPORT,
+        peer_isn,
+        isn.wrapping_add(1),
+        TCP_SYN | TCP_ACK,
+        TCP_WINDOW,
+        b"",
+    );
+    let synack = match tcp_parse_eth(eth, fl - VNET_HDR_LEN) {
+        Some(s) => s,
+        None => return false,
+    };
+    if synack.flags != (TCP_SYN | TCP_ACK) {
+        return false;
+    }
+    if synack.seq != peer_isn || synack.ack != isn.wrapping_add(1) {
+        return false;
+    }
+    let peer_next = synack.seq.wrapping_add(1);
+    let our_next = isn.wrapping_add(1);
+
+    // 2) 握手第三个 ACK（us → peer）。
+    let fl = tcp_build(
+        tx_va,
+        our_mac,
+        peer_mac,
+        us,
+        peer,
+        TEST_TCP_SPORT,
+        TEST_TCP_DPORT,
+        our_next,
+        peer_next,
+        TCP_ACK,
+        TCP_WINDOW,
+        b"",
+    );
+    match tcp_parse_eth(eth, fl - VNET_HDR_LEN) {
+        Some(s) => {
+            if s.flags != TCP_ACK || s.seq != our_next || s.ack != peer_next {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    // 3) 最小数据段（PSH|ACK），载荷逐字节核对。
+    let data = b"MORION-N4";
+    let fl = tcp_build(
+        tx_va,
+        our_mac,
+        peer_mac,
+        us,
+        peer,
+        TEST_TCP_SPORT,
+        TEST_TCP_DPORT,
+        our_next,
+        peer_next,
+        TCP_PSH | TCP_ACK,
+        TCP_WINDOW,
+        data,
+    );
+    let seg = match tcp_parse_eth(eth, fl - VNET_HDR_LEN) {
+        Some(s) => s,
+        None => return false,
+    };
+    if seg.flags != (TCP_PSH | TCP_ACK) || seg.payload_len != data.len() as u64 {
+        return false;
+    }
+    let mut i = 0u64;
+    while i < data.len() as u64 {
+        if rd8(seg.payload_off + i) != data[i as usize] {
+            return false;
+        }
+        i += 1;
+    }
+
+    // 4) 篡改一个载荷字节 → 伪首部 + 段校验和应拦截（证明校验和真的覆盖了段）。
+    wr8(
+        seg.payload_off + data.len() as u64 - 1,
+        data[data.len() - 1] ^ 0xff,
+    );
+    tcp_parse_eth(eth, fl - VNET_HDR_LEN).is_none()
 }
 
 /// 收到的是否为对我们 echo request（`id`/`seq`）的 echo reply；是则返回发送方 IP。
@@ -521,6 +784,94 @@ fn gw_arp_reply_mac(buf_va: u64, len: u64) -> Option<[u8; 6]> {
         rd8(arp + 12),
         rd8(arp + 13),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// ARP 缓存老化（网关 MAC + 时间戳，TTL 过期后重新广播 ARP 刷新）
+// ---------------------------------------------------------------------------
+
+/// 网关 ARP 缓存条目：MAC + 老化计时（无墙钟 syscall，用 RX 循环累计毫秒近似）。
+struct ArpCache {
+    mac: [u8; 6],
+    valid: bool,
+    age_ms: u64,
+    hits: u64,
+}
+
+impl ArpCache {
+    const fn new() -> Self {
+        ArpCache {
+            mac: [0u8; 6],
+            valid: false,
+            age_ms: 0,
+            hits: 0,
+        }
+    }
+
+    /// 写入/刷新缓存（重置老化计时）。
+    fn insert(&mut self, mac: [u8; 6]) {
+        self.mac = mac;
+        self.valid = true;
+        self.age_ms = 0;
+    }
+
+    /// 推进老化计时。
+    fn advance(&mut self, ms: u64) {
+        self.age_ms = self.age_ms.saturating_add(ms);
+    }
+
+    /// 未过期则返回 MAC 并记一次命中；无效或已过期返回 `None`。
+    fn lookup(&mut self) -> Option<[u8; 6]> {
+        if self.valid && self.age_ms < ARP_CACHE_TTL_MS {
+            self.hits += 1;
+            Some(self.mac)
+        } else {
+            None
+        }
+    }
+
+    /// 是否已过期（需重新广播 ARP 刷新）。
+    fn is_stale(&self) -> bool {
+        self.valid && self.age_ms >= ARP_CACHE_TTL_MS
+    }
+
+    /// 重新发过 ARP 后重置计时，避免连续重发。
+    fn mark_refreshed(&mut self) {
+        self.age_ms = 0;
+    }
+}
+
+/// 有界自证 ARP 缓存老化：空缓存不命中 → TTL 内命中 → 边界前仍命中 → 到 TTL 变陈旧
+/// → 重插后再次命中。返回 `(是否通过, 命中计数)`。
+fn arp_cache_selftest() -> (bool, u64) {
+    let gw = [0x52u8, 0x54, 0x00, 0x12, 0x34, 0x56];
+    let mut c = ArpCache::new();
+    if c.lookup().is_some() {
+        return (false, c.hits); // 空缓存不应命中
+    }
+    c.insert(gw);
+    if c.lookup() != Some(gw) {
+        return (false, c.hits); // TTL 内应命中
+    }
+    c.advance(ARP_CACHE_TTL_MS - 1);
+    if c.is_stale() {
+        return (false, c.hits); // 未到 TTL 不应陈旧
+    }
+    if c.lookup() != Some(gw) {
+        return (false, c.hits); // 边界前仍应命中
+    }
+    c.advance(1);
+    if !c.is_stale() {
+        return (false, c.hits); // 恰好到 TTL 应变陈旧
+    }
+    if c.lookup().is_some() {
+        return (false, c.hits); // 陈旧不应命中
+    }
+    c.insert(gw);
+    if c.lookup() != Some(gw) {
+        return (false, c.hits); // 刷新后应再次命中
+    }
+    (true, c.hits) // hits == 3
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1421,21 @@ pub fn run() {
         println("net: ipv4/icmp echo-reply path FAILED (synthetic request not answered)");
     }
 
+    // N4 前置：TCP 头构造/解析 + 伪首部校验和 + 握手/数据段的确定性自证（不需要对端）。
+    let tcp_selftest_ok = tcp_selftest(mac, ip_buf_va);
+
+    // ARP 缓存老化自证（有界）：空缓存不命中 / TTL 内命中 / 到 TTL 过期 / 重插后命中。
+    let (arp_cache_ok, arp_cache_hits) = arp_cache_selftest();
+    if arp_cache_ok {
+        print("net: arp cache aging OK, hits=");
+        print_u64(arp_cache_hits);
+        print(" ttl_ms=");
+        print_u64(ARP_CACHE_TTL_MS);
+        println("");
+    } else {
+        println("net: arp cache aging FAILED");
+    }
+
     // 收帧：有中断走中断（快路径 poll + 阻塞 wait，超时回落重扫），否则轮询。
     let mut rx_frames: u64 = 0;
     let mut irq_hits: u64 = 0;
@@ -1082,6 +1448,12 @@ pub fn run() {
     let mut udp_ok = false;
     let mut net2_done = false;
     let mut probe_ms: u64 = 0;
+    // N4 / ARP 老化状态。
+    let mut arp_cache = ArpCache::new();
+    let mut tcp_syn_sent = false;
+    let mut tcp_peer: u8 = 0; // 0=未知/超时, 1=握手完成, 2=被拒(RST)
+    let mut tcp_ms: u64 = 0;
+    let mut tcp_done = false;
     loop {
         let used_idx = rx.used_idx();
         let mut drained = 0u32;
@@ -1094,11 +1466,12 @@ pub fn run() {
             let buf_va = g.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
             let eth_va = buf_va + VNET_HDR_LEN;
             let eth_len = len.saturating_sub(VNET_HDR_LEN);
-            // NET1：命中网关 ARP 应答即记下其 MAC 并打自测标记。
-            if !arp_ok {
-                if let Some(m) = gw_arp_reply_mac(buf_va, len) {
+            // NET1：命中网关 ARP 应答即记下其 MAC 并打自测标记；同时写入/刷新 ARP 缓存。
+            if let Some(m) = gw_arp_reply_mac(buf_va, len) {
+                gw_mac = m;
+                arp_cache.insert(m);
+                if !arp_ok {
                     arp_ok = true;
-                    gw_mac = m;
                     print("NET1 virtio-net up, MAC=");
                     print_mac(mac);
                     println(", ARP reply OK");
@@ -1124,6 +1497,63 @@ pub fn run() {
                 tx_send(&caps, &tx, ip_buf_pa, rlen);
                 println("net: icmp echo request answered");
             }
+            // NET4：观察对真实对端 SYN 的回应（RST = 被拒；SYN-ACK = 完成握手并发数据）。
+            if tcp_syn_sent && tcp_peer == 0 {
+                if let Some(seg) = tcp_parse_eth(eth_va, eth_len) {
+                    if seg.sport == TEST_TCP_DPORT && seg.dport == TEST_TCP_SPORT {
+                        if (seg.flags & TCP_RST) != 0 {
+                            tcp_peer = 2;
+                            println("net: tcp peer refused (RST)");
+                        } else if (seg.flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
+                            && seg.ack == TEST_TCP_ISN.wrapping_add(1)
+                        {
+                            // 三次握手收尾（ACK）+ 一个最小 PSH/ACK 数据段。
+                            let peer_next = seg.seq.wrapping_add(1);
+                            let our_next = TEST_TCP_ISN.wrapping_add(1);
+                            let dst_mac = [
+                                rd8(eth_va + 6),
+                                rd8(eth_va + 7),
+                                rd8(eth_va + 8),
+                                rd8(eth_va + 9),
+                                rd8(eth_va + 10),
+                                rd8(eth_va + 11),
+                            ];
+                            let ack = tcp_build(
+                                ip_buf_va,
+                                mac,
+                                dst_mac,
+                                our_ip(),
+                                gw_ip(),
+                                TEST_TCP_SPORT,
+                                TEST_TCP_DPORT,
+                                our_next,
+                                peer_next,
+                                TCP_ACK,
+                                TCP_WINDOW,
+                                b"",
+                            );
+                            tx_send(&caps, &tx, ip_buf_pa, ack);
+                            let data = tcp_build(
+                                ip_buf_va,
+                                mac,
+                                dst_mac,
+                                our_ip(),
+                                gw_ip(),
+                                TEST_TCP_SPORT,
+                                TEST_TCP_DPORT,
+                                our_next,
+                                peer_next,
+                                TCP_PSH | TCP_ACK,
+                                TCP_WINDOW,
+                                b"MORION-N4",
+                            );
+                            tx_send(&caps, &tx, ip_buf_pa, data);
+                            tcp_peer = 1;
+                            println("net: tcp handshake + data sent (SYN-ACK received)");
+                        }
+                    }
+                }
+            }
             // 把同一个描述符补投回 avail 环，缓冲可被复用。
             rx.avail_push(id);
             last_used = last_used.wrapping_add(1);
@@ -1136,9 +1566,11 @@ pub fn run() {
             print_u64(irq_hits);
             println("");
         }
-        // 拿到网关 MAC 后各发一次 ICMP echo request 与 UDP（串行复用页 7）。
+        // 拿到网关 MAC 后各发一次 ICMP echo request / UDP / TCP SYN（串行复用页 7）。
         if arp_ok && !icmp_sent {
-            let pay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_ICMP, gw_ip());
+            // 从 ARP 缓存取网关 MAC（记一次命中，未命中回落到最近一次应答值）。
+            let dst_mac = arp_cache.lookup().unwrap_or(gw_mac);
+            let pay = ipv4_build(ip_buf_va, mac, dst_mac, IP_PROTO_ICMP, gw_ip());
             let ilen = icmp_echo_write(
                 pay,
                 ICMP_ECHO_REQ,
@@ -1151,12 +1583,31 @@ pub fn run() {
             icmp_sent = true;
             println("net: icmp echo request sent to 10.0.2.2");
 
-            let upay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_UDP, gw_ip());
+            let upay = ipv4_build(ip_buf_va, mac, dst_mac, IP_PROTO_UDP, gw_ip());
             let ulen = udp_write(upay, TEST_UDP_SPORT, TEST_UDP_DPORT, b"MORION-UDP");
             let ufl = ipv4_finish(ip_buf_va, ulen);
             tx_send(&caps, &tx, ip_buf_pa, ufl);
             udp_sent = true;
             println("net: udp sent to 10.0.2.2:9999");
+
+            // N4：向 slirp 网关试发一个 SYN（无监听端口多半回 RST/超时；有对端则完成握手）。
+            let syn = tcp_build(
+                ip_buf_va,
+                mac,
+                dst_mac,
+                our_ip(),
+                gw_ip(),
+                TEST_TCP_SPORT,
+                TEST_TCP_DPORT,
+                TEST_TCP_ISN,
+                0,
+                TCP_SYN,
+                TCP_WINDOW,
+                b"",
+            );
+            tx_send(&caps, &tx, ip_buf_pa, syn);
+            tcp_syn_sent = true;
+            println("net: tcp SYN sent to 10.0.2.2:12345");
         }
         // NET2 判据：ICMP+UDP 都有结果，或到点收手（绝不阻塞后续保活）。
         if !net2_done && icmp_sent && ((icmp_ok && udp_ok) || probe_ms >= NET2_TIMEOUT_MS) {
@@ -1174,19 +1625,49 @@ pub fn run() {
             println(if responder_ok { "OK" } else { "FAILED" });
             net2_done = true;
         }
+        // NET4 判据：确定性自证结果 + 对真实对端的有界尝试（有结论或到点即打，绝不阻塞）。
+        if !tcp_done && tcp_syn_sent && (tcp_peer != 0 || tcp_ms >= TCP_PEER_TIMEOUT_MS) {
+            print("NET4 tcp ");
+            print(if tcp_selftest_ok { "OK" } else { "FAILED" });
+            print(", handshake+data selftest ");
+            print(if tcp_selftest_ok { "OK" } else { "FAILED" });
+            print(", peer ");
+            print(match tcp_peer {
+                1 => "handshake OK",
+                2 => "refused(RST)",
+                _ => "timeout",
+            });
+            println("");
+            tcp_done = true;
+        }
+        let mut elapsed_ms: u64 = 0;
         if irq_vectors != 0 {
             // 快路径 poll 命中就不睡；否则阻塞等下一次中断，超时回落重扫。
             let hit = sys_irq_poll(irq_mask) != 0 || sys_irq_wait(irq_mask, IRQ_WAIT_MS) != 0;
             if hit {
                 irq_hits += 1;
-            } else if !net2_done {
-                probe_ms += IRQ_WAIT_MS;
+            } else {
+                elapsed_ms = IRQ_WAIT_MS;
             }
         } else {
             sys_sleep(20);
-            if !net2_done {
-                probe_ms += 20;
-            }
+            elapsed_ms = 20;
+        }
+        if !net2_done {
+            probe_ms += elapsed_ms;
+        }
+        if tcp_syn_sent && !tcp_done {
+            tcp_ms += elapsed_ms;
+        }
+        // ARP 缓存老化：推进计时；过期即重新广播 ARP 刷新（约每 TTL 一次，有界）。
+        arp_cache.advance(elapsed_ms);
+        if arp_cache.is_stale() {
+            let flen = arp_build(tx_buf_va, mac);
+            tx_send(&caps, &tx, tx_buf_pa, flen);
+            arp_cache.mark_refreshed();
+            print("net: arp cache expired, re-ARP sent (hits=");
+            print_u64(arp_cache.hits);
+            println(")");
         }
     }
 }
