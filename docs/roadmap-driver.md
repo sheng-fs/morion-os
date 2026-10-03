@@ -36,7 +36,7 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层） |
+| 用户态驱动 | **5 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N3b）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
@@ -55,7 +55,7 @@
   **17** 给 `net_srv`(16) 腾号、**D3** 扩到 **18** 给 `virtio_blk_srv`(17) 腾号、**D4** 扩到 **19** 给
   `ahci_srv`(18) 腾号（各表是 `Vec` 且按需增长，
   机制上可行；**boot 侧 `SERVICE_FILES`/模块表已同步**）。再加驱动时继续按需扩。
-- **没有网络驱动**（N0–N3 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）。
+- **没有网络驱动**（N0–N3b 已解决）：`net_srv` 走通用授权 + virtio-modern，ARP 端到端自测（`NET1`）+ **最小 IPv4 栈**（IPv4 头构造/解析 + ICMP echo 收发 + UDP，端到端 `NET2`）；TCP 未做。
 - **没有 IOMMU**（`grep` 内核无任何 DMAR / VT-d 代码，E1a 只加了**探测**）→ 直通设备的 DMA **无法隔离**，这是飞地的**安全前提**（重映射域与拒绝取证 = E1b/E1c）。**→ 已由 E1b 落地**（建根表/上下文表 + 恒等二级页表、打开 `GCMD.TE`）与 **E1c**（目标设备窗口收成 `[0, 3 GiB)`、越界 DMA 被拒并留证）。
 - **没有 LibDevice**（D2 已解决首批）：`user/libdevice` 抽出 `grant`/`mmio`/`msix`，三个驱动共用；设备**语义**（vring 等）留 D2b 去重。
 - **没有飞地管理器**、没有 `create_enclave` 之类的内核原语。
@@ -166,6 +166,27 @@
   （`num_buffers` 总在；只有 legacy 且未协商 `MRG_RXBUF` 才是 10）。起初按 10 拼包，设备**已发出**
   （`tx_used=1`）但 slirp 因解包错位丢弃、无应答；改成 12 后立刻收到应答。
 - 驱动起来后即由 `init` 监督（域 16），与其它服务一致。
+
+#### N3b — 最小 IPv4 栈（IPv4 / ICMP / UDP）✅ 已完成
+- 目标：在**不新增服务 / 不新增 syscall / 不动公共文件**的前提下，给 `net_srv` 补上网卡之上的
+  协议语义（实现全在 [`net_srv.rs`](../user/srv/src/net_srv.rs) 内）。
+- 做法：
+  - **IPv4**：20 字节定长头（`IHL=5`、DF 置位）构造 + 解析；Internet 校验和（RFC 1071 反码和）
+    覆盖头部，解析时校验。解析拒非 IPv4 / 版本非 4 / IHL 或总长越界 / 校验和非法 /
+    **任何分片**（不实现重组，`MF` 与 `frag_offset≠0` 一律拒）。UDP 校验和置 0（IPv4 允许）。
+  - **ICMP echo**：向网关 `10.0.2.2` 发 echo request（id/seq + 负载），收 reply 校验
+    type=0 / id / seq / 校验和 → **端到端**；另加「收发往 `OUR_IP` 的 echo request → 回 echo reply」
+    （目的 MAC 取请求源 MAC）。
+  - **UDP**：构造报头 + 发送；slirp 对未监听端口回 **ICMP 目的不可达（type 3 code 3）**，
+    解析内嵌原始 IP/UDP 作副证据。
+  - **缓冲区**：IP 帧走**独立的一页 TX**（`IP_TX_BUF_PAGE=7`，与 ARP 的页 6 错开），发送**串行复用**
+    （`tx_send` 等 TX used 环前进再复用）；网关 MAC 从 ARP 应答的 `sha` 取，不写死。
+- **无显示器自证**：「收 request 回 reply」路径用**合成 echo request**（栈上）喂给 responder，
+  再解析生成的回包断言字段 + IP/ICMP 双校验和（确定性，不依赖对端）。最终打一行
+  `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；
+  探针有界收手，超时字段标 `timeout`（绝不静默）。
+- 判据：串口出现上述 `NET2` 行且四段全成立；`NET1 … ARP reply OK` 不变；全量回归不退化。
+- 不做（明确排除）：IP 分片/重组、TCP、DHCP、多网卡、ARP 缓存老化。
 
 ### D2 — LibDevice 双形态 ✅ 首批已完成（驱动底座）
 - 新 crate [`user/libdevice/`](../../user/libdevice)（`#![no_std]`，零依赖）：把**与"我在服务进程
@@ -299,7 +320,7 @@
 
 ### 远期（跨模块，尚未排期）
 - **引导安全链密码库（GmSSL）**：`boot/src/security/` 的国密实现目前部分为桩 —— SM3 映像哈希与 SM2 验签已用 RustCrypto `no_std` 纯 Rust，**TPM 2.0 PCR 测量仍为桩**（待接 `EFI_TCG2_PROTOCOL`）。计划把桩替换为 **GmSSL (C)** 实现，并打通自加密镜像解封与飞地预认证。
-- **独立高精度定时器（hrtimer / TSC，1 ms 精度）**：模仿 Linux `hrtimer` 思路，**不改动全局 100 Hz 调度 tick**，另实现一套基于 APIC/TSC 的独立高精度定时器；普通任务 `sleep` 走普通 tick，游戏 / 多媒体经**新 syscall** 走 hrtimer 做 1 ms 精度等待。取舍：只有需要高精度的任务受影响，其余系统部分不受拖累、功耗可控；调度抢占仍 10 ms 一次，但程序休眠唤醒可做到 1 ms。**注（02b-2 续）**：全局调度 tick 已由 100 Hz 提到 **500 Hz**（tick 2 ms）—— 实测「阻塞→唤醒」被 tick 量化正是文件系统 I/O 墙钟的主要来源，提到 500 Hz 后全量回归 118 s → 33 s（3.6×）；hrtimer 的动机与「只让高精度任务受影响、功耗可控」的取舍不变，只是普通 tick 粒度已从 10 ms 收到 2 ms。
+- **独立高精度定时器（hrtimer / TSC，1 ms 精度）**：模仿 Linux `hrtimer` 思路，**不改动全局 100 Hz 调度 tick**，另实现一套基于 APIC/TSC 的独立高精度定时器；普通任务 `sleep` 走普通 tick，游戏 / 多媒体经**新 syscall** 走 hrtimer 做 1 ms 精度等待。取舍：只有需要高精度的任务受影响，其余系统部分不受拖累、功耗可控；调度抢占仍 10 ms 一次，但程序休眠唤醒可做到 1 ms。**注（02b-2 续 → 1000 Hz）**：全局调度 tick 已由 100 Hz 提到 **500 Hz**、再提到 **1000 Hz**（tick 1 ms）—— 实测「阻塞→唤醒」被 tick 量化正是文件系统 I/O 墙钟的主要来源，全量回归 118 s → 33 s → **23 s**；提 1000 Hz 前先修掉一条**启动期测试时序竞态**（`sender` 委派 `SendTo(3)` 与 `receiver` 零能力负例赛跑，见 [dev-reference.md](dev-reference.md) §9 第 85 行）。hrtimer 的动机与「只让高精度任务受影响、功耗可控」的取舍不变，只是普通 tick 粒度已从 10 ms 收到 1 ms。
 
 ---
 
@@ -309,7 +330,7 @@
 2. **N0 域表扩容**（✅ 已完成）：`BOOT_DOMAINS` 16 → 17 + boot 侧服务表同步 + `net_srv` 骨架。
 3. **N1 PCI 通用查找 + 设备声明**（✅ 已完成）：按类找 virtio-net（BAR4）+ `device::grant` 声明 + QEMU 加网卡；**MSI-X 表在 BAR1** 的缺口留给 N2。
 4. **N2 `net_srv`**：virtio-net 初始化（✅ N2a：PCI 能力 / MAC / virtqueue / `DRIVER_OK` / 轮询取帧；✅ N2b：MSI-X 中断化，表在 BAR1 由内核另映射）。
-5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）。
+5. **N3 网络自测**（✅ 已完成）：ARP 请求 → 应答取证（`NET1`）；✅ **N3b** 最小 IPv4 栈（IPv4 头 + ICMP echo 收发 + UDP，端到端 `NET2`）。
 6. **D2 LibDevice**（✅ 首批完成，驱动底座）：抽 `libdevice`（`grant`/`mmio`/`msix`），`block_srv` 与 `net_srv` 改为消费者；✅ **D2b** 已完成：`virtio` 传输层 + vring 去重进 `libdevice::virtio`（`net_srv` 与 `virtio_blk_srv` 共用）；NVMe 队列语义仍留待 E3。
 7. **D3 virtio-blk**（✅ 已完成）：用通用路径加第二个真实驱动 `virtio_blk_srv`（域 17）+ 读签名/写读回自测（`VBLK1`）。**注**：boot 期**声明式**授权（内核只多一个按类查找器 + 一行声明），运行期 `SYS_DEVICE_*`（D1b）✅ 已完成（见第 4 节 D1b）。**D4** 真机存储驱动 `ahci_srv`（✅ 已完成，域 18，SATA/AHCI，全轮询、不申请中断；03b 起读+写并经 IPC 接进 `block_srv` 卷层）。
 8. **D0 I/O 端口能力**（✅ 已完成）：`Capability::IoPort(base, len)` + 给既有的 `SYS_PORT_*`（22–25）加门禁（此前无门禁）；按半开区间授权，只给 `block_srv`（IDE）与 `mfs_srv`/`exfat_srv`（CMOS）。
@@ -333,6 +354,7 @@
 | N2a | net_srv 读到 MAC、RX/TX virtqueue 建好、`DRIVER_OK`，并能取到帧 —— ✅ `net: virtio-net up MAC=… rx=8 tx=8`、`net: rx frames=1` |
 | N2b | MSI-X 中断化（表在 BAR1，D1 支持另映射 MSI-X 表 BAR）：`net: MSI-X prepared … table_bar=1`、`net: MSI-X enabled vectors=0x53..0x54` —— ✅ |
 | N3 | 收到 ARP 应答（`NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`）—— ✅ |
+| N3b | 最小 IPv4 栈（IPv4 头构造/解析 + 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送）—— ✅ `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；`NET1 … ARP reply OK` 不变；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0 |
 | D3 | virtio-blk 读写自测通过（`app:` marker），且未改内核设备代码 —— ✅ `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`；内核侧只多 `pci::find_virtio_blk` + 一行 `device::grant`（无 virtio-blk 协议代码） |
 | D4 | AHCI/SATA **只读**驱动落地（域 18），仍走通用授权、内核无设备专属逻辑；全轮询、不申请中断 —— ✅ `[OK] 19 service ELFs loaded` + `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`；`irq_cmds == cmds == 28672` 且 `poll_cmds = 0`；宿主 `sha256sum build/ahci.img` 运行前后一致（只读；`dd … conv=notrunc` 预写签名）；全量回归 `SELFTEST DONE`×1、`FAILED`/`PANIC` 0（隔离树验证：HEAD + 仅 03 补丁）；**收口后已把测试盘接进 Makefile 与标准回归**（`AHCI_IMG` 规则 + `scripts/fs-regress.sh` 判定 `AHCI1 … sig=ok`），不再需要手工 `QEMU_EXTRA` | ✅ |
 | D2b | virtio 传输层 + vring 去重进 `libdevice::virtio`（两个驱动共用，`libdevice` 保持零依赖），行为零变化 —— ✅ `NET1 … ARP reply OK` + `VBLK1 … sig=ok, rw=ok` 不变，全量回归全绿 |

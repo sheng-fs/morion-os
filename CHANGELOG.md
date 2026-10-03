@@ -62,13 +62,26 @@
   CPU 仅 ~9%、91% 在等 tick），同一份代码全量回归 **118 s → 33 s（3.6×）**、逐条命令墙钟 7.2 → 1.4 ms
   （`cmds` 不变 16384）。1000 Hz 更快（→ 23 s）但 ~18% 概率触发内核潜藏竞态（能力负例测试偶发「域 1
   零能力却调通 echo」→ 门禁失败），故停在 500 Hz（**连续 16 次全绿**）；修好该竞态后可再上 1000 Hz。
+- **内核调度 1000 Hz + 启动握手修复**：把 `arch::pit::TARGET_FREQ` 由 500 提到 **1000 Hz**（tick 1 ms）。
+  1000 Hz 下会以 ~18% 概率让能力负例「意外通过」，本轮定位到根因是**测试时序**（`sender` 委派
+  `SendTo(3)` 与 `receiver` 的「启动时零能力」负例赛跑）而**不是内核 bug** —— 修法是 sender/receiver
+  **显式握手**（`RECV_HANDSHAKE_TAG/ACK`，顺序由同步而非时间片决定；回 ACK 时 receiver 仍零能力，
+  `reply` 走内核记录的回复目标、不需 `SendTo`，故「零能力启动」前提不变）。全量回归 **33 s → 23 s**
+  （较 02b-2 前 258 s 约 11×），**连续 5 次全绿**。
+- **`net_srv` 最小 IPv4 栈（N3b）**：纯 `net_srv` 内、不加服务 / 不改公共文件 —— IPv4 头构造·解析
+  （RFC 1071 校验和 + 拒分片）、ICMP echo（发 request 收 reply + 收 request 回 reply）、UDP 构造·发送
+  （slirp 对未监听端口回 ICMP 端口不可达作副证据）；IP 帧走独立 TX 页串行复用，网关 MAC 从 ARP 应答取。
+  端到端 `NET2 ipv4/icmp OK, …`；TCP / DHCP / 多网卡 / 分片重组未做。
+- **MFS 元数据读批量化评估（02b-3，结论：不实现）**：量化后 GC 遍历读 = 0、可批的「扇形展开」读仅
+  234 / 16384 条命令（<1% 收益），其余是数据依赖的串行链（下一块号依赖上一块读回）；故不做批量化，
+  计数插桩已回滚，行为零变化。
 - **开发工作流文档**：新增 [docs/dev-workflow.md](docs/dev-workflow.md) —— 环境陷阱 / 回归门禁 / 已知坑清单 /
   加一个用户态服务的 9 处接线 / 并行协作三铁律；原先散落在本地临时交接文件里的这部分内容沉淀入库。
 
 ### 文档
 
-- `docs/dev-reference.md` §9 阶段进度表补齐 **74–83 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 500 Hz、`NVME_POLL_FIRST`）。
-- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」；`docs/roadmap-driver.md`、`README.md` 状态与勾选同步。
+- `docs/dev-reference.md` §9 阶段进度表补齐 **74–85 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
+- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
 
 ## [0.4.0-nogui] — 2026-10-01
 
