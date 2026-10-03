@@ -743,6 +743,10 @@ const EXFAT_BMP_VADDR: u64 = 0x0000_0080_0015_4000;
 const EXFAT_UPC_VADDR: u64 = 0x0000_0080_0015_5000;
 /// 通用单页暂存: FAT 表项读改写、引导扇区、卷表扫描。
 const EXFAT_PG_VADDR: u64 = 0x0000_0080_0015_6000;
+/// 02b-2 写背缓存: 暂存窗 16 页 `+0x24_0000` + 描述符 1 页 `+0x25_0000` (同址共享给 block_srv)。
+const EXFAT_WB_VADDR: u64 = 0x0000_0080_0024_0000;
+const EXFAT_WB_PAGES: usize = 16;
+const EXFAT_WB_DESC_VADDR: u64 = 0x0000_0080_0025_0000;
 
 fn exfat_clu() -> *mut u8 {
     EXFAT_CLU_VADDR as *mut u8
@@ -1840,6 +1844,23 @@ pub fn run() {
             return;
         }
     }
+    // 02b-2 写背缓存: 暂存窗 + 描述符页 (同址共享给 block_srv), 使连续小块写攒批下发。
+    let mut w = 0usize;
+    while w < EXFAT_WB_PAGES {
+        let p = EXFAT_WB_VADDR + (w as u64) * 4096;
+        if sys_alloc_page(p) != 1 || sys_share_page(p, BLOCK_DOMAIN) != 1 {
+            println("exfat: alloc/share write-back buffer FAILED");
+            return;
+        }
+        w += 1;
+    }
+    if sys_alloc_page(EXFAT_WB_DESC_VADDR) != 1
+        || sys_share_page(EXFAT_WB_DESC_VADDR, BLOCK_DOMAIN) != 1
+    {
+        println("exfat: alloc/share write-back descriptor FAILED");
+        return;
+    }
+    block_wb_enable(EXFAT_WB_VADDR, EXFAT_WB_PAGES, EXFAT_WB_DESC_VADDR);
     // 认领卷: 第一个 exFAT 签名的卷; 无分区表的整盘镜像即卷 5 (回退值)。
     unsafe {
         EXFAT_VOL = vol_claim(exfat_pg(), 16, VOL_KIND_EXFAT, EXFAT_VOL_FALLBACK);
@@ -1884,6 +1905,8 @@ pub fn run() {
     };
     loop {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
+        // 02b-2: 每个请求处理前把上一轮攒下的写落盘 (避免暂存写跨请求滞留太久)。
+        block_wb_flush();
         // 同 fat32_srv: tag 高位带卷编码 (M1b); fd 类请求的卷由 fd 绑定决定。
         let tag = vfs::tag_body(msg.tag);
         let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { EXFAT_VOL });

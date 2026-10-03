@@ -82,8 +82,8 @@ pub struct BlockReq {
     pub buf: u64,   // 数据缓冲页虚拟地址; opcode=2 时为卷描述符输出页
 }
 
-/// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。
-pub fn block_read_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
+/// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。**直通**实现 (不经写背缓存)。
+pub fn block_raw_read(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     let req = BlockReq {
         op: dev << 8,
         lba: lba as u64,
@@ -99,8 +99,8 @@ pub fn block_read_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
 }
 
-/// 带卷号的写 (卷号由卷层分配, 0 = 第一个卷)。
-pub fn block_write_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
+/// 带卷号的写 (卷号由卷层分配, 0 = 第一个卷)。**直通**实现 (不经写背缓存)。
+pub fn block_raw_write(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     let req = BlockReq {
         op: (dev << 8) | 1,
         lba: lba as u64,
@@ -114,6 +114,163 @@ pub fn block_write_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
         )
     };
     sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload) == 1
+}
+
+// ---------------------------------------------------------------------------
+// 通用可选写背缓存 (opt-in, 默认关闭)
+//
+// 详见 [block_wb_enable]。只对「一连串 <= 4 KiB 的小写」有意义的负载 (如 fat32 / exfat
+// 的元数据更新) 才打开; 打开后小块写先攒进**调用方的暂存窗**, 满窗或显式 flush 时用
+// [`block_batch`] 一次下发, 把 N 次「提交-等完成」并成 1 次。
+// ---------------------------------------------------------------------------
+
+/// 写背缓存: 暂存窗最大块数 (= 批量子请求上限)。
+const WB_MAX: usize = BLOCK_BATCH_MAX;
+/// 写背缓存: 每块最多扇区数 (一页 = 4 KiB)。
+const WB_SUB_SECTORS: u64 = 8;
+/// 计数打印的间隔 (累计块数)。
+const WB_PRINT_EVERY: u64 = 512;
+
+static mut WB_ON: bool = false;
+/// 调用方暂存窗基址 (每块一页, 需同址共享给 block_srv)。
+static mut WB_STAGE: u64 = 0;
+/// 描述符数组页基址 (同址共享给 block_srv)。
+static mut WB_DESC: u64 = 0;
+/// 当前攒批所属的卷号 (`u64::MAX` = 空)。
+static mut WB_DEV: u64 = u64::MAX;
+static mut WB_N: usize = 0;
+static mut WB_LBA: [u64; WB_MAX] = [0; WB_MAX];
+static mut WB_SEC: [u64; WB_MAX] = [0; WB_MAX];
+static mut WB_WRITTEN: u64 = 0;
+static mut WB_BATCHES: u64 = 0;
+static mut WB_NEXT: u64 = WB_PRINT_EVERY;
+
+/// 暂存窗第 `i` 块的虚拟地址。
+fn wb_page(i: usize) -> *mut u8 {
+    (unsafe { WB_STAGE } + (i as u64) * 4096) as *mut u8
+}
+
+/// 启用写背缓存。`stage_vaddr` 起 `pages` 页是暂存窗 (每块一页), `desc_vaddr` 是描述符
+/// 数组页 —— 两者都须由调用方 `sys_alloc_page` + `sys_share_page(.., BLOCK_DOMAIN)`。
+/// 只对 `count <= 8` 扇区的小写攒批; 大写或换卷会先 flush。
+pub fn block_wb_enable(stage_vaddr: u64, pages: usize, desc_vaddr: u64) {
+    if pages == 0 || pages > WB_MAX {
+        return;
+    }
+    unsafe {
+        WB_STAGE = stage_vaddr;
+        WB_DESC = desc_vaddr;
+        WB_ON = true;
+        WB_N = 0;
+        WB_DEV = u64::MAX;
+    }
+}
+
+/// 待写入区间是否与暂存区重叠 (读前须先落盘, 保证写后读一致)。
+fn wb_overlap(dev: u64, lba: u64, count: u64) -> bool {
+    unsafe {
+        if WB_N == 0 || WB_DEV != dev {
+            return false;
+        }
+        let end = lba + count;
+        let mut i = 0usize;
+        while i < WB_N {
+            let s = WB_LBA[i];
+            let e = s + WB_SEC[i];
+            if lba < e && s < end {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// 把暂存区一次落盘 (batch 不行则退回逐块直写)。无待写时直接返回 true。
+pub fn block_wb_flush() -> bool {
+    unsafe {
+        if !WB_ON || WB_N == 0 {
+            return true;
+        }
+        let dev = WB_DEV;
+        let n = WB_N;
+        let desc = WB_DESC as *mut BatchEnt;
+        let mut i = 0usize;
+        while i < n {
+            core::ptr::write_unaligned(
+                desc.add(i),
+                BatchEnt {
+                    lba: WB_LBA[i],
+                    sectors: WB_SEC[i],
+                    buf: wb_page(i) as u64,
+                },
+            );
+            i += 1;
+        }
+        let mut ok = block_batch(dev, desc, n, true) == 1;
+        if !ok {
+            ok = true;
+            i = 0;
+            while i < n {
+                if !block_raw_write(dev, WB_LBA[i] as u32, WB_SEC[i] as u16, wb_page(i)) {
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        WB_WRITTEN += n as u64;
+        WB_BATCHES += 1;
+        WB_N = 0;
+        WB_DEV = u64::MAX;
+        if WB_WRITTEN >= WB_NEXT {
+            print("blk-wb: blocks=");
+            print_u64(WB_WRITTEN);
+            print(" batches=");
+            print_u64(WB_BATCHES);
+            print(" avg=");
+            print_u64(WB_WRITTEN / WB_BATCHES.max(1));
+            println("");
+            WB_NEXT += WB_PRINT_EVERY;
+        }
+        ok
+    }
+}
+
+/// 把一次小块写攒进暂存区 (不可攒时先 flush 再直写)。
+fn wb_put(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
+    unsafe {
+        if count == 0 || count as u64 > WB_SUB_SECTORS {
+            return block_wb_flush() && block_raw_write(dev, lba, count, buf);
+        }
+        if (WB_N >= WB_MAX || (WB_DEV != u64::MAX && WB_DEV != dev)) && !block_wb_flush() {
+            return false;
+        }
+        WB_DEV = dev;
+        let i = WB_N;
+        core::ptr::copy_nonoverlapping(buf, wb_page(i), count as usize * 512);
+        WB_LBA[i] = lba as u64;
+        WB_SEC[i] = count as u64;
+        WB_N += 1;
+        true
+    }
+}
+
+/// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。启用写背缓存且命中暂存区时先落盘。
+pub fn block_read_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
+    if unsafe { WB_ON } && wb_overlap(dev, lba as u64, count as u64) && !block_wb_flush() {
+        return false;
+    }
+    block_raw_read(dev, lba, count, buf)
+}
+
+/// 带卷号的写 (卷号由卷层分配, 0 = 第一个卷)。启用写背缓存时先攒批, 否则直写。
+pub fn block_write_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
+    if unsafe { WB_ON } {
+        wb_put(dev, lba, count, buf)
+    } else {
+        block_raw_write(dev, lba, count, buf)
+    }
 }
 
 /// 读一个 16 位小端无符号整数 (引导扇区字段)。
@@ -334,6 +491,51 @@ pub const BLOCK_OP_DISK_READ: u8 = 7;
 /// 为它分配一个传输暂存页 (同址共享给 ahci), 登记成一个 AHCI 后端卷, 之后对外的读/写
 /// 都经 block_srv 的卷层转发回 ahci_srv —— 上层文件系统因此完全不必知道盘挂在哪种控制器上。
 pub const BLOCK_OP_ATTACH: u8 = 8;
+/// 散聚**批读**: 一次 IPC 带 K 个子请求。`BlockReq.lba` = 子请求数 K,
+/// `BlockReq.buf` = 调用方共享页里的 [`BatchEnt`] 数组 (每子请求 ≤ 8 扇区 = 一页)。
+///
+/// 动机 (02b-2): 量化发现耗时主因是**每条 NVMe 命令的完成等待**, 故把「逐个提交-等完成」
+/// 改成「一次排 K 条 SQE、只敲一次门铃、统一等完成」。非 NVMe 后端自动退回逐块。回复 1/0。
+pub const BLOCK_OP_BATCH_READ: u8 = 9;
+/// 散聚**批写**: 语义同 [`BLOCK_OP_BATCH_READ`], 方向为写。
+pub const BLOCK_OP_BATCH_WRITE: u8 = 10;
+/// 一次批量子请求数上限 (也是写暂存窗的页数)。
+pub const BLOCK_BATCH_MAX: usize = 16;
+
+/// 批量子请求描述符 (24 字节, `repr(C)`)。数据缓冲 `buf` 须已共享给 block_srv 且页对齐。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BatchEnt {
+    /// 卷内起始扇区号。
+    pub lba: u64,
+    /// 扇区数 (1..=8, 一页以内)。
+    pub sectors: u64,
+    /// 数据缓冲页虚拟地址 (页对齐)。
+    pub buf: u64,
+}
+
+/// 一次提交 K 个块读 / 写子请求 (`write = true` 为写)。`ents` 指向共享页里的描述符数组。
+/// 成功返回 1, 失败 0。
+pub fn block_batch(vol: u64, ents: *const BatchEnt, k: usize, write: bool) -> u64 {
+    let opcode = if write {
+        BLOCK_OP_BATCH_WRITE as u64
+    } else {
+        BLOCK_OP_BATCH_READ as u64
+    };
+    let req = BlockReq {
+        op: (vol << 8) | opcode,
+        lba: k as u64,
+        count: 0,
+        buf: ents as u64,
+    };
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            &req as *const BlockReq as *const u8,
+            core::mem::size_of::<BlockReq>(),
+        )
+    };
+    sys_call_payload(BLOCK_DOMAIN, BLOCK_REQ_TAG, payload)
+}
 
 /// 分区表 / 裸盘请求 (`op & 0xFF` 是 `BLOCK_OP_PART_*` / `BLOCK_OP_DISK_READ` 时按本结构解释)。
 ///

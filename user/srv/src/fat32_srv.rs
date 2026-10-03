@@ -1263,6 +1263,11 @@ const FAT32_CLU_VADDR: u64 = 0x0000_0080_0020_0000;
 const FAT32_CLU_PAGES: u64 = 16;
 /// FAT32 允许的最大簇字节数 (`SecPerClus` ≤ 128 扇区 × 512 B)。
 const FAT32_MAX_CLUSTER_BYTES: u32 = 128 * 512;
+/// 02b-2 写背缓存: 暂存窗 16 页 `+0x22_0000` + 描述符 1 页 `+0x23_0000` (同址共享给 block_srv)。
+/// 地址须**独家** (撞址会 `PageAlreadyMapped`), 故排在 exfat 段 (`+0x24_0000`) 之前。
+const FAT32_WB_VADDR: u64 = 0x0000_0080_0022_0000;
+const FAT32_WB_PAGES: usize = 16;
+const FAT32_WB_DESC_VADDR: u64 = 0x0000_0080_0023_0000;
 
 /// 载入卷 `vol` 的 BPB 到 `out`, 并把 `FAT_BPB_VOL` 标成 `vol`。
 ///
@@ -1320,6 +1325,24 @@ pub fn run() {
             return;
         }
     }
+
+    // 02b-2 写背缓存: 暂存窗 + 描述符页 (同址共享给 block_srv), 使连续小块写攒批下发。
+    let mut w = 0usize;
+    while w < FAT32_WB_PAGES {
+        let p = FAT32_WB_VADDR + (w as u64) * 4096;
+        if sys_alloc_page(p) != 1 || sys_share_page(p, BLOCK_DOMAIN) != 1 {
+            println("fat32: alloc/share write-back buffer FAILED");
+            return;
+        }
+        w += 1;
+    }
+    if sys_alloc_page(FAT32_WB_DESC_VADDR) != 1
+        || sys_share_page(FAT32_WB_DESC_VADDR, BLOCK_DOMAIN) != 1
+    {
+        println("fat32: alloc/share write-back descriptor FAILED");
+        return;
+    }
+    block_wb_enable(FAT32_WB_VADDR, FAT32_WB_PAGES, FAT32_WB_DESC_VADDR);
 
     // 认领卷: 第一个 FAT 签名的卷; 无分区表的整盘镜像即卷 0 (回退值)。
     unsafe {
@@ -1453,6 +1476,8 @@ pub fn run() {
             payload: [0; PAYLOAD_LEN],
         };
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
+        // 02b-2: 每个请求处理前把上一轮攒下的写落盘 (避免暂存写跨请求滞留太久)。
+        block_wb_flush();
 
         let tag = vfs::tag_body(msg.tag);
         // tag 高位携带卷编码 (M1b): 路径类请求由它决定目标卷; fd 类请求由 fd 绑定的卷

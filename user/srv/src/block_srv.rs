@@ -272,6 +272,79 @@ fn nvme_stats_tick() {
     nvme_stats_print("nvme: stats ");
 }
 
+/// 块服务**请求**计数 (每 `BLK_REQ_STATS_EVERY` 条打印一次)。
+///
+/// 与上面的 `NVME_CMDS_TOTAL` 是**两个层级**: 前者是客户端经 IPC 发来的读/写请求条数
+/// (含被只读缓存吸收、不发 NVMe 命令的那些), 后者是真正下发的 NVMe 命令数。两者放在一起
+/// 才能回答 02b-2 的关键问题 —— 回归耗时的大头是「每请求一跳 IPC」还是「每命令一次完成
+/// 等待」。`secs` 是请求覆盖的扇区总数 (≈ 数据量), `large` 是 `count > 8` (超过缓存行) 的
+/// 请求数。`runs` / `breaks` 度量**相邻同卷请求的 LBA 是否首尾相接** —— `runs` 高才说明
+/// 「合并连续请求」有收益。
+static mut BLK_REQ_READS: u64 = 0;
+static mut BLK_REQ_WRITES: u64 = 0;
+static mut BLK_REQ_SECTORS: u64 = 0;
+static mut BLK_REQ_LARGE: u64 = 0;
+static mut R_RUNS: u64 = 0;
+static mut R_BREAKS: u64 = 0;
+static mut W_RUNS: u64 = 0;
+static mut W_BREAKS: u64 = 0;
+static mut LAST_R_END: u64 = 0;
+static mut LAST_R_VOL: u64 = u64::MAX;
+static mut LAST_W_END: u64 = 0;
+static mut LAST_W_VOL: u64 = u64::MAX;
+const BLK_REQ_STATS_EVERY: u64 = 4096;
+
+/// 记一条块请求并在整点打印 (证据行)。`vol` = 卷号, `lba` = 卷内起始扇区。
+fn blk_req_tick(is_read: bool, vol: usize, lba: u64, sectors: u64) {
+    unsafe {
+        let vo = vol as u64;
+        if is_read {
+            BLK_REQ_READS += 1;
+            if LAST_R_VOL == vo && lba == LAST_R_END {
+                R_RUNS += 1;
+            } else {
+                R_BREAKS += 1;
+            }
+            LAST_R_VOL = vo;
+            LAST_R_END = lba + sectors;
+        } else {
+            BLK_REQ_WRITES += 1;
+            if LAST_W_VOL == vo && lba == LAST_W_END {
+                W_RUNS += 1;
+            } else {
+                W_BREAKS += 1;
+            }
+            LAST_W_VOL = vo;
+            LAST_W_END = lba + sectors;
+        }
+        BLK_REQ_SECTORS += sectors;
+        if sectors > 8 {
+            BLK_REQ_LARGE += 1;
+        }
+        let total = BLK_REQ_READS + BLK_REQ_WRITES;
+        if !total.is_multiple_of(BLK_REQ_STATS_EVERY) {
+            return;
+        }
+        print("blk-req: reads=");
+        print_u64(BLK_REQ_READS);
+        print(" writes=");
+        print_u64(BLK_REQ_WRITES);
+        print(" secs=");
+        print_u64(BLK_REQ_SECTORS);
+        print(" large=");
+        print_u64(BLK_REQ_LARGE);
+        print(" r-run=");
+        print_u64(R_RUNS);
+        print(" r-brk=");
+        print_u64(R_BREAKS);
+        print(" w-run=");
+        print_u64(W_RUNS);
+        print(" w-brk=");
+        print_u64(W_BREAKS);
+        println("");
+    }
+}
+
 /// 尝试从完成队列取一条 CQE。
 ///
 /// 取到则推进 head / 翻转 phase / 敲 CQ 门铃, 返回 `Some(状态码是否为 0)`;
@@ -436,6 +509,133 @@ fn submit_wait(
     print_u64(s1);
     println("");
     false
+}
+
+/// 一次提交 K 条散聚 NVMe 读 / 写命令, 统一等完成 (02b-2)。
+///
+/// `desc_va` 指向调用方共享页里的 [`BatchEnt`] 数组 (每子请求 ≤ 8 扇区 = 一页); 全部排在
+/// I/O 队列 0 上、**只敲一次门铃**, 再统一收 `k` 个完成 —— 把 (k-1) 段「提交-等完成」
+/// 重叠成一段。完成等待与单命令路径同源 (中断优先 / 回退轮询)。
+#[allow(clippy::too_many_arguments)]
+fn nvme_batch_rw(
+    cfg: &NvmeConfig,
+    mmio: u64,
+    stride: u64,
+    io_tail: &mut [u32; IO_QUEUES],
+    io_head: &mut [u32; IO_QUEUES],
+    io_phase: &mut [u32; IO_QUEUES],
+    vol: &Volume,
+    desc_va: u64,
+    k: usize,
+    is_read: bool,
+) -> bool {
+    const Q: usize = 0;
+    let qd = cfg.io_qdepth as u32;
+    let (sq_vaddr, cq_vaddr) = io_q_vaddrs(cfg, Q);
+    let (sq_db, cq_db) = io_q_doorbells(mmio, stride, Q);
+    let desc = desc_va as *const BatchEnt;
+
+    // 1) 逐个构造 SQE 排进 SQ (先不敲门铃)。
+    let mut submitted: u32 = 0;
+    for i in 0..k {
+        let ent = unsafe { core::ptr::read_unaligned(desc.add(i)) };
+        if ent.sectors == 0 || ent.sectors > BLK_CACHE_SECTORS_PER_LINE || ent.buf == 0 {
+            return false;
+        }
+        let pa = sys_virt_to_phys(ent.buf);
+        if pa == 0 || !pa.is_multiple_of(NVME_PAGE_SIZE as u64) {
+            return false;
+        }
+        let mut sqe = Sqe::zero();
+        sqe.opcode = if is_read { OP_READ } else { OP_WRITE };
+        sqe.cid = i as u16;
+        sqe.nsid = vol.nsid;
+        sqe.prp1 = pa;
+        sqe.cdw10 = vol.start_lba.saturating_add(ent.lba as u32);
+        sqe.cdw12 = (ent.sectors as u32) - 1;
+        let idx = (io_tail[Q] % qd) as u64;
+        unsafe {
+            core::ptr::write_volatile((sq_vaddr + idx * 64) as *mut Sqe, sqe);
+        }
+        io_tail[Q] = (io_tail[Q] + 1) % qd;
+        submitted += 1;
+    }
+    // 2) 一次门铃把 k 条命令一起发出去 (设备侧并发处理)。
+    wr32(sq_db, io_tail[Q]);
+
+    // 3) 统一等 k 个完成 (中断优先, 等不到回退轮询)。
+    let dummy = Sqe::zero();
+    let mut done: u32 = 0;
+    let mut all_ok = true;
+    let mut rounds = NVME_IRQ_WAIT_ROUNDS * (submitted + 1);
+    let mut spins: u32 = 0;
+    while done < submitted {
+        if nvme_irq_mode() {
+            let hit = {
+                let h = sys_irq_poll(io_wait_mask());
+                if h != 0 {
+                    h
+                } else {
+                    sys_irq_wait(io_wait_mask(), NVME_IRQ_WAIT_TIMEOUT_MS)
+                }
+            };
+            if hit != 0 {
+                unsafe {
+                    NVME_IRQ_OBSERVED += 1;
+                    NVME_IRQ_VEC_MASK |= 1 << (hit - NVME_IRQ_VECTOR);
+                }
+                let mut drained = false;
+                while let Some(ok) = try_complete(
+                    cq_vaddr,
+                    cq_db,
+                    qd,
+                    &dummy,
+                    &mut io_head[Q],
+                    &mut io_phase[Q],
+                ) {
+                    unsafe { NVME_IRQ_CMDS += 1 };
+                    nvme_stats_tick();
+                    done += 1;
+                    drained = true;
+                    if !ok {
+                        all_ok = false;
+                    }
+                }
+                if drained {
+                    continue;
+                }
+                // 陈旧中断 (CQE 已被取走): 继续等本批自己的完成。
+            }
+            rounds -= 1;
+            if rounds == 0 {
+                unsafe { NVME_IRQ_MODE = false };
+                println("nvme: irq wait timed out (batch), fallback to polling");
+            }
+        }
+        // 轮询 (兼作中断超时回退): 读 CSTS 触发 VM exit, 让 QEMU 主循环有机会 post CQE。
+        while let Some(ok) = try_complete(
+            cq_vaddr,
+            cq_db,
+            qd,
+            &dummy,
+            &mut io_head[Q],
+            &mut io_phase[Q],
+        ) {
+            unsafe { NVME_POLL_CMDS += 1 };
+            nvme_stats_tick();
+            done += 1;
+            if !ok {
+                all_ok = false;
+            }
+        }
+        spins += 1;
+        if spins > NVME_POLL_LIMIT {
+            println("nvme: batch CQE timeout");
+            return false;
+        }
+        let _ = rd32(mmio + REG_CSTS);
+    }
+    all_ok
 }
 
 /// 轮询 CQE 的迭代上限。
@@ -1218,6 +1418,7 @@ fn nvme_main() {
                     sys_reply(0);
                     continue;
                 }
+                blk_req_tick(is_read, dev, req.lba, total);
                 // 小读 (≤ 一行 = 8 扇区) 走只读缓存: 命中直接回数据, 未命中按行读入。
                 // 大读与写保持下面的直传路径 (取舍见缓存段注释)。容量未知 (sectors==0)
                 // 的卷不缓存 —— 按行读可能越过盘尾。
@@ -1275,6 +1476,57 @@ fn nvme_main() {
                 // 写穿透: 写盘成功后失效被覆盖的缓存行 (不允许脏数据)。
                 if !is_read && ok {
                     blk_cache_invalidate(dev, req.lba, total);
+                }
+                blk_cache_stats_tick();
+                sys_reply(if ok { 1 } else { 0 });
+            }
+            // 散聚批读 / 批写 (02b-2): 一次 IPC 带 K 个子请求 (描述符数组在调用方共享页),
+            // 只敲一次门铃、统一等完成。非 NVMe 后端不支持 (退回逐块)。
+            BLOCK_OP_BATCH_READ | BLOCK_OP_BATCH_WRITE => {
+                let vol = match vol_get(dev) {
+                    Some(v) => v,
+                    None => {
+                        sys_reply(0);
+                        continue;
+                    }
+                };
+                let is_read = opcode_low == BLOCK_OP_BATCH_READ;
+                if vol.backend != BACKEND_NVME {
+                    sys_reply(0);
+                    continue;
+                }
+                let k = req.lba as usize;
+                if k == 0 || k > BLOCK_BATCH_MAX {
+                    sys_reply(0);
+                    continue;
+                }
+                let desc = req.buf as *const BatchEnt;
+                let mut t = 0usize;
+                while t < k {
+                    let ent = unsafe { core::ptr::read_unaligned(desc.add(t)) };
+                    blk_req_tick(is_read, dev, ent.lba, ent.sectors);
+                    t += 1;
+                }
+                let ok = nvme_batch_rw(
+                    &cfg,
+                    mmio,
+                    stride,
+                    &mut io_tail,
+                    &mut io_head,
+                    &mut io_phase,
+                    &vol,
+                    req.buf,
+                    k,
+                    is_read,
+                );
+                // 写穿透: 失效被覆盖的缓存行 (不允许脏数据)。
+                if !is_read && ok {
+                    let mut t = 0usize;
+                    while t < k {
+                        let ent = unsafe { core::ptr::read_unaligned(desc.add(t)) };
+                        blk_cache_invalidate(dev, ent.lba, ent.sectors);
+                        t += 1;
+                    }
                 }
                 blk_cache_stats_tick();
                 sys_reply(if ok { 1 } else { 0 });

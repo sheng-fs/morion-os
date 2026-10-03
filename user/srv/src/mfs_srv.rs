@@ -361,6 +361,45 @@ const MFS_SEEN_VADDR: u64 = 0x0000_0080_0180_0000;
 /// 位图头块缓冲页 (单页)。同样共享给 block_srv —— 头块经它读入 / 写出。
 const MFS_BMPH_VADDR: u64 = 0x0000_0080_0016_2000;
 
+// ---------------------------------------------------------------------------
+// 02b-2 批 I/O 缓冲 (mfs_srv 同址共享给 block_srv 供其 DMA)
+//
+//   读批窗口 16 页 `+0x18_0000` + 读描述符 1 页 `+0x19_0000`
+//   写暂存窗 16 页 `+0x1A_0000` + 写描述符 1 页 `+0x1B_0000`
+//
+// 读 / 写用**不同**的描述符页: 否则一次写批 flush 会覆盖读批刚填好的描述符。地址段排
+// 在 mfs 既有缓冲 (`..+0x16_3000`) 之上、fat32 整簇缓冲 (`+0x20_0000`) 之下, 互不撞址。
+// ---------------------------------------------------------------------------
+/// 读批窗口基址 (16 页)。
+const MFS_RDBUF_VADDR: u64 = 0x0000_0080_0018_0000;
+/// 读批窗口页数。
+const MFS_RDBUF_PAGES: usize = BLOCK_BATCH_MAX;
+/// 读批描述符页 (单页)。
+const MFS_RDBUF_DESC_VADDR: u64 = 0x0000_0080_0019_0000;
+/// 写暂存窗基址 (16 页)。
+const MFS_WB_VADDR: u64 = 0x0000_0080_001A_0000;
+/// 写暂存窗页数。
+const MFS_WB_PAGES: usize = BLOCK_BATCH_MAX;
+/// 写暂存描述符页 (单页)。
+const MFS_WB_DESC_VADDR: u64 = 0x0000_0080_001B_0000;
+
+/// 读批窗口第 `i` 个块缓冲 (每块一页)。
+fn mfs_rdbuf(i: usize) -> *mut u8 {
+    (MFS_RDBUF_VADDR + (i as u64) * MFS_BLOCK as u64) as *mut u8
+}
+/// 读批描述符数组页。
+fn mfs_rdbuf_desc() -> *mut BatchEnt {
+    MFS_RDBUF_DESC_VADDR as *mut BatchEnt
+}
+/// 写暂存窗第 `i` 个块缓冲 (每块一页)。
+fn mfs_wbuf(i: usize) -> *mut u8 {
+    (MFS_WB_VADDR + (i as u64) * MFS_BLOCK as u64) as *mut u8
+}
+/// 写暂存描述符数组页。
+fn mfs_wb_desc() -> *mut BatchEnt {
+    MFS_WB_DESC_VADDR as *mut BatchEnt
+}
+
 fn mfs_a() -> *mut u8 {
     MFS_BUF_A_VADDR as *mut u8
 }
@@ -544,7 +583,110 @@ fn mfs_ok(buf: *const u8, magic: u32) -> bool {
     mfs_crc32(p) == stored
 }
 
+// ---------------------------------------------------------------------------
+// 02b-2 写回攒批
+//
+// 所有块写 (`mfs_commit` 的 COW 内容块, `mfs_write_blk` 的位图数据 / 头块 / 超级块) 都先
+// 拷进**写暂存窗**, 满窗或到强制落盘点才用一次 `block_batch` 下发 —— 把 N 次「提交-等完成」
+// 并成 1 次。`mfs_commit_flush` 是唯一的落盘出口。
+// ---------------------------------------------------------------------------
+/// 写暂存窗当前块数。
+static mut MFS_WB_COUNT: usize = 0;
+/// 写暂存窗各块的块号。
+static mut MFS_WB_BLOCKS: [u32; MFS_WB_PAGES] = [0; MFS_WB_PAGES];
+static mut MFS_WB_WRITTEN: u64 = 0;
+static mut MFS_WB_BATCHES: u64 = 0;
+static mut MFS_WB_NEXT: u64 = 512;
+
+/// 块 `block_no` 是否还在写暂存窗里 (写后读一致用)。
+fn mfs_wb_has(block_no: u32) -> bool {
+    unsafe {
+        let n = MFS_WB_COUNT;
+        let mut i = 0usize;
+        while i < n {
+            if MFS_WB_BLOCKS[i] == block_no {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// 把 `src` 的内容攒进写暂存窗 (块号 `block_no`); 窗满先落盘。
+fn mfs_wb_stage(block_no: u32, src: *const u8) -> bool {
+    unsafe {
+        if MFS_WB_COUNT >= MFS_WB_PAGES && !mfs_commit_flush() {
+            return false;
+        }
+        let i = MFS_WB_COUNT;
+        core::ptr::copy_nonoverlapping(src, mfs_wbuf(i), MFS_BLOCK);
+        MFS_WB_BLOCKS[i] = block_no;
+        MFS_WB_COUNT = i + 1;
+        true
+    }
+}
+
+/// 把写暂存窗一次批写落盘 (block_batch 不行则退回逐块直写)。无待写时直接返回 true。
+/// **唯一的落盘出口** —— 强制落盘点 (GC / fsck / 换卷 / 裸读) 都调它。
+fn mfs_commit_flush() -> bool {
+    unsafe {
+        let n = MFS_WB_COUNT;
+        if n == 0 {
+            return true;
+        }
+        let vol = MFS_CUR_VOL;
+        let mut i = 0usize;
+        while i < n {
+            core::ptr::write_unaligned(
+                mfs_wb_desc().add(i),
+                BatchEnt {
+                    lba: MFS_WB_BLOCKS[i] as u64 * MFS_SECTORS_PER_BLOCK as u64,
+                    sectors: MFS_SECTORS_PER_BLOCK as u64,
+                    buf: mfs_wbuf(i) as u64,
+                },
+            );
+            i += 1;
+        }
+        let mut ok = block_batch(vol, mfs_wb_desc(), n, true) == 1;
+        if !ok {
+            ok = true;
+            i = 0;
+            while i < n {
+                if !block_raw_write(
+                    vol,
+                    MFS_WB_BLOCKS[i] * MFS_SECTORS_PER_BLOCK as u32,
+                    MFS_SECTORS_PER_BLOCK,
+                    mfs_wbuf(i),
+                ) {
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        MFS_WB_WRITTEN += n as u64;
+        MFS_WB_BATCHES += 1;
+        MFS_WB_COUNT = 0;
+        if MFS_WB_WRITTEN >= MFS_WB_NEXT {
+            print("mfs-wb: blocks=");
+            print_u64(MFS_WB_WRITTEN);
+            print(" batches=");
+            print_u64(MFS_WB_BATCHES);
+            print(" avg=");
+            print_u64(MFS_WB_WRITTEN / MFS_WB_BATCHES.max(1));
+            println("");
+            MFS_WB_NEXT += 512;
+        }
+        ok
+    }
+}
+
 fn mfs_read_blk(block_no: u32, dst: *mut u8) -> bool {
+    // 写后读一致: 目标块还在写暂存窗里, 先落盘再读。
+    if mfs_wb_has(block_no) && !mfs_commit_flush() {
+        return false;
+    }
     block_read_dev(
         unsafe { MFS_CUR_VOL },
         block_no * MFS_SECTORS_PER_BLOCK as u32,
@@ -553,12 +695,7 @@ fn mfs_read_blk(block_no: u32, dst: *mut u8) -> bool {
     )
 }
 fn mfs_write_blk(block_no: u32, src: *const u8) -> bool {
-    block_write_dev(
-        unsafe { MFS_CUR_VOL },
-        block_no * MFS_SECTORS_PER_BLOCK as u32,
-        MFS_SECTORS_PER_BLOCK,
-        src as *mut u8,
-    )
+    mfs_wb_stage(block_no, src)
 }
 
 /// 探测**任意卷** `vol` 的超级块: 只要能读出一份有效的 MFS 超级块, 就返回其中的主卷
@@ -574,6 +711,10 @@ fn mfs_write_blk(block_no: u32, src: *const u8) -> bool {
 /// 缓冲借用位图头块页 (`mfs_bmph_buf`) —— 该页只在 `mfs_bmp_flush` 内部使用, 而本函数
 /// 只从启动认领与 `mkfs` / `set-primary` 的**提交之外**环节调用, 与提交路径不重叠。
 fn mfs_sb_probe(vol: u64) -> Option<u64> {
+    // 裸读超级块前先落盘 (写暂存窗里可能有更早的写)。
+    if !mfs_commit_flush() {
+        return None;
+    }
     let buf = mfs_bmph_buf();
     let mut best: Option<u64> = None;
     for copy in 0..MFS_SB_COPIES {
@@ -1041,6 +1182,10 @@ fn mfs_gc_sweep() -> u64 {
 
 /// 空间回收: 标记 (当前根 + 全部快照) 后清扫不可达块。返回回收块数; 失败 `u64::MAX`。
 fn mfs_gc() -> u64 {
+    // 强制落盘: GC 搬运块前必须让写暂存窗里的写先出去。
+    if !mfs_commit_flush() {
+        return 0;
+    }
     // 02b: GC 会搬运/回收块 —— 缓存里的 (块, 偏移) 一律作废。
     mfs_didx_invalidate_all();
     if !mfs_gc_mark() {
@@ -1058,6 +1203,9 @@ fn mfs_gc() -> u64 {
 /// 失败返回 `u64::MAX`。可达性以**当前根目录树**为准 (快照不算当前命名空间的可达性),
 /// 但块的可回收性仍按 GC 的全根可达性判定 —— 二者不可混用。
 fn mfs_fsck(repair: bool) -> u64 {
+    if !mfs_commit_flush() {
+        return u64::MAX;
+    }
     let total = unsafe { MFS_TOTAL_BLOCKS } as usize;
     if total == 0 || total > MFS_MAX_BLOCKS as usize {
         return u64::MAX;
@@ -1825,6 +1973,10 @@ fn mfs_bmp_flush() -> bool {
             return false;
         }
     }
+    // 真正的落盘出口: 上面所有 `mfs_write_blk` 只是攒进写暂存窗, 这里一次批写出去。
+    if !mfs_commit_flush() {
+        return false;
+    }
     for i in 0..MFS_BMP_DIRTY_BYTES {
         unsafe {
             *core::ptr::addr_of_mut!(MFS_BMP_DIRTY).cast::<u8>().add(i) = 0;
@@ -1839,6 +1991,9 @@ fn mfs_bmp_flush() -> bool {
 /// **不**在这里格式化 —— 格式化是调用方的决定 (首次挂载可格式化, 但切卷时不行:
 /// 那会把一块读不出来的盘直接抹掉, 里面可能是用户唯一的副本)。
 fn mfs_load_state() -> bool {
+    if !mfs_commit_flush() {
+        return false;
+    }
     let mut found = false;
     let mut best_gen = 0u64;
     let mut bitmap_ok = false;
@@ -2041,6 +2196,10 @@ fn mfs_win_ensure(pages: u32) -> bool {
 /// 失败时内存态已不可信 —— 调用方必须放弃本次请求 (见服务循环), 不能继续用旧卷的
 /// 位图去写新卷。
 fn mfs_switch_vol(vol: u64) -> bool {
+    // 换卷前把**当前卷**的暂存写落盘 (flush 用的是 `MFS_CUR_VOL`, 必须在切换之前)。
+    if !mfs_commit_flush() {
+        return false;
+    }
     let sectors = vol_sectors(mfs_a(), vol);
     unsafe {
         MFS_CUR_VOL = vol;
@@ -2061,6 +2220,9 @@ fn mfs_switch_vol(vol: u64) -> bool {
 /// 有效副本); 两份都不是 `MFS8` 但至少一份属 MFS 系 (`MFS0`..`MFS9`) 即判 MISMATCH;
 /// 都不是则 NONE (空白 / 非 MFS)。
 fn mfs_sb_magic_state(vol: u64) -> (u8, u32) {
+    if !mfs_commit_flush() {
+        return (MFS_MAGIC_FAMILY_MISMATCH, 0);
+    }
     let buf = mfs_a();
     let mut mismatch = 0u32;
     for copy in 0..MFS_SB_COPIES {
@@ -3767,6 +3929,11 @@ fn mfs_resolve_ex(canon: &[u8], follow_leaf: bool) -> Option<u32> {
 ///
 /// **空洞按 0 返回**: 逻辑块未分配 (`db == 0`) 或超出 `nblocks` 时, 该段视为稀疏空洞,
 /// 填 0 后继续 —— 若在这里 break, 稀疏文件 (truncate 扩展出来的区段) 会读成短读。
+///
+/// 02b-2: 按「最多 `MFS_RDBUF_PAGES` 个连续逻辑块」为一个窗口做**批读** —— 把窗口内各
+/// 已分配块的目标物理块填进共享描述符页, 一次 [`block_batch`] 下发; 空洞填 0、逐块
+/// `mfs_ok` 校验在收到数据后处理; 批读失败退回逐块直读。元数据块 (inode / 间接块) 仍走
+/// [`mfs_read_blk`] 的只读缓存 —— 它们被反复读, 缓存收益更大。
 fn mfs_read_file(ino: u32, offset: u64, count: u32, dst: *mut u8) -> u64 {
     let a = mfs_a();
     let block = match mfs_ino_block(ino) {
@@ -3782,39 +3949,97 @@ fn mfs_read_file(ino: u32, offset: u64, count: u32, dst: *mut u8) -> u64 {
     }
     let end = core::cmp::min(offset + count as u64, size);
     let n = (end - offset) as u32;
-    let c = mfs_c();
+    let nblocks = mfs_file_nblocks(a) as usize;
+    let vol = unsafe { MFS_CUR_VOL };
+
     let mut done = 0u32;
     while done < n {
         let pos = offset + done as u64;
-        let bi = (pos as usize) / MFS_DATA_CAP;
-        let boff = (pos as usize) % MFS_DATA_CAP;
-        let chunk = core::cmp::min(MFS_DATA_CAP - boff, (n - done) as usize);
-        let db = if bi >= mfs_file_nblocks(a) as usize {
-            0 // 超出已分配的逻辑块数 -> 空洞
-        } else {
-            match mfs_file_map(a, bi) {
-                Some(x) => x,
-                None => return u64::MAX,
+        let bi0 = (pos as usize) / MFS_DATA_CAP;
+        let first_boff = (pos as usize) % MFS_DATA_CAP;
+
+        // 本窗逻辑块数: 按剩余字节跨的块数取, 不超过窗口容量。
+        let mut jmax = ((n - done) as usize + first_boff).div_ceil(MFS_DATA_CAP);
+        if jmax > MFS_RDBUF_PAGES {
+            jmax = MFS_RDBUF_PAGES;
+        }
+
+        // 1) 收集本窗各逻辑块的目标物理块 (空洞 = 0, 不占读窗口槽)。
+        let mut db_of = [0u32; MFS_RDBUF_PAGES];
+        let mut slot_of = [usize::MAX; MFS_RDBUF_PAGES];
+        let mut ndb = 0usize;
+        let mut j = 0usize;
+        while j < jmax {
+            let bi = bi0 + j;
+            if bi < nblocks {
+                db_of[j] = match mfs_file_map(a, bi) {
+                    Some(x) => x,
+                    None => return u64::MAX,
+                };
             }
-        };
-        if db == 0 {
-            unsafe {
-                core::ptr::write_bytes(dst.add(done as usize), 0, chunk);
+            if db_of[j] != 0 {
+                slot_of[j] = ndb;
+                unsafe {
+                    core::ptr::write_unaligned(
+                        mfs_rdbuf_desc().add(ndb),
+                        BatchEnt {
+                            lba: db_of[j] as u64 * MFS_SECTORS_PER_BLOCK as u64,
+                            sectors: MFS_SECTORS_PER_BLOCK as u64,
+                            buf: mfs_rdbuf(ndb) as u64,
+                        },
+                    );
+                }
+                ndb += 1;
+            }
+            j += 1;
+        }
+
+        // 2) 一批读下全部非空块; 失败退回逐块直读。
+        if ndb > 0 {
+            let mut ok = block_batch(vol, mfs_rdbuf_desc(), ndb, false) == 1;
+            if !ok {
+                ok = true;
+                let mut t = 0usize;
+                while t < ndb {
+                    let ent = unsafe { core::ptr::read_unaligned(mfs_rdbuf_desc().add(t)) };
+                    if !block_raw_read(vol, ent.lba as u32, ent.sectors as u16, ent.buf as *mut u8)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    t += 1;
+                }
+            }
+            if !ok {
+                return u64::MAX;
+            }
+        }
+
+        // 3) 逐块校验并拷贝到 dst (空洞填 0)。
+        let mut j = 0usize;
+        while j < jmax && done < n {
+            let boff = if j == 0 { first_boff } else { 0 };
+            let chunk = core::cmp::min(MFS_DATA_CAP - boff, (n - done) as usize);
+            if db_of[j] == 0 {
+                unsafe {
+                    core::ptr::write_bytes(dst.add(done as usize), 0, chunk);
+                }
+            } else {
+                let src = mfs_rdbuf(slot_of[j]);
+                if !mfs_ok(src, MFS_MAGIC_DATA) {
+                    return u64::MAX;
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        mfs_at(src, MFS_HDR + boff),
+                        dst.add(done as usize),
+                        chunk,
+                    );
+                }
             }
             done += chunk as u32;
-            continue;
+            j += 1;
         }
-        if !mfs_read_blk(db, c) || !mfs_ok(c, MFS_MAGIC_DATA) {
-            return u64::MAX;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                mfs_at(c, MFS_HDR + boff),
-                dst.add(done as usize),
-                chunk,
-            );
-        }
-        done += chunk as u32;
     }
     done as u64
 }
@@ -4539,6 +4764,35 @@ pub fn run() {
         || sys_share_page(mfs_bmph_buf() as u64, BLOCK_DOMAIN) != 1
     {
         println("mfs: share block buffers FAILED");
+        return;
+    }
+    // 02b-2 批 I/O 缓冲窗: 读窗 + 读描述符 + 写暂存窗 + 写描述符, 全部同址共享给 block_srv。
+    let mut p = 0usize;
+    while p < MFS_RDBUF_PAGES {
+        if sys_alloc_page(mfs_rdbuf(p) as u64) != 1 || sys_alloc_page(mfs_wbuf(p) as u64) != 1 {
+            println("mfs: alloc batch windows FAILED");
+            return;
+        }
+        p += 1;
+    }
+    if sys_alloc_page(MFS_RDBUF_DESC_VADDR) != 1 || sys_alloc_page(MFS_WB_DESC_VADDR) != 1 {
+        println("mfs: alloc batch descriptors FAILED");
+        return;
+    }
+    p = 0;
+    while p < MFS_RDBUF_PAGES {
+        if sys_share_page(mfs_rdbuf(p) as u64, BLOCK_DOMAIN) != 1
+            || sys_share_page(mfs_wbuf(p) as u64, BLOCK_DOMAIN) != 1
+        {
+            println("mfs: share batch windows FAILED");
+            return;
+        }
+        p += 1;
+    }
+    if sys_share_page(MFS_RDBUF_DESC_VADDR, BLOCK_DOMAIN) != 1
+        || sys_share_page(MFS_WB_DESC_VADDR, BLOCK_DOMAIN) != 1
+    {
+        println("mfs: share batch descriptors FAILED");
         return;
     }
     // 认领卷: 优先「主卷序号最大」的 MFS 卷 (= 最近一次 `mkfs.mfs` 过的那块), 其次
