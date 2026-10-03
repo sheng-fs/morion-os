@@ -54,6 +54,10 @@ const CONSOLE: usize = 0;
 /// 单次 `GFX_OP_TEXT` 允许的最大字节数 (客户端共享页就是一页)。
 const MAX_TEXT_BYTES: usize = 4096;
 
+/// 单个表面最多占用的字节数（与客户端 `SURFACE_MAX_PAGES` 对齐：256 页 = 1 MiB）。
+/// 超过即拒 —— 既挡住 `(h-1)*stride*4` 的 u64 回绕绕过，也避免逐页校验本身成为 DoS。
+const MAX_SURFACE_BYTES: u64 = 256 * 4096;
+
 /// 控制台窗口底色 (深蓝黑); 也是终端背景。
 const BG: u32 = 0x10_18_28;
 /// **桌面背景色** (合成器底色): 没有窗口覆盖处显示它。故意与控制台底色不同,
@@ -370,8 +374,8 @@ impl Compositor {
             return 0;
         }
         // 表面必须已映射进本域 (合并时读它才不会缺页)。
-        let last = req.buf + (h as u64 - 1) * stride as u64 * 4 + (w as u64 - 1) * 4;
-        if sys_virt_to_phys(req.buf) == 0 || sys_virt_to_phys(last) == 0 {
+        // 用 surface_mapped 逐页校验，杜绝 (h-1)*stride*4 的 u64 回绕绕过与跳页绕过。
+        if !surface_mapped(req.buf, w as u64, h as u64, stride as u64) {
             return GFX_REPLY_NO_SESSION;
         }
         let slot = match (1..MAX_WINDOWS).find(|&i| !self.wins[i].used) {
@@ -469,6 +473,52 @@ impl Compositor {
             0
         }
     }
+}
+
+/// 校验一块 `w × h`、行跨度 `stride`（像素）的表面在本域**每一页都已映射**。
+///
+/// 旧实现只校验首尾两像素的地址：`(h-1)*stride*4` 可达 ~2^66，在 u64 里回绕后**末地址**
+/// 可能落回首地址所在页 → 首尾"假通过"，而合成时读到的中间页未映射 → 缺页崩溃 gfx_srv。
+/// 即便不溢出，只共享首尾两页、跳过中间页的客户端也能让 blit 读到未映射页。故这里：
+/// ① checked 算术算末字节，溢出即拒；② 限制表面 ≤ [`MAX_SURFACE_BYTES`]；③ 逐页
+/// `SYS_VIRT_TO_PHYS` 确认 `[buf, last]` 之间**每一页**都已映射。
+fn surface_mapped(buf: u64, w: u64, h: u64, stride: u64) -> bool {
+    if buf == 0 || w == 0 || h == 0 || stride == 0 || stride < w {
+        return false;
+    }
+    // 末字节地址 = buf + (h-1)*stride*4 + (w-1)*4 + 3（最后一像素占 4 字节）。
+    let last = match (h.checked_sub(1))
+        .and_then(|v| v.checked_mul(stride))
+        .and_then(|v| v.checked_mul(4))
+        .and_then(|row| {
+            (w.checked_sub(1))
+                .and_then(|c| c.checked_mul(4))
+                .and_then(|c| row.checked_add(c))
+        })
+        .and_then(|off| buf.checked_add(off))
+        .and_then(|p| p.checked_add(3))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    // size == 0 仅在 (last-buf)+1 回绕过 0 时出现，等价于溢出 → 拒。
+    let size = last.wrapping_sub(buf).wrapping_add(1);
+    if size == 0 || size > MAX_SURFACE_BYTES {
+        return false;
+    }
+    // 逐页确认整段都已映射（不止首尾两页：跳过中间页也能让旧校验"假通过"）。
+    let last_page = last & !0xFFF;
+    let mut p = buf & !0xFFF;
+    loop {
+        if sys_virt_to_phys(p) == 0 {
+            return false;
+        }
+        if p == last_page {
+            break;
+        }
+        p += 4096;
+    }
+    true
 }
 
 /// 处理一条绘图/文本/窗口请求, 返回 `(回复值, 是否请求退出)`。
@@ -583,8 +633,9 @@ fn blit_to_screen(fb: &Fb, req: &GfxReq) -> u64 {
         return 0;
     }
     let src = req.buf;
-    let last = src + (sh - 1) * sstride * 4 + (sw - 1) * 4;
-    if sys_virt_to_phys(src) == 0 || sys_virt_to_phys(last) == 0 {
+    // 逐页校验整段表面都已映射：旧实现只查首尾两像素，(sh-1)*sstride*4 的 u64 回绕或
+    // 跳过中间页的客户端都能让它"假通过" → blit 读到未映射页 → 缺页崩溃 gfx_srv。
+    if !surface_mapped(src, sw, sh, sstride) {
         return GFX_REPLY_NO_SESSION;
     }
 

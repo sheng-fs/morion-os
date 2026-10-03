@@ -172,6 +172,10 @@ pub fn run() {
     if gs3_window_compositor().is_none() {
         return;
     }
+    // GS-4 (G5): 表面校验加固 —— 溢出回绕 / 跳页的恶意表面参数必须被拒、不能崩 gfx_srv。
+    if gs4_gfx_surface_validation().is_none() {
+        return;
+    }
     // D0: I/O 端口能力门禁 —— 本域 (app) 未持任何 `IoPort` 能力, 读 CMOS 数据口必须被拒
     // (内核回 `u64::MAX`; 端口读只可能是 0..=0xFF, 不会与真实值混淆)。反面证据在回归里:
     // mfs_srv / exfat_srv 仍能写时间戳, 说明持有 0x70..0x72 的域照常放行。
@@ -3854,6 +3858,98 @@ fn gs3_window_compositor() -> Option<()> {
     }
 
     println("app: GS3 window compositor OK (z-order + clipping verified on framebuffer)");
+    Some(())
+}
+
+/// GS-4 取证 (G5 表面校验加固): 恶意表面参数必须被服务端**拒收**，而不是缺页崩溃 gfx_srv。
+///
+/// 覆盖两条旧实现里首尾两像素校验"假通过"的崩溃路径：
+///   ① **回绕绕过** —— 只共享一页, 发 `WIN_CREATE` 带使 `(h-1)*stride*4` 在 u64 里回绕到 0
+///      的参数：旧实现末地址回绕回首地址所在页 → 首尾都映射 → "假通过" → 合成时读到未映射
+///      的巨大偏移 → 缺页崩溃。修复后 checked 算术当场拒。
+///   ② **跳页绕过** —— 只共享首尾两页、跳过中间页, 发 `BLIT`：旧实现首尾都映射即"假通过"
+///      → blit 读中间未映射页 → 缺页崩溃。修复后逐页校验当场拒。
+///
+/// 两条修复后都回 `0`/`GFX_REPLY_NO_SESSION` 且 gfx_srv 仍存活（`ping` 通过）。
+fn gs4_gfx_surface_validation() -> Option<()> {
+    const GFX: u64 = morion::gfx::GFX_DOMAIN;
+    const TAG: u64 = morion::gfx::GFX_TAG;
+    /// 测试专用页 VA：位于 gfx_srv 的控制台后备表面 (0x80_2000_0000) 与帧缓冲
+    /// (0x80_4000_0000) 之间，两域都未占用。
+    const SEC_VA: u64 = 0x0000_0080_3000_0000;
+
+    fn call(req: &morion::gfx::GfxReq) -> u64 {
+        let payload = unsafe {
+            core::slice::from_raw_parts(
+                req as *const morion::gfx::GfxReq as *const u8,
+                core::mem::size_of::<morion::gfx::GfxReq>(),
+            )
+        };
+        sys_call_payload(GFX, TAG, payload)
+    }
+
+    if !morion::gfx::ping() {
+        println("app: GS4 gfx_srv not serving before test FAILED");
+        return None;
+    }
+
+    // ---- ① 回绕绕过：共享一页，发使末地址回绕回首地址的 WIN_CREATE ----
+    if sys_alloc_page(SEC_VA) != 1 {
+        println("app: GS4 alloc overflow page FAILED");
+        return None;
+    }
+    if sys_share_page(SEC_VA, GFX) != 1 {
+        println("app: GS4 share overflow page FAILED");
+        return None;
+    }
+    // (h-1)*stride*4 = 0x8000_0000 * 0x8000_0000 * 4 = 2^64 → 回绕到 0 → 末地址 = 首地址。
+    let r = call(&morion::gfx::GfxReq {
+        op: morion::gfx::GFX_OP_WIN_CREATE,
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 0x8000_0001,
+        color: 0,
+        buf: SEC_VA,
+        stride: 0x8000_0000,
+    });
+    // WIN_CREATE 成功才回窗口 id (≥0x101)；0 / GFX_REPLY_NO_SESSION 都是拒收。
+    if r >= 0x101 {
+        println("app: GS4 overflow WIN_CREATE not rejected FAILED");
+        return None;
+    }
+    if !morion::gfx::ping() {
+        println("app: GS4 gfx_srv crashed by overflow WIN_CREATE FAILED");
+        return None;
+    }
+
+    // ---- ② 跳页绕过：只共享首尾两页、跳过中间页，发 BLIT ----
+    // 首页 SEC_VA 已共享；再共享 SEC_VA + 2*4096，跳过 SEC_VA + 4096。
+    if sys_alloc_page(SEC_VA + 2 * 4096) != 1 || sys_share_page(SEC_VA + 2 * 4096, GFX) != 1 {
+        println("app: GS4 alloc/share tail page FAILED");
+        return None;
+    }
+    // stride=1024 像素 → 行跨度 4096 字节 = 1 页；h=3 → 跨 3 页，中间页未映射。
+    let r = call(&morion::gfx::GfxReq {
+        op: morion::gfx::GFX_OP_BLIT,
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 3,
+        color: 0,
+        buf: SEC_VA,
+        stride: 1024,
+    });
+    if r == 1 {
+        println("app: GS4 gap-mapping BLIT not rejected FAILED");
+        return None;
+    }
+    if !morion::gfx::ping() {
+        println("app: GS4 gfx_srv crashed by gap-mapping BLIT FAILED");
+        return None;
+    }
+
+    println("app: GS4 surface validation hardening OK (overflow + gap-mapping rejected, gfx_srv alive)");
     Some(())
 }
 
