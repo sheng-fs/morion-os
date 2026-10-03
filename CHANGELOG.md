@@ -86,6 +86,22 @@
   进 TTL 30s 缓存、过期重发广播 ARP。端到端
   `NET4 tcp OK, handshake+data selftest OK, peer refused(RST)` + `net: arp cache aging OK, hits=3 ttl_ms=30000`；
   `NET1`/`NET2`/`NET3` 不变。不做：重传 / 拥塞控制 / 窗口管理 / 连接状态机 / TCP 选项。
+- **ext2 只读 → 有限写**：`ext2_srv`（域 12）新增 `CREAT` / `WRITE`（直接块 + 一级间接）/ `UNLINK` ——
+  块与 inode 位图按组分配/释放、目录项插入（复用空槽 / 切分尾项 / 目录块满则追加）、同步超级块 `s_free_*`
+  与块组描述符 `bg_free_*`；`app.rs` 把 `WRITE_BUF` 也共享给 ext2 域。实测 `build/ext2.img` 不含
+  metadata_csum（`mke2fs -t ext2`）故不做校验和；只维护**主**超级块/主 GDT，不建 htree、不支持二级/三级间接写入。
+  FS7 由「创建必须被拒」改为**写往返自证**（creat → write → read 断言内容 → unlink → 再 open 必失败；自清理使
+  free counts 复原、可反复跑）：`app: FS7 ext2 write round-trip OK (creat/write/read/unlink)`。
+- **图形 G5：surface 合成 / 多窗口**：`gfx_srv` 内新增 `Compositor`（窗口表 `MAX_WINDOWS=4`，**槽 0 = 文本控制台窗口**），
+  窗口 = 几何 + z 序 + 一块**同址共享**表面；合成 = 桌面底色 + 按 z 序 blit（与目标矩形取交 → 屏幕边界 + 窗口
+  边界双向裁剪），文本终端渲染进控制台窗口的**后备表面**后由合成器上屏 —— 控制台重绘不再擦掉客户端窗口，
+  `GFX_OP_TEXT/CLEAR/MOVE/QUERY` 对外语义不变（shell 镜像自证照旧）。客户端新增 `morion::gfx::Window`
+  （建窗/移动/置顶/销毁）与多表面槽（`SURFACE_SLOTS=3`）；协议新增 `GFX_OP_WIN_CREATE/MOVE/RAISE/DESTROY/FLUSH`、
+  `GFX_OP_PIXEL`、`GFX_OP_COMPOSE`、`GFX_OP_INFO`。自测 GS-3（两个重叠窗口：z 序 / 裁剪 / `raise` 翻转 /
+  窗口外=桌面底色，全部靠**服务端回读帧缓冲**断言）：`app: GS3 window compositor OK (z-order + clipping verified on framebuffer)`。
+  **坑（关键）**：窗口 id 最初直接用槽号，**槽 2 的 id 撞上 `GFX_REPLY_NO_SESSION(2)`** → 客户端误判「会话失效」、
+  对已映射页重发 `SYS_SHARE_PAGE` → 内核 `map_user_page` 撞 `PageAlreadyMapped` panic；改用独立 id 命名空间
+  `WIN_ID_BASE(0x100) + 槽号`（避开小整数回复码）后修复。
 - **MFS 元数据读批量化评估（02b-3，结论：不实现）**：量化后 GC 遍历读 = 0、可批的「扇形展开」读仅
   234 / 16384 条命令（<1% 收益），其余是数据依赖的串行链（下一块号依赖上一块读回）；故不做批量化，
   计数插桩已回滚，行为零变化。
@@ -96,6 +112,7 @@
 
 - `docs/dev-reference.md` §9 阶段进度表补齐 **74–87 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz / N3c / N4）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
 - `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b / N3c / N4 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
+- `docs/dev-reference.md` §9 阶段进度表补齐 **88–89 行**（ext2 有限写 / 图形 G5）；§3 地址表新增「图形表面 / 控制台后备」布局。`docs/roadmap-fs.md` 的 ext2 段标注「已补有限写」；`docs/roadmap-gfx.md` 的 G5 标记完成（含窗口 id 命名空间那个坑）；`docs/roadmap-driver.md` 新增 **03c xHCI/USB 存储（设计，未实现）** 小节；`README.md` 状态与勾选同步。
 
 ## [0.4.0-nogui] — 2026-10-01
 

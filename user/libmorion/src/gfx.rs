@@ -49,6 +49,24 @@ pub const GFX_OP_QUERY: u64 = 7;
 /// **自测用**: 让服务回复本请求后**退出** (监督者应把它就地重启)。生产代码不该发它。
 pub const GFX_OP_EXIT: u64 = 8;
 
+/// 创建一个窗口（`x,y,w,h` = 屏幕几何；`buf` = 表面 VA、`stride` = 表面跨度像素）。
+/// 回复窗口 id（≥1）；0 = 失败、[`GFX_REPLY_NO_SESSION`] = 共享会话失效（可重建后重试）。
+pub const GFX_OP_WIN_CREATE: u64 = 9;
+/// 移动窗口（`color` = 窗口 id；`x,y` = 新位置）。
+pub const GFX_OP_WIN_MOVE: u64 = 10;
+/// 把窗口置顶（`color` = 窗口 id）。
+pub const GFX_OP_WIN_RAISE: u64 = 11;
+/// 销毁窗口（`color` = 窗口 id）。
+pub const GFX_OP_WIN_DESTROY: u64 = 12;
+/// 重新合成该窗口（`color` = 窗口 id）—— 往窗口表面里画完后用它上屏。
+pub const GFX_OP_WIN_FLUSH: u64 = 13;
+/// 读帧缓冲一个像素（`x,y`）；回复低 24 位 RGB，越界回 `u64::MAX`。
+pub const GFX_OP_PIXEL: u64 = 14;
+/// 全屏重合成（桌面背景 + 所有窗口按 z 序重铺一遍）。
+pub const GFX_OP_COMPOSE: u64 = 15;
+/// 问屏幕几何；回复 `(宽 << 32) | 高`。
+pub const GFX_OP_INFO: u64 = 16;
+
 /// 服务端回复值: 请求引用的**共享页在服务域里没有映射** (通常是服务刚重启过、旧映射没了)。
 ///
 /// 客户端据此判定"会话失效", 重建共享 (`SYS_SHARE_PAGE`) 后重试 —— 与 `u64::MAX`
@@ -95,10 +113,25 @@ pub fn surface_va() -> u64 {
     SURFACE_BASE + domain_id() * SURFACE_STRIDE
 }
 
+/// 每个域窗口（[`SURFACE_STRIDE`] = 4 MiB）内的表面槽数：3 个 1 MiB 表面槽，尾部 1 MiB
+/// 留给 [`text_va`] 的文本页。
+pub const SURFACE_SLOTS: usize = 3;
+
+/// 相邻表面槽的地址步长（1 MiB = [`SURFACE_MAX_PAGES`] 页）。
+const SURFACE_SLOT_STRIDE: u64 = 0x0010_0000;
+
+/// 第 `slot` 个表面槽在本域的虚拟地址（按域 id 错开，见模块头注释）。
+///
+/// 一个域可同时持有多个表面（多窗口），各占一个槽 —— 同址共享给 `gfx_srv` 时不会互相踩。
+pub fn surface_slot_va(slot: usize) -> u64 {
+    surface_va() + slot as u64 * SURFACE_SLOT_STRIDE
+}
+
 /// 一块客户端表面：本域内的一段连续像素缓冲，已同址共享给 `gfx_srv`。
 ///
-/// 布局为紧凑的行主序 BGRA（每像素 4 字节，`stride` 单位像素）。表面**只有一块**（VA 由
-/// 域 id 决定），故 [`Surface::new`] 在一个进程里只应调用一次；重复调用会复用已分配的页。
+/// 布局为紧凑的行主序 BGRA（每像素 4 字节，`stride` 单位像素）。一个进程可持有**多块**表面
+/// （多窗口用），各占本域窗口里的一个**表面槽**（见 [`surface_slot_va`]）；[`Surface::new`]
+/// 自动取一个空闲槽并共享给 `gfx_srv`。
 #[derive(Clone, Copy)]
 pub struct Surface {
     /// 表面基址（本域虚拟地址）。
@@ -107,22 +140,47 @@ pub struct Surface {
     pub height: u32,
     /// 行跨度（像素）。
     pub stride: u32,
+    /// 表面槽下标（决定共享就绪标志与 VA）。
+    slot: usize,
 }
 
-/// 本域的表面页是否已**就绪**（已分配并共享给 `gfx_srv`）。
+/// 本域各表面槽是否已**就绪**（已分配并共享给 `gfx_srv`）。
 ///
-/// 服务重启会把它域内的页表清空，之前共享过去的映射随之消失 —— 此时 [`call`] 会把本标志
+/// 服务重启会把它域内的页表清空，之前共享过去的映射随之消失 —— 此时 [`call`] 会把整张表
 /// 与 [`TEXT_READY`] 一起清掉，下一次使用由 [`ensure_shared`] 重建（只重发 `share`，不再
 /// `alloc`），故重复 `share_page` 不会在服务域撞 panic。
-static mut SURFACE_READY: bool = false;
+static mut SURFACE_READY: [bool; SURFACE_SLOTS] = [false; SURFACE_SLOTS];
+
+/// **本进程内**各表面槽是否已被占用（避免两次分配落到同一 VA）。
+static mut SLOT_USED: [bool; SURFACE_SLOTS] = [false; SURFACE_SLOTS];
+
+/// 取一个空闲表面槽并标记占用；槽耗尽返回 `None`。
+fn alloc_slot() -> Option<usize> {
+    unsafe {
+        let mut s = 0;
+        while s < SURFACE_SLOTS {
+            if !SLOT_USED[s] {
+                SLOT_USED[s] = true;
+                return Some(s);
+            }
+            s += 1;
+        }
+    }
+    None
+}
 
 impl Surface {
-    /// 分配一块 `width × height` 的表面并共享给 `gfx_srv`；失败返回 `None`。
+    /// 分配一块 `width × height` 的表面（自动取一个空闲槽）并共享给 `gfx_srv`；失败返回 `None`。
     ///
-    /// 首次调用分配并共享全部页；此后复用（同一进程只支持一块表面）。若服务重启过，
-    /// 这里会**重新共享**（页仍在本域，无需再分配）。
+    /// 首次分配会分配并共享全部页；若服务重启过，这里会**重新共享**（页仍在本域，无需再分配）。
     pub fn new(width: u32, height: u32) -> Option<Surface> {
-        if width == 0 || height == 0 {
+        let slot = alloc_slot()?;
+        Surface::in_slot(slot, width, height)
+    }
+
+    /// 在指定槽内分配并共享一块表面（供 [`Window`] 等多表面场景使用）。
+    fn in_slot(slot: usize, width: u32, height: u32) -> Option<Surface> {
+        if width == 0 || height == 0 || slot >= SURFACE_SLOTS {
             return None;
         }
         let stride = width;
@@ -130,13 +188,13 @@ impl Surface {
         if pages == 0 || pages > SURFACE_MAX_PAGES {
             return None;
         }
-        let va = surface_va();
+        let va = surface_slot_va(slot);
         unsafe {
-            if !SURFACE_READY {
+            if !SURFACE_READY[slot] {
                 if !ensure_shared(va, pages) {
                     return None;
                 }
-                SURFACE_READY = true;
+                SURFACE_READY[slot] = true;
             }
         }
         Some(Surface {
@@ -144,6 +202,7 @@ impl Surface {
             width,
             height,
             stride,
+            slot,
         })
     }
 
@@ -193,7 +252,7 @@ impl Surface {
         }
         if r == GFX_REPLY_NO_SESSION {
             unsafe {
-                SURFACE_READY = false;
+                SURFACE_READY[self.slot] = false;
             }
             return self.send_blit(x, y) == 1;
         }
@@ -204,11 +263,11 @@ impl Surface {
     fn send_blit(&self, x: u32, y: u32) -> u64 {
         // 服务重启过就先把表面重新共享过去，否则它读不到本域这块表面。
         unsafe {
-            if !SURFACE_READY {
+            if !SURFACE_READY[self.slot] {
                 if !ensure_shared(self.va, surface_pages(self.height, self.stride)) {
                     return u64::MAX;
                 }
-                SURFACE_READY = true;
+                SURFACE_READY[self.slot] = true;
             }
         }
         let req = GfxReq {
@@ -255,8 +314,9 @@ pub fn ping() -> bool {
     }) == 1
 }
 
-/// 文本页相对本域表面窗口的偏移：表面最多占窗口头部 1 MiB，文本从 +1 MiB 起另开一页。
-const TEXT_OFF: u64 = 0x0010_0000;
+/// 文本页相对本域表面窗口的偏移：`SURFACE_SLOTS` 个表面槽（各 1 MiB）之后，文本从 +3 MiB
+/// 起另开一页（不占表面槽）。
+const TEXT_OFF: u64 = 0x0030_0000;
 
 /// 一次能提交的文本上限（字节）。文本页就是一页，服务端也只收这么多。
 pub const TEXT_MAX: usize = 4096;
@@ -367,7 +427,11 @@ fn call(req: &GfxReq) -> u64 {
     let r = sys_call_payload(GFX_DOMAIN, GFX_TAG, payload);
     if r == u64::MAX {
         unsafe {
-            SURFACE_READY = false;
+            let mut s = 0;
+            while s < SURFACE_SLOTS {
+                SURFACE_READY[s] = false;
+                s += 1;
+            }
             TEXT_READY = false;
         }
     }
@@ -423,4 +487,153 @@ const ALIVE_WAIT_MS: u64 = 1000;
 /// 表面页是否已映射（供调用方判断能否复用，避免重复 `alloc_page` panic）。
 pub fn surface_mapped() -> bool {
     sys_virt_to_phys(surface_va()) != 0
+}
+
+/// 一个客户端窗口：一块共享表面 + 屏幕矩形，由 `gfx_srv` 的**合成器**按 z 序合成上屏。
+///
+/// 生命周期：`create` 建立窗口并取一块共享表面 → 往 [`Window::surface`] 里画 →
+/// [`Window::present`] 让合成器上屏 → 可 [`Window::move_to`] / [`Window::raise`] /
+/// [`Window::destroy`]。
+///
+/// ⚠️ 窗口表在 `gfx_srv` 域内，服务重启即清空: 重启后旧 [`Window`] 的 `id` 失效，须重新
+/// `create`（[`ensure_shared`] 的会话重建只恢复**共享表面**，不恢复窗口）。
+pub struct Window {
+    /// 服务端窗口 id（≥1；0 保留给文本控制台窗口）。
+    pub id: u64,
+    surface: Surface,
+    x: u32,
+    y: u32,
+}
+
+impl Window {
+    /// 在屏幕 `(x, y)` 处创建一个 `width × height` 的窗口并取一块共享表面；失败返回 `None`。
+    ///
+    /// 新窗口位于**最上层**；窗口矩形可超出屏幕（服务端按屏幕边界裁剪）。
+    pub fn create(x: u32, y: u32, width: u32, height: u32) -> Option<Window> {
+        let surface = Surface::new(width, height)?;
+        let mut r = send_win_create(&surface, x, y, width, height);
+        if r == GFX_REPLY_NO_SESSION {
+            // 服务重启落在"共享之后、建窗之前": 重建共享再试一次。
+            unsafe {
+                SURFACE_READY[surface.slot] = false;
+            }
+            r = send_win_create(&surface, x, y, width, height);
+        }
+        if r == 0 || r == u64::MAX {
+            return None;
+        }
+        Some(Window {
+            id: r,
+            surface,
+            x,
+            y,
+        })
+    }
+
+    /// 底层共享表面（往它里面画，再 [`Window::present`] 上屏）。
+    pub fn surface(&self) -> &Surface {
+        &self.surface
+    }
+
+    /// 窗口当前位置 `(x, y)`。
+    pub fn position(&self) -> (u32, u32) {
+        (self.x, self.y)
+    }
+
+    /// 让合成器把本窗口（连同其下各层）重新合成到屏幕；画完表面后调用。
+    pub fn present(&self) -> bool {
+        win_call(GFX_OP_WIN_FLUSH, self.id, 0, 0) == 1
+    }
+
+    /// 把窗口移到 `(x, y)`。
+    pub fn move_to(&mut self, x: u32, y: u32) -> bool {
+        if win_call(GFX_OP_WIN_MOVE, self.id, x, y) == 1 {
+            self.x = x;
+            self.y = y;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 把窗口置顶（z 序最高）。
+    pub fn raise(&self) -> bool {
+        win_call(GFX_OP_WIN_RAISE, self.id, 0, 0) == 1
+    }
+
+    /// 销毁窗口（服务端窗口表槽释放；本域的表面页仍保留）。
+    pub fn destroy(&self) -> bool {
+        win_call(GFX_OP_WIN_DESTROY, self.id, 0, 0) == 1
+    }
+}
+
+/// 发一条建窗请求（必要时先重建共享）。返回服务端回复值。
+fn send_win_create(surface: &Surface, x: u32, y: u32, w: u32, h: u32) -> u64 {
+    unsafe {
+        if !SURFACE_READY[surface.slot] {
+            if !ensure_shared(surface.va, surface_pages(surface.height, surface.stride)) {
+                return u64::MAX;
+            }
+            SURFACE_READY[surface.slot] = true;
+        }
+    }
+    call(&GfxReq {
+        op: GFX_OP_WIN_CREATE,
+        x: x as u64,
+        y: y as u64,
+        w: w as u64,
+        h: h as u64,
+        color: 0,
+        buf: surface.va,
+        stride: surface.stride as u64,
+    })
+}
+
+/// 发一条窗口控制请求（`color` 携带窗口 id）。
+fn win_call(op: u64, id: u64, x: u32, y: u32) -> u64 {
+    call(&GfxReq {
+        op,
+        x: x as u64,
+        y: y as u64,
+        w: 0,
+        h: 0,
+        color: id,
+        buf: 0,
+        stride: 0,
+    })
+}
+
+/// 读帧缓冲上 `(x, y)` 处像素（低 24 位 RGB）；越界或服务不可用返回 `None`。
+pub fn read_screen_pixel(x: u32, y: u32) -> Option<u32> {
+    let r = call(&GfxReq {
+        op: GFX_OP_PIXEL,
+        x: x as u64,
+        y: y as u64,
+        ..Default::default()
+    });
+    if r == u64::MAX {
+        None
+    } else {
+        Some(r as u32)
+    }
+}
+
+/// 问屏幕几何 `(宽, 高)`；服务不可用返回 `None`。
+pub fn screen_size() -> Option<(u32, u32)> {
+    let r = call(&GfxReq {
+        op: GFX_OP_INFO,
+        ..Default::default()
+    });
+    if r == u64::MAX {
+        return None;
+    }
+    Some(((r >> 32) as u32, (r & 0xFFFF_FFFF) as u32))
+}
+
+/// 触发一次**全屏重合成**（桌面背景 + 所有窗口按 z 序重铺一遍）；成功返回 `true`。
+pub fn compose() -> bool {
+    call(&GfxReq {
+        op: GFX_OP_COMPOSE,
+        ..Default::default()
+    }) == 1
 }

@@ -153,9 +153,19 @@
   `init: restarted gfx_srv (domain 15, total N, from memory)` ×2 +
   `app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)`。
 
-### G5（可选后续）— surface 合成 / 多窗口
+### G5 — surface 合成 / 多窗口 ✅ 已完成（G5a）
 
-- 引入 surface 合成与多窗口，为「桌面」铺路。当前只有一个全屏文本控制台客户端。
+- 引入 surface 合成与多窗口，为「桌面」铺路。**已实现**：`gfx_srv` 内新增 `Compositor`
+  （窗口表 `MAX_WINDOWS=4`，槽 0 = 文本控制台窗口），客户端经 `libmorion::gfx::Window`
+  建窗 / 移动 / 置顶 / 销毁；合成 = 桌面底色 + 按 z 序 blit 各窗口（屏幕边界与窗口边界双向裁剪），
+  控制台渲染进**后备表面**后由合成器上屏 —— 于是控制台重绘不再擦掉客户端窗口。
+  自测 **GS-3**（两个重叠窗口：z 序 / 裁剪 / `raise` 翻转重叠色 / 窗口外 = 桌面底色，全部靠
+  **服务端回读帧缓冲**断言）；GS-1 / GT-1 / GS-2 与 `shell: screen console mirror` 均不变。
+- **坑（关键）**：窗口 id 最初直接用**槽号**，而槽 2 的 id == `GFX_REPLY_NO_SESSION(2)` ——
+  客户端的「会话失效重试」被误触发、对**已映射**的页重发 `SYS_SHARE_PAGE` → 内核
+  `map_user_page` 撞 `PageAlreadyMapped` panic。修法：id 用独立命名空间 `WIN_ID_BASE(0x100) + 槽号`，
+  避开小整数回复码。
+- **未做**：窗口销毁的自测（协议已实现）、write-combining（D2）。
 
 ---
 

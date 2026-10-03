@@ -46,7 +46,7 @@
 | 系统调用接口 | ✅ 46 个（编号 0–53） | 内核完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节；面向应用的子集见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
 | 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2/N3 驱动已跑通（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK` / **MSI-X 中断驱动收帧**，并自发 ARP 请求收到网关应答 `NET1 … ARP reply OK`）。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力，MSI-X 表在别的 BAR 上时内核按 `BIR` 另映射给驱动 |
-| 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2 **只读**、exFAT（读 + 写，支持大容量/大簇卷） |
+| 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2（读 + 有限写）、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**块层只读扇区缓存 + 顺序预读**（4 KiB/行 × 240 行 = 960 KiB，键含卷号、写穿透 + 按区间失效，对上层透明；实测回归命中率 ≈80%）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路；**02b-2**：驱动侧批量提交 + 等完成（`nvme_batch_rw` 一次敲铃发 K 条 SQE 再统一等 K 个 CQE + `BLOCK_OP_BATCH_READ/WRITE` 协议 + MFS 写回 16 页暂存窗）→ 全量回归 258 s → 133 s；**02b-2 续**：完成路径默认轮询（`NVME_POLL_FIRST`）+ 时钟 tick 100→500 Hz → 再降到 **33 s（3.6×）**；**1000 Hz**：修掉启动期 sender/receiver 握手竞态后 tick 500→1000 Hz → **23 s**（较 02b-2 前 258 s 共约 11×） |
 | Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，接管后内核终端不再写屏（输出只留 COM1）。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功（自测 GS-1，已肉眼确认画面）。**G3a** 文本渲染外移：字库（ASCII 8×16 + 汉字 16×16 `cjk.bin` ≈276 KB）与终端状态（光标/换行/滚动/清屏，按**显示列**排版）从内核搬到 [`gfx/`](./user/srv/src/gfx/)，新协议 `GFX_OP_TEXT/CLEAR/MOVE/QUERY`，落笔**逐像素写后回读**校验（自测 GT-1 断言 ASCII 5 列 / 汉字 10 列）。**G3b** shell 输出上屏：新增 `SYS_CONSOLE_READY(47)`，`libmorion` 的打印出口 `sink()` 支持按进程**镜像**一份到屏幕控制台（只有 shell 开），shell 的横幅/中文欢迎语/命令输出同时进串口与屏幕。**G3c** 内核卸掉汉字字库（−276 KB，内核 ELF 347 KB → 69 KB），终端降为 ASCII + 豆腐块，汉字渲染只在用户态。**G4** 输入搬出内核：新增 `SYS_KEY_PUSH(48)/SYS_KEY_READ(49)` 键字节队列（内核只做搬运），行编辑/回显落客户端库 `morion::console::readline`，内核侧输入机件全部删除、终端降为只输出。**G6** 服务自愈：`ipc::call` 不再永久挂起（超时 + 目标无存活任务即失败）+ 帧缓冲登记内核保留区间 + 重启丢弃目标邮箱旧请求 + 客户端重建共享会话 + `gfx_srv` 纳入 init 监督（自测 GS-2）。内核文本控制台仅剩引导期与 panic 输出 |
@@ -149,7 +149,7 @@
 
 | 服务 | 职责 | 状态 |
 |------|------|------|
-| 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2 只读、exFAT（读 + 写），通过 libvfs 统一接口 | ✅ 已实现（ext2 只读 / exFAT 读写） |
+| 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2（读 + 有限写）、exFAT（读 + 写），通过 libvfs 统一接口 | ✅ 已实现（ext2 读 + 有限写 / exFAT 读写） |
 | 设备服务 | 块设备（NVMe 驱动）、键盘驱动、中断分发 | ✅ 部分实现 |
 | Shell 服务 | 命令行解释器 + 统一目录树 / 运行时挂载 | ✅ 已实现 |
 | 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 | ⏳ 规划中 |
@@ -248,10 +248,10 @@
 │           ├── mount_srv.rs  #     域 9  挂载服务
 │           ├── tmpfs_srv.rs  #     域 10 内存文件系统
 │           ├── mfs_srv.rs    #     域 11 MorionFS
-│           ├── ext2_srv.rs   #     域 12 ext2 只读
+│           ├── ext2_srv.rs   #     域 12 ext2 读 + 有限写 (creat/write/unlink)
 │           ├── exfat_srv.rs  #     域 13 exFAT 读写
 │           ├── init.rs       #     域 14 监督者 (巡检服务域, 退出后用内存镜像原地重启)
-│           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端)
+│           ├── gfx_srv.rs    #     域 15 图形服务 (持帧缓冲, 用户态渲染: 绘图原语 + 文本终端 + surface 合成/多窗口)
 │           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N4: MSI-X 中断 + ARP + 最小 IPv4/ICMP/UDP + DHCP + 最小 TCP/ARP 缓存老化 自测)
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
 │           ├── ahci_srv.rs   #     域 18 AHCI/SATA 驱动 (D4: 通用授权, 全轮询; 03b: 读+写并经 IPC 接进块服务卷层)
@@ -339,7 +339,7 @@
 - [x] MBR/GPT **分区解析 + 卷层**（block_srv 内，`dev` = 卷号；按卷首签名探测 FAT / exFAT / MFS / ext2）
 - [x] **多卷挂载**：请求 tag 高 32 位携带卷编码、一次打开绑定一个卷、切卷时重解析该卷几何；各文件服务把自己那类的**额外卷**自动上报挂载（`/usb<卷号>`）；顺带把 fat32 簇缓冲从 2 页扩到 16 页（**64 KiB 簇**上限，真机 U 盘常见 32 KiB 簇可挂）、ext2 块组上限 16 → 4096
 - [x] 文件系统：FAT32（含 VFAT 长名）/ tmpfs / 原创 MorionFS（COW 写时复制 + 快照）
-- [x] ext2 **只读**兼容（挂载既有 Linux 分区）
+- [x] ext2 **读 + 有限写**兼容（挂载既有 Linux 分区；`CREAT`/`WRITE`/`UNLINK`，见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)）
 - [x] exFAT 兼容（`exfat_srv` 域 13，挂载 `/usb`）：**只读** = 引导区 + boot checksum、FAT 链、目录 entry set、分配位图、upcase 表；**读写** = 位图分配/释放、FAT 链扩展、entry set 增删（含 NameHash/SetChecksum 生成），`CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`rename`/`chmod`/`link` 除外）；**大容量卷** = 块层多页 DMA（单命令 ≤ 256 扇区 = 128 KiB，更大请求自动切段）+ exFAT 去掉 4 KiB 簇 / 4 KiB 位图 / 8 KiB upcase 三处硬上限（集群缓冲依簇大小动态分配、位图与 upcase 改按需扇区窗口）
 - [x] libvfs + 挂载层：多文件系统拼成单根 `/`，支持运行时挂载
 - [x] Shell（内置命令 + cwd 相对路径）与用户态键盘驱动
@@ -373,6 +373,7 @@
 - [x] **图形子系统 G3c（内核卸 CJK 字库：−276 KB）**（内核侧 `cjk.bin` 的 `include_bytes!`、定长记录二分查表与「按字形宽度排版」全部删除 —— 内核不再携带任何汉字点阵，**内核 ELF 347376 → 70504 字节（−276872 / ≈ −80%）**；只留接管前那几秒 + panic 屏够用的最小能力：UTF-8 `decode`/`prev_index`/`next_index`（退格与左右移不切开多字节）、宽度改按**东亚宽度**粗判（ASCII 1 格、汉字类 2 格，与用户态口径一致）、非 ASCII 画**空心豆腐块**。代价是 `gfx_srv` 接管前那几秒屏上中文是豆腐块、panic 屏同理；**COM1 串口全程原样 UTF-8**，headless 回归判据不受影响。`video/unicode.rs` 加 4 条 host 单测（内核单测 16 → 20））
 - [x] **图形子系统 G4（输入搬出内核）**（内核侧新增唯一的输入机件 `key.rs`：64 字节环形键队列 + `SYS_KEY_PUSH(48)`（中断/驱动推字节）/ `SYS_KEY_READ(49)`（阻塞取键，空则 `block_current(KEY_WAIT)` 睡下、有键 `wake_one` 唤醒）—— 内核只做"按键字节搬运"、不再理解编辑语义。行编辑/回显改落客户端库 `morion::console::readline`（可打印字符入缓冲并回显、`\b`/`0x7F` 退格删缓冲并擦屏、回车提交，`\b` 由 `Term::write` 左移一列 + 涂背景色实现）；`kbd_srv` 的所有输入动作改为 `sys_key_push` 推字节。内核侧输入机件全删：`term_put / term_backspace / term_left/right / input_read / INPUT_QUEUE / SCROLL_OFFSET / CURSOR_*` 与 `SYS_TERM_PUT / SYS_BACKSPACE / SYS_SCROLL_UP/DOWN / SYS_TERM_LEFT/RIGHT / SYS_READLINE`，`video` 终端降为**只输出**（512 行历史环 + 当前行，只服务引导期与 panic 屏）；`INPUT_WAIT` → `KEY_WAIT`。**顺带修掉一个真竞态**：`gfx_srv` 原"整屏绘制 → 回读校验 → 接管"在接管前会被内核重绘擦掉被校验的像素 → 假失败；改为"顶部带 `probe` 探测映射可写 → 接管 → 独占后 `paint`+`verify`"。内核 ELF 70504 → **66040 字节**；`key.rs` 加 3 条 host 单测（内核单测 20 → 23）。无头实测（QEMU `sendkey`）：注入 `help⏎` 屏幕命令列表、`echo hiZ⌫⏎` 串口回显 `echo hiz\x08\r\nhi`，证明"取键 → 回显 → 退格删缓冲并擦屏 → 回车提交"整条链路）
 - [x] **图形子系统 G6（图形服务自愈：监督重启 + 客户端会话重建）**（补掉 G4 后遗留的真实缺口：`gfx_srv` 一崩，屏幕永久死，且 `ipc::call` 的调用方会**永久挂起**。内核三处 —— ① `ipc::call` 改**带超时轮询**（`CALL_POLL_MS=200`）并在目标域**无存活任务**时立即失败返回 `u64::MAX`（挂死根因：调用方阻塞在**自己的域键**上、服务死在回复前就没人回它）；② 帧缓冲登记为**内核保留区间**（`frame_allocator::pin_range`，`free_frame` 空操作）—— `SYS_FB_MAP` 走 `map_mmio` 不计引用计数，「同域重启」清地址空间时会误把显存当独占帧释放；③ 「原地重启」加 `ipc::remove_domain` **丢弃目标域邮箱里未处理的请求**（否则新实例去读旧请求的悬空共享页而再崩）。客户端 [`morion::gfx`](./user/libmorion/src/gfx.rs)：`call` 收 `u64::MAX` 作废会话；`ensure_shared` 重建**只重发 `share` 不再 `alloc`**、且先**有界等待服务活过来**；服务端对悬空共享页回新码 `GFX_REPLY_NO_SESSION(2)`，`print`/`blit` **重建共享再试一次**（覆盖"重启落在两次调用之间、客户端没察觉"）。服务侧加 `GFX_OP_EXIT(8)` 自测钩子（先回复再退出）；`init` 把 `gfx_srv(15)` 纳入 `SUPERVISED`（10 个）。顺带修：GT-1 的列数断言原依赖**全局光标**、被 shell 启动输出插队会偏大 → 改**重试到干净窗口**。自测 **GS-2**：杀 `gfx_srv` 两轮（空窗期不调用走 `NO_SESSION` 重建 / 空窗期调用走快速失败），日志 `init: restarted gfx_srv (domain 15, total N, from memory)` ×2 + `app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)`)
+- [x] **图形子系统 G5（surface 合成 / 多窗口）**（`gfx_srv` 内新增 `Compositor`：窗口表 `MAX_WINDOWS=4`、**槽 0 = 文本控制台窗口**，窗口 = 几何 + z 序 + 一块**同址共享**表面；合成 = 桌面底色 + 按 z 序 blit（与目标矩形取交 → 屏幕/窗口边界双向裁剪），控制台渲染进**后备表面**后由合成器上屏 —— 控制台重绘不再擦客户端窗口。客户端 [`morion::gfx::Window`](./user/libmorion/src/gfx.rs)（建窗/移动/置顶/销毁）+ `Surface` 多槽（`SURFACE_SLOTS=3`）；协议新增 `GFX_OP_WIN_CREATE/MOVE/RAISE/DESTROY/FLUSH`、`PIXEL`、`COMPOSE`、`INFO`。自测 **GS-3**：两重叠窗口的 z 序 / 裁剪 / `raise` 翻转 / 窗口外=桌面底色，全部靠**服务端回读帧缓冲**断言。**坑**：窗口 id 一度误用槽号，槽 2 的 id 撞上 `GFX_REPLY_NO_SESSION(2)` → 客户端误触发「会话失效重试」→ 对已映射页重发 `SYS_SHARE_PAGE` → 内核 `PageAlreadyMapped` panic；改用独立 id 命名空间 `WIN_ID_BASE(0x100)+槽号` 修复）
 - [ ] **更多文件系统兼容**（ext4 写、UDF 等）
 - [ ] 网络协议栈
 

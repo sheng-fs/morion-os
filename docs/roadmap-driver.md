@@ -260,6 +260,40 @@
   回归判定新增 `AHCI1 … sig=ok`、`block: ahci volume attached … sig=ok`、`AHCI2 … rw=ok`。
 - **不做（明确排除）**：热插拔、xHCI/USB（03c）、MSI/INTx 通路。
 
+### 03c — xHCI / USB 存储（设计已定，未实现）
+
+> 真机 U 盘启动的前置。**本轮只出设计**：唯一独占文件是 `user/srv/src/xhci_srv.rs` 与
+> `user/srv/src/bin/xhci_srv.rs`，其余全是**公共文件** → 必须**串行**实现。
+
+- **域 / 接线**：新服务 `xhci_srv` 取**域 19**（`BOOT_DOMAINS` 19 → 20；`SERVICE_FILES` 长度
+  同步 19 → 20），沿 [dev-workflow.md](dev-workflow.md) §4 的 9 处接线（`user/srv/Cargo.toml`、
+  `user/srv/src/lib.rs`、`Makefile` 的 `SRV_NAMES`、`boot/src/main.rs`、`kernel/src/domain.rs`、
+  `kernel/src/main.rs` 建域 + 授权、`kernel/src/arch/pci.rs` 加 `find_xhci`）。
+- **PCI / 授权**：xHCI class `0x0C:0x03:0x30`（prog-if=0x30 天然滤掉 q35 的 UHCI/EHCI），
+  BAR0 是 64 位 MMIO（QEMU `qemu-xhci` 约 4 页）；内核复用通用 `device::grant`
+  （`bar_pages=4`、`dma_pages≈16` 由驱动自行排版、**`msix_vectors=0`**）。
+- **中断取舍**：本仓库只有 MSI-X 一条中断通路，而 xHCI 常态用 INTx/MSI。第一版与 `ahci_srv`
+  一致**全轮询、不申请向量**（轮询事件环 `ERDP`，有界 `POLL_MAX` + `sys_sleep`）——不占内核
+  MSI 向量段、不影响既有设备，`irq_cmds == cmds` / `poll_cmds = 0` 判据保持。
+- **xHCI 最小子集**：读 `CAPLENGTH / HCSPARAMS1,2 / HCCPARAMS1(CSZ) / DBOFF / RTSOFF` →
+  `USBCMD.HCRST` → `CONFIG.MaxSlotsEn` / `DCBAAP` / `CRCR` / interrupter0（`ERSTSZ/ERSTBA/ERDP`）
+  → `USBCMD.RS`；端口复位（`PORTSC.PR` 等 `PRC`）→ Enable Slot → Address Device →
+  GET_DESCRIPTOR(Device/Configuration) → SET_CONFIGURATION → Configure Endpoint（Bulk-In/Out）。
+  命令环 / 事件环 / 传输环 + TRB（cycle bit、Link TRB 回绕）是首版最易错处，单独留证。
+- **USB 存储协议**：**BOT（Bulk-Only Transport）+ SCSI 透明命令集**（**不做 UAS**）：CBW/CSW +
+  INQUIRY / READ CAPACITY(10) / READ(10) /（写）WRITE(10) / REQUEST SENSE（含 UNIT ATTENTION 处理）。
+- **接进块层（仿 03b）**：`block_srv` 加 `BACKEND_USB` + `xhci_rw` 转发（按一页 8 扇区切分，
+  **在 `blk_req_tick` 之前 `continue`**，保持 NVMe 计数不被污染）+ `BLOCK_OP_ATTACH` 按 `msg.from`
+  分流 + 暂存页 `XHCI_SCRATCH_VADDR = USER_BASE + 0x16_4000`（紧接 AHCI 的 `0x16_3000`，**须独家**）
+  + 重扫保活；内核补 `block ↔ xhci` 三条能力授权。
+- **测试装置**：`-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=usb0`；
+  `Makefile` 加 `USB_IMG` 规则（1 MiB，扇区 0 预写 16 字节 `MORION-USB-TST!!`，`dd … conv=notrunc,sync`）；
+  `fs-regress.sh` 判据 `USB1 … sig=ok` / `block: usb volume attached … sig=ok` / `USB2 … rw=ok`。
+- **分步**：① 接线 + 只读 bring-up（打 `USB1`，**不碰块层**）→ ② 卷层接入 + 写回读（`USB2`，
+  安全门 = 仅当扇区 0 命中宿主签名才写）→ ③ 回归判据 + `IOMMU=1` 复跑 + 文档收口。
+- **风险**：枚举链路长、首版失败率高（务必带足端口 / 槽 / EP / CSW 日志）；真机有 UNIT ATTENTION /
+  多 LUN 与热插拔（不做）；DMA 块须落在内核恒等映射区（< 4 GiB）。
+
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
 - 与 D1 结合：`SYS_DEVICE_GRANT` 在飞地场景下把设备的 DMA 权限绑到一个 **IOVA 窗口**（只映射飞地自己的缓冲），其余一律**拒绝**。

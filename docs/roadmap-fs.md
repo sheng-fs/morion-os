@@ -124,6 +124,8 @@ qemu-system-x86_64 \
       二级间接块映射（三级不实现）；目录项 `inode/rec_len/name_len/file_type/name` 顺序遍历。
       只服务 `OPEN/READ/READDIR/STAT/CLOSE`（写类 tag 一律 `u64::MAX`）；**不写盘、不自动格式化**
       —— 超级块无效即挂载失败（定位是「读既有 Linux 分区」）。
+      → **已由后续补上「有限写」**：`CREAT` / `WRITE`（直接块 + 一级间接）/ `UNLINK` + 位图与超级块
+      计数同步；取证见 [dev-reference.md](dev-reference.md) §9 第 88 行与 `CHANGELOG.md`。
 - [x] VFAT 长名读取 ✅ 已完成：`readdir` 拼接 LFN 项（32 字节/项、逻辑逆序、校验和存于 LFN 项偏移 13）
       转成 UTF-8 存入 `DirEntry.long`；`open` 短名优先、长名（ASCII 大小写不敏感）回退；shell 显示长名。
       **只读长名，不生成 LFN 项**（写入仍只写 8.3 短名）。

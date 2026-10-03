@@ -168,6 +168,10 @@ pub fn run() {
     if gs2_gfx_srv_restart().is_none() {
         return;
     }
+    // GS-3 (G5): surface 合成 / 多窗口 —— 两个部分重叠的窗口按 z 序合成上屏 (含边界裁剪)。
+    if gs3_window_compositor().is_none() {
+        return;
+    }
     // D0: I/O 端口能力门禁 —— 本域 (app) 未持任何 `IoPort` 能力, 读 CMOS 数据口必须被拒
     // (内核回 `u64::MAX`; 端口读只可能是 0..=0xFF, 不会与真实值混淆)。反面证据在回归里:
     // mfs_srv / exfat_srv 仍能写时间戳, 说明持有 0x70..0x72 的域照常放行。
@@ -197,6 +201,7 @@ pub fn run() {
         || sys_share_page(vfs::WRITE_BUF, vfs::TMPFS_DOMAIN) != 1
         || sys_share_page(vfs::WRITE_BUF, vfs::MFS_DOMAIN) != 1
         || sys_share_page(vfs::WRITE_BUF, vfs::EXFAT_DOMAIN) != 1
+        || sys_share_page(vfs::WRITE_BUF, vfs::EXT2_DOMAIN) != 1
     {
         println("app: share write buf FAILED");
         return;
@@ -581,12 +586,13 @@ pub fn run() {
         vfs::close(f);
     }
 
-    // 10. FS-7 自测 (阶段 C3): ext2 只读兼容 (挂载既有 Linux 分区)。
+    // 10. FS-7 自测 (阶段 C3): ext2 兼容 (挂载既有 Linux 分区)。
     //     - 根目录可达且列出宿主预置的 hello.txt / subdir (长名字段 = ext2 名字);
     //     - 读文件内容与宿主预置一致;
     //     - 子目录递归可达;
     //     - 大小写不敏感回退 (ext2 本身大小写敏感, 便于交互才加这一层);
-    //     - 只读: 创建文件必须被拒; 不存在的路径必须失败。
+    //     - 有限写: creat/write/read/unlink 往返自证 (结束 unlink, 逻辑状态复原);
+    //     - 不存在的路径必须失败。
     let efd = vfs::open("/ext2");
     if efd == u64::MAX {
         println("app: FS7 open /ext2 FAILED");
@@ -675,15 +681,57 @@ pub fn run() {
     }
     vfs::close(cfd7);
 
-    // 只读: 创建文件必须被拒 (ext2_srv 对写类 tag 一律回 u64::MAX)。
-    if vfs::creat("/ext2/NEW.TXT") != u64::MAX {
-        println("app: FS7 creat on read-only ext2 NOT rejected FAILED");
+    // 有限写往返自证: creat -> write -> close -> open -> read -> unlink -> open 必须失败。
+    // 结束前 unlink 掉新建文件, 使 ext2 镜像逻辑状态 (free counts) 复原, 回归可反复跑。
+    // 幂等防护: 回归复用同一 ext2.img (fs-regress.sh 不重建它), 上一轮若中途崩溃可能残留
+    // 同名文件; 先尽力清掉 (干净镜像上该调用失败, 忽略即可), 否则 creat 会因重名而被拒。
+    let _ = vfs::unlink("/ext2/NEW.TXT");
+    let wfd7 = vfs::creat("/ext2/NEW.TXT");
+    if wfd7 == u64::MAX {
+        println("app: FS7 creat /ext2/NEW.TXT FAILED");
+        return;
+    }
+    let wdata7 = b"MORION EXT2 WRITE OK 0123456789";
+    if vfs::write(wfd7, 0, wdata7) != wdata7.len() as u64 {
+        println("app: FS7 write /ext2/NEW.TXT FAILED");
+        vfs::close(wfd7);
+        return;
+    }
+    vfs::close(wfd7);
+
+    let rfd7 = vfs::open("/ext2/NEW.TXT");
+    if rfd7 == u64::MAX {
+        println("app: FS7 reopen /ext2/NEW.TXT FAILED");
+        return;
+    }
+    let rn7 = vfs::read(rfd7, 0, 4096);
+    vfs::close(rfd7);
+    if rn7 != wdata7.len() as u64 {
+        println("app: FS7 read back /ext2/NEW.TXT FAILED");
+        return;
+    }
+    {
+        let got =
+            unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, rn7 as usize) };
+        if got != &wdata7[..] {
+            println("app: FS7 /ext2/NEW.TXT content MISMATCH");
+            return;
+        }
+    }
+
+    if vfs::unlink("/ext2/NEW.TXT") == u64::MAX {
+        println("app: FS7 unlink /ext2/NEW.TXT FAILED");
+        return;
+    }
+    if vfs::open("/ext2/NEW.TXT") != u64::MAX {
+        println("app: FS7 unlinked /ext2/NEW.TXT still openable FAILED");
         return;
     }
     if vfs::open("/ext2/NOPE.TXT") != u64::MAX {
         println("app: FS7 missing path NOT rejected FAILED");
         return;
     }
+    println("app: FS7 ext2 write round-trip OK (creat/write/read/unlink)");
 
     // 11. FS-8 自测 (阶段 C3): VFAT 长名 —— 读取 + 条目长名字段 + 按长名打开。
     let rfd8 = vfs::open("/");
@@ -3721,6 +3769,91 @@ fn gs2_gfx_srv_restart() -> Option<()> {
     }
 
     println("app: GS2 gfx_srv restart + client session rebuild OK (screen recovered)");
+    Some(())
+}
+
+/// GS-3 取证 (G5 surface 合成 / 多窗口): 合成器按 z 序把窗口表面合成到帧缓冲, 带边界裁剪。
+///
+/// 建两个**部分重叠**的窗口 (先建的 A 在下、后建的 B 在上), 各铺不同颜色, 然后逐点从**真的
+/// 帧缓冲**回读 (`morion::gfx::read_screen_pixel`) 断言:
+///   ① 重叠区显示**上层** B 的颜色 (z 序);
+///   ② 非重叠区各显示自己的颜色 (窗口边界裁剪);
+///   ③ 两个窗口之外是**桌面背景色** (合成器底色, 与控制台窗口底色不同 —— 可逐像素区分);
+/// 再把 A **置顶** (`raise`) → 重叠区颜色**翻转**为 A。
+///
+/// 屏幕其余部分 (控制台窗口 0) 与真显示器无关, 全部断言都来自服务端回读帧缓冲, 无显示器可断言。
+fn gs3_window_compositor() -> Option<()> {
+    // 与 `gfx_srv` 的 `DESK_BG` 保持一致: 窗口外应是这个桌面底色。
+    const DESK_BG: u32 = 0x20_28_38;
+    const COL_A: u32 = 0xD0_30_30; // 下层: 红
+    const COL_B: u32 = 0x30_60_D0; // 上层: 蓝
+
+    let (sw, sh) = match morion::gfx::screen_size() {
+        Some(s) => s,
+        None => {
+            println("app: GS3 screen_size FAILED");
+            return None;
+        }
+    };
+
+    // 两个部分重叠的窗口 (都在控制台窗口之上)。
+    let a = match morion::gfx::Window::create(700, 300, 300, 300) {
+        Some(w) => w,
+        None => {
+            println("app: GS3 window A create FAILED");
+            return None;
+        }
+    };
+    let b = match morion::gfx::Window::create(800, 400, 300, 300) {
+        Some(w) => w,
+        None => {
+            println("app: GS3 window B create FAILED");
+            return None;
+        }
+    };
+    a.surface().fill(COL_A);
+    b.surface().fill(COL_B);
+    // 往表面里画完后上屏 (present = 重合成该窗口); 再整屏合成一次铺好桌面背景与所有窗口。
+    if !a.present() || !b.present() {
+        println("app: GS3 window present FAILED");
+        return None;
+    }
+    if !morion::gfx::compose() {
+        println("app: GS3 compose FAILED");
+        return None;
+    }
+
+    // 重叠区 (两窗口都在): 上层 B 胜。
+    if morion::gfx::read_screen_pixel(900, 500) != Some(COL_B) {
+        println("app: GS3 overlap should show upper window FAILED");
+        return None;
+    }
+    // 非重叠区各显其色 (窗口边界裁剪)。
+    if morion::gfx::read_screen_pixel(720, 320) != Some(COL_A) {
+        println("app: GS3 non-overlap A color FAILED");
+        return None;
+    }
+    if morion::gfx::read_screen_pixel(1060, 660) != Some(COL_B) {
+        println("app: GS3 non-overlap B color FAILED");
+        return None;
+    }
+    // 窗口之外: 桌面背景色 (屏幕右下角, 在控制台窗口之外)。
+    if morion::gfx::read_screen_pixel(sw - 4, sh - 4) != Some(DESK_BG) {
+        println("app: GS3 outside-window should be desk background FAILED");
+        return None;
+    }
+
+    // 把下层 A 置顶 → 重叠区颜色翻转。
+    if !a.raise() {
+        println("app: GS3 raise FAILED");
+        return None;
+    }
+    if morion::gfx::read_screen_pixel(900, 500) != Some(COL_A) {
+        println("app: GS3 overlap did not flip to raised window FAILED");
+        return None;
+    }
+
+    println("app: GS3 window compositor OK (z-order + clipping verified on framebuffer)");
     Some(())
 }
 
