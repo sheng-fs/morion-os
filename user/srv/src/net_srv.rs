@@ -12,6 +12,8 @@
 //! **N3b**：网卡之上的**最小 IPv4 栈** —— IPv4 头构造/解析（总长/协议/头校验和、拒分片）、
 //! ICMP echo（发 request 收 reply 端到端 + 收 request 回 reply，后者以无对端合成请求自证）、
 //! UDP 构造/发送（slirp 对未监听端口回 ICMP 端口不可达作副证据）。自测标记 `NET2 ipv4/icmp …`。
+//! **N3c**：DHCP 客户端 —— 广播 DHCPDISCOVER → OFFER → REQUEST → ACK，取得 IP/掩码/网关/DNS，
+//! 替换写死的 `10.0.2.15`/`10.0.2.2`（取不到则回落默认值）。自测标记 `NET3 dhcp …`。
 //!
 //! **D2b**：把「所有 virtio 设备都一样」的传输层（能力解析 / common cfg / 复位协商 / 队列
 //! 配置 / avail·used 环）搬进 [`libdevice::virtio`]，与 `virtio_blk_srv` 共用 —— 本文件因此
@@ -51,9 +53,21 @@ const TX_BUF_PAGE: u64 = 6;
 /// virtio-net 包头长度：**modern（`VIRTIO_F_VERSION_1`）恒为 12 字节**
 /// （`num_buffers` 字段总是存在；只有 legacy 且未协商 `MRG_RXBUF` 时才是 10）。
 const VNET_HDR_LEN: u64 = 12;
-/// 自测地址（QEMU user-net 约定：`10.0.2.0/24`，guest `10.0.2.15`，网关 `10.0.2.2`）。
-const OUR_IP: [u8; 4] = [10, 0, 2, 15];
-const GW_IP: [u8; 4] = [10, 0, 2, 2];
+/// QEMU user-net 默认地址（DHCP 未取得租约时的回落值：guest `10.0.2.15`、网关 `10.0.2.2`）。
+const DEFAULT_OUR_IP: [u8; 4] = [10, 0, 2, 15];
+const DEFAULT_GW_IP: [u8; 4] = [10, 0, 2, 2];
+/// 运行期本机 / 网关地址：N3c 的 DHCP 取得租约后写入，缺省为上面的回落值。
+static mut OUR_IP: [u8; 4] = DEFAULT_OUR_IP;
+static mut GW_IP: [u8; 4] = DEFAULT_GW_IP;
+
+/// 读运行期本机地址（按值拷贝，避免 `static_mut_refs`）。
+fn our_ip() -> [u8; 4] {
+    unsafe { OUR_IP }
+}
+/// 读运行期网关地址。
+fn gw_ip() -> [u8; 4] {
+    unsafe { GW_IP }
+}
 
 // ---------------------------------------------------------------------------
 // N3b — 最小 IPv4 栈（仅网卡之上的协议语义）
@@ -188,6 +202,18 @@ fn ipv4_parse(eth_va: u64, eth_len: u64) -> Option<Ipv4Info> {
 /// 在 `buf_va` 写以太头 + 20 字节 IPv4 头（无选项、DF 置位），返回 **payload 起始地址**；
 /// 调用方写完 payload 后再调 [`ipv4_finish`] 回填总长与头校验和。
 fn ipv4_build(buf_va: u64, src_mac: u64, dst_mac: [u8; 6], proto: u8, dst_ip: [u8; 4]) -> u64 {
+    ipv4_build_ex(buf_va, src_mac, dst_mac, proto, our_ip(), dst_ip)
+}
+
+/// 同 [`ipv4_build`]，但显式给出源 IP（DHCP 在拿到租约前用 `0.0.0.0`）。
+fn ipv4_build_ex(
+    buf_va: u64,
+    src_mac: u64,
+    dst_mac: [u8; 6],
+    proto: u8,
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+) -> u64 {
     let f = buf_va + VNET_HDR_LEN;
     let src = mac_bytes(src_mac);
     let mut i = 0u64;
@@ -208,7 +234,7 @@ fn ipv4_build(buf_va: u64, src_mac: u64, dst_mac: [u8; 6], proto: u8, dst_ip: [u
     put_be16(ip + 10, 0); // header checksum（finish 回填）
     let mut k = 0u64;
     while k < 4 {
-        wr8(ip + 12 + k, OUR_IP[k as usize]);
+        wr8(ip + 12 + k, src_ip[k as usize]);
         wr8(ip + 16 + k, dst_ip[k as usize]);
         k += 1;
     }
@@ -301,14 +327,14 @@ fn icmp_unreachable_for_udp(eth_va: u64, eth_len: u64) -> bool {
         rd8(inner + 13),
         rd8(inner + 14),
         rd8(inner + 15),
-    ] == OUR_IP
+    ] == our_ip()
 }
 
 /// 若 `eth_va` 是发往 `OUR_IP` 的 ICMP echo request，则在 `tx_va` 构造 echo reply，
 /// 返回整帧长度（含 12 字节 virtio 包头）；否则 `None`。目的 MAC 取请求的源 MAC。
 fn icmp_echo_reply_build(eth_va: u64, eth_len: u64, our_mac: u64, tx_va: u64) -> Option<u64> {
     let info = ipv4_parse(eth_va, eth_len)?;
-    if info.proto != IP_PROTO_ICMP || info.payload_len < 8 || info.dst != OUR_IP {
+    if info.proto != IP_PROTO_ICMP || info.payload_len < 8 || info.dst != our_ip() {
         return None;
     }
     let icmp = info.payload_off;
@@ -365,10 +391,12 @@ fn icmp_responder_selftest(our_mac: u64, tx_va: u64) -> bool {
     put_be16(ip + 6, 0x4000);
     wr8(ip + 8, IP_TTL);
     wr8(ip + 9, IP_PROTO_ICMP);
+    let gw = gw_ip();
+    let us = our_ip();
     let mut k = 0u64;
     while k < 4 {
-        wr8(ip + 12 + k, GW_IP[k as usize]); // 模拟对端 = 网关
-        wr8(ip + 16 + k, OUR_IP[k as usize]);
+        wr8(ip + 12 + k, gw[k as usize]); // 模拟对端 = 网关
+        wr8(ip + 16 + k, us[k as usize]);
         k += 1;
     }
     let icmp_len = icmp_echo_write(ip + 20, ICMP_ECHO_REQ, TEST_ICMP_ID, TEST_ICMP_SEQ, b"loop");
@@ -386,7 +414,7 @@ fn icmp_responder_selftest(our_mac: u64, tx_va: u64) -> bool {
         Some(v) => v,
         None => return false,
     };
-    if info.proto != IP_PROTO_ICMP || info.src != OUR_IP || info.dst != GW_IP {
+    if info.proto != IP_PROTO_ICMP || info.src != our_ip() || info.dst != gw_ip() {
         return false;
     }
     let icmp = info.payload_off;
@@ -453,10 +481,11 @@ fn arp_build(buf_va: u64, our_mac: u64) -> u64 {
     put_be16(f + 12, ETH_ARP);
     // ARP 报文（28 字节）：Ethernet/IPv4，oper=1 (request)，sha/spa = 本机，tpa = 网关。
     let a = f + 14;
+    let ip = our_ip();
+    let gw = gw_ip();
     let arp: [u8; 28] = [
         0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3], 0, 0, 0, 0, 0, 0, GW_IP[0], GW_IP[1], GW_IP[2],
-        GW_IP[3],
+        ip[0], ip[1], ip[2], ip[3], 0, 0, 0, 0, 0, 0, gw[0], gw[1], gw[2], gw[3],
     ];
     let mut m = 0u64;
     while m < 28 {
@@ -481,7 +510,7 @@ fn gw_arp_reply_mac(buf_va: u64, len: u64) -> Option<[u8; 6]> {
     if be16(arp + 6) != 0x0002 {
         return None; // oper = reply
     }
-    if [rd8(arp + 14), rd8(arp + 15), rd8(arp + 16), rd8(arp + 17)] != GW_IP {
+    if [rd8(arp + 14), rd8(arp + 15), rd8(arp + 16), rd8(arp + 17)] != gw_ip() {
         return None;
     }
     Some([
@@ -492,6 +521,341 @@ fn gw_arp_reply_mac(buf_va: u64, len: u64) -> Option<[u8; 6]> {
         rd8(arp + 12),
         rd8(arp + 13),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// N3c — DHCP 客户端（BOOTP/DHCP over UDP；复用 ARP 的 TX 页 6，二者串行）
+// ---------------------------------------------------------------------------
+
+/// DHCP 服务端 / 客户端端口。
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+/// DHCP 事务 id（单客户端固定值即可）。
+const DHCP_XID: u32 = 0x4d4f_4e31; // "MON1"
+/// magic cookie（RFC 2131）。
+const DHCP_MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+/// DHCP 消息类型（option 53）。
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+/// BOOTP 固定区（op..file）= 236 字节；其后是 4 字节 magic。
+const DHCP_BOOTP_FIXED: u64 = 236;
+/// DHCP 报文最小长度（BOOTP 经典要求；短包部分服务端会忽略）。
+const DHCP_MIN_MSG: u64 = 300;
+/// N3c 有界等待（毫秒）：到点无论结果如何都收手，不阻塞系统。
+const DHCP_TIMEOUT_MS: u64 = 3000;
+
+/// DHCP 租约。
+struct DhcpLease {
+    ip: [u8; 4],
+    mask: [u8; 4],
+    gw: [u8; 4],
+    dns: [u8; 4],
+}
+
+/// 网络序（大端）读 32 位。
+fn be32(a: u64) -> u32 {
+    ((rd8(a) as u32) << 24)
+        | ((rd8(a + 1) as u32) << 16)
+        | ((rd8(a + 2) as u32) << 8)
+        | rd8(a + 3) as u32
+}
+
+/// 以 `a.b.c.d` 打印 IPv4 地址（十进制点分，供自测取证）。
+fn print_ip(ip: [u8; 4]) {
+    print_u64(ip[0] as u64);
+    print(".");
+    print_u64(ip[1] as u64);
+    print(".");
+    print_u64(ip[2] as u64);
+    print(".");
+    print_u64(ip[3] as u64);
+}
+
+/// 从以太帧里取满足 `dport` 的 UDP 载荷，返回 (载荷地址, 载荷长度, 源 IP, 目的 IP)。
+fn udp_payload(eth_va: u64, eth_len: u64, dport: u16) -> Option<(u64, u64, [u8; 4], [u8; 4])> {
+    let info = ipv4_parse(eth_va, eth_len)?;
+    if info.proto != IP_PROTO_UDP || info.payload_len < 8 {
+        return None;
+    }
+    let udp = info.payload_off;
+    if be16(udp + 2) != dport {
+        return None;
+    }
+    let ulen = be16(udp + 4) as u64;
+    if ulen < 8 || ulen > info.payload_len {
+        return None;
+    }
+    Some((udp + 8, ulen - 8, info.src, info.dst))
+}
+
+/// 解析 DHCP 回包：BOOTREPLY + xid 匹配 + magic cookie，返回
+/// (消息类型, yiaddr, 掩码, 路由器, DNS, 服务端标识)；缺失的 option 返回 `0.0.0.0`。
+#[allow(clippy::type_complexity)]
+fn dhcp_parse(
+    payload: u64,
+    len: u64,
+    xid: u32,
+) -> Option<(u8, [u8; 4], [u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
+    if len < DHCP_BOOTP_FIXED + 4 || rd8(payload) != 2 || be32(payload + 4) != xid {
+        return None;
+    }
+    let yiaddr = [
+        rd8(payload + 16),
+        rd8(payload + 17),
+        rd8(payload + 18),
+        rd8(payload + 19),
+    ];
+    let ck = payload + DHCP_BOOTP_FIXED;
+    if [rd8(ck), rd8(ck + 1), rd8(ck + 2), rd8(ck + 3)] != DHCP_MAGIC {
+        return None;
+    }
+    let mut msg = 0u8;
+    let mut mask = [0u8; 4];
+    let mut gw = [0u8; 4];
+    let mut dns = [0u8; 4];
+    let mut server = [0u8; 4];
+    let end = payload + len;
+    let mut o = ck + 4;
+    while o < end {
+        let code = rd8(o);
+        if code == 255 {
+            break;
+        }
+        if code == 0 {
+            o += 1;
+            continue;
+        }
+        if o + 2 > end {
+            break;
+        }
+        let olen = rd8(o + 1) as u64;
+        if o + 2 + olen > end {
+            break;
+        }
+        let d = o + 2;
+        if olen >= 4 {
+            let v = [rd8(d), rd8(d + 1), rd8(d + 2), rd8(d + 3)];
+            match code {
+                1 => mask = v,
+                3 => gw = v,
+                6 => dns = v,
+                54 => server = v,
+                _ => {}
+            }
+        }
+        if code == 53 && olen >= 1 {
+            msg = rd8(d);
+        }
+        o += 2 + olen;
+    }
+    if msg == 0 {
+        return None;
+    }
+    Some((msg, yiaddr, mask, gw, dns, server))
+}
+
+/// 在 `buf_va`（TX 页）拼一条 DHCP 报文：以太广播 + IPv4(`0.0.0.0`→`255.255.255.255`) +
+/// UDP `68→67` + BOOTP + magic + options，返回整帧长度。
+fn dhcp_build(buf_va: u64, mac: u64, msg_type: u8, req_ip: [u8; 4], server_id: [u8; 4]) -> u64 {
+    let macb = mac_bytes(mac);
+    // 包头 12 字节清零（无 offload）。
+    let mut k = 0u64;
+    while k < VNET_HDR_LEN {
+        wr8(buf_va + k, 0);
+        k += 1;
+    }
+    // 以太 / IPv4（源 IP 0.0.0.0）/ UDP 头起始地址。
+    let udp = ipv4_build_ex(
+        buf_va,
+        mac,
+        [0xff; 6],
+        IP_PROTO_UDP,
+        [0, 0, 0, 0],
+        [255, 255, 255, 255],
+    );
+    let bootp = udp + 8;
+    // BOOTP 固定区清零后填字段。
+    let mut i = 0u64;
+    while i < DHCP_BOOTP_FIXED {
+        wr8(bootp + i, 0);
+        i += 1;
+    }
+    wr8(bootp, 1); // op = BOOTREQUEST
+    wr8(bootp + 1, 1); // htype = Ethernet
+    wr8(bootp + 2, 6); // hlen
+    wr8(bootp + 3, 0); // hops
+    wr8(bootp + 4, (DHCP_XID >> 24) as u8);
+    wr8(bootp + 5, (DHCP_XID >> 16) as u8);
+    wr8(bootp + 6, (DHCP_XID >> 8) as u8);
+    wr8(bootp + 7, DHCP_XID as u8);
+    put_be16(bootp + 10, 0x8000); // flags = broadcast（尚未取得 IP，避免服务端 ARP）
+    let mut j = 0u64;
+    while j < 6 {
+        wr8(bootp + 28 + j, macb[j as usize]); // chaddr
+        j += 1;
+    }
+    // magic cookie + options。
+    let ck = bootp + DHCP_BOOTP_FIXED;
+    let mut m = 0u64;
+    while m < 4 {
+        wr8(ck + m, DHCP_MAGIC[m as usize]);
+        m += 1;
+    }
+    let mut o = ck + 4;
+    wr8(o, 53);
+    wr8(o + 1, 1);
+    wr8(o + 2, msg_type);
+    o += 3;
+    if msg_type == DHCP_REQUEST {
+        // option 50 = requested IP，option 54 = server identifier。
+        wr8(o, 50);
+        wr8(o + 1, 4);
+        let mut r = 0u64;
+        while r < 4 {
+            wr8(o + 2 + r, req_ip[r as usize]);
+            r += 1;
+        }
+        o += 6;
+        wr8(o, 54);
+        wr8(o + 1, 4);
+        let mut s = 0u64;
+        while s < 4 {
+            wr8(o + 2 + s, server_id[s as usize]);
+            s += 1;
+        }
+        o += 6;
+    }
+    // option 55 = 参数请求列表（掩码 / 路由器 / DNS / 租期 / 服务端标识）。
+    wr8(o, 55);
+    wr8(o + 1, 5);
+    wr8(o + 2, 1);
+    wr8(o + 3, 3);
+    wr8(o + 4, 6);
+    wr8(o + 5, 51);
+    wr8(o + 6, 54);
+    o += 7;
+    wr8(o, 255); // end
+    o += 1;
+    // 补零到 DHCP 最小报文长度。
+    let mut pad = o - bootp;
+    while pad < DHCP_MIN_MSG {
+        wr8(bootp + pad, 0);
+        pad += 1;
+    }
+    // UDP 头。
+    let ulen = 8 + DHCP_MIN_MSG;
+    put_be16(udp, DHCP_CLIENT_PORT);
+    put_be16(udp + 2, DHCP_SERVER_PORT);
+    put_be16(udp + 4, ulen as u16);
+    put_be16(udp + 6, 0); // 校验和 0 = 不校验（IPv4 允许）
+    ipv4_finish(buf_va, ulen)
+}
+
+/// N3c：DHCP 客户端。`last_used` 是 RX used 环的消费游标（与随后主循环共用）；
+/// 成功返回租约并推进游标，超时返回 `None`（调用方回落默认地址）。
+#[allow(clippy::too_many_arguments)]
+fn dhcp_acquire(
+    caps: &virtio::Caps,
+    tx: &Vq,
+    rx: &Vq,
+    g: &DeviceGrant,
+    mac: u64,
+    rx_size: u16,
+    irq_mask: u64,
+    irq_vectors: u64,
+    last_used: &mut u16,
+) -> Option<DhcpLease> {
+    // DHCP 与随后的 ARP 串行，复用 ARP 的 TX 页（页 6），不额外占用 DMA 页。
+    let tx_va = g.dma_vaddr + TX_BUF_PAGE * PAGE;
+    let tx_pa = g.dma_paddr + TX_BUF_PAGE * PAGE;
+
+    let mut offered = [0u8; 4];
+    let mut server_id = [0u8; 4];
+    let mut mask = [0u8; 4];
+    let mut gw = [0u8; 4];
+    let mut dns = [0u8; 4];
+    let mut got_offer = false;
+    let mut request_sent = false;
+    let mut got_ack = false;
+
+    let len = dhcp_build(tx_va, mac, DHCP_DISCOVER, [0; 4], [0; 4]);
+    tx_send(caps, tx, tx_pa, len);
+    println("net: DHCPDISCOVER sent (broadcast)");
+
+    let mut ms: u64 = 0;
+    while ms < DHCP_TIMEOUT_MS && !got_ack {
+        // OFFER 到手就立刻发 REQUEST（并把 offered / server id 回填进去）。
+        if got_offer && !request_sent {
+            let len = dhcp_build(tx_va, mac, DHCP_REQUEST, offered, server_id);
+            tx_send(caps, tx, tx_pa, len);
+            request_sent = true;
+            print("net: DHCPREQUEST sent for ");
+            print_ip(offered);
+            println("");
+        }
+        // 排干 RX（把每个描述符补投回 avail 环）。
+        let used = rx.used_idx();
+        let mut drained = 0u32;
+        while *last_used != used {
+            let slot = (*last_used as u64) % (rx_size as u64);
+            let (id, rlen) = rx.used_elem(slot as u16);
+            let rlen = rlen as u64;
+            let buf_va = g.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
+            let eth_va = buf_va + VNET_HDR_LEN;
+            let eth_len = rlen.saturating_sub(VNET_HDR_LEN);
+            if let Some((p, l, _s, _d)) = udp_payload(eth_va, eth_len, DHCP_CLIENT_PORT) {
+                if let Some((msg, yi, m, r, dn, sid)) = dhcp_parse(p, l, DHCP_XID) {
+                    if msg == DHCP_ACK {
+                        offered = yi;
+                        mask = m;
+                        gw = r;
+                        dns = dn;
+                        got_ack = true;
+                    } else if msg != 0 && !got_offer {
+                        // OFFER（type 2）或其它中间类型：记下 offered / server id。
+                        offered = yi;
+                        server_id = sid;
+                        got_offer = true;
+                        print("net: DHCPOFFER ");
+                        print_ip(yi);
+                        print(" from ");
+                        print_ip(sid);
+                        println("");
+                    }
+                }
+            }
+            rx.avail_push(id);
+            *last_used = (*last_used).wrapping_add(1);
+            drained += 1;
+        }
+        if drained > 0 {
+            rx.kick(caps, 0);
+        }
+        if got_ack {
+            break;
+        }
+        // 有界等待（有中断优先，否则睡一小段）。
+        if irq_vectors != 0 {
+            let _ = sys_irq_poll(irq_mask) != 0 || sys_irq_wait(irq_mask, IRQ_WAIT_MS) != 0;
+            ms += IRQ_WAIT_MS;
+        } else {
+            sys_sleep(20);
+            ms += 20;
+        }
+    }
+    if !got_ack {
+        return None;
+    }
+    if mask == [0u8; 4] {
+        mask = [255, 255, 255, 0];
+    }
+    Some(DhcpLease {
+        ip: offered,
+        mask,
+        gw,
+        dns,
+    })
 }
 
 /// 永不返回的保活循环（无设备 / 初始化失败时用）。
@@ -641,6 +1005,45 @@ pub fn run() {
     caps.driver_ok();
     println("net: DRIVER_OK, RX buffers posted");
 
+    // N3c：先走 DHCP 取租约（失败回落默认地址）。DHCP 与随后的 ARP 串行复用 TX 页 6；
+    // RX used 环消费游标 `last_used` 自这里开始，DHCP 消费后主循环接着往后走。
+    let mut last_used: u16 = 0;
+    match dhcp_acquire(
+        &caps,
+        &tx,
+        &rx,
+        &g,
+        mac,
+        rx_size,
+        irq_mask,
+        irq_vectors,
+        &mut last_used,
+    ) {
+        Some(l) => {
+            let gw = if l.gw == [0u8; 4] {
+                DEFAULT_GW_IP
+            } else {
+                l.gw
+            };
+            unsafe {
+                OUR_IP = l.ip;
+                GW_IP = gw;
+            }
+            print("NET3 dhcp OK, ip=");
+            print_ip(l.ip);
+            print(" mask=");
+            print_ip(l.mask);
+            print(" gw=");
+            print_ip(gw);
+            if l.dns != [0u8; 4] {
+                print(" dns=");
+                print_ip(l.dns);
+            }
+            println("");
+        }
+        None => println("net: DHCP timeout, using default 10.0.2.15/10.0.2.2"),
+    }
+
     // N3 自测：发一个广播 ARP 请求问网关 MAC（QEMU user-net 会应答）——
     // 应答回来即证明「TX 通路 + RX 通路 + 中断/轮询」整条链路通。
     let tx_buf_va = g.dma_vaddr + TX_BUF_PAGE * PAGE;
@@ -668,7 +1071,6 @@ pub fn run() {
     }
 
     // 收帧：有中断走中断（快路径 poll + 阻塞 wait，超时回落重扫），否则轮询。
-    let mut last_used: u16 = 0;
     let mut rx_frames: u64 = 0;
     let mut irq_hits: u64 = 0;
     // N3/N3b 自测状态。
@@ -707,7 +1109,7 @@ pub fn run() {
                 if let Some(src) =
                     icmp_echo_reply_from(eth_va, eth_len, TEST_ICMP_ID, TEST_ICMP_SEQ)
                 {
-                    if src == GW_IP {
+                    if src == gw_ip() {
                         icmp_ok = true;
                         println("net: icmp echo reply from 10.0.2.2");
                     }
@@ -736,7 +1138,7 @@ pub fn run() {
         }
         // 拿到网关 MAC 后各发一次 ICMP echo request 与 UDP（串行复用页 7）。
         if arp_ok && !icmp_sent {
-            let pay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_ICMP, GW_IP);
+            let pay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_ICMP, gw_ip());
             let ilen = icmp_echo_write(
                 pay,
                 ICMP_ECHO_REQ,
@@ -749,7 +1151,7 @@ pub fn run() {
             icmp_sent = true;
             println("net: icmp echo request sent to 10.0.2.2");
 
-            let upay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_UDP, GW_IP);
+            let upay = ipv4_build(ip_buf_va, mac, gw_mac, IP_PROTO_UDP, gw_ip());
             let ulen = udp_write(upay, TEST_UDP_SPORT, TEST_UDP_DPORT, b"MORION-UDP");
             let ufl = ipv4_finish(ip_buf_va, ulen);
             tx_send(&caps, &tx, ip_buf_pa, ufl);
