@@ -79,6 +79,13 @@
   `10.0.2.15`/`10.0.2.2` 换成运行期值（失败回落）。端到端
   `NET3 dhcp OK, ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3`；`NET1`/`NET2` 不变。
   不做：租约续约 / 过期、静态地址、多网卡、DHCPv6。
+- **`net_srv` 最小 TCP + ARP 缓存老化（N4）**：仍只在 `net_srv.rs` 内（不加服务 / 不改公共文件）——
+  TCP 头构造/解析（校验和含 12 字节伪首部）+ 三次握手（SYN/SYN-ACK/ACK）+ 单段 PSH/ACK；自证用
+  **确定性**路线（合成 SYN-ACK → 解析断言字段/序号/校验和 → 握手 ACK → 数据段 → 篡改载荷确认校验和
+  拦截），并另发真实 SYN 到 `10.0.2.2:12345` 取链路副证据（slirp 回 RST）。ARP 缓存老化：网关 MAC
+  进 TTL 30s 缓存、过期重发广播 ARP。端到端
+  `NET4 tcp OK, handshake+data selftest OK, peer refused(RST)` + `net: arp cache aging OK, hits=3 ttl_ms=30000`；
+  `NET1`/`NET2`/`NET3` 不变。不做：重传 / 拥塞控制 / 窗口管理 / 连接状态机 / TCP 选项。
 - **MFS 元数据读批量化评估（02b-3，结论：不实现）**：量化后 GC 遍历读 = 0、可批的「扇形展开」读仅
   234 / 16384 条命令（<1% 收益），其余是数据依赖的串行链（下一块号依赖上一块读回）；故不做批量化，
   计数插桩已回滚，行为零变化。
@@ -87,8 +94,8 @@
 
 ### 文档
 
-- `docs/dev-reference.md` §9 阶段进度表补齐 **74–86 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz / N3c）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
-- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b / N3c 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
+- `docs/dev-reference.md` §9 阶段进度表补齐 **74–87 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续 / N3b / 1000 Hz / N3c / N4）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 1000 Hz、`NVME_POLL_FIRST`）。
+- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」与「02b-3 评估（结论：不实现）」；`docs/roadmap-driver.md` 新增 N3b / N3c / N4 小节并把 hrtimer 注同步到 1000 Hz；`README.md` 状态与勾选同步。
 
 ## [0.4.0-nogui] — 2026-10-01
 
