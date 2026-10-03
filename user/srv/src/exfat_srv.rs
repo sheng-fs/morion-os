@@ -1977,6 +1977,8 @@ pub fn run() {
                             is_dir: u32::from(e.is_dir),
                             mode: if e.is_dir { 0o755 } else { 0o644 },
                             owner: 0,
+                            uid: 0,
+                            gid: 0,
                             nlink: 1,
                             mtime: e.mtime,
                             ctime: e.mtime,

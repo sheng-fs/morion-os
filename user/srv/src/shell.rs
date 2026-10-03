@@ -247,7 +247,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  mv <src> <dst> rename / move (same filesystem)");
             println("  ln <src> <dst> hard link an existing file (same filesystem)");
             println("  ln -s <target> <name>  symbolic link (target kept verbatim; MFS only)");
-            println("  chmod <mode> <path>  set permission bits (octal, display-only)");
+            println("  chmod <mode> <path>  set permission bits (octal; enforced since 04b)");
+            println("  chown <uid>:<gid> <path>  change owner/group (MFS; uid 0 only)");
             println("  truncate <file> <size>  resize a file (sparse on grow)");
             println("  stat <path>    show metadata (mode / owner / links / times)");
             println("  lstat <path>   like stat but on the link itself (no follow)");
@@ -289,6 +290,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "mv" => shell_mv(st, arg),
         "ln" => shell_ln(st, arg),
         "chmod" => shell_chmod(st, arg),
+        "chown" => shell_chown(st, arg),
         "truncate" => shell_truncate(st, arg),
         "stat" => shell_stat(st, arg, false),
         "lstat" => shell_stat(st, arg, true),
@@ -431,6 +433,10 @@ fn shell_ls(st: &ShellState, arg: &str) {
             print_mode(de.mode, de.is_dir != 0);
             print(" owner=");
             print_u64(de.owner as u64);
+            print(" uid=");
+            print_u64(de.uid as u64);
+            print(" gid=");
+            print_u64(de.gid as u64);
             print(" links=");
             print_u64(de.nlink as u64);
             print(" size=");
@@ -455,7 +461,7 @@ fn shell_ls(st: &ShellState, arg: &str) {
 
 /// `chmod <mode> <path>` — 修改权限位 (八进制, 低 12 位有效)。
 ///
-/// 权限位当前只存储与显示, 不参与访问判定 (系统还没有多用户概念)。
+/// 04b 起权限位**参与访问判定** (见 `mfs_srv` 的 `mfs_check_access`), 不再只是显示。
 fn shell_chmod(st: &ShellState, arg: &str) {
     let (mode_s, path_s) = match arg.find(' ') {
         Some(i) => (&arg[..i], arg[i + 1..].trim()),
@@ -492,6 +498,80 @@ fn shell_chmod(st: &ShellState, arg: &str) {
         print("chmod: failed: ");
         println(path);
     }
+}
+
+/// `chown <uid>:<gid> <path>` — 改属主 / 属组 (04b; 仅 MFS, 只有 `uid 0` 能成功)。
+fn shell_chown(st: &ShellState, arg: &str) {
+    let (spec, path_s) = match arg.find(' ') {
+        Some(i) => (&arg[..i], arg[i + 1..].trim()),
+        None => {
+            println("chown: usage: chown <uid>:<gid> <path>");
+            return;
+        }
+    };
+    if path_s.is_empty() {
+        println("chown: usage: chown <uid>:<gid> <path>");
+        return;
+    }
+    let (uid_s, gid_s) = match spec.find(':') {
+        Some(i) => (&spec[..i], &spec[i + 1..]),
+        None => {
+            println("chown: usage: chown <uid>:<gid> <path>");
+            return;
+        }
+    };
+    let uid = match parse_u16_dec(uid_s) {
+        Some(v) => v,
+        None => {
+            println("chown: bad uid");
+            return;
+        }
+    };
+    let gid = match parse_u16_dec(gid_s) {
+        Some(v) => v,
+        None => {
+            println("chown: bad gid");
+            return;
+        }
+    };
+    let path = match resolve_in_cwd(st.cwd_str(), path_s) {
+        Some(p) => p,
+        None => {
+            println("chown: path too long");
+            return;
+        }
+    };
+    if vfs::chown_into(path, uid, gid, vfs::SHELL_RESULT_BUF) == 1 {
+        print("chown: ");
+        print(path);
+        print(" -> ");
+        print_u64(uid as u64);
+        print(":");
+        print_u64(gid as u64);
+        println("");
+    } else {
+        print("chown: failed (uid 0 required): ");
+        println(path);
+    }
+}
+
+/// 十进制无符号 u16 解析 (空串 / 非数字 / 越界 -> `None`)。
+fn parse_u16_dec(s: &str) -> Option<u16> {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u32;
+        if v > u16::MAX as u32 {
+            return None;
+        }
+    }
+    Some(v as u16)
 }
 
 /// `mv <src> <dst>` — 重命名 / 移动 (同一次请求内跨目录; 不支持跨文件系统)。
@@ -684,6 +764,10 @@ fn shell_stat(st: &ShellState, arg: &str, no_follow: bool) {
     print_mode(st.mode, st.is_dir != 0);
     print("  Owner: domain ");
     print_u64(st.owner as u64);
+    print("  Uid: ");
+    print_u64(st.uid as u64);
+    print("  Gid: ");
+    print_u64(st.gid as u64);
     print("  Links: ");
     print_u64(st.nlink as u64);
     print("  Size:  ");

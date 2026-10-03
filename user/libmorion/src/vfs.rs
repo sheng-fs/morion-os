@@ -13,7 +13,49 @@
 //! 句柄 (见 `cap_guard`), `close` 时撤销句柄。句柄被撤销后, 该 fd 上的任何操作
 //! 都会失败 —— 即使 fd 数值被伪造也无法访问服务 (无能力即不可访问)。
 
-use crate::syscall::{sys_call_payload, sys_cap_drop, sys_cap_issue, sys_cap_lookup, PAYLOAD_LEN};
+use crate::syscall::{
+    sys_call_payload as sys_call_raw, sys_cap_drop, sys_cap_issue, sys_cap_lookup, PAYLOAD_LEN,
+};
+
+/// 04b: MFS 失败回复的错误码波段 (高 16 位全 1)。`mfs_is_err(u64::MAX) == true`
+/// —— 旧的通用失败天然并入; 成功值 (小整数 / fd 编码, 句柄索引 < 32) 都不落此段。
+pub fn mfs_is_err(v: u64) -> bool {
+    (v >> 48) == 0xFFFF
+}
+
+/// 解出 MFS 错误码 (低 16 位); 非错误返回 0。
+pub fn mfs_errno(v: u64) -> u64 {
+    if mfs_is_err(v) {
+        v & 0xFFFF
+    } else {
+        0
+    }
+}
+
+/// 最近一次文件服务调用看到的错误码 (0 = 无错误)。供需要区分 `ENOENT` / `EACCES`
+/// 的调用方读取 —— 对外的返回值仍是 `u64::MAX` (见下)。
+static mut MFS_LAST_ERRNO: u64 = 0;
+
+/// 最近一次文件服务调用的错误码。
+pub fn mfs_last_errno() -> u64 {
+    unsafe { MFS_LAST_ERRNO }
+}
+
+/// 文件服务调用出口: 把 MFS 的 `mfs_err(...)` 波段**归一化回 `u64::MAX`**, 保持
+/// "失败 = `u64::MAX`" 的既有对外契约 —— 否则 `read` 拿到 `EACCES` (一个巨大整数)
+/// 会被旧判定当成"读到了天文数字字节"(静默错误)。原始码记进 `MFS_LAST_ERRNO`。
+///
+/// 非 MFS 服务仍回 `u64::MAX`, 归一化后行为不变; 两类服务对"通用失败"表现一致。
+fn sys_call_payload(domain: u64, tag: u64, payload: &[u8]) -> u64 {
+    let v = sys_call_raw(domain, tag, payload);
+    if mfs_is_err(v) {
+        unsafe { MFS_LAST_ERRNO = v & 0xFFFF };
+        u64::MAX
+    } else {
+        unsafe { MFS_LAST_ERRNO = 0 };
+        v
+    }
+}
 
 /// fat32 文件服务域 id (与内核 `main.rs` 创建顺序一致), 挂载于 `/`。
 pub const FAT32_DOMAIN: u64 = 6;
@@ -204,6 +246,8 @@ pub const MFS_SETPRIMARY_TAG: u64 = 0x4D53_5052; // "MSPR"
 pub const MFS_FSCK_TAG: u64 = 0x4D46_5343; // "MFSC"
 /// 显式同步 (01): 幂等落盘一次 (刷新位图 + 两份超级块), 回复落盘后的代际 gen; 失败 `u64::MAX`。
 pub const MFS_SYNC_TAG: u64 = 0x4D53_594E; // "MSYN"
+/// 04b: 改属主 / 属组 (仅 MFS, `PathReq`; `aux = uid << 16 | gid`)。
+pub const MFS_CHOWN_TAG: u64 = 0x4348_4F57; // "CHOW"
 
 /// 把卷 `vol` 标记为 MorionFS **主卷**, 不改变卷上的数据。
 ///
@@ -534,6 +578,9 @@ pub struct DirEntry {
     pub mode: u16,
     /// 属主域 id (仅 MFS 提供; 其它服务填 0)。
     pub owner: u16,
+    /// 04b: 属主 uid / 属组 gid (仅 MFS 提供; 其它服务填 0)。
+    pub uid: u16,
+    pub gid: u16,
     /// 硬链接数 (仅 MFS 提供; 其它服务填 1)。
     pub nlink: u32,
     /// 最后修改时间 (Unix 秒; 0 = 未知)。
@@ -552,6 +599,8 @@ impl DirEntry {
             is_dir,
             mode: if is_dir == 1 { 0o755 } else { 0o644 },
             owner: 0,
+            uid: 0,
+            gid: 0,
             nlink: 1,
             mtime: 0,
         }
@@ -574,6 +623,8 @@ impl DirEntry {
             is_dir,
             mode: if is_dir == 1 { 0o755 } else { 0o644 },
             owner: 0,
+            uid: 0,
+            gid: 0,
             nlink: 1,
             mtime: 0,
         }
@@ -597,6 +648,9 @@ pub struct Stat {
     pub mode: u16,
     /// 属主域 id (创建者)。仅展示。
     pub owner: u16,
+    /// 04b: 属主 uid / 属组 gid (仅 MFS 提供; 其它服务填 0)。
+    pub uid: u16,
+    pub gid: u16,
     /// 硬链接数。
     pub nlink: u32,
     /// 最后修改时间 (内容变更)。
@@ -615,6 +669,8 @@ impl Stat {
             is_dir,
             mode: if is_dir == 1 { 0o755 } else { 0o644 },
             owner: 0,
+            uid: 0,
+            gid: 0,
             nlink: 1,
             mtime: 0,
             ctime: 0,
@@ -958,6 +1014,33 @@ pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
                 )
             };
             sys_call_payload(domain, with_vol(VFS_CHMOD_TAG, vol_enc), payload)
+        }
+        None => u64::MAX,
+    }
+}
+
+/// 改属主 / 属组 (04b, 仅 MFS; 只有 `uid 0` 能成功)。成功返回 1, 失败 `u64::MAX`。
+pub fn chown(path: &str, uid: u16, gid: u16) -> u64 {
+    chown_into(path, uid, gid, RESULT_BUF)
+}
+
+/// 同 `chown`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
+pub fn chown_into(path: &str, uid: u16, gid: u16, buf: u64) -> u64 {
+    match route(path) {
+        Some((domain, vol_enc, sub)) => {
+            let req = PathReq {
+                aux: ((uid as u32) << 16) | gid as u32,
+                _pad: 0,
+                buf,
+            };
+            write_cstr(sub, buf);
+            let payload = unsafe {
+                core::slice::from_raw_parts(
+                    &req as *const PathReq as *const u8,
+                    core::mem::size_of::<PathReq>(),
+                )
+            };
+            sys_call_payload(domain, with_vol(MFS_CHOWN_TAG, vol_enc), payload)
         }
         None => u64::MAX,
     }

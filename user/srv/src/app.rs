@@ -3293,6 +3293,11 @@ pub fn run() {
             return;
         }
     }
+    // 04b: 清掉可能由上一轮启动遗留的权限自测开关 —— 保证本轮 FS-27/28 的 hello 实例
+    // 不会去共享自测缓冲页 (`SYS_SHARE_PAGE` 的同地址映射在服务域里是持久的, 重复共享
+    // 会撞 `PageAlreadyMapped` 内核 panic; 每轮启动只允许 FS-34 那次 hello 共享一次)。
+    vfs::unlink("/mfs/pub/perm.go");
+
     // 32. FS-27 自测 (E1/E2 可执行文件加载): 从**磁盘上的文件**加载一个独立编译的程序 ——
     //     `morion::exec::spawn_file` 打开路径、分块读进本域内存、交给内核 `SYS_SPAWN_ELF`,
     //     内核校验后建**新域**、按 ELF 段映射、起任务。走的是与 shell `run` 命令**同一条**
@@ -3415,7 +3420,128 @@ pub fn run() {
         println(" persisted on disk (raw superblock match, readback ok)");
     }
 
+    // 36. FS-34..37 自测 (04b 权限与多用户): 低权身份端到端。
+    //     `mfs_srv` 按**发起域**静态映射身份 —— 引导期服务域 = uid 0, 运行期新建域 = uid 1000。
+    //     app 本身是引导期服务域 (root), 故先以 root 造夹具, 再 `spawn_file` 一个**新域**里的
+    //     `user/hello`(拿到 uid 1000)去跑权限用例; hello 把 4 个结果字节写进
+    //     `/mfs/pub/perm.result`, 这里读回断言。详见 `fs34_perm_suite`。
+    if fs34_perm_suite().is_none() {
+        return;
+    }
+
     println("app: SELFTEST DONE");
+}
+
+/// FS-34..37 (04b): 权限与多用户的端到端自测 (见调用点注释)。
+///
+/// 夹具开关 `perm.go` 决定 hello 是否跑权限用例 —— FS-27/28 复用的 hello 实例看不到它。
+fn fs34_perm_suite() -> Option<()> {
+    const PUB: &str = "/mfs/pub";
+    const CASE34: &str = "/mfs/pub/case34.txt";
+    const CASE35: &str = "/mfs/pub/case35.txt";
+    const GATE: &str = "/mfs/pub/perm.go";
+    const RESULT: &str = "/mfs/pub/perm.result";
+    const STICKY: &str = "/mfs/sticky";
+    const STICKY_ROOT: &str = "/mfs/sticky/rootfile.txt";
+    const HELLO: &str = "/hello.mex";
+
+    // 1) root 造夹具 (已存在时 mkdir/creat 的失败可忽略, 靠 chmod 把模式定死)。
+    vfs::mkdir(PUB);
+    if vfs::chmod_into(PUB, 0o777, vfs::RESULT_BUF) == u64::MAX {
+        println("app: FS34 chmod /mfs/pub FAILED");
+        return None;
+    }
+    let fd = vfs::creat(CASE34);
+    if fd == u64::MAX {
+        println("app: FS34 creat case34 FAILED");
+        return None;
+    }
+    vfs::close(fd);
+    if vfs::chmod_into(CASE34, 0o000, vfs::RESULT_BUF) == u64::MAX {
+        println("app: FS34 chmod case34 FAILED");
+        return None;
+    }
+    let fd = vfs::creat(CASE35);
+    if fd == u64::MAX || vfs::write(fd, 0, b"hello") != 5 {
+        println("app: FS34 creat/write case35 FAILED");
+        return None;
+    }
+    vfs::close(fd);
+    if vfs::chmod_into(CASE35, 0o666, vfs::RESULT_BUF) == u64::MAX {
+        println("app: FS34 chmod case35 FAILED");
+        return None;
+    }
+    vfs::mkdir(STICKY);
+    if vfs::chmod_into(STICKY, 0o1777, vfs::RESULT_BUF) == u64::MAX {
+        println("app: FS34 chmod /mfs/sticky FAILED");
+        return None;
+    }
+    let fd = vfs::creat(STICKY_ROOT);
+    if fd == u64::MAX {
+        println("app: FS34 creat sticky/rootfile FAILED");
+        return None;
+    }
+    vfs::close(fd);
+    // 夹具开关 + 结果位图 (先清零, 免得读到上一轮)。
+    let fd = vfs::creat(GATE);
+    if fd == u64::MAX {
+        println("app: FS34 creat perm.go FAILED");
+        return None;
+    }
+    vfs::close(fd);
+    let fd = vfs::creat(RESULT);
+    if fd == u64::MAX || vfs::write(fd, 0, b"0000") != 4 {
+        println("app: FS34 creat/write perm.result FAILED");
+        return None;
+    }
+    vfs::close(fd);
+    // 结果文件要给低权身份**可写** (hello 在 uid 1000 下写回位图), 故放开到 0666。
+    if vfs::chmod_into(RESULT, 0o666, vfs::RESULT_BUF) == u64::MAX {
+        println("app: FS34 chmod perm.result FAILED");
+        return None;
+    }
+
+    // 2) 以**新域**跑 hello (uid 1000)。
+    let base = sys_domain_count();
+    let child = match morion::exec::spawn_file(HELLO) {
+        Some(d) => d,
+        None => {
+            println("app: FS34 spawn hello FAILED");
+            return None;
+        }
+    };
+    if !wait_domain_alive(child, false, 4000) {
+        println("app: FS34 hello did not exit FAILED");
+        return None;
+    }
+    if sys_domain_count() != base {
+        println("app: FS34 domain count drift FAILED");
+        return None;
+    }
+
+    // 3) 读回结果位图并断言 (hello 侧已把低权域的真实结果写进来)。
+    let fd = vfs::open(RESULT);
+    if fd == u64::MAX {
+        println("app: FS34 open perm.result FAILED");
+        return None;
+    }
+    let n = vfs::read(fd, 0, 4);
+    vfs::close(fd);
+    if n != 4 {
+        println("app: FS34 read perm.result FAILED");
+        return None;
+    }
+    let got = unsafe { core::slice::from_raw_parts(vfs::RESULT_BUF as *const u8, 4) };
+    if got != b"1111" {
+        print("app: FS34-37 permission suite FAILED (FS34..37=");
+        print(unsafe { core::str::from_utf8_unchecked(got) });
+        println(")");
+        return None;
+    }
+    println("app: FS34-37 permission suite OK (low-priv uid 1000 end-to-end)");
+    // 关掉开关: 之后的 hello 实例 (如 shell `run`) 不再重复共享自测缓冲页。
+    vfs::unlink(GATE);
+    Some(())
 }
 
 /// GT-1 取证 (G3a 图形子系统): 文本渲染搬到用户态后的端到端验证。

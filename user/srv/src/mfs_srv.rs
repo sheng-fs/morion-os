@@ -115,6 +115,10 @@ const MFS_META_NLINK: usize = 4;
 const MFS_META_MTIME: usize = 8;
 const MFS_META_CTIME: usize = 16;
 const MFS_META_ATIME: usize = 24;
+/// 04b: 元数据 `+32` 起 8 字节保留区启用为 **uid / gid**（各 u16）。**不升 magic、
+/// 不改元数据尺寸** —— 老 MFS8 盘该处为 0，读出来即 `uid=0/gid=0`（旧文件全归 root）。
+const MFS_META_UID: usize = 32;
+const MFS_META_GID: usize = 34;
 
 /// 新建目录的默认权限 (rwxr-xr-x)。
 const MFS_MODE_DIR: u16 = 0o755;
@@ -490,6 +494,10 @@ struct MfsFd {
     path_len: u8,
     /// 打开时本服务服务的卷号 (M1b 多卷挂载: fd 类请求靠它找回该卷, 见服务循环)。
     vol: u64,
+    /// 04b: 打开者身份与**打开时判定的有效权限位** (R/W/X)。已打开的 fd 在 `chmod`
+    /// 之后仍按这份快照放行 —— 与 Unix 一致 (权限在 open 时判一次)。
+    cred: Cred,
+    perm: u8,
     path: [u8; TMP_PATH_MAX],
 }
 const MFS_FD_EMPTY: MfsFd = MfsFd {
@@ -497,6 +505,11 @@ const MFS_FD_EMPTY: MfsFd = MfsFd {
     is_dir: false,
     path_len: 0,
     vol: 0,
+    cred: Cred {
+        uid: MFS_UID_ROOT,
+        gid: MFS_GID_ROOT,
+    },
+    perm: 0,
     path: [0; TMP_PATH_MAX],
 };
 static mut MFS_FDS: [MfsFd; MFS_MAX_FD] = [MFS_FD_EMPTY; MFS_MAX_FD];
@@ -1028,6 +1041,8 @@ fn mfs_gc_sweep() -> u64 {
 
 /// 空间回收: 标记 (当前根 + 全部快照) 后清扫不可达块。返回回收块数; 失败 `u64::MAX`。
 fn mfs_gc() -> u64 {
+    // 02b: GC 会搬运/回收块 —— 缓存里的 (块, 偏移) 一律作废。
+    mfs_didx_invalidate_all();
     if !mfs_gc_mark() {
         return u64::MAX;
     }
@@ -1434,6 +1449,8 @@ fn mfs_ino_block(ino: u32) -> Option<u32> {
 ///
 /// 挂载与快照回滚都要用它 —— 回滚会把 `MFS_ITAB` 换成旧索引块, 镜像必须跟着换。
 fn mfs_itab_reload() -> bool {
+    // 02b: 整张 ino→对象块 映射被替换 (挂载 / 快照回滚) → 目录索引里的 (块, 偏移) 全部作废。
+    mfs_didx_invalidate_all();
     let x = mfs_itabx_buf();
     let itab = unsafe { MFS_ITAB };
     if itab == 0 || !mfs_read_blk(itab, x) || !mfs_ok(x, MFS_MAGIC_ITABX) {
@@ -1639,6 +1656,9 @@ fn mfs_itab_set(ino: u32, blk: u32) -> bool {
         MFS_ITAB_CACHE_IDX = k;
     }
     mfs_set_itab_table(k, new_t);
+    // 02b: inode 表槽 (对象块号) 变了 → 该 ino 的目录索引失效 (目录内容改动 / chmod /
+    // chown / 删除 / ino 复用都会经这里; 文件 ino 调用时只是空扫描, 无开销)。
+    mfs_didx_invalidate(ino);
     mfs_itab_flush()
 }
 
@@ -2129,6 +2149,8 @@ fn mfs_format_total_blocks() -> u32 {
 /// 首次格式化 (含旧格式升级): 清空位图 -> 占用元数据区 -> 建空根目录 (ino 1) ->
 /// 建 inode 表 -> 提交 (写位图数据块 + 位图头块 + 超级块)。
 fn mfs_format() -> bool {
+    // 02b: 重建文件系统 → 所有目录索引作废。
+    mfs_didx_invalidate_all();
     let total = mfs_format_total_blocks();
     unsafe {
         MFS_TOTAL_BLOCKS = total;
@@ -2173,7 +2195,17 @@ fn mfs_format() -> bool {
     let buf = mfs_a();
     zero_bytes(buf, MFS_BLOCK);
     mfs_dir_init_empty(buf);
-    mfs_init_meta(buf, true, MFS_FTYPE_DIR, 0, MFS_MODE_DIR);
+    mfs_init_meta(
+        buf,
+        true,
+        MFS_FTYPE_DIR,
+        0,
+        Cred {
+            uid: MFS_UID_ROOT,
+            gid: MFS_GID_ROOT,
+        },
+        MFS_MODE_DIR,
+    );
     let root = match mfs_commit(buf, MFS_MAGIC_DIR) {
         Some(b) => b,
         None => return false,
@@ -2224,6 +2256,20 @@ fn mfs_get_owner(buf: *const u8, is_dir: bool) -> u16 {
 fn mfs_set_owner(buf: *mut u8, is_dir: bool, v: u16) {
     write_u16(mfs_atm(buf, mfs_meta_off(is_dir) + MFS_META_OWNER), v);
 }
+/// 04b: 节点属主 uid (元数据 `+32`)。
+fn mfs_get_uid(buf: *const u8, is_dir: bool) -> u16 {
+    read_u16(mfs_at(buf, mfs_meta_off(is_dir) + MFS_META_UID))
+}
+fn mfs_set_uid(buf: *mut u8, is_dir: bool, v: u16) {
+    write_u16(mfs_atm(buf, mfs_meta_off(is_dir) + MFS_META_UID), v);
+}
+/// 04b: 节点属组 gid (元数据 `+34`)。
+fn mfs_get_gid(buf: *const u8, is_dir: bool) -> u16 {
+    read_u16(mfs_at(buf, mfs_meta_off(is_dir) + MFS_META_GID))
+}
+fn mfs_set_gid(buf: *mut u8, is_dir: bool, v: u16) {
+    write_u16(mfs_atm(buf, mfs_meta_off(is_dir) + MFS_META_GID), v);
+}
 fn mfs_get_nlink(buf: *const u8, is_dir: bool) -> u32 {
     read_u32(mfs_at(buf, mfs_meta_off(is_dir) + MFS_META_NLINK))
 }
@@ -2253,7 +2299,7 @@ fn mfs_set_atime(buf: *mut u8, is_dir: bool, v: u64) {
 ///
 /// `ftype` 是 `mode` 高 4 位的节点类型 (文件 / 目录 / 软链接); 节点刚清零过, 类型位
 /// 必须在这里写入 —— `mfs_set_mode` 是"保留类型"的, 零值下它只能写权限。
-fn mfs_init_meta(buf: *mut u8, is_dir: bool, ftype: u16, owner: u16, mode: u16) {
+fn mfs_init_meta(buf: *mut u8, is_dir: bool, ftype: u16, owner: u16, cred: Cred, mode: u16) {
     let now = mfs_now();
     let off = mfs_meta_off(is_dir) + MFS_META_MODE;
     write_u16(
@@ -2261,6 +2307,9 @@ fn mfs_init_meta(buf: *mut u8, is_dir: bool, ftype: u16, owner: u16, mode: u16) 
         (ftype & MFS_FTYPE_MASK) | (mode & MFS_MODE_MASK),
     );
     mfs_set_owner(buf, is_dir, owner);
+    // 04b: 新节点的属主 / 属组 = 发起者身份 (`owner` 仍是创建者域号, 仅供诊断)。
+    mfs_set_uid(buf, is_dir, cred.uid);
+    mfs_set_gid(buf, is_dir, cred.gid);
     mfs_set_nlink(buf, is_dir, 1);
     mfs_set_mtime(buf, is_dir, now);
     mfs_set_ctime(buf, is_dir, now);
@@ -2543,8 +2592,295 @@ fn mfs_dir_has_entry(buf: *const u8) -> bool {
     false
 }
 
-/// 在目录 (`dir_ino`, 含扩展块) 中查找条目。用 A(节点)/B(索引块)/C(扩展块) 缓冲。
+// ---------------------------------------------------------------------------
+// 目录项索引缓存 (02b)
+//
+// 动机: `mfs_dir_lookup` 每次都要读「节点块 + (如有) 索引块 + 逐扩展块」, 而每次
+// `mfs_read_blk` 都是一次到 block_srv 的 IPC (≈1 tick ≈10 ms)。目录密集的负载 (如
+// FS-12: 200 项目录逐项 open) 因此是 O(n²) 次块 IPC。这里按 `(卷, 目录 ino)` 把目录
+// 条目解析成内存表 —— 命中即免 IPC。
+//
+// 正确性: 只缓存 `name -> (条目所在块, 块内偏移)`; 任何可能改变目录内容或块号的路径
+// 都让对应目录失效 —— `mfs_itab_set` 是**唯一**改 inode 表槽的漏斗 (目录内容改动、
+// chmod/chown、ino 复用、删除都要经它), GC 会搬块、mkfs 会重建, 二者整表失效。
+// 缓存「不完整」(arena 装不下) 时, 未命中**必须回退**线性扫描 —— 绝不把"没缓存"
+// 当成"不存在"。
+// ---------------------------------------------------------------------------
+
+/// 构建期开关 (02b 取证用: 唯一变量 = 目录索引缓存)。`false` 时全部走线性扫描 ——
+/// 作为 before/after 对照。默认 `true`。
+const MFS_DIDX_ENABLED: bool = true;
+const MFS_DIDX_CACHE_DIRS: usize = 8;
+const MFS_DIDX_ARENA: usize = 8 * 1024;
+
+#[derive(Clone, Copy)]
+struct DirIdxMeta {
+    used: bool,
+    complete: bool,
+    vol: u64,
+    dir_ino: u32,
+    count: u16,
+    arena_len: u16,
+}
+const DIRIDX_EMPTY: DirIdxMeta = DirIdxMeta {
+    used: false,
+    complete: false,
+    vol: 0,
+    dir_ino: 0,
+    count: 0,
+    arena_len: 0,
+};
+
+static mut MFS_DIDX_META: [DirIdxMeta; MFS_DIDX_CACHE_DIRS] = [DIRIDX_EMPTY; MFS_DIDX_CACHE_DIRS];
+/// 每目录的条目数据 arena (变长打包: `[blk u32][off u16][name_len u8][name…]`)。
+static mut MFS_DIDX_ARENAS: [[u8; MFS_DIDX_ARENA]; MFS_DIDX_CACHE_DIRS] =
+    [[0u8; MFS_DIDX_ARENA]; MFS_DIDX_CACHE_DIRS];
+static mut MFS_DIDX_EVICT: usize = 0;
+static mut MFS_DIDX_LOOKUPS: u64 = 0;
+static mut MFS_DIDX_HITS: u64 = 0;
+static mut MFS_DIDX_BUILDS: u64 = 0;
+static mut MFS_DIDX_EVICTS: u64 = 0;
+
+fn mfs_didx_meta(i: usize) -> *mut DirIdxMeta {
+    unsafe {
+        core::ptr::addr_of_mut!(MFS_DIDX_META)
+            .cast::<DirIdxMeta>()
+            .add(i)
+    }
+}
+fn mfs_didx_arena(i: usize) -> *mut u8 {
+    unsafe {
+        core::ptr::addr_of_mut!(MFS_DIDX_ARENAS)
+            .cast::<[u8; MFS_DIDX_ARENA]>()
+            .add(i)
+            .cast::<u8>()
+    }
+}
+
+/// 让某个目录 (任意卷) 的索引失效。
+fn mfs_didx_invalidate(dir_ino: u32) {
+    if dir_ino == 0 {
+        return;
+    }
+    for i in 0..MFS_DIDX_CACHE_DIRS {
+        let m = mfs_didx_meta(i);
+        unsafe {
+            if (*m).used && (*m).dir_ino == dir_ino {
+                (*m).used = false;
+            }
+        }
+    }
+}
+
+/// 整表失效 (GC 搬块 / mkfs 重建后)。
+fn mfs_didx_invalidate_all() {
+    for i in 0..MFS_DIDX_CACHE_DIRS {
+        unsafe {
+            (*mfs_didx_meta(i)).used = false;
+        }
+    }
+}
+
+/// `(卷, dir_ino)` 是否已缓存; 返回槽号。
+fn mfs_didx_find(dir_ino: u32) -> Option<usize> {
+    for i in 0..MFS_DIDX_CACHE_DIRS {
+        let m = mfs_didx_meta(i);
+        unsafe {
+            if (*m).used && (*m).dir_ino == dir_ino && (*m).vol == MFS_CUR_VOL {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// 取一个空槽; 没有则轮转淘汰一个 (clock)。
+fn mfs_didx_slot() -> usize {
+    for i in 0..MFS_DIDX_CACHE_DIRS {
+        if !unsafe { (*mfs_didx_meta(i)).used } {
+            return i;
+        }
+    }
+    let i = unsafe { MFS_DIDX_EVICT } % MFS_DIDX_CACHE_DIRS;
+    unsafe {
+        MFS_DIDX_EVICT = (i + 1) % MFS_DIDX_CACHE_DIRS;
+        MFS_DIDX_EVICTS += 1;
+    }
+    i
+}
+
+/// 把 `buf` (块号 `blk`) 里的有效条目追加进槽 `i`; 装不下则标记不完整并停止。
+fn mfs_didx_fill_block(i: usize, blk: u32, buf: *const u8) {
+    let m = mfs_didx_meta(i);
+    let arena = mfs_didx_arena(i);
+    let end = MFS_HDR + MFS_PAYLOAD;
+    let mut off = MFS_HDR + MFS_DIR_HDR;
+    while off + MFS_DIR_ENT_HDR <= end {
+        let nl = mfs_ent_name_len(buf, off);
+        if nl != 0 {
+            // 名字必须真能装进本条目的 rec_len (防损坏条目越界读); 结构可疑就保守地
+            // 把索引标成不完整 —— 未命中会回退线性扫描, 绝不误判"不存在"。
+            if mfs_ent_need(nl) > mfs_ent_rec_len(buf, off) {
+                unsafe { (*m).complete = false };
+                return;
+            }
+            let used = unsafe { (*m).arena_len } as usize;
+            if used + 7 + nl > MFS_DIDX_ARENA {
+                unsafe { (*m).complete = false };
+                return;
+            }
+            let blk_b = blk.to_le_bytes();
+            let off_b = (off as u16).to_le_bytes();
+            unsafe {
+                let dst = arena.add(used);
+                core::ptr::copy_nonoverlapping(blk_b.as_ptr(), dst, 4);
+                core::ptr::copy_nonoverlapping(off_b.as_ptr(), dst.add(4), 2);
+                *dst.add(6) = nl as u8;
+                core::ptr::copy_nonoverlapping(mfs_at(buf, off + MFS_DIR_ENT_HDR), dst.add(7), nl);
+                (*m).arena_len = (used + 7 + nl) as u16;
+                (*m).count += 1;
+            }
+        }
+        match mfs_ent_step(buf, off) {
+            Some(n) => off = n,
+            None => {
+                // 走到损坏/异常边界: 索引不完整 (回退线性扫描), 不当作"目录到此结束"。
+                unsafe { (*m).complete = false };
+                return;
+            }
+        }
+    }
+}
+
+/// 为目录 `dir_ino` 建索引 (当前卷)。失败返回 false → 调用方回退线性扫描。
+fn mfs_didx_build(dir_ino: u32) -> bool {
+    let base = match mfs_ino_block(dir_ino) {
+        Some(b) if b != 0 => b,
+        _ => return false,
+    };
+    let a = mfs_a();
+    if !mfs_read_blk(base, a) || !mfs_ok(a, MFS_MAGIC_DIR) {
+        return false;
+    }
+    let i = mfs_didx_slot();
+    let m = mfs_didx_meta(i);
+    unsafe {
+        (*m).used = true;
+        (*m).complete = true;
+        (*m).vol = MFS_CUR_VOL;
+        (*m).dir_ino = dir_ino;
+        (*m).count = 0;
+        (*m).arena_len = 0;
+        MFS_DIDX_BUILDS += 1;
+    }
+    mfs_didx_fill_block(i, base, a);
+    let ext = mfs_dir_ext(a);
+    if ext != 0 {
+        let b = mfs_b();
+        if mfs_read_blk(ext, b) && mfs_ok(b, MFS_MAGIC_DIDX) {
+            let c = mfs_c();
+            for k in 0..MFS_DIR_SLOTS {
+                let blk = read_u32(mfs_at(b, MFS_HDR + k * 4));
+                if blk == 0 {
+                    continue;
+                }
+                if mfs_read_blk(blk, c) && mfs_ok(c, MFS_MAGIC_DIR) {
+                    mfs_didx_fill_block(i, blk, c);
+                    if !unsafe { (*m).complete } {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// 目录索引查找结果。
+enum DidxLookup {
+    Hit(MfsLoc),
+    /// 索引**完整**且无此名字 → 可断定不存在。
+    Absent,
+    /// 没缓存 / 缓存不完整 / 建索引失败 → 必须回退线性扫描。
+    Unknown,
+}
+
+fn mfs_didx_lookup(dir_ino: u32, comp: &[u8]) -> DidxLookup {
+    if !MFS_DIDX_ENABLED {
+        return DidxLookup::Unknown;
+    }
+    unsafe { MFS_DIDX_LOOKUPS += 1 };
+    let i = match mfs_didx_find(dir_ino) {
+        Some(i) => i,
+        None => {
+            if !mfs_didx_build(dir_ino) {
+                return DidxLookup::Unknown;
+            }
+            match mfs_didx_find(dir_ino) {
+                Some(k) => k,
+                None => return DidxLookup::Unknown,
+            }
+        }
+    };
+    let m = mfs_didx_meta(i);
+    let arena = mfs_didx_arena(i);
+    let len = unsafe { (*m).arena_len } as usize;
+    let mut p = 0usize;
+    while p + 7 <= len {
+        let (blk, off, nl) = unsafe {
+            let q = arena.add(p);
+            (
+                u32::from_le_bytes([*q, *q.add(1), *q.add(2), *q.add(3)]),
+                u16::from_le_bytes([*q.add(4), *q.add(5)]) as usize,
+                *q.add(6) as usize,
+            )
+        };
+        if nl == comp.len() {
+            let hit = unsafe { core::slice::from_raw_parts(arena.add(p + 7), nl) == comp };
+            if hit {
+                unsafe { MFS_DIDX_HITS += 1 };
+                return DidxLookup::Hit(MfsLoc { dir_ino, blk, off });
+            }
+        }
+        p += 7 + nl;
+    }
+    if unsafe { (*m).complete } {
+        DidxLookup::Absent
+    } else {
+        DidxLookup::Unknown
+    }
+}
+
+/// 每 4096 次目录查找打印一次计数 (回归日志可 grep, 作为 02b 的取证)。
+fn mfs_didx_maybe_log() {
+    let n = unsafe { MFS_DIDX_LOOKUPS };
+    if n != 0 && n % 4096 == 0 {
+        print("mfs-didx: lookups=");
+        print_u64(n);
+        print(" hits=");
+        print_u64(unsafe { MFS_DIDX_HITS });
+        print(" builds=");
+        print_u64(unsafe { MFS_DIDX_BUILDS });
+        print(" evict=");
+        print_u64(unsafe { MFS_DIDX_EVICTS });
+        print(" entries=");
+        let mut entries = 0u64;
+        for i in 0..MFS_DIDX_CACHE_DIRS {
+            entries += unsafe { (*mfs_didx_meta(i)).count } as u64;
+        }
+        print_u64(entries);
+        println("");
+    }
+}
+
+/// 在目录 (`dir_ino`, 含扩展块) 中查找条目。先查内存索引 (02b); 不命中再走线性扫描。
 fn mfs_dir_lookup(dir_ino: u32, comp: &[u8]) -> Option<MfsLoc> {
+    mfs_didx_maybe_log();
+    match mfs_didx_lookup(dir_ino, comp) {
+        DidxLookup::Hit(loc) => return Some(loc),
+        DidxLookup::Absent => return None,
+        DidxLookup::Unknown => {}
+    }
     let base = mfs_ino_block(dir_ino)?;
     if base == 0 {
         return None;
@@ -3705,7 +4041,7 @@ fn mfs_truncate(ino: u32, new_size: u64) -> u64 {
 ///
 /// 目标已存在时的语义: 都是文件 → 覆盖; 目标是非空目录 / 类型不匹配 → 拒绝。
 /// 移动目录时拒绝把它移进自己的子孙 (会形成环)。
-fn mfs_rename(src: &str, dst: &str) -> u64 {
+fn mfs_rename(src: &str, dst: &str, cred: Cred) -> u64 {
     let mut sc = [0u8; TMP_PATH_MAX];
     let mut dc = [0u8; TMP_PATH_MAX];
     let sn = match mfs_normalize(src, &mut sc) {
@@ -3742,6 +4078,29 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
     // 目录不能移进自己的子孙 (否则目录树成环, 解析会绕圈)。
     if s_is_dir && dn > sn && dc[..sn] == sc[..sn] && dc[sn] == b'/' {
         return u64::MAX;
+    }
+    // 04b: 源父目录 W+X (root 直通); sticky 时再限「节点属主 / 目录属主 / uid 0」。
+    let mut ssplit = sn;
+    while ssplit > 1 && sc[ssplit - 1] != b'/' {
+        ssplit -= 1;
+    }
+    let sparent_end = if ssplit > 1 { ssplit - 1 } else { 1 };
+    let sparent_ino = match mfs_resolve(&sc[..sparent_end]) {
+        Some(x) => x,
+        None => return mfs_err(MFS_ENOENT),
+    };
+    if !mfs_check_dir_ino(sparent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
+    if mfs_get_mode(mfs_a(), true) & 0o1000 != 0 && cred.uid != MFS_UID_ROOT {
+        let s_uid = if mfs_read_blk(sblock, mfs_s()) {
+            mfs_get_uid(mfs_s(), s_is_dir)
+        } else {
+            MFS_UID_ROOT
+        };
+        if cred.uid != mfs_get_uid(mfs_a(), true) && cred.uid != s_uid {
+            return mfs_err(MFS_EACCES);
+        }
     }
     // 目标父路径与末分量。
     let mut split = dn;
@@ -3783,8 +4142,12 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
     // 1) 先在新位置建条目 (同一个 ino, 此时可能短暂存在两个名字)。
     let dparent_ino = match mfs_resolve(&dc[..dparent_end]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
+    // 04b: 目标父目录 W+X (root 直通)。
+    if !mfs_check_dir_ino(dparent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
     if !mfs_dir_insert(dparent_ino, dcomp, s_ino, s_typ) {
         return u64::MAX;
     }
@@ -3801,8 +4164,8 @@ fn mfs_rename(src: &str, dst: &str) -> u64 {
 
 /// 修改 `path` 的权限位 (低 12 位), 成功返回 1。
 ///
-/// 权限位只存储与显示, 不参与访问判定 —— 当前系统没有多用户概念 (见 roadmap M5)。
-fn mfs_chmod(path: &str, mode: u16) -> u64 {
+/// 04b: 仅**节点属主**或 `uid 0` 可改 (否则 `EPERM`)。
+fn mfs_chmod(path: &str, mode: u16, cred: Cred) -> u64 {
     let mut canon = [0u8; TMP_PATH_MAX];
     let n = match mfs_normalize(path, &mut canon) {
         Some(n) => n,
@@ -3810,7 +4173,7 @@ fn mfs_chmod(path: &str, mode: u16) -> u64 {
     };
     let ino = match mfs_resolve(&canon[..n]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
     let block = match mfs_ino_block(ino) {
         Some(b) if b != 0 => b,
@@ -3818,16 +4181,63 @@ fn mfs_chmod(path: &str, mode: u16) -> u64 {
     };
     let a = mfs_a();
     if !mfs_read_blk(block, a) {
-        return u64::MAX;
+        return mfs_err(MFS_EIO);
     }
     let (is_dir, magic) = if mfs_ok(a, MFS_MAGIC_DIR) {
         (true, MFS_MAGIC_DIR)
     } else if mfs_ok(a, MFS_MAGIC_FILE) {
         (false, MFS_MAGIC_FILE)
+    } else if mfs_ok(a, MFS_MAGIC_LINK) {
+        (false, MFS_MAGIC_LINK)
     } else {
-        return u64::MAX;
+        return mfs_err(MFS_EIO);
     };
+    if cred.uid != MFS_UID_ROOT && cred.uid != mfs_get_uid(a, is_dir) {
+        return mfs_err(MFS_EPERM);
+    }
     mfs_set_mode(a, is_dir, mode);
+    mfs_touch_ctime(a, is_dir);
+    if mfs_commit_object(ino, a, magic).is_none() {
+        return u64::MAX;
+    }
+    1
+}
+
+/// 修改 `path` 的属主 / 属组 (04b)。成功返回 1。
+///
+/// 仅 `uid 0` 可改 (最小实现; 演进项: 属主可把自己文件的 gid 改到所属组)。
+fn mfs_chown(path: &str, uid: u16, gid: u16, cred: Cred) -> u64 {
+    let mut canon = [0u8; TMP_PATH_MAX];
+    let n = match mfs_normalize(path, &mut canon) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    let ino = match mfs_resolve(&canon[..n]) {
+        Some(x) => x,
+        None => return mfs_err(MFS_ENOENT),
+    };
+    let block = match mfs_ino_block(ino) {
+        Some(b) if b != 0 => b,
+        _ => return u64::MAX,
+    };
+    let a = mfs_a();
+    if !mfs_read_blk(block, a) {
+        return mfs_err(MFS_EIO);
+    }
+    let (is_dir, magic) = if mfs_ok(a, MFS_MAGIC_DIR) {
+        (true, MFS_MAGIC_DIR)
+    } else if mfs_ok(a, MFS_MAGIC_FILE) {
+        (false, MFS_MAGIC_FILE)
+    } else if mfs_ok(a, MFS_MAGIC_LINK) {
+        (false, MFS_MAGIC_LINK)
+    } else {
+        return mfs_err(MFS_EIO);
+    };
+    if cred.uid != MFS_UID_ROOT {
+        return mfs_err(MFS_EPERM);
+    }
+    mfs_set_uid(a, is_dir, uid);
+    mfs_set_gid(a, is_dir, gid);
     mfs_touch_ctime(a, is_dir);
     if mfs_commit_object(ino, a, magic).is_none() {
         return u64::MAX;
@@ -3869,6 +4279,8 @@ fn mfs_dir_emit(buf: *const u8, out: *mut vfs::DirEntry, count: &mut usize) {
                 }
                 de.mode = mfs_get_mode(s, is_dir);
                 de.owner = mfs_get_owner(s, is_dir);
+                de.uid = mfs_get_uid(s, is_dir);
+                de.gid = mfs_get_gid(s, is_dir);
                 de.nlink = mfs_get_nlink(s, is_dir);
                 de.mtime = mfs_get_mtime(s, is_dir);
             }
@@ -3926,13 +4338,15 @@ fn mfs_readdir(ino: u32, out: *mut vfs::DirEntry) -> u64 {
 // fd 表 (按路径)
 // ---------------------------------------------------------------------------
 
-fn mfs_fd_alloc(path: &[u8], is_dir: bool) -> u64 {
+fn mfs_fd_alloc(path: &[u8], is_dir: bool, cred: Cred, perm: u8) -> u64 {
     for i in 0..MFS_MAX_FD {
         unsafe {
             let s = &mut *core::ptr::addr_of_mut!(MFS_FDS).cast::<MfsFd>().add(i);
             if !s.used {
                 s.used = true;
                 s.is_dir = is_dir;
+                s.cred = cred;
+                s.perm = perm;
                 s.path_len = path.len() as u8;
                 // 绑定分配时所在的卷: 之后这个 fd 上的请求可能落在别的卷被处理
                 // (服务循环按请求切卷), 靠它把请求拉回本 fd 所属的那一卷。
@@ -3974,6 +4388,120 @@ fn mfs_fd_free(fd: u32) -> u64 {
         } else {
             0
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 权限与多用户 (04b) —— 能力在前, 权限在后
+// ---------------------------------------------------------------------------
+
+/// 失败回复编码: 保留**高 16 位全 1** 的波段表示错误 (fd 把能力句柄放最高 16 位,
+/// 但句柄索引 < 32, 永不落在本段; 字节数/条目数等成功值也远小于此)。
+const MFS_ERR_BASE: u64 = 0xFFFF_FFFF_FFFF_0000;
+const MFS_EPERM: u64 = 1;
+const MFS_EACCES: u64 = 2;
+const MFS_ENOENT: u64 = 3;
+const MFS_EEXIST: u64 = 4;
+const MFS_ENOTDIR: u64 = 5;
+const MFS_EISDIR: u64 = 6;
+const MFS_ENOTEMPTY: u64 = 7;
+const MFS_EINVAL: u64 = 8;
+const MFS_ENOSPC: u64 = 10;
+const MFS_EIO: u64 = 11;
+
+fn mfs_err(code: u64) -> u64 {
+    MFS_ERR_BASE | (code & 0xFFFF)
+}
+/// `u64::MAX` (旧通用失败) 天然并入: `mfs_is_err(u64::MAX) == true`。
+fn mfs_is_err(v: u64) -> bool {
+    (v >> 48) == 0xFFFF
+}
+
+/// 主体身份 (`04b` 静态凭证表)。uid/gid 与落盘字段同宽 (u16)。
+#[derive(Clone, Copy)]
+struct Cred {
+    uid: u16,
+    gid: u16,
+}
+
+/// 引导期长期服务域数 (与内核 `kernel/src/domain.rs` 的 `BOOT_DOMAINS` 对齐)。
+///
+/// 域 id `< 本值` = 引导期服务域 => 系统身份 `0:0`; `>= 本值` = 运行期新建域 =>
+/// 低权身份 `1000:1000`。**域号会复用**, 但本映射是按域号**现算**的确定性函数
+/// (不缓存用户可选身份), 复用后仍是同一档身份, 不存在"继承旧身份"问题。
+/// 目标形态改由认证服务签发 `Cred` 时, 才需要随域销毁失效的凭证表。
+const MFS_BOOT_DOMAINS: u64 = 19;
+const MFS_UID_ROOT: u16 = 0;
+const MFS_GID_ROOT: u16 = 0;
+const MFS_UID_USER: u16 = 1000;
+const MFS_GID_USER: u16 = 1000;
+
+fn mfs_cred_of(domain: u64) -> Cred {
+    if domain < MFS_BOOT_DOMAINS {
+        Cred {
+            uid: MFS_UID_ROOT,
+            gid: MFS_GID_ROOT,
+        }
+    } else {
+        Cred {
+            uid: MFS_UID_USER,
+            gid: MFS_GID_USER,
+        }
+    }
+}
+
+/// 访问类型位 (与 rwx 位同序)。
+const MFS_ACC_R: u8 = 0o4;
+const MFS_ACC_W: u8 = 0o2;
+const MFS_ACC_X: u8 = 0o1;
+
+/// `cred` 对节点 (块已在缓冲中) 的**有效权限位**。`uid 0` => 全放行 (`0o7`)。
+fn mfs_effective_perm(buf: *const u8, is_dir: bool, cred: Cred) -> u8 {
+    if cred.uid == MFS_UID_ROOT {
+        return 0o7;
+    }
+    let mode = mfs_get_mode(buf, is_dir) & 0o777;
+    let shift = if cred.uid == mfs_get_uid(buf, is_dir) {
+        6
+    } else if cred.gid == mfs_get_gid(buf, is_dir) {
+        3
+    } else {
+        0
+    };
+    ((mode >> shift) & 0o7) as u8
+}
+
+/// `cred` 是否具备 `want` (R/W/X 位组合)。
+fn mfs_check_access(buf: *const u8, is_dir: bool, cred: Cred, want: u8) -> bool {
+    mfs_effective_perm(buf, is_dir, cred) & want == want
+}
+
+/// 目录 `ino` 的节点块读进 A 缓冲, 返回 `(is_dir=true, ok)`。仅用于目录类检查。
+fn mfs_load_dir(ino: u32) -> bool {
+    match mfs_ino_block(ino) {
+        Some(b) if b != 0 => mfs_read_blk(b, mfs_a()) && mfs_ok(mfs_a(), MFS_MAGIC_DIR),
+        _ => false,
+    }
+}
+
+/// 对**父目录 inode** 做 `want` 检查 (路径类操作的公共入口)。父目录读失败即拒绝。
+fn mfs_check_dir_ino(dir_ino: u32, cred: Cred, want: u8) -> bool {
+    mfs_load_dir(dir_ino) && mfs_check_access(mfs_a(), true, cred, want)
+}
+
+/// 路径可达性 (STAT / LSTAT / READLINK): 末段的父目录需具备 X (穿越)。root 直通。
+fn mfs_check_traverse(canon: &[u8], cred: Cred) -> bool {
+    if cred.uid == MFS_UID_ROOT {
+        return true;
+    }
+    let mut split = canon.len();
+    while split > 1 && canon[split - 1] != b'/' {
+        split -= 1;
+    }
+    let parent_end = if split > 1 { split - 1 } else { 1 };
+    match mfs_resolve(&canon[..parent_end]) {
+        Some(p) => mfs_check_dir_ino(p, cred, MFS_ACC_X),
+        None => false,
     }
 }
 
@@ -4087,6 +4615,9 @@ pub fn run() {
         sys_recv_msg(&mut msg as *mut Message as *mut u8);
         // 请求间隙无在建 COW, 是唯一安全的回收时机: 空闲块偏少就先整理一次。
         mfs_maybe_gc();
+        // 04b: 发起者身份一律由服务侧按 `msg.from` (内核在 IPC 层保证) 查表得出,
+        // 请求消息里**不携带** uid/gid —— 消息里的数字可伪造, 域号不可。
+        let cred = mfs_cred_of(msg.from);
         let tag = vfs::tag_body(msg.tag);
         // 卷编码 (tag 高位, M1b) 决定路径类请求落在哪个卷; fd 类请求的卷由 fd 自己
         // 绑定 (fd 是这些请求 payload 的首字段), 先探一次 fd, 使两类请求都对。
@@ -4116,10 +4647,30 @@ pub fn run() {
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 let fd = match mfs_normalize(path, &mut canon) {
                     Some(n) => match mfs_resolve(&canon[..n]).and_then(mfs_ino_block) {
-                        Some(blk) if blk != 0 => mfs_fd_alloc(&canon[..n], mfs_is_dir(blk)),
-                        _ => u64::MAX,
+                        Some(blk) if blk != 0 => {
+                            let a = mfs_a();
+                            if !mfs_read_blk(blk, a) {
+                                mfs_err(MFS_EIO)
+                            } else {
+                                let is_dir = mfs_ok(a, MFS_MAGIC_DIR);
+                                // 04b: 打开时判一次 (Unix 语义), 结果随 fd 快照。
+                                // 文件需 R; 目录需 R+X (读条目列表 + 穿越)。
+                                let want = if is_dir {
+                                    MFS_ACC_R | MFS_ACC_X
+                                } else {
+                                    MFS_ACC_R
+                                };
+                                if !mfs_check_access(a, is_dir, cred, want) {
+                                    mfs_err(MFS_EACCES)
+                                } else {
+                                    let perm = mfs_effective_perm(a, is_dir, cred);
+                                    mfs_fd_alloc(&canon[..n], is_dir, cred, perm)
+                                }
+                            }
+                        }
+                        _ => mfs_err(MFS_ENOENT),
                     },
-                    None => u64::MAX,
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(fd);
             }
@@ -4129,15 +4680,20 @@ pub fn run() {
                 };
                 let n = match mfs_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
-                        let p = &fd.path[..fd.path_len as usize];
-                        match mfs_resolve(p) {
-                            Some(ino) => {
-                                mfs_read_file(ino, req.offset, req.count, req.buf as *mut u8)
+                        if fd.perm & MFS_ACC_R == 0 {
+                            mfs_err(MFS_EACCES)
+                        } else {
+                            let p = &fd.path[..fd.path_len as usize];
+                            match mfs_resolve(p) {
+                                Some(ino) => {
+                                    mfs_read_file(ino, req.offset, req.count, req.buf as *mut u8)
+                                }
+                                None => mfs_err(MFS_ENOENT),
                             }
-                            None => u64::MAX,
                         }
                     }
-                    _ => u64::MAX,
+                    Some(_) => mfs_err(MFS_EISDIR),
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4147,18 +4703,23 @@ pub fn run() {
                 };
                 let n = match mfs_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
-                        // 复制路径 (解析会复用 canon/缓冲, 避免借用冲突)。
-                        let mut p = [0u8; TMP_PATH_MAX];
-                        let plen = fd.path_len as usize;
-                        p[..plen].copy_from_slice(&fd.path[..plen]);
-                        match mfs_resolve(&p[..plen]) {
-                            Some(ino) => {
-                                mfs_write_file(ino, req.offset, req.count, req.buf as *const u8)
+                        if fd.perm & MFS_ACC_W == 0 {
+                            mfs_err(MFS_EACCES)
+                        } else {
+                            // 复制路径 (解析会复用 canon/缓冲, 避免借用冲突)。
+                            let mut p = [0u8; TMP_PATH_MAX];
+                            let plen = fd.path_len as usize;
+                            p[..plen].copy_from_slice(&fd.path[..plen]);
+                            match mfs_resolve(&p[..plen]) {
+                                Some(ino) => {
+                                    mfs_write_file(ino, req.offset, req.count, req.buf as *const u8)
+                                }
+                                None => mfs_err(MFS_ENOENT),
                             }
-                            None => u64::MAX,
                         }
                     }
-                    _ => u64::MAX,
+                    Some(_) => mfs_err(MFS_EISDIR),
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4168,15 +4729,20 @@ pub fn run() {
                 };
                 let n = match mfs_fd_get(req.fd) {
                     Some(fd) if fd.is_dir => {
-                        let mut p = [0u8; TMP_PATH_MAX];
-                        let plen = fd.path_len as usize;
-                        p[..plen].copy_from_slice(&fd.path[..plen]);
-                        match mfs_resolve(&p[..plen]) {
-                            Some(ino) => mfs_readdir(ino, req.buf as *mut vfs::DirEntry),
-                            None => u64::MAX,
+                        if fd.perm & (MFS_ACC_R | MFS_ACC_X) != (MFS_ACC_R | MFS_ACC_X) {
+                            mfs_err(MFS_EACCES)
+                        } else {
+                            let mut p = [0u8; TMP_PATH_MAX];
+                            let plen = fd.path_len as usize;
+                            p[..plen].copy_from_slice(&fd.path[..plen]);
+                            match mfs_resolve(&p[..plen]) {
+                                Some(ino) => mfs_readdir(ino, req.buf as *mut vfs::DirEntry),
+                                None => mfs_err(MFS_ENOENT),
+                            }
                         }
                     }
-                    _ => u64::MAX,
+                    Some(_) => mfs_err(MFS_ENOTDIR),
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4192,8 +4758,8 @@ pub fn run() {
                     .position(|&b| b == 0)
                     .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
-                // 创建者域 id 作为 owner 记进元数据 (fire-and-forget 显示用)。
-                let fd = mfs_create(path, is_dir, msg.from as u16);
+                // 创建者域 id 作为 owner 记进元数据 (fire-and-forget 诊断用)。
+                let fd = mfs_create(path, is_dir, msg.from as u16, cred);
                 sys_reply(fd);
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
@@ -4204,7 +4770,7 @@ pub fn run() {
                     .position(|&b| b == 0)
                     .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
-                sys_reply(mfs_remove(path, want_dir));
+                sys_reply(mfs_remove(path, want_dir, cred));
             }
             vfs::VFS_TRUNCATE_TAG => {
                 let req: vfs::TruncateReq = unsafe {
@@ -4212,30 +4778,39 @@ pub fn run() {
                 };
                 let n = match mfs_fd_get(req.fd) {
                     Some(fd) if !fd.is_dir => {
-                        let mut p = [0u8; TMP_PATH_MAX];
-                        let plen = fd.path_len as usize;
-                        p[..plen].copy_from_slice(&fd.path[..plen]);
-                        match mfs_resolve(&p[..plen]) {
-                            Some(ino) => mfs_truncate(ino, req.size),
-                            None => u64::MAX,
+                        if fd.perm & MFS_ACC_W == 0 {
+                            mfs_err(MFS_EACCES)
+                        } else {
+                            let mut p = [0u8; TMP_PATH_MAX];
+                            let plen = fd.path_len as usize;
+                            p[..plen].copy_from_slice(&fd.path[..plen]);
+                            match mfs_resolve(&p[..plen]) {
+                                Some(ino) => mfs_truncate(ino, req.size),
+                                None => mfs_err(MFS_ENOENT),
+                            }
                         }
                     }
-                    _ => u64::MAX,
+                    Some(_) => mfs_err(MFS_EISDIR),
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
             vfs::VFS_RENAME_TAG => {
-                sys_reply(with_two_paths(msg.payload.as_ptr(), mfs_rename));
+                sys_reply(with_two_paths(msg.payload.as_ptr(), |a, b| {
+                    mfs_rename(a, b, cred)
+                }));
             }
             vfs::VFS_LINK_TAG => {
-                sys_reply(with_two_paths(msg.payload.as_ptr(), mfs_link));
+                sys_reply(with_two_paths(msg.payload.as_ptr(), |a, b| {
+                    mfs_link(a, b, cred)
+                }));
             }
             // 软链接 (M5c): 两条路径 = (目标, 链接自身)。目标的**原样**存储, 故只有
             // 链接自身的路径经挂载层路由 (见 `vfs::symlink_into`)。
             vfs::VFS_SYMLINK_TAG => {
                 let owner = msg.from as u16;
                 sys_reply(with_two_paths(msg.payload.as_ptr(), |t, l| {
-                    mfs_symlink(t, l, owner)
+                    mfs_symlink(t, l, owner, cred)
                 }));
             }
             vfs::VFS_CHMOD_TAG => {
@@ -4243,19 +4818,30 @@ pub fn run() {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::PathReq)
                 };
                 let path = unsafe { core::str::from_utf8_unchecked(page_path(req.buf)) };
-                sys_reply(mfs_chmod(path, req.aux as u16));
+                sys_reply(mfs_chmod(path, req.aux as u16, cred));
+            }
+            // 改属主 / 属组 (04b): 路径与 `PathReq` 同款; `aux` = `uid << 16 | gid`。
+            vfs::MFS_CHOWN_TAG => {
+                let req: vfs::PathReq = unsafe {
+                    core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::PathReq)
+                };
+                let path = unsafe { core::str::from_utf8_unchecked(page_path(req.buf)) };
+                let uid = (req.aux >> 16) as u16;
+                let gid = (req.aux & 0xFFFF) as u16;
+                sys_reply(mfs_chown(path, uid, gid, cred));
             }
             vfs::VFS_STAT_TAG => {
                 let (buf, path) = parse_path_req(msg.payload.as_ptr());
                 let n = match mfs_normalize(path, &mut canon) {
                     Some(nn) => match mfs_resolve(&canon[..nn]) {
-                        Some(ino) => {
+                        Some(ino) if mfs_check_traverse(&canon[..nn], cred) => {
                             let blk = mfs_ino_block(ino).unwrap_or_default();
                             mfs_stat_into(blk, buf)
                         }
-                        None => u64::MAX,
+                        Some(_) => mfs_err(MFS_EACCES),
+                        None => mfs_err(MFS_ENOENT),
                     },
-                    None => u64::MAX,
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4263,8 +4849,11 @@ pub fn run() {
             vfs::VFS_READLINK_TAG => {
                 let (buf, path) = parse_path_req(msg.payload.as_ptr());
                 let n = match mfs_normalize(path, &mut canon) {
-                    Some(nn) => mfs_readlink(&canon[..nn], buf),
-                    None => u64::MAX,
+                    Some(nn) if mfs_check_traverse(&canon[..nn], cred) => {
+                        mfs_readlink(&canon[..nn], buf)
+                    }
+                    Some(_) => mfs_err(MFS_EACCES),
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4273,10 +4862,13 @@ pub fn run() {
                 let (buf, path) = parse_path_req(msg.payload.as_ptr());
                 let n = match mfs_normalize(path, &mut canon) {
                     Some(nn) => match mfs_resolve_no_follow(&canon[..nn]) {
-                        Some(ino) => mfs_stat_into(mfs_ino_block(ino).unwrap_or_default(), buf),
-                        None => u64::MAX,
+                        Some(ino) if mfs_check_traverse(&canon[..nn], cred) => {
+                            mfs_stat_into(mfs_ino_block(ino).unwrap_or_default(), buf)
+                        }
+                        Some(_) => mfs_err(MFS_EACCES),
+                        None => mfs_err(MFS_ENOENT),
                     },
-                    None => u64::MAX,
+                    None => mfs_err(MFS_EINVAL),
                 };
                 sys_reply(n);
             }
@@ -4473,6 +5065,8 @@ fn mfs_stat_into(block: u32, buf: u64) -> u64 {
         is_dir: u32::from(is_dir),
         mode: mfs_get_mode(a, is_dir),
         owner: mfs_get_owner(a, is_dir),
+        uid: mfs_get_uid(a, is_dir),
+        gid: mfs_get_gid(a, is_dir),
         nlink: mfs_get_nlink(a, is_dir),
         mtime: mfs_get_mtime(a, is_dir),
         ctime: mfs_get_ctime(a, is_dir),
@@ -4486,8 +5080,9 @@ fn mfs_stat_into(block: u32, buf: u64) -> u64 {
 
 /// 创建文件 (`is_dir=false`) 或目录 (`is_dir=true`)。成功返回 fd。
 ///
-/// `owner` = 发起请求的域 id, 只记进元数据供 `ls -l` 显示 (不做权限检查)。
-fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
+/// `owner` = 发起请求的域 id (只记进元数据供 `ls -l` 诊断); `cred` = 发起者身份,
+/// 决定访问判定与新节点的 uid/gid。
+fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
     let mut canon = [0u8; TMP_PATH_MAX];
     let n = match mfs_normalize(path, &mut canon) {
         Some(n) => n,
@@ -4496,16 +5091,21 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     // 已存在: 文件直接打开; 目录按类型匹配 (creat 遇目录 / mkdir 遇任何已有项都失败)。
     if let Some(x) = mfs_resolve(&canon[..n]) {
         if is_dir {
-            return u64::MAX;
+            return mfs_err(MFS_EEXIST);
         }
         let blk = match mfs_ino_block(x) {
             Some(b) if b != 0 => b,
             _ => return u64::MAX,
         };
         if mfs_is_dir(blk) {
-            return u64::MAX;
+            return mfs_err(MFS_EISDIR);
         }
-        return mfs_fd_alloc(&canon[..n], false);
+        // `creat` 对已存在文件 = 打开待写: 需文件可写 (root 直通)。
+        if !mfs_read_blk(blk, mfs_a()) || !mfs_check_access(mfs_a(), false, cred, MFS_ACC_W) {
+            return mfs_err(MFS_EACCES);
+        }
+        let perm = mfs_effective_perm(mfs_a(), false, cred);
+        return mfs_fd_alloc(&canon[..n], false, cred, perm);
     }
     // 父目录路径与末分量。
     let mut split = n;
@@ -4519,11 +5119,15 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     }
     let parent_ino = match mfs_resolve(&canon[..parent_end]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
+    // 04b: 在父目录内创建需父目录 W+X (root 直通)。
+    if !mfs_check_dir_ino(parent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
     // 名称查重 (也顺带校验父目录可解析)。
     if mfs_dir_lookup(parent_ino, comp).is_some() {
-        return u64::MAX;
+        return mfs_err(MFS_EEXIST);
     }
     // 新建空节点 (用 C, 避免覆盖 A 中的父目录)。
     let c = mfs_c();
@@ -4540,7 +5144,7 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
         mfs_file_set_size(c, 0);
         mfs_file_set_nblocks(c, 0);
     }
-    mfs_init_meta(c, is_dir, ftype, owner, mode);
+    mfs_init_meta(c, is_dir, ftype, owner, cred, mode);
     let magic = if is_dir {
         MFS_MAGIC_DIR
     } else {
@@ -4563,7 +5167,13 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
     if is_dir {
         1
     } else {
-        mfs_fd_alloc(&canon[..n], false)
+        // 创建者即属主: 有效权限 = 属主三位 (root 全放行)。
+        let perm = if cred.uid == MFS_UID_ROOT {
+            0o7
+        } else {
+            ((mode >> 6) & 0o7) as u8
+        };
+        mfs_fd_alloc(&canon[..n], false, cred, perm)
     }
 }
 
@@ -4579,7 +5189,7 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16) -> u64 {
 ///
 /// 软链接节点沿用文件布局 (目标内联在 payload 里, 不占数据块), 故元数据用
 /// `is_dir = false` 读写; 它不参与硬链接, `nlink` 恒为 1。
-fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
+fn mfs_symlink(target: &str, linkpath: &str, owner: u16, cred: Cred) -> u64 {
     let tb = target.as_bytes();
     if tb.is_empty() || tb.len() > MFS_LINK_MAX {
         return u64::MAX;
@@ -4607,10 +5217,14 @@ fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
     }
     let parent_ino = match mfs_resolve(&canon[..parent_end]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
+    // 04b: 建链接需链接自身父目录 W+X (root 直通); 目标路径不判。
+    if !mfs_check_dir_ino(parent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
     if mfs_dir_lookup(parent_ino, comp).is_some() {
-        return u64::MAX;
+        return mfs_err(MFS_EEXIST);
     }
     // 目标内联进节点 (复用文件布局的 size 字段存目标长度)。
     let c = mfs_c();
@@ -4620,7 +5234,7 @@ fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
     unsafe {
         core::ptr::copy_nonoverlapping(tb.as_ptr(), mfs_atm(c, MFS_LINK_TARGET_OFF), tb.len());
     }
-    mfs_init_meta(c, false, MFS_FTYPE_LINK, owner, MFS_MODE_LINK);
+    mfs_init_meta(c, false, MFS_FTYPE_LINK, owner, cred, MFS_MODE_LINK);
     let obj = match mfs_commit(c, MFS_MAGIC_LINK) {
         Some(b) => b,
         None => return u64::MAX,
@@ -4640,7 +5254,7 @@ fn mfs_symlink(target: &str, linkpath: &str, owner: u16) -> u64 {
 /// 目录不允许硬链接 (会形成环)。有了 inode 表, 两个名字共享同一个 ino, 之后从任一个
 /// 名字改写文件, 另一个名字都会看到新内容 —— 这正是 inode 间接层的核心收益:
 /// 改对象只动它自己的表槽, 与"有多少个名字引用它"无关。
-fn mfs_link(src: &str, dst: &str) -> u64 {
+fn mfs_link(src: &str, dst: &str, cred: Cred) -> u64 {
     let mut sc = [0u8; TMP_PATH_MAX];
     let mut dc = [0u8; TMP_PATH_MAX];
     let sn = match mfs_normalize(src, &mut sc) {
@@ -4665,9 +5279,19 @@ fn mfs_link(src: &str, dst: &str) -> u64 {
     if mfs_is_dir(sblk) {
         return u64::MAX; // 目录不能硬链接
     }
+    // 04b: 受保护硬链接 —— 无源写权限时, 仅当 uid 相同或 uid 0 才允许。
+    if cred.uid != MFS_UID_ROOT {
+        let a = mfs_a();
+        if mfs_read_blk(sblk, a) {
+            let s_uid = mfs_get_uid(a, false);
+            if cred.uid != s_uid && !mfs_check_access(a, false, cred, MFS_ACC_W) {
+                return mfs_err(MFS_EPERM);
+            }
+        }
+    }
     // 目标必须不存在 (不覆盖)。
     if mfs_resolve(&dc[..dn]).is_some() {
-        return u64::MAX;
+        return mfs_err(MFS_EEXIST);
     }
     let mut split = dn;
     while split > 1 && dc[split - 1] != b'/' {
@@ -4680,8 +5304,12 @@ fn mfs_link(src: &str, dst: &str) -> u64 {
     }
     let dparent_ino = match mfs_resolve(&dc[..dparent_end]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
+    // 04b: 目标父目录 W+X (root 直通)。
+    if !mfs_check_dir_ino(dparent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
     // 先建新名字再抬链接数: 反过来会留一段「计数已加但名字还不存在」的窗口, 崩溃后
     // 计数偏高 (只影响显示, 不丢数据)。
     if !mfs_dir_insert(dparent_ino, dcomp, s_ino, MFS_TYPE_FILE) {
@@ -4708,7 +5336,7 @@ fn mfs_link(src: &str, dst: &str) -> u64 {
 ///
 /// 文件是「摘名字」而不是「删对象」: 链接数减到 0 才释放它的 ino, 否则只是少了一个
 /// 名字 (块交给 GC 按可达性回收)。
-fn mfs_remove(path: &str, want_dir: bool) -> u64 {
+fn mfs_remove(path: &str, want_dir: bool, cred: Cred) -> u64 {
     let mut canon = [0u8; TMP_PATH_MAX];
     let n = match mfs_normalize(path, &mut canon) {
         Some(n) => n,
@@ -4717,24 +5345,55 @@ fn mfs_remove(path: &str, want_dir: bool) -> u64 {
     if n == 1 {
         return u64::MAX; // 不允许删除根
     }
+    // 04b: 父目录 W+X (root 直通)。先把 sticky / 属主取出 (A 缓冲随后会被别名复用)。
+    let mut split = n;
+    while split > 1 && canon[split - 1] != b'/' {
+        split -= 1;
+    }
+    let parent_end = if split > 1 { split - 1 } else { 1 };
+    let parent_ino = match mfs_resolve(&canon[..parent_end]) {
+        Some(x) => x,
+        None => return mfs_err(MFS_ENOENT),
+    };
+    if !mfs_check_dir_ino(parent_ino, cred, MFS_ACC_W | MFS_ACC_X) {
+        return mfs_err(MFS_EACCES);
+    }
+    let dir_sticky = mfs_get_mode(mfs_a(), true) & 0o1000 != 0;
+    let dir_uid = mfs_get_uid(mfs_a(), true);
     let ino = match mfs_resolve_no_follow(&canon[..n]) {
         Some(x) => x,
-        None => return u64::MAX,
+        None => return mfs_err(MFS_ENOENT),
     };
     // 刚解析完, `MFS_LEAF` 就是指向它的那条条目 (可能在扩展块里)。
     // 用**不跟随**的解析: `rm`/`rmdir` 删的是条目本身 —— `rm link` 摘掉的是软链接,
     // 绝不能跟着目标去删目标文件。
     let loc = unsafe { MFS_LEAF };
     if loc.dir_ino == 0 {
-        return u64::MAX;
+        return mfs_err(MFS_ENOENT);
     }
     if !mfs_dir_load_loc(&loc) {
-        return u64::MAX;
+        return mfs_err(MFS_EIO);
     }
     let typ = mfs_ent_type(mfs_c(), loc.off);
     let is_dir = typ == MFS_TYPE_DIR;
+    // 04b: sticky 目录里删除他人节点, 仅「节点属主 / 目录属主 / uid 0」可做。
+    if dir_sticky && cred.uid != MFS_UID_ROOT {
+        let nblk = mfs_ino_block(ino).unwrap_or_default();
+        let n_uid = if nblk != 0 && mfs_read_blk(nblk, mfs_s()) {
+            mfs_get_uid(mfs_s(), is_dir)
+        } else {
+            MFS_UID_ROOT
+        };
+        if cred.uid != dir_uid && cred.uid != n_uid {
+            return mfs_err(MFS_EACCES);
+        }
+    }
     if want_dir != is_dir {
-        return u64::MAX;
+        return if is_dir {
+            mfs_err(MFS_EISDIR)
+        } else {
+            mfs_err(MFS_ENOTDIR)
+        };
     }
     if is_dir {
         // 目录必须为空 (条目可能散在扩展块里), 且目录不参与硬链接 -> 直接释放 ino。

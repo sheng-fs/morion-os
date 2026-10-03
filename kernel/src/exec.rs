@@ -1,8 +1,10 @@
 //! 运行时加载可执行文件并启动 —— `SYS_SPAWN_ELF` 的落点
 //!
 //! 一条完整链路: 解析校验 (`elf::parse`) → 建新域 → 逐段映射 (含 `.bss` 补零) →
-//! 映射用户栈 → `spawn_user` 起一个 Ring 3 任务。新域**零能力**, 且它的分页器登记为
-//! **调用者** —— 加载者就是这个程序的 loader（后续缺页交给它决定怎么补）。
+//! 映射用户栈 → `spawn_user` 起一个 Ring 3 任务。新域只拿到**访问文件系统所需的最小
+//! 能力**（`SendTo` 挂载层 / MFS + `MapInto` MFS, 见 [`spawn_elf`]），不授予 Mmio / Irq /
+//! Fb / Spawn 等特权能力; 且它的分页器登记为 **调用者** —— 加载者就是这个程序的 loader
+//! （后续缺页交给它决定怎么补）。
 //!
 //! 与引导期的 [`spawn_elf_at`] 相比, 这里加载的是**任意镜像**而不是编译期嵌入的
 //! 那一份, 并且每个程序拿到自己的域/地址空间, 不再共享"同一份镜像 + 域 id 分流"。
@@ -13,6 +15,11 @@ use crate::memory::paging::{self, map_user_page, UserPagePerm, USER_STACK_PAGES,
 
 /// 一次加载允许占用的最大物理页数（防止一个坏镜像把内存吃光）。
 pub const MAX_IMAGE_PAGES: u64 = 4096; // 16 MiB
+
+/// 引导期服务域号（与 `kernel/src/main.rs` 的建域顺序一致）: 运行期加载的程序默认需要
+/// 访问挂载层与文件服务 —— 否则它连「打开一个文件」都发不出去（`SYS_CALL` 需 `SendTo`）。
+const MOUNT_SRV_DOMAIN: u64 = 9;
+const MFS_SRV_DOMAIN: u64 = 11;
 
 /// 加载 `image` 里的 ELF 并启动它; 成功返回新域 id。
 ///
@@ -36,6 +43,14 @@ pub fn spawn_elf(image: &[u8], loader: u64) -> Option<u64> {
     crate::cap::add_domain(domain);
     crate::ipc::add_domain(domain);
     crate::pager::add_domain(domain, loader);
+
+    // 运行期程序默认要能用文件系统: 授予到挂载层 (路由) 与 MFS (调用) 的 `SendTo`,
+    // 以及把结果 / 写缓冲页映射进 MFS 的 `MapInto`。不给 Mmio / Irq / Fb / Spawn 等
+    // 特权能力 —— 这是**最小可用**面 (04b 低权自测的前提, 也修了"运行时程序无法访问
+    // 任何服务"这个缺口)。
+    crate::cap::grant(domain, crate::cap::Capability::SendTo(MOUNT_SRV_DOMAIN));
+    crate::cap::grant(domain, crate::cap::Capability::SendTo(MFS_SRV_DOMAIN));
+    crate::cap::grant(domain, crate::cap::Capability::MapInto(MFS_SRV_DOMAIN));
 
     // 映射镜像与用户栈, 再起任务。任一步失败都要**销毁这个半成品域** ——
     // 域回收 (E2b 地基) 已经就位, 失败路径再漏域漏页就说不过去了。
