@@ -280,6 +280,9 @@ pub extern "C" fn kernel_main() -> ! {
     let blk2_domain = domain::create();
     // 域 18 — ahci_srv (SATA/AHCI 只读驱动, 驱动路线 D4): 仍走通用设备授权; 第一版全轮询, 不申请中断。
     let ahci_domain = domain::create();
+    // 域 19 — xhci_srv (USB 存储驱动, 驱动路线 D4 续 03c): 仍走通用设备授权; 第一版全轮询
+    // (轮询事件环), 不申请中断向量。
+    let xhci_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -520,6 +523,40 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(block_domain, cap::Capability::SendTo(ahci_domain));
     cap::grant(block_domain, cap::Capability::MapInto(ahci_domain));
     cap::grant(ahci_domain, cap::Capability::SendTo(block_domain));
+
+    // 探测 xHCI (USB 3.x) 控制器并通用地授权给域 19（驱动路线 03c: USB 存储, 第一版只读
+    // bring-up）。BAR0 是 64 位 MMIO 寄存器窗口 (约 4 页, 含端口寄存器区); DMA 16 页:
+    // DCBAA / 命令环 / 事件环 / ERST / 输入·设备上下文 / EP0+两条 Bulk 传输环 / 数据页 /
+    // 命令表。**第一版全轮询** —— 轮询事件环, 不申请向量 (msix_vectors=0), 判据不变。
+    match arch::pci::find_xhci(&pci_devices) {
+        Some((bus, dev, func, bar0)) => {
+            device::grant(device::GrantRequest {
+                domain: xhci_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar0,
+                bar_pages: 4,
+                dma_pages: 16,
+                msix_vectors: 0,
+                label: "xhci",
+            });
+            video::print("[OK] xHCI controller BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(xhci_domain);
+            video::println("[OK] no xHCI controller, xhci_srv idle");
+        }
+    }
+
+    // 授权 (03c): USB 盘经 block_srv 的**卷层**对外提供 —— 同 03b 的 AHCI 模式：
+    // xhci_srv 异步把盘挂进 block_srv (SendTo(block))，block_srv 分配传输暂存页并同址共享给
+    // xhci_srv (MapInto(xhci))，之后把读/写经 IPC 转发回 xhci_srv (SendTo(xhci))。
+    cap::grant(block_domain, cap::Capability::SendTo(xhci_domain));
+    cap::grant(block_domain, cap::Capability::MapInto(xhci_domain));
+    cap::grant(xhci_domain, cap::Capability::SendTo(block_domain));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。

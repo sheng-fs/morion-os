@@ -160,6 +160,23 @@ pub fn find_ahci(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
+/// 在枚举结果中查找 **xHCI (USB 3.x) 控制器** (串行总线控制器 class `0C`, subclass `03`,
+/// prog-if `30` = xHCI), 返回其 PCI 位置与 **BAR0** 的物理基址。
+///
+/// prog-if `30` 天然滤掉 q35 上的 UHCI (`00`) / EHCI (`20`) —— 本内核只驱动 xHCI。
+/// BAR0 是 64 位 MMIO 寄存器窗口 (QEMU `qemu-xhci` 约 4 页)。
+pub fn find_xhci(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x0C || d.subclass != 0x03 || d.progif != 0x30 {
+            continue;
+        }
+        if let Some(bar0) = read_bar0(d.bus, d.dev, d.func) {
+            return Some((d.bus, d.dev, d.func, bar0));
+        }
+    }
+    None
+}
+
 /// 在枚举结果中查找 **virtio-blk** (存储控制器 class `01`, vendor `1AF4`, device `1042`/`1001`),
 /// 返回其 PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
 ///

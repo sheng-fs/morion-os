@@ -31,7 +31,7 @@ pub struct Domain {
 static DOMAINS: Mutex<Vec<Option<Domain>>> = Mutex::new(Vec::new());
 
 /// 引导期域数: 域 id `0..BOOT_DOMAINS` 是引导期建的长期服务域
-/// (sender/receiver/pager/echo/kbd/block/fat32/app/shell/mount/tmpfs/mfs/ext2/exfat/init/gfx_srv/net_srv/virtio_blk_srv/ahci_srv)。
+/// (sender/receiver/pager/echo/kbd/block/fat32/app/shell/mount/tmpfs/mfs/ext2/exfat/init/gfx_srv/net_srv/virtio_blk_srv/ahci_srv/xhci_srv)。
 ///
 /// 它们的槽位**始终被占用**, 所以 `slot_for` 永远不会把运行时新域分配到这些 id 上 ——
 /// 「id < `BOOT_DOMAINS` 即引导域」是一条稳定不变量。这些域**永不自动销毁** (退出即回收
@@ -40,7 +40,7 @@ static DOMAINS: Mutex<Vec<Option<Domain>>> = Mutex::new(Vec::new());
 /// 注意「永不自动销毁」不等于「实例永不退出」: 白名单域里的任务退出后域还留着 (槽位
 /// 仍占用), 由监督者 [`crate::syscall`] 的 `SYS_SPAWN_ELF_AT` 用 [`reset`] 原地重启
 /// (E3c) —— 见 `user/srv/src/init.rs`。
-pub const BOOT_DOMAINS: u64 = 19;
+pub const BOOT_DOMAINS: u64 = 20;
 
 /// 该域是否是引导期服务域 (白名单: 退出时不自动销毁)。
 pub fn is_boot(id: u64) -> bool {

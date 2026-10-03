@@ -9,9 +9,9 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：19 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4, SATA/AHCI 只读) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：20 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4/03b, SATA/AHCI 读写) / `xhci_srv` (03c, USB/xHCI 存储读写) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
-| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` / `ahci_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
+| `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -84,6 +84,7 @@ UEFI 固件
 | exFAT 缓冲 | `USER_BASE + 0x11_4000` 起 | 集群缓冲（按簇大小最多 64 页，`..+0x15_4000`）+ 位图窗口 `+0x15_4000` + upcase 窗口 `+0x15_5000` + 单页暂存 `+0x15_6000`（M6c 起集群缓冲动态分配） |
 | block_srv 私有页 | `USER_BASE + 0x16_0000` 起 / `+0x30_0000` 起 | 卷扫描页 `+0x16_0000` + PRP 表页 `+0x16_1000`（M6c）；**只读缓存数据页 `+0x30_0000..+0x3F_0000`**（240 页 = 960 KiB，块层性能；避开用户栈底 `+0x3F_9000`；均不共享给任何域） |
 | AHCI 传输暂存页 | `USER_BASE + 0x16_3000` | 1 页（03b）；**block_srv 同址共享给 ahci_srv** —— 卷层转发的 AHCI 读/写数据经它互拷 |
+| USB 传输暂存页 | `USER_BASE + 0x16_4000` | 1 页（03c）；**block_srv 同址共享给 xhci_srv** —— 卷层转发的 USB 读/写数据经它互拷（紧接 AHCI 页） |
 | mfs 位图头块缓冲 | `USER_BASE + 0x16_2000` | 1 页；**mfs_srv 同址共享给 block_srv** 作整卷读写 DMA 目标 —— block_srv 选缓存地址时必须避开它 |
 | fat32 整簇缓冲 | `USER_BASE + 0x20_0000` 起 | 16 页 = 64 KiB（`FAT32_CLU_VADDR`/`FAT32_CLU_PAGES`，M1b 大簇支持），`dir_buf`/`file_buf` 都别名到它 |
 | MFS 批 I/O 缓冲 | `USER_BASE + 0x18_0000` 起 | 02b-2：读批窗口 16 页 `+0x18_0000` + 读描述符 1 页 `+0x19_0000` + 写暂存窗 16 页 `+0x1A_0000` + 写描述符 1 页 `+0x1B_0000` —— 全部**mfs_srv 同址共享给 block_srv** 供其 DMA 读写 |
@@ -256,7 +257,7 @@ UEFI 固件
 - `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
 - `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
 - `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
-- `is_boot(id)` / `BOOT_DOMAINS = 19`（**白名单**：引导期服务域 `0..18` 退出时不自动销毁；它们的槽位始终被占用，故「id < 19 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号，**D4** 由 18 扩到 19 给 `ahci_srv`(18) 腾号）
+- `is_boot(id)` / `BOOT_DOMAINS = 20`（**白名单**：引导期服务域 `0..19` 退出时不自动销毁；它们的槽位始终被占用，故「id < 20 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号，**D4** 由 18 扩到 19 给 `ahci_srv`(18) 腾号，**03c** 由 19 扩到 20 给 `xhci_srv`(19) 腾号）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
 - `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
 - **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
@@ -416,7 +417,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv`（共 19 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv / 19 xhci_srv`（共 20 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 服务监督者 init（E3c）
 
@@ -504,7 +505,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 - `pit::init()`（周期时钟，频率 `pit::TARGET_FREQ` = 500 Hz；调度 tick + `ms_to_ticks` 的唯一来源）
 - `keyboard::read_scancode()`
 - `apic::init() -> Option<u32>` / `apic::msi_address() -> u32` / `apic::eoi()`（LAPIC 最小支撑，见下）
-- `pci::enumerate()` / `pci::find_nvme()` / `pci::find_net()` / `pci::find_virtio_blk()` / `pci::find_ahci()` / `pci::read_bar(index)` / `pci::read_bar0()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
+- `pci::enumerate()` / `pci::find_nvme()` / `pci::find_net()` / `pci::find_virtio_blk()` / `pci::find_ahci()` / `pci::find_xhci()` / `pci::read_bar(index)` / `pci::read_bar0()` / `pci::find_msix()` / `pci::disable_intx()` / `pci::enable_msix()`
 - `device::grant(GrantRequest) -> bool` / `device::grant_empty(domain)` / `device::enable_msix()` / `device::config_read(offset) -> Option<u32>`（**D1 通用设备授权**：BAR 映射 + DMA 块分配 + MSI-X 向量段分配 + `Mmio`/`Irq` 能力签发 + 写 `DeviceGrant` 描述；内核**不含**任何设备专属逻辑 —— 原 `nvme::setup` 已并入。`config_read` 是 N2 加的窄接口：把"域→设备"绑定后只放行读自己那台设备的配置空间。**N2b** 起：MSI-X 表若不在设备 BAR 上（如 virtio-net 在 BAR1），内核把那根 BAR 映射到 `DEVICE_MSIX_VADDR`，窗口基址写进 `DeviceGrant.msix_table_vaddr`）
 
 ## 7. 构建 / 测试命令（Makefile）

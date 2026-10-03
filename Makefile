@@ -69,7 +69,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -129,6 +129,11 @@ VBLK_MIB      ?= 1
 # 必须确定 (签名是自测判据), 故每次重建而非增量。
 AHCI_IMG      ?= $(OUT_DIR)/ahci.img
 AHCI_MIB      ?= 1
+# USB 存储测试盘 (驱动路线 03c): 空白 raw, **扇区 0 预写已知签名** —— 域 19 的 xhci_srv 起来后
+# 经 qemu-xhci + usb-storage 用 SCSI READ(10) 读扇区 0 校验签名, 打 `USB1 ... sig=ok` marker。
+# 盘内容必须确定 (签名是自测判据), 故每次重建而非增量。
+USB_IMG       ?= $(OUT_DIR)/usb.img
+USB_MIB       ?= 1
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
 
@@ -335,8 +340,9 @@ run-nokvm: iso
 #   nsid=7 -> $(PT_IMG)    (空白盘, 供 `part.*` 自测: 建/删 GPT 与 MBR 分区)
 #   另挂一台 virtio-blk ($(VBLK_IMG)) 给域 17 的 virtio_blk_srv (驱动路线 D3) 做块设备自测。
 #   再挂一台 AHCI/SATA 盘 ($(AHCI_IMG), q35 自带的 ich9-ahci) 给域 18 的 ahci_srv (D4) 做只读自测。
+#   另挂一台 xHCI 控制器 (qemu-xhci) + usb-storage 盘 ($(USB_IMG)) 给域 19 的 xhci_srv (03c)。
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG)
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG) $(USB_IMG)
 	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
 	$(QEMU) \
 		-machine q35 \
@@ -365,6 +371,9 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device virtio-blk-pci,drive=vblk0 \
 		-drive file=$(AHCI_IMG),if=none,id=ahci0,format=raw \
 		-device ide-hd,drive=ahci0 \
+		-drive file=$(USB_IMG),if=none,id=usb0,format=raw \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usb0 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors
@@ -399,6 +408,15 @@ $(AHCI_IMG):
 	dd if=/dev/zero of=$(AHCI_IMG) bs=1M count=$(AHCI_MIB) status=none
 	printf 'MORION-AHCI-TST!' | dd of=$(AHCI_IMG) bs=512 count=1 conv=notrunc,sync status=none
 	@echo "  ✓ AHCI 盘: $(AHCI_IMG)"
+
+# USB 存储测试盘: 空白 raw + 扇区 0 写入已知签名 (供域 19 的 03c 自测读回校验)。
+# 挂在 qemu-xhci 的 usb-storage 上 (`-device usb-storage,bus=xhci.0`)。
+$(USB_IMG):
+	@echo "==> 创建 USB 存储测试盘 ($(USB_MIB)MiB, 扇区 0 = 签名, 供 03c 自测)..."
+	$(MKDIR) $(OUT_DIR)
+	dd if=/dev/zero of=$(USB_IMG) bs=1M count=$(USB_MIB) status=none
+	printf 'MORION-USB-TST!!' | dd of=$(USB_IMG) bs=512 count=1 conv=notrunc,sync status=none
+	@echo "  ✓ USB 盘: $(USB_IMG)"
 
 # MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
 $(MFS_IMG):

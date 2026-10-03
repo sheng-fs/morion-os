@@ -45,6 +45,17 @@
   （`WRITE DMA EXT` + `FLUSH CACHE EXT`），上层文件系统对 AHCI/NVMe 无感；挂载时读扇区 0 校验签名
   （`block: ahci volume attached … sig=ok`）+ 写回读自测（`AHCI2 … rw=ok`）。内核只加 `block ↔ ahci` 三条
   能力授权。分区表重扫后 AHCI 卷仍保留。
+- **USB 存储驱动（03c）**：新增 `xhci_srv`（域 19，xHCI/USB 存储**读写**）—— 用同一套通用设备授权驱动**又一台**
+  类型迥异的控制器（xHCI），内核只加 `pci::find_xhci`（class `0C:03:30` → BAR0）与一行 `device::grant`，
+  另补 `block ↔ xhci` 三条能力授权；第一版**全轮询、不申请中断**（本仓库只有 MSI-X，xHCI 常态用 INTx/MSI）。
+  全链路：控制器复位 → 端口复位 → `Enable Slot` → `Address Device` → 取设备/配置描述符 →
+  `SET_CONFIGURATION` → `Configure Endpoint`（两条 Bulk）→ **BOT（Bulk-Only Transport）+ SCSI 透明命令集**
+  （`INQUIRY` / `READ CAPACITY(10)` / `READ(10)` / `WRITE(10)` / `REQUEST SENSE`，含 UNIT ATTENTION 重试）。
+  自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层（`backend=usb`，区别于 `backend=ahci` 的 USB 暂存页），
+  读/写按 8 扇区经 IPC 转发；端到端 `USB1 … sig=ok` + `block: usb volume attached … sig=ok` +
+  `USB2 … rw=ok`，分区表重扫后 USB 卷仍保留，`IOMMU=1` 复跑亦通过。首版排掉三坑：输入上下文位偏移
+  （Slot 端口号在 DWORD1 bits 23:16、EP 字段全在 DWORD1）、interrupter 的 `ERSTBA=0x10`/`ERDP=0x18`、
+  以及把物理地址 `data_pa` 当虚拟地址用。
 - **块层批量提交 / 等完成（02b-2）**：量化发现耗时主因是**每条 NVMe 命令的完成等待**（16384 条命令
   摊到 258 s ≈ 15.7 ms/条，不是每请求一跳 IPC），故改为「一次下发 K 条命令再统一等完成」。三层：
   ① `block_srv` 的 `nvme_batch_rw` —— 一条 I/O 队列排 k 条 SQE、只敲一次门铃、统一等完成（中断优先、

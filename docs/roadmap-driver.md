@@ -258,12 +258,12 @@
   注意 D3 记过的"漏 `conv=notrunc` 会截断"坑），**已接进 `make run-nvme` 与 `scripts/fs-regress.sh`**
   （挂 `-drive file=…ahci.img,if=none,id=ahci0,format=raw -device ide-hd,drive=ahci0`），
   回归判定新增 `AHCI1 … sig=ok`、`block: ahci volume attached … sig=ok`、`AHCI2 … rw=ok`。
-- **不做（明确排除）**：热插拔、xHCI/USB（03c）、MSI/INTx 通路。
+- **不做（明确排除）**：热插拔、MSI/INTx 通路（xHCI/USB 见 03c）。
 
-### 03c — xHCI / USB 存储（设计已定，未实现）
+### 03c — xHCI / USB 存储（`xhci_srv`）✅ 已完成（读+写 + 接进卷层）
 
-> 真机 U 盘启动的前置。**本轮只出设计**：唯一独占文件是 `user/srv/src/xhci_srv.rs` 与
-> `user/srv/src/bin/xhci_srv.rs`，其余全是**公共文件** → 必须**串行**实现。
+> 真机 U 盘启动的前置。唯一独占文件是 `user/srv/src/xhci_srv.rs` 与
+> `user/srv/src/bin/xhci_srv.rs`，其余全是**公共文件** → **串行**实现。
 
 - **域 / 接线**：新服务 `xhci_srv` 取**域 19**（`BOOT_DOMAINS` 19 → 20；`SERVICE_FILES` 长度
   同步 19 → 20），沿 [dev-workflow.md](dev-workflow.md) §4 的 9 处接线（`user/srv/Cargo.toml`、
@@ -271,7 +271,7 @@
   `kernel/src/main.rs` 建域 + 授权、`kernel/src/arch/pci.rs` 加 `find_xhci`）。
 - **PCI / 授权**：xHCI class `0x0C:0x03:0x30`（prog-if=0x30 天然滤掉 q35 的 UHCI/EHCI），
   BAR0 是 64 位 MMIO（QEMU `qemu-xhci` 约 4 页）；内核复用通用 `device::grant`
-  （`bar_pages=4`、`dma_pages≈16` 由驱动自行排版、**`msix_vectors=0`**）。
+  （`bar_pages=4`、`dma_pages=16` 由驱动自行排版、**`msix_vectors=0`**）。
 - **中断取舍**：本仓库只有 MSI-X 一条中断通路，而 xHCI 常态用 INTx/MSI。第一版与 `ahci_srv`
   一致**全轮询、不申请向量**（轮询事件环 `ERDP`，有界 `POLL_MAX` + `sys_sleep`）——不占内核
   MSI 向量段、不影响既有设备，`irq_cmds == cmds` / `poll_cmds = 0` 判据保持。
@@ -279,7 +279,6 @@
   `USBCMD.HCRST` → `CONFIG.MaxSlotsEn` / `DCBAAP` / `CRCR` / interrupter0（`ERSTSZ/ERSTBA/ERDP`）
   → `USBCMD.RS`；端口复位（`PORTSC.PR` 等 `PRC`）→ Enable Slot → Address Device →
   GET_DESCRIPTOR(Device/Configuration) → SET_CONFIGURATION → Configure Endpoint（Bulk-In/Out）。
-  命令环 / 事件环 / 传输环 + TRB（cycle bit、Link TRB 回绕）是首版最易错处，单独留证。
 - **USB 存储协议**：**BOT（Bulk-Only Transport）+ SCSI 透明命令集**（**不做 UAS**）：CBW/CSW +
   INQUIRY / READ CAPACITY(10) / READ(10) /（写）WRITE(10) / REQUEST SENSE（含 UNIT ATTENTION 处理）。
 - **接进块层（仿 03b）**：`block_srv` 加 `BACKEND_USB` + `xhci_rw` 转发（按一页 8 扇区切分，
@@ -289,10 +288,19 @@
 - **测试装置**：`-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=usb0`；
   `Makefile` 加 `USB_IMG` 规则（1 MiB，扇区 0 预写 16 字节 `MORION-USB-TST!!`，`dd … conv=notrunc,sync`）；
   `fs-regress.sh` 判据 `USB1 … sig=ok` / `block: usb volume attached … sig=ok` / `USB2 … rw=ok`。
-- **分步**：① 接线 + 只读 bring-up（打 `USB1`，**不碰块层**）→ ② 卷层接入 + 写回读（`USB2`，
-  安全门 = 仅当扇区 0 命中宿主签名才写）→ ③ 回归判据 + `IOMMU=1` 复跑 + 文档收口。
-- **风险**：枚举链路长、首版失败率高（务必带足端口 / 槽 / EP / CSW 日志）；真机有 UNIT ATTENTION /
-  多 LUN 与热插拔（不做）；DMA 块须落在内核恒等映射区（< 4 GiB）。
+- **落地 / 取证**：`xhci_srv` 全轮询起控制器 → 枚举 slot 1（SuperSpeed，EP0 MPS=512，两条 Bulk
+  dci 3/4、MPS 1024）→ BOT+SCSI 读扇区 0 校验宿主签名，打
+  `USB1 xhci OK, cap=2048, sector0 sig=MORION-USB-TST!!, sig=ok`；随后异步挂进卷层
+  （`block: usb volume attached (vol=9, sectors=2048, sig=ok)`），经卷层转发做写回读
+  （`USB2 usb volume rw OK, vol=9, lba=2047, rw=ok`）。卷表 `backend=usb`，`PART_RELOAD`
+  重建卷表后仍在（非 NVMe 后端卷另存一份、重扫后挂回表尾）。四道门禁 + `IOMMU=1` 全过。
+- **排错记（首版三坑，均已修）**：① 输入上下文字段位偏移 —— Slot 的 Root Hub Port Number 在
+  **DWORD1 bits 23:16**（不是 15:8），EP 的 MaxPacketSize / EP Type / CErr **全在 DWORD1**
+  （原误写 DWORD0），字段错位致 Address Device 回 `TRB Error(5)`；② interrupter 的 ERSTBA=0x10、
+  ERDP=0x18（写反则 QEMU 置 HCE、事件环彻底静默）；③ `scsi_read_capacity` 误把 `data_pa`（物理）
+  当 `data_va`（虚拟）拷数据 → 域 19 protection fault。
+- **风险（仍存，未做）**：真机 UNIT ATTENTION / 多 LUN / 热插拔（不做）；DMA 块须落在内核恒等
+  映射区（< 4 GiB，与本仓库 VT-d 窗口一致）。
 
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。

@@ -150,7 +150,7 @@
 | 服务 | 职责 | 状态 |
 |------|------|------|
 | 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2（读 + 有限写）、exFAT（读 + 写），通过 libvfs 统一接口 | ✅ 已实现（ext2 读 + 有限写 / exFAT 读写） |
-| 设备服务 | 块设备（NVMe 驱动）、键盘驱动、中断分发 | ✅ 部分实现 |
+| 设备服务 | 块设备（NVMe / virtio-blk / AHCI-SATA / xHCI-USB 驱动）、键盘驱动、中断分发 | ✅ 部分实现 |
 | Shell 服务 | 命令行解释器 + 统一目录树 / 运行时挂载 | ✅ 已实现 |
 | 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 | ⏳ 规划中 |
 | 安全/审计服务 | 认证、策略引擎、入侵检测 | ⏳ 规划中 |
@@ -255,9 +255,10 @@
 │           ├── net_srv.rs    #     域 16 网络驱动 (virtio-net; N0–N4: MSI-X 中断 + ARP + 最小 IPv4/ICMP/UDP + DHCP + 最小 TCP/ARP 缓存老化 自测)
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
 │           ├── ahci_srv.rs   #     域 18 AHCI/SATA 驱动 (D4: 通用授权, 全轮询; 03b: 读+写并经 IPC 接进块服务卷层)
+│           ├── xhci_srv.rs   #     域 19 xHCI/USB 存储驱动 (03c: 通用授权, 全轮询; BOT+SCSI 读+写并经 IPC 接进块服务卷层)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     19 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     20 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -388,6 +389,7 @@
 - [x] **第二个真实驱动（virtio-blk）**（`virtio_blk_srv` 域 17，仍走通用设备授权、内核无设备专属逻辑：D3 —— 读签名 / 写读回自测）
 - [x] **运行期设备授权（D1b）**（`SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` + `Mmio` 能力门禁；NVMe / `net_srv` / `virtio_blk_srv` 经运行期 syscall 取得 `DeviceGrant`，行为零变化，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 D1b）
 - [x] **真机存储驱动（AHCI/SATA）**（`ahci_srv` 域 18，仍走通用设备授权、内核无设备专属逻辑：D4 —— `IDENTIFY` + LBA48 DMA 读扇区 0 校验签名，全轮询不申请中断；**03b** —— 自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层，读/写经 IPC 转发（`WRITE DMA EXT` + `FLUSH CACHE EXT`），`block: ahci volume attached … sig=ok` + `AHCI2 … rw=ok`）
+- [x] **USB 存储驱动（xHCI）**（`xhci_srv` 域 19，仍走通用设备授权、内核无设备专属逻辑：**03c** —— 控制器复位/端口复位/Enable Slot/Address Device/Configure Endpoint 全链路 + **BOT + SCSI 透明命令集**（INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10)），全轮询不申请中断；自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层，读/写经 IPC 转发，`USB1 … sig=ok` + `block: usb volume attached … sig=ok` + `USB2 … rw=ok`，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 03c）
 - [x] **权限与多用户（04b）**（MFS 元数据 `+32` 存 uid/gid、不升 magic；`mfs_srv` 内按发起域静态映射身份做 rwx 强制 + `chown` + `MFS_E*` 错误码；`exec::spawn_elf` 给运行期程序授最小文件系统能力，FS-34..37 端到端验证低权（uid 1000）拒绝路径，见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)）
 - [x] **最小 IPv4 协议栈 + DHCP + 最小 TCP（N3b/N3c/N4）**（纯 `net_srv` 内、不加服务不改公共文件：IPv4 头构造/解析 + RFC 1071 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送。端到端 `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；**N3c** DHCP 客户端 DISCOVER/OFFER/REQUEST/ACK，端到端 `NET3 dhcp OK, ip=… mask=… gw=… dns=…`；**N4** 最小 TCP（三次握手 + 单段数据）+ ARP 缓存老化，端到端 `NET4 tcp OK, handshake+data selftest OK, peer refused(RST)`；TCP 仅最小握手/单段（无重传/拥塞控制），见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N3b/N3c/N4）
 - [ ] TCP/IP 协议栈、能力审计、策略引擎

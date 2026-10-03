@@ -40,6 +40,10 @@ printf 'MORION-VBLK-TST!' | dd of="$OUT_DIR/vblk.img" bs=512 count=1 conv=notrun
 # ahci_srv 做「IDENTIFY + DMA 读扇区 0 校验签名」自测 (只读: 驱动全程不发写命令)。
 dd if=/dev/zero of="$OUT_DIR/ahci.img" bs=1M count="${AHCI_MIB:-1}" status=none
 printf 'MORION-AHCI-TST!' | dd of="$OUT_DIR/ahci.img" bs=512 count=1 conv=notrunc,sync status=none
+# USB 存储测试盘 (驱动路线 03c): 空白 raw + 扇区 0 已知签名, 供域 19 的 xhci_srv 经
+# qemu-xhci + usb-storage 用 SCSI READ(10) 读回校验 (只读 bring-up)。
+dd if=/dev/zero of="$OUT_DIR/usb.img" bs=1M count="${USB_MIB:-1}" status=none
+printf 'MORION-USB-TST!!' | dd of="$OUT_DIR/usb.img" bs=512 count=1 conv=notrunc,sync status=none
 
 # FAT32 卷 (nvme.img) 是**持久卷**, 脚本一直沿用既有的那份 (它同时被交互式验证用)。
 # 但可执行文件加载 (FS-27 / shell `run`) 需要卷根目录里有 hello.mex —— 就地补进去,
@@ -115,6 +119,9 @@ $QEMU \
   -device virtio-blk-pci,drive=vblk0 \
   -drive file="$OUT_DIR/ahci.img",if=none,id=ahci0,format=raw \
   -device ide-hd,drive=ahci0 \
+  -drive file="$OUT_DIR/usb.img",if=none,id=usb0,format=raw \
+  -device qemu-xhci,id=xhci \
+  -device usb-storage,bus=xhci.0,drive=usb0 \
   -display none -monitor none -serial file:"$log" -no-reboot ${accel} ${QEMU_EXTRA:-} \
   >/dev/null 2>&1 &
 pid=$!
@@ -180,6 +187,15 @@ grep -nE 'ahci:|AHCI1|AHCI2|block: ahci volume' "$log" 2>/dev/null || echo "(无
 grep -qE 'AHCI1 ahci OK.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
 grep -qE 'block: ahci volume attached.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
 grep -qE 'AHCI2 ahci volume rw OK.*rw=ok' "$log" 2>/dev/null || ahci_bad=1
+# 驱动路线 03c: xHCI/USB 存储驱动 (域 19) —— ① 枚举 + BOT/SCSI 读扇区 0 校验宿主签名 (`USB1`);
+# ② 把 U 盘**挂进 block_srv 的卷层** (`block: usb volume attached`), 并经卷层转发做一次写回读
+# 自测 (`USB2`)。三者缺任一即判失败。
+usb_bad=0
+echo "== xHCI/USB 存储驱动自测 + 卷层挂载 (03c) =="
+grep -nE 'xhci:|USB1|USB2|block: usb volume' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'USB1 xhci OK.*sig=ok' "$log" 2>/dev/null || usb_bad=1
+grep -qE 'block: usb volume attached.*sig=ok' "$log" 2>/dev/null || usb_bad=1
+grep -qE 'USB2 usb volume rw OK.*rw=ok' "$log" 2>/dev/null || usb_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
@@ -188,4 +204,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ]
