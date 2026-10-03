@@ -186,7 +186,7 @@ pub fn receive() -> Message {
 /// 「`gfx_srv` 一崩, shell 的 ipc 卡死」的根因)。故改为**带超时轮询**: 每 [`CALL_POLL_MS`]
 /// 醒一次, 顺便看目标域还活着没有; 不活就失败返回, 让客户端能降级 / 重试。
 ///
-/// 正常调用不受影响: 回复通常在 1~2 个时钟 tick (10~20 ms) 内到达, 早于超时。
+/// 正常调用不受影响: 回复通常在 1~2 个时钟 tick 内到达 (500 Hz → 2~4 ms), 早于超时。
 pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
     x86_64::instructions::interrupts::disable();
     let me = crate::scheduler::current_domain();

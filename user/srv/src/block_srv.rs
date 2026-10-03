@@ -222,6 +222,15 @@ fn write_msix_table_entry(cfg: &NvmeConfig, entry: usize, vector: u64) {
 const NVME_IRQ_WAIT_TIMEOUT_MS: u64 = 10;
 const NVME_IRQ_WAIT_ROUNDS: u32 = 16;
 
+/// 完成路径策略 (02b-2 实测结论): `true` = **轮询优先**。
+///
+/// A/B 实测 (同代码, 仅此开关不同, 均全绿): 轮询始终更快 —— 100 Hz 时 **118 s** vs
+/// 中断 **133 s**; 1000 Hz 时 **23 s** vs 中断 **28 s**。中断路径每次完成要多等一次
+/// 「tick 量化的中断投递」, 而轮询直接读 CQE 无此开销, 故默认轮询。MSI-X 仍照常配置
+/// (向量表/注册全保留), 中断路径代码与 `irq_cmds`/`irqs` 证据改回 `false` 即可复现 ——
+/// 这是**默认策略**, 不是删能力。
+const NVME_POLL_FIRST: bool = true;
+
 /// 中断模式是否启用 (粘性: 一旦回退就不再回到中断路径)。
 static mut NVME_IRQ_MODE: bool = false;
 /// 中断模式下向量段的**基址** (= 完成队列 0 的向量, 来自内核配置结构)。
@@ -1054,12 +1063,17 @@ fn nvme_main() {
         } else {
             unsafe {
                 NVME_IRQ_VECTOR = base;
-                NVME_IRQ_MODE = true;
+                NVME_IRQ_MODE = !NVME_POLL_FIRST;
             }
-            print("nvme: irq-driven completions, vectors=0x");
+            print("nvme: msix ready, vectors=0x");
             print_hex(base);
             print("..0x");
             print_hex(base + count - 1);
+            print(if NVME_POLL_FIRST {
+                ", completion mode=poll"
+            } else {
+                ", completion mode=irq"
+            });
             println("");
         }
     } else {
@@ -2374,8 +2388,12 @@ impl NvmeIo<'_> {
 // 批量读) 保持原有的 256 扇区直传路径 —— 若强行按 4 KiB 行拆, 一条命令会变成 32 条,
 // 反而更慢。缓存服务的是 inode 表 / 目录项 / 位图这类**重复小读**。
 
-/// 缓存行数 (每行一页 = 8 扇区 = 4 KiB)。128 行 = 512 KiB。
-const BLK_CACHE_LINES: usize = 128;
+/// 缓存行数 (每行一页 = 8 扇区 = 4 KiB)。240 行 = 960 KiB。
+///
+/// 02b-2 实测: 128 行时命中率 79%, 但淘汰高达 2036 次 (元数据工作集 > 512 KiB), 抖动
+/// 明显。这里扩到 240 行 —— 复用 `+0x38_0000..+0x3F_0000` 这段空闲区 (用户栈底自
+/// `+0x3F_9000` 起, 仍留 36 KiB 间隔)。
+const BLK_CACHE_LINES: usize = 240;
 /// 编译期开关: false = 完全关闭缓存 (对照构建, 用于 before/after 量化; 不影响正确性)。
 const BLK_CACHE_ENABLE: bool = true;
 /// 每行扇区数 (4 KiB / 512 B)。
@@ -2386,8 +2404,8 @@ const BLK_CACHE_LINE_BYTES: usize = 4096;
 ///
 /// 必须落在本服务既有映射之上 —— 注意 block_srv 域里除了自己的卷扫描页 (0x16_0000)
 /// 与 PRP 表页 (0x16_1000), 还**同址共享**了各文件服务的请求/工作缓冲 (0x10_0000..0x16_2000
-/// 与 fat32 的 0x20_0000), 故这里选 3 MiB 处这一整段空闲区 (128 页 = 512 KiB, 到 0x38_0000
-/// 为止, 低于用户栈 0x40_0000)。这些页是 block_srv **私有**的, 不与任何域共享。
+/// 与 fat32 的 0x20_0000), 故这里选 3 MiB 处这一整段空闲区 (240 页 = 960 KiB, 到 0x3F_0000
+/// 为止, 低于用户栈底 0x3F_9000)。这些页是 block_srv **私有**的, 不与任何域共享。
 const BLK_CACHE_VADDR: u64 = 0x0000_0080_0030_0000;
 /// 顺序命中时向后预取的行数。
 const BLK_CACHE_PREFETCH_LINES: u64 = 2;

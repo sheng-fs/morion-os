@@ -10,7 +10,7 @@
 //! 第 5 小步: 带超时的阻塞 — `wake_deadline` + `block_current_timeout_ms`, 供
 //! `SYS_IRQ_WAIT` 阻塞等设备中断 (到期由时钟 tick 唤醒, 保证「等不到就回退」)。
 //!
-//! 抢占由时钟中断 (IRQ0, 100 Hz) 驱动, 每 10ms 一次;
+//! 抢占由时钟中断 (IRQ0, 频率见 `arch::pit::TARGET_FREQ`) 驱动;
 //! 协作式让出/睡眠由任务在运行中主动调用。
 
 pub mod context;
@@ -90,13 +90,15 @@ pub struct Task {
 pub struct Scheduler {
     tasks: Box<[Option<Task>; MAX_TASKS]>,
     current: usize,
-    /// 自启动以来累计的时钟 tick 数 (100 Hz → 每 tick 10ms)。
+    /// 自启动以来累计的时钟 tick 数 (每 tick = `1000 / TARGET_FREQ` 毫秒)。
     ticks: u64,
 }
 
-/// 毫秒 → tick 数 (100 Hz → 每 tick 10ms), 至少 1 tick。
+/// 毫秒 → tick 数 (频率取自 [`crate::arch::pit::TARGET_FREQ`]), 至少 1 tick。
 fn ms_to_ticks(ms: u64) -> u64 {
-    ms.div_ceil(10).max(1)
+    ms.saturating_mul(crate::arch::pit::TARGET_FREQ as u64)
+        .div_ceil(1000)
+        .max(1)
 }
 
 /// 加载页表根 (CR3), 保留原 CR3 标志位。
