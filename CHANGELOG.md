@@ -45,13 +45,30 @@
   （`WRITE DMA EXT` + `FLUSH CACHE EXT`），上层文件系统对 AHCI/NVMe 无感；挂载时读扇区 0 校验签名
   （`block: ahci volume attached … sig=ok`）+ 写回读自测（`AHCI2 … rw=ok`）。内核只加 `block ↔ ahci` 三条
   能力授权。分区表重扫后 AHCI 卷仍保留。
+- **块层批量提交 / 等完成（02b-2）**：量化发现耗时主因是**每条 NVMe 命令的完成等待**（16384 条命令
+  摊到 258 s ≈ 15.7 ms/条，不是每请求一跳 IPC），故改为「一次下发 K 条命令再统一等完成」。三层：
+  ① `block_srv` 的 `nvme_batch_rw` —— 一条 I/O 队列排 k 条 SQE、只敲一次门铃、统一等完成（中断优先、
+  回退轮询）；② `common.rs` 新增 `BLOCK_OP_BATCH_READ/WRITE` + `BatchEnt` + `block_batch()`（每子请求
+  ≤ 8 扇区 = 一页，非 NVMe 后端自动退回逐块）；③ `mfs_srv` 写回攒批 —— COW 内容块（`mfs_commit`）与
+  位图/头块/超级块（`mfs_write_blk`）共用 16 页**写暂存窗**，满窗或 `mfs_bmp_flush` 末尾才一次批写，
+  `mfs_read_blk` 命中暂存块先落盘（写后读一致），GC/fsck/换卷/裸读超级块前强制落盘。全量回归
+  **258 s → 133 s（-48%）**，NVMe 命令数不变、中断等待 16385 → 6159（`mfs-wb` 平均 9 条一批）。
+  另加通用可选写背缓存并把 `fat32_srv`/`exfat_srv` 接上（实测这两服务写的块极少，收益仅数秒）。
+- **块层完成路径改轮询 + 时钟 tick 100→500 Hz（02b-2 续）**：继续量化 —— ① 只读缓存 128 → 240 行
+  （淘汰 2036 → 1522、未命中 2875 → 2632）但耗时**不变**（118 s），可见**读缓存不是瓶颈**；② NVMe
+  完成**默认改轮询**（`NVME_POLL_FIRST`，MSI-X 仍照常写表 + 逐向量注册，中断路径代码与 `irq_cmds`/`irqs`
+  证据保留），A/B 同代码：100 Hz 下 118 s vs 中断 133 s；③ `arch/pit::TARGET_FREQ` **100 → 500 Hz** ——
+  根因确认是**调度 / IPC 唤醒被时钟 tick 量化**（100 Hz 时一次「阻塞→唤醒」最坏等 10 ms，那轮 QEMU 进程
+  CPU 仅 ~9%、91% 在等 tick），同一份代码全量回归 **118 s → 33 s（3.6×）**、逐条命令墙钟 7.2 → 1.4 ms
+  （`cmds` 不变 16384）。1000 Hz 更快（→ 23 s）但 ~18% 概率触发内核潜藏竞态（能力负例测试偶发「域 1
+  零能力却调通 echo」→ 门禁失败），故停在 500 Hz（**连续 16 次全绿**）；修好该竞态后可再上 1000 Hz。
 - **开发工作流文档**：新增 [docs/dev-workflow.md](docs/dev-workflow.md) —— 环境陷阱 / 回归门禁 / 已知坑清单 /
   加一个用户态服务的 9 处接线 / 并行协作三铁律；原先散落在本地临时交接文件里的这部分内容沉淀入库。
 
 ### 文档
 
-- `docs/dev-reference.md` §9 阶段进度表补齐 **74–81 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b）。
-- `docs/roadmap-driver.md`、`docs/roadmap-fs.md`、`README.md` 状态与勾选同步。
+- `docs/dev-reference.md` §9 阶段进度表补齐 **74–83 行**（D4 / V3 / FS 流 01 / FS 流 02 / 收口补测 / 04b / 02b / 03b / 02b-2 / 02b-2 续）；§3 地址表与模块 API 同步（只读缓存 240 行、PIT 500 Hz、`NVME_POLL_FIRST`）。
+- `docs/roadmap-fs.md` 新增「02b-2 续 —— 完成路径改轮询 + 时钟 tick 100→500 Hz」；`docs/roadmap-driver.md`、`README.md` 状态与勾选同步。
 
 ## [0.4.0-nogui] — 2026-10-01
 

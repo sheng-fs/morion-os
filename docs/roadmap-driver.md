@@ -299,7 +299,7 @@
 
 ### 远期（跨模块，尚未排期）
 - **引导安全链密码库（GmSSL）**：`boot/src/security/` 的国密实现目前部分为桩 —— SM3 映像哈希与 SM2 验签已用 RustCrypto `no_std` 纯 Rust，**TPM 2.0 PCR 测量仍为桩**（待接 `EFI_TCG2_PROTOCOL`）。计划把桩替换为 **GmSSL (C)** 实现，并打通自加密镜像解封与飞地预认证。
-- **独立高精度定时器（hrtimer / TSC，1 ms 精度）**：模仿 Linux `hrtimer` 思路，**不改动全局 100 Hz 调度 tick**，另实现一套基于 APIC/TSC 的独立高精度定时器；普通任务 `sleep` 走普通 tick，游戏 / 多媒体经**新 syscall** 走 hrtimer 做 1 ms 精度等待。取舍：只有需要高精度的任务受影响，其余系统部分不受拖累、功耗可控；调度抢占仍 10 ms 一次，但程序休眠唤醒可做到 1 ms。
+- **独立高精度定时器（hrtimer / TSC，1 ms 精度）**：模仿 Linux `hrtimer` 思路，**不改动全局 100 Hz 调度 tick**，另实现一套基于 APIC/TSC 的独立高精度定时器；普通任务 `sleep` 走普通 tick，游戏 / 多媒体经**新 syscall** 走 hrtimer 做 1 ms 精度等待。取舍：只有需要高精度的任务受影响，其余系统部分不受拖累、功耗可控；调度抢占仍 10 ms 一次，但程序休眠唤醒可做到 1 ms。**注（02b-2 续）**：全局调度 tick 已由 100 Hz 提到 **500 Hz**（tick 2 ms）—— 实测「阻塞→唤醒」被 tick 量化正是文件系统 I/O 墙钟的主要来源，提到 500 Hz 后全量回归 118 s → 33 s（3.6×）；hrtimer 的动机与「只让高精度任务受影响、功耗可控」的取舍不变，只是普通 tick 粒度已从 10 ms 收到 2 ms。
 
 ---
 
