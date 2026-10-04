@@ -234,6 +234,8 @@ grep -qE 'NET9 e1000e OK.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic1 up \(e1000e OK\)' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET11 udp via e1000e \(nic1\) OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic1 rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
+# N7 (TCP 完整化): netstack 的 TCP 连接状态机 + 重传的确定性自证。
+grep -qE 'NET6 tcp conn OK' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
