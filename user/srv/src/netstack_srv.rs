@@ -1062,6 +1062,156 @@ fn tcp_selftest(io: u64) -> bool {
     parse_seg_io(io, fl).is_none()
 }
 
+/// N8.2 回归: 一条已 graceful close 进入 TimeWait 的服务端连接**不能**吞掉同一 4-tuple 的
+/// 新 SYN —— 否则下次 `wget` (同源端口) 永不收 SYN-ACK。
+///
+/// 触发路径: `tcp_input` 旧实现按 `used && 4-tuple 匹配` 找已有连接, TimeWait 的 handler
+/// 静默 return 0, 屏蔽了被动打开。修法: 跳过 TimeWait/Closed。
+fn tcp_timewait_does_not_eat_new_syn(st: &mut Stack, io: u64) -> bool {
+    const LPORT: u16 = 8080;
+    const RPORT: u16 = 40001;
+    let peer_ip = [10u8, 0, 2, 7];
+    let peer_mac = [0x02u8, 0, 0, 0, 0, 7];
+
+    // 1) 找到一个空槽: 留给 TimeWait 连接 (模拟「上次 wget 留下的服务端连接」)。
+    let mut tw_slot = usize::MAX;
+    let mut i = 0;
+    while i < MAX_TCONS {
+        if !st.tcons[i].used {
+            tw_slot = i;
+            break;
+        }
+        i += 1;
+    }
+    if tw_slot == usize::MAX {
+        return false;
+    }
+
+    // 2) 起一个监听者 (槽 0 已被 HTTP listener 占, 这里用另外一个空槽)。
+    let mut li_slot = usize::MAX;
+    i = 0;
+    while i < MAX_TCONS {
+        if i != tw_slot && !st.tcons[i].used {
+            li_slot = i;
+            break;
+        }
+        i += 1;
+    }
+    if li_slot == usize::MAX {
+        return false;
+    }
+    let mut li = TcpConn::new();
+    li.used = true;
+    li.role = TCP_ROLE_LISTENER;
+    li.state = TcpState::Listen;
+    li.nic = 0;
+    li.local_port = LPORT;
+    li.mac = st.links[0].mac;
+    st.tcons[li_slot] = li;
+
+    // 3) 在 tw_slot 上摆一个 TimeWait 状态的「幽灵」连接 (4-tuple 与新 SYN 一致)。
+    let mut tw = TcpConn::new();
+    tw.used = true;
+    tw.role = TCP_ROLE_SERVER;
+    tw.state = TcpState::TimeWait;
+    tw.nic = 0;
+    tw.mac = st.links[0].mac;
+    tw.dst_mac = peer_mac;
+    tw.local_port = LPORT;
+    tw.remote_ip = peer_ip;
+    tw.remote_port = RPORT;
+    tw.snd_nxt = 0x1234_5678;
+    tw.snd_una = tw.snd_nxt;
+    tw.rcv_nxt = 0x9abc_def0;
+    st.tcons[tw_slot] = tw;
+
+    // 4) 构造一个来自「同 client 同源端口」的新 SYN。
+    let new_isn = 0xfeed_faceu32;
+    let fl = tcp_build(
+        io,
+        0,
+        mac_bytes(st.links[0].mac),
+        peer_ip,
+        OUR_IP,
+        RPORT,
+        LPORT,
+        new_isn,
+        0,
+        TCP_SYN,
+        TCP_WINDOW,
+        &[],
+    );
+    let info = match ipv4_parse(io, fl) {
+        Some(i) => i,
+        None => return false,
+    };
+    let seg = match tcp_parse(&info) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // 5) 调 tcp_input —— 修好后应当走被动打开, 回 SYN-ACK (帧长 > 0),
+    //    而不是被 TimeWait 静默吞掉 (len = 0)。
+    let resp = tcp_input(st, 0, info.src, &seg, 0);
+    if resp == 0 {
+        return false;
+    }
+
+    // 6) 解析回应: 必须是 SYN|ACK, 目的端口/对端 IP 与新连接一致。
+    let rinfo = match ipv4_parse(io, resp) {
+        Some(i) => i,
+        None => return false,
+    };
+    let rseg = match tcp_parse(&rinfo) {
+        Some(s) => s,
+        None => return false,
+    };
+    if rseg.flags & (TCP_SYN | TCP_ACK) != (TCP_SYN | TCP_ACK) {
+        return false;
+    }
+    if rseg.sport != LPORT || rseg.dport != RPORT {
+        return false;
+    }
+
+    // 7) 验证: 应有一个新的 SynRcvd 连接被建出来 (旧 TimeWait 槽位应保持 TimeWait, 不被覆写)。
+    let mut new_synrcvd_found = false;
+    let mut new_idx = usize::MAX;
+    i = 0;
+    while i < MAX_TCONS {
+        let c = &st.tcons[i];
+        if c.used
+            && i != li_slot
+            && i != tw_slot
+            && c.role == TCP_ROLE_SERVER
+            && c.state == TcpState::SynRcvd
+            && c.local_port == LPORT
+            && c.remote_ip == peer_ip
+            && c.remote_port == RPORT
+        {
+            new_synrcvd_found = true;
+            new_idx = i;
+            break;
+        }
+        i += 1;
+    }
+    if !new_synrcvd_found {
+        return false;
+    }
+
+    // 8) 旧 TimeWait 槽位不应被这次 SYN 改变状态 (它的 socket 还在, 只是不再吞新 SYN)。
+    if st.tcons[tw_slot].state != TcpState::TimeWait {
+        return false;
+    }
+
+    // 清理: 释放为测试占用的槽位, 不影响后续真实运行。
+    st.tcons[li_slot] = TcpConn::new();
+    st.tcons[tw_slot] = TcpConn::new();
+    if new_idx != usize::MAX {
+        st.tcons[new_idx] = TcpConn::new();
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // TCP socket 操作（N7.2：应用经 libnetv 调用）
 // ---------------------------------------------------------------------------
@@ -1274,7 +1424,11 @@ fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64
     let mut i = 0;
     while i < MAX_TCONS {
         let c = &st.tcons[i];
+        // 仅「活」的连接才算已存在: TimeWait / Closed 的槽位不会响应新 SYN,
+        // 否则同一 4-tuple 的新连接会被旧 TimeWait 静默吞掉, 重连失败。
         if c.used
+            && c.state != TcpState::TimeWait
+            && c.state != TcpState::Closed
             && c.nic == nic
             && c.local_port == seg.dport
             && c.remote_ip == src_ip
