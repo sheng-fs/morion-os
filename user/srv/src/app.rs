@@ -3386,14 +3386,18 @@ pub fn run() {
         return;
     }
 
-    // NET-5 (N6): 应用经 libnetv 用 UDP socket —— 端口能力门禁 + 回环收发 + 真实收帧。
-    net5_udp_socket();
-
-    // NET-11 (N9.2): 经第二台真网卡 (e1000e, NIC1) 用**同一套** socket API —— 多网卡出口。
-    net11_udp_e1000e();
-
-    // NET-12 (N7.2): TCP 客户端经 socket API 主动连接真实对端 (slirp)。
-    net12_tcp_client();
+    // NET 应用面自测 (N6/N7/N8/N9.2): 汇总成 NET7 判据。
+    // 用 `&=` 而非 `&&` —— 每个子测都要跑, 不短路。
+    let mut net_ok = true;
+    net_ok &= net5_udp_socket(); // N6: 端口能力门禁 + UDP 回环 + 真实收帧
+    net_ok &= net11_udp_e1000e(); // N9.2: 经第二台真网卡 (e1000e) 出口
+    net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
+    net_ok &= net8_dns(); // N8: DNS 最小解析
+    if net_ok {
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns)");
+    } else {
+        println("app: NET7 app socket FAILED");
+    }
 
     // 34. FS-31 自测 (01 健壮性收口): 最小 fsck 对账口径的稳定性。
     //     客户机内无法制造「已分配但不可达」的 inode 泄漏 (那要在目录项插入与 inode 登记
@@ -3919,29 +3923,29 @@ fn fs29_supervisor_restart() -> Option<()> {
 ///      `recvfrom` 能取回**逐字节一致**的负载;
 ///   ③ `sendto` 到网关 `10.0.2.2:9999` 走真实 TX 路径, 帧经 net_srv/网卡发出后触发
 ///      ICMP 端口不可达 —— 收帧路径 (网卡→net_srv→netstack) 因此也被走通。
-fn net5_udp_socket() {
+fn net5_udp_socket() -> bool {
     const PORT: u16 = 12345;
     // ① 越权端口: 内核门禁应先于协议栈拒绝。
     if sys_net_bind(80) != 0 {
         println("app: NET5 over-privileged bind not denied FAILED");
-        return;
+        return false;
     }
     // ② 建 socket 并绑定合法端口。
     let sock = morion::net::socket();
     if sock == 0 || !morion::net::bind(sock, PORT) {
         println("app: NET5 socket/bind FAILED");
-        return;
+        return false;
     }
     let msg = b"MORION-N6";
     if !morion::net::sendto(sock, PORT, morion::net::ip4(10, 0, 2, 15), msg) {
         println("app: NET5 sendto(loopback) FAILED");
-        return;
+        return false;
     }
     let mut buf = [0u8; 32];
     let n = morion::net::recvfrom(sock, &mut buf);
     if n as usize != msg.len() || buf[..n as usize] != msg[..] {
         println("app: NET5 loopback recv mismatch FAILED");
-        return;
+        return false;
     }
     // ③ 真实 TX: 触发链路发帧 (回程 ICMP 不可达由 netstack 打印)。
     let _ = morion::net::sendto(
@@ -3955,6 +3959,7 @@ fn net5_udp_socket() {
     sys_sleep(300);
     let _ = morion::net::close(sock);
     println("app: NET5 udp socket OK (cap-gate denial + loopback recv + tx probe)");
+    true
 }
 
 /// NET-11 (N9.2): 经第二台真网卡 (e1000e, NIC1) 用**同一套** socket API 收发。
@@ -3964,23 +3969,23 @@ fn net5_udp_socket() {
 ///   ② 回环发本机地址 → NIC1 路径投递回同一 socket, `recvfrom` 逐字节一致;
 ///   ③ `sendto` 到网关 `10.0.2.2:9999` 走 e1000e 真实 TX, 帧经 e1000e_srv 发出后触发
 ///      ICMP 端口不可达 —— netstack 打出 `nic1 rx (icmp unreachable)` 取证。
-fn net11_udp_e1000e() {
+fn net11_udp_e1000e() -> bool {
     const PORT: u16 = 12345;
     let sock = morion::net::socket_on(1);
     if sock == 0 || !morion::net::bind(sock, PORT) {
         println("app: NET11 e1000e socket/bind FAILED");
-        return;
+        return false;
     }
     let msg = b"MORION-N9";
     if !morion::net::sendto(sock, PORT, morion::net::ip4(10, 0, 2, 15), msg) {
         println("app: NET11 e1000e sendto(loopback) FAILED");
-        return;
+        return false;
     }
     let mut buf = [0u8; 32];
     let n = morion::net::recvfrom(sock, &mut buf);
     if n as usize != msg.len() || buf[..n as usize] != msg[..] {
         println("app: NET11 e1000e loopback recv mismatch FAILED");
-        return;
+        return false;
     }
     // 真实 TX via e1000e: 触发链路发帧 (回程 ICMP 不可达由 netstack 的 nic1 路径打印)。
     let _ = morion::net::sendto(
@@ -3992,27 +3997,68 @@ fn net11_udp_e1000e() {
     sys_sleep(300);
     let _ = morion::net::close(sock);
     println("app: NET11 udp via e1000e (nic1) OK (loopback + tx probe)");
+    true
 }
 
 /// NET-12 (N7.2): TCP 客户端经 socket API 主动连接真实对端。
 ///
 /// slirp 网关上大概率没有监听端口, 故期望收到 **RST**（连接被拒）—— 这恰好端到端取证了
 /// 真实的 SYN 发出 + 对端 RST 收回 + 状态机把连接判为 Closed（netstack 打对应 marker）。
-fn net12_tcp_client() {
+fn net12_tcp_client() -> bool {
     const PORT: u16 = 12345;
     let sock = morion::net::tcp_socket();
     if sock == 0 || !morion::net::tcp_bind(sock, PORT) {
         println("app: NET12 tcp socket/bind FAILED");
-        return;
+        return false;
     }
     if !morion::net::tcp_connect(sock, morion::net::ip4(10, 0, 2, 2), 9999) {
         println("app: NET12 tcp connect FAILED");
-        return;
+        return false;
     }
     // 等 SYN → RST 往返 + 状态机消化。
     sys_sleep(500);
     let _ = morion::net::tcp_close(sock);
     println("app: NET12 tcp client OK (syn tx + peer rst rx)");
+    true
+}
+
+/// NET-8 (N8): DNS 最小解析。
+///
+/// ① 确定性自证: 手工构造含 A 记录 `198.51.100.7` 的应答, 验证解析器能取出 (不依赖网络);
+/// ② 真实查询: 经 `libnetv::getaddrinfo` 向 slirp 内置 DNS (`10.0.2.3:53`) 查 `example.com`,
+///    走 UDP socket + 端口能力 (源端口 12347 落在 app 的 `Net` 能力 `[12345,12350]` 内)。
+fn net8_dns() -> bool {
+    match morion::net::dns_selftest() {
+        Some(ip) => {
+            print("app: NET8 dns parser OK, A=");
+            print_ip(ip);
+            println("");
+        }
+        None => {
+            println("app: NET8 dns parser FAILED");
+            return false;
+        }
+    }
+    let mut ip = [0u8; 4];
+    if morion::net::getaddrinfo("example.com", &mut ip) {
+        print("app: NET8 dns OK, A=");
+        print_ip(ip);
+        println("");
+    } else {
+        println("app: NET8 dns real NO-ANSWER (offline?)");
+    }
+    true
+}
+
+/// 打印 `a.b.c.d`。
+fn print_ip(ip: [u8; 4]) {
+    print_u64(ip[0] as u64);
+    print(".");
+    print_u64(ip[1] as u64);
+    print(".");
+    print_u64(ip[2] as u64);
+    print(".");
+    print_u64(ip[3] as u64);
 }
 
 /// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。

@@ -609,7 +609,7 @@ pub extern "C" fn kernel_main() -> ! {
     // 端口能力 (自测端口 12345; 绑其它端口会被内核拒 —— 越权取证的负例)。
     cap::grant(app_domain, cap::Capability::SendTo(netstack_domain));
     cap::grant(app_domain, cap::Capability::MapInto(netstack_domain));
-    cap::grant(app_domain, cap::Capability::Net(12345, 12345));
+    cap::grant(app_domain, cap::Capability::Net(12345, 12350));
 
     // 授权 (N9): 网络协议栈 (域 21) 可把 e1000e (域 22) 当作第二台网卡 —— 帧级 IPC 走同一个
     // `NetReq` 契约 (SendTo + MapInto)。协议栈因此能按网卡索引选出口, 上层 socket API 不变。

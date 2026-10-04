@@ -194,3 +194,172 @@ pub fn tcp_close(sock: u64) -> bool {
 pub const fn ip4(a: u8, b: u8, c: u8, d: u8) -> u32 {
     ((a as u32) << 24) | ((b as u32) << 16) | ((c as u32) << 8) | d as u32
 }
+
+// ---------------------------------------------------------------------------
+// N8 — DNS 最小客户端（A 记录）
+// ---------------------------------------------------------------------------
+
+/// slirp 内置 DNS 服务地址（`10.0.2.3`）。
+const NET_DNS: u32 = ip4(10, 0, 2, 3);
+/// DNS 服务端口与本地源端口（源端口须落在应用的 `Net` 能力范围内）。
+const DNS_PORT: u16 = 53;
+const DNS_LOCAL_PORT: u16 = 12347;
+/// 查询 id（固定值，便于解析时校验；同时用于自证）。
+const DNS_ID: u16 = 0x4D4F;
+
+fn wr8b(b: &mut [u8], p: usize, v: u8) {
+    b[p] = v;
+}
+fn wr16b(b: &mut [u8], p: usize, v: u16) {
+    b[p] = (v >> 8) as u8;
+    b[p + 1] = v as u8;
+}
+fn rd16b(b: &[u8], p: usize) -> u16 {
+    ((b[p] as u16) << 8) | b[p + 1] as u16
+}
+
+/// 组装 DNS A 查询：`name` 形如 `a.b.c`；写入 `out`，返回报文长度（0 = 非法）。
+fn dns_build(name: &str, out: &mut [u8]) -> usize {
+    if out.len() < 12 + name.len() + 6 || name.is_empty() {
+        return 0;
+    }
+    // 头部：id / flags(RD) / qd=1 / 其余 0。
+    wr16b(out, 0, DNS_ID);
+    wr16b(out, 2, 0x0100);
+    wr16b(out, 4, 1);
+    wr16b(out, 6, 0);
+    wr16b(out, 8, 0);
+    wr16b(out, 10, 0);
+    let mut p = 12usize;
+    // QNAME：按 '.' 切分，每段前置长度；非法(空段/超长)则失败。
+    let bytes = name.as_bytes();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    while idx <= bytes.len() {
+        if idx == bytes.len() || bytes[idx] == b'.' {
+            let seg = idx - start;
+            if seg == 0 || seg > 63 {
+                return 0;
+            }
+            wr8b(out, p, seg as u8);
+            p += 1;
+            let mut k = 0;
+            while k < seg {
+                wr8b(out, p, bytes[start + k]);
+                p += 1;
+                k += 1;
+            }
+            start = idx + 1;
+        }
+        idx += 1;
+    }
+    wr8b(out, p, 0); // 根标签
+    p += 1;
+    wr16b(out, p, 1); // QTYPE = A
+    p += 2;
+    wr16b(out, p, 1); // QCLASS = IN
+    p += 2;
+    p
+}
+
+/// 跳过一个 DNS 名字（支持 0xC0 压缩指针）。
+fn dns_skip_name(b: &[u8], mut p: usize) -> usize {
+    loop {
+        if p >= b.len() {
+            return b.len();
+        }
+        let c = b[p];
+        if c == 0 {
+            return p + 1;
+        }
+        if c & 0xc0 == 0xc0 {
+            return p + 2;
+        }
+        p += 1 + c as usize;
+    }
+}
+
+/// 从 DNS 应答里取第一条 A 记录的地址。
+fn dns_parse_a(b: &[u8]) -> Option<[u8; 4]> {
+    if b.len() < 12 || rd16b(b, 0) != DNS_ID {
+        return None;
+    }
+    let qd = rd16b(b, 4) as usize;
+    let an = rd16b(b, 6) as usize;
+    let mut p = 12usize;
+    let mut i = 0;
+    while i < qd {
+        p = dns_skip_name(b, p);
+        p += 4; // qtype + qclass
+        i += 1;
+    }
+    let mut j = 0;
+    while j < an {
+        p = dns_skip_name(b, p);
+        if p + 10 > b.len() {
+            return None;
+        }
+        let rtype = rd16b(b, p);
+        let rclass = rd16b(b, p + 2);
+        let rdlen = rd16b(b, p + 8) as usize;
+        p += 10;
+        if p + rdlen > b.len() {
+            return None;
+        }
+        if rtype == 1 && rclass == 1 && rdlen == 4 {
+            return Some([b[p], b[p + 1], b[p + 2], b[p + 3]]);
+        }
+        p += rdlen;
+        j += 1;
+    }
+    None
+}
+
+/// 解析器确定性自证：手工构造一个含 A 记录 `198.51.100.7` 的应答，验证能正确取出。
+/// （不依赖网络，保证回归稳定。）
+pub fn dns_selftest() -> Option<[u8; 4]> {
+    // 头部 + 问题 "a.com" + 回答（压缩指针 0xC00C）。
+    let msg: [u8; 39] = [
+        0x4d, 0x4f, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // header
+        1, b'a', 3, b'c', b'o', b'm', 0, // QNAME
+        0x00, 0x01, 0x00, 0x01, // QTYPE/QCLASS
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, // answer hdr
+        198, 51, 100, 7, // RDATA
+    ];
+    dns_parse_a(&msg)
+}
+
+/// 最小 `getaddrinfo`：向 slirp 内置 DNS 查 `name` 的 A 记录。成功写入 `out_ip`。
+pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
+    if !ensure() {
+        return false;
+    }
+    let mut q = [0u8; 256];
+    let qn = dns_build(name, &mut q);
+    if qn == 0 {
+        return false;
+    }
+    let sock = socket();
+    if sock == 0 {
+        return false;
+    }
+    let mut ok = false;
+    if bind(sock, DNS_LOCAL_PORT) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
+        let mut rbuf = [0u8; 512];
+        let mut i = 0;
+        while i < 50 {
+            let n = recvfrom(sock, &mut rbuf);
+            if n > 0 {
+                if let Some(ip) = dns_parse_a(&rbuf[..n as usize]) {
+                    *out_ip = ip;
+                    ok = true;
+                }
+                break;
+            }
+            sys_sleep(20);
+            i += 1;
+        }
+    }
+    let _ = close(sock);
+    ok
+}
