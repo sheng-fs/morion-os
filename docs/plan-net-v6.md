@@ -117,6 +117,12 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 - libnetv：`IpAddr` + `getaddrinfo` 支持 **AAAA**（与现有 A 并列）；socket API 增加 family 参数（或新 `*6` 变体）。
 - 能力：`Capability::Net(lo,hi)` **与 v4/v6 正交**（端口门禁不变）；`SYS_NET_BIND/OWNER` 语义不变。
 - app 自测：`NET19 dns AAAA OK`；shell 可选 `ping6`。
+- marker：`app: NET19 dns AAAA OK`。**已过**。
+- 实现：`libnetv` 增 `IpAddr{V4,V6}`；`dns_build` 参数化 QTYPE；新增 `dns_parse_aaaa`（QTYPE 28 /
+  RDATA 16）+ 确定性自证 `dns_selftest_aaaa`（`2001:db8::1`）；`getaddrinfo6`（真实 AAAA 查询）+
+  双栈 `resolve`（先 A 后 AAAA）；app 侧 `net19_dns_aaaa`（确定性 + 真实 best-effort）。
+  端口门禁不变（DNS 仍走 v4 UDP，源端口 `DNS_LOCAL_PORT` 落在 app 的 `Net` 能力内）。
+  **注**：socket 的 family 形参 / v6 收发（`sendto6` 等）随 V6.4 双栈落地，届时再接 `udp6_input`。
 
 ### V6.4 — 双栈
 - socket 默认双栈（v4-mapped `::ffff:a.b.c.d`）；`socket_on(nic)` + family 可指定出口与协议族。
@@ -141,7 +147,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 1. ✅ **R1 取证（已完成）**：发 RS → slirp 回 RA，**前缀 `fec0::/64`**；自派生链路本地 `fe80::5054:ff:fe12:3456`。证据 marker `NET16 ipv6 ll=… / ra rx, prefix=…`（已入 `scripts/fs-regress.sh` 判据）。
 2. ✅ **V6.1 地址 + SLAAC + NDP（已完成）**：`NET16 ipv6 slaac OK (g=fec0:0:0:0:5054:ff:fe12:3456, gw mac learned)` + `NET16 ndp self-test OK (ns->na)`。
 3. ✅ **V6.2 传输（已完成）**：ICMPv6 echo（`NET17 icmpv6 echo OK`，另 slirp 回 `NET17 ipv6 echo OK (router replied)`）+ UDPv6（`NET17 udp6 OK`）+ TCPv6（`NET18 tcp6 OK`）。
-4. **V6.3** AAAA + 应用面（`NET19`）。
+4. ✅ **V6.3 应用面（已完成）**：`IpAddr` + DNS AAAA（确定性解析器自证 + 双栈 `resolve`），`app: NET19 dns AAAA OK`。
 5. **DRV-A** NIC 表驱动化（回归逐字不变）。
 6. **DRV-B** `rtl8139_srv`（`NET14`）→ 视情况 `e1000_srv`（`NET15`）。
 7. **DRV-C** `virtio_input` → `virtio_gpu_srv`。

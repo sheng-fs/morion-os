@@ -247,8 +247,8 @@ fn rd16b(b: &[u8], p: usize) -> u16 {
     ((b[p] as u16) << 8) | b[p + 1] as u16
 }
 
-/// 组装 DNS A 查询：`name` 形如 `a.b.c`；写入 `out`，返回报文长度（0 = 非法）。
-fn dns_build(name: &str, out: &mut [u8]) -> usize {
+/// 组装 DNS 查询（QTYPE 由 `qtype` 给出：1=A，28=AAAA）；写入 `out`，返回报文长度（0 = 非法）。
+fn dns_build(name: &str, qtype: u16, out: &mut [u8]) -> usize {
     if out.len() < 12 + name.len() + 6 || name.is_empty() {
         return 0;
     }
@@ -284,7 +284,7 @@ fn dns_build(name: &str, out: &mut [u8]) -> usize {
     }
     wr8b(out, p, 0); // 根标签
     p += 1;
-    wr16b(out, p, 1); // QTYPE = A
+    wr16b(out, p, qtype); // QTYPE
     p += 2;
     wr16b(out, p, 1); // QCLASS = IN
     p += 2;
@@ -364,7 +364,7 @@ pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
         return false;
     }
     let mut q = [0u8; 256];
-    let qn = dns_build(name, &mut q);
+    let qn = dns_build(name, 1, &mut q);
     if qn == 0 {
         return false;
     }
@@ -391,4 +391,113 @@ pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
     }
     let _ = close(sock);
     ok
+}
+
+// ---------------------------------------------------------------------------
+// V6.3 — 应用侧 IPv6 地址面（IpAddr + DNS AAAA）
+// ---------------------------------------------------------------------------
+
+/// 应用侧 IP 地址（V4 = 点分四段；V6 = 16 字节）。
+#[derive(Clone, Copy)]
+pub enum IpAddr {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+/// 从 DNS 应答里取第一条 AAAA 记录的地址（QTYPE 28，RDATA 16 字节）。
+fn dns_parse_aaaa(b: &[u8]) -> Option<[u8; 16]> {
+    if b.len() < 12 || rd16b(b, 0) != DNS_ID {
+        return None;
+    }
+    let qd = rd16b(b, 4) as usize;
+    let an = rd16b(b, 6) as usize;
+    let mut p = 12usize;
+    let mut i = 0;
+    while i < qd {
+        p = dns_skip_name(b, p);
+        p += 4;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < an {
+        p = dns_skip_name(b, p);
+        if p + 10 > b.len() {
+            return None;
+        }
+        let rtype = rd16b(b, p);
+        let rclass = rd16b(b, p + 2);
+        let rdlen = rd16b(b, p + 8) as usize;
+        p += 10;
+        if p + rdlen > b.len() {
+            return None;
+        }
+        if rtype == 28 && rclass == 1 && rdlen == 16 {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&b[p..p + 16]);
+            return Some(a);
+        }
+        p += rdlen;
+        j += 1;
+    }
+    None
+}
+
+/// AAAA 解析器确定性自证：手工构造含 AAAA 记录 `2001:db8::1` 的应答，验证能取出。
+pub fn dns_selftest_aaaa() -> Option<[u8; 16]> {
+    let msg: [u8; 51] = [
+        0x4d, 0x4f, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // header
+        1, b'a', 3, b'c', b'o', b'm', 0, // QNAME
+        0x00, 0x1c, 0x00, 0x01, // QTYPE=AAAA / QCLASS=IN
+        0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, // answer hdr
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // RDATA 2001:db8::1
+    ];
+    dns_parse_aaaa(&msg)
+}
+
+/// 最小 `getaddrinfo`（AAAA）：向 slirp 内置 DNS 查 `name` 的 AAAA 记录。成功写入 `out_ip`。
+pub fn getaddrinfo6(name: &str, out_ip: &mut [u8; 16]) -> bool {
+    if !ensure() {
+        return false;
+    }
+    let mut q = [0u8; 256];
+    let qn = dns_build(name, 28, &mut q);
+    if qn == 0 {
+        return false;
+    }
+    let sock = socket();
+    if sock == 0 {
+        return false;
+    }
+    let mut ok = false;
+    if bind(sock, DNS_LOCAL_PORT) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
+        let mut rbuf = [0u8; 512];
+        let mut i = 0;
+        while i < 50 {
+            let n = recvfrom(sock, &mut rbuf);
+            if n > 0 {
+                if let Some(ip) = dns_parse_aaaa(&rbuf[..n as usize]) {
+                    *out_ip = ip;
+                    ok = true;
+                }
+                break;
+            }
+            sys_sleep(20);
+            i += 1;
+        }
+    }
+    let _ = close(sock);
+    ok
+}
+
+/// 双栈解析：先试 A，再试 AAAA。
+pub fn resolve(name: &str) -> Option<IpAddr> {
+    let mut v4 = [0u8; 4];
+    if getaddrinfo(name, &mut v4) {
+        return Some(IpAddr::V4(v4));
+    }
+    let mut v6 = [0u8; 16];
+    if getaddrinfo6(name, &mut v6) {
+        return Some(IpAddr::V6(v6));
+    }
+    None
 }

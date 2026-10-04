@@ -3393,9 +3393,10 @@ pub fn run() {
     net_ok &= net11_udp_e1000e(); // N9.2: 经第二台真网卡 (e1000e) 出口
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
+    net_ok &= net19_dns_aaaa(); // V6.3: DNS AAAA（应用侧 IPv6 地址面）
     net_ok &= net13_http(); // N8.2: 回环 TCP + 客户机内建 HTTP 服务
     if net_ok {
-        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + http)");
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http)");
     } else {
         println("app: NET7 app socket FAILED");
     }
@@ -4060,6 +4061,50 @@ fn print_ip(ip: [u8; 4]) {
     print_u64(ip[2] as u64);
     print(".");
     print_u64(ip[3] as u64);
+}
+
+/// 打印 `hhhh:hhhh:...`（16 字节 IPv6）。
+fn print_ip6(a: [u8; 16]) {
+    let mut i = 0usize;
+    while i < 8 {
+        print_hex(((a[i * 2] as u64) << 8) | a[i * 2 + 1] as u64);
+        if i != 7 {
+            print(":");
+        }
+        i += 1;
+    }
+}
+
+/// NET-19 (V6.3): DNS AAAA（应用侧 IPv6 地址面）。
+///
+/// ① 确定性自证: 手工构造含 AAAA 记录 `2001:db8::1` 的应答, 验证解析器能取出 (不依赖网络);
+/// ② 真实查询: 经 `libnetv::resolve`（双栈: 先 A 后 AAAA）向 slirp 内置 DNS 查 `example.com`。
+fn net19_dns_aaaa() -> bool {
+    match morion::net::dns_selftest_aaaa() {
+        Some(a) => {
+            print("app: NET19 dns AAAA OK, AAAA=");
+            print_ip6(a);
+            println("");
+        }
+        None => {
+            println("app: NET19 dns AAAA parser FAILED");
+            return false;
+        }
+    }
+    match morion::net::resolve("example.com") {
+        Some(morion::net::IpAddr::V6(a)) => {
+            print("app: NET19 dns AAAA real OK, AAAA=");
+            print_ip6(a);
+            println("");
+        }
+        Some(morion::net::IpAddr::V4(ip)) => {
+            print("app: NET19 dns A-only real OK, A=");
+            print_ip(ip);
+            println("");
+        }
+        None => println("app: NET19 dns real NO-ANSWER (offline?)"),
+    }
+    true
 }
 
 /// 子串查找（`naive`）。
