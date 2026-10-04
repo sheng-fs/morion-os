@@ -30,6 +30,10 @@
 # 切到仓库根 (rust-analyzer 一般在根目录调用, 但不依赖它的 cwd)。
 cd "$(dirname "$0")/.." || exit 0
 
+# 保证无论如何都能找到 cargo: IDE 启动 rust-analyzer 时的 PATH 往往不含 ~/.cargo/bin,
+# 缺了 cargo 会让 overrideCommand 整体失败 (诊断反而全无)。
+export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
 # 与 Makefile 相同的编译期环境变量 (见 Makefile 28-44 行): 版本串与 nightly 门。
 export RUSTC_BOOTSTRAP=1
 export MORION_BUILD="${MORION_BUILD:-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d)}"

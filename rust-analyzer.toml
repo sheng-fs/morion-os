@@ -13,5 +13,9 @@
 #
 # 说明: 该文件由 rust-analyzer 服务端直接读取 (项目级, 优先级高于 IDE 设置),
 #       改完后 Reload Window (或重启 rust-analyzer) 生效。
+#
+# 注意: 必须同时给出 `command = "custom"` —— 否则部分 rust-analyzer 版本会忽略
+#       `overrideCommand`, 继续跑宿主 target 的默认检查, Problems 面板仍是一堆假红。
 [check]
+command = "custom"
 overrideCommand = ["bash", "scripts/ra-check.sh"]
