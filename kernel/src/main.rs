@@ -421,7 +421,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 共享页用于收发负载 (SendTo + MapInto)。
     cap::grant(shell_domain, cap::Capability::SendTo(netstack_domain));
     cap::grant(shell_domain, cap::Capability::MapInto(netstack_domain));
-    cap::grant(shell_domain, cap::Capability::Net(12345, 12350));
+    // Net 端口能力: shell 的 wget (12349) 与 DNS 源端口 = 12345 + 域号 (shell 域 8 -> 12353)。
+    // 内核端口归属表一个端口只归一个域, 故 DNS 源端口按域派生, 能力范围须覆盖 base + 域号。
+    cap::grant(shell_domain, cap::Capability::Net(12345, 12399));
     // 授权: 各文件服务把**自己那类的额外卷**上报给 mount_srv (M1b 多卷挂载:
     // `/usb<卷号>`)。只需 SendTo —— 挂载请求是一条普通 IPC, 不经共享页。
     cap::grant(fat32_domain, cap::Capability::SendTo(mount_domain));
@@ -692,9 +694,11 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 授权 (N6.6): app(域 7) 用网络 —— 可向 netstack 发请求并共享负载页, 且持一条 Net
     // 端口能力 (自测端口 12345; 绑其它端口会被内核拒 —— 越权取证的负例)。
+    // DNS 源端口 = 12345 + 域号 (app 域 7 -> 12352), 故范围覆盖到 12399; 端口 80 仍在范围外,
+    // NET5 的越权负例 (bind 80 被拒) 不受影响。
     cap::grant(app_domain, cap::Capability::SendTo(netstack_domain));
     cap::grant(app_domain, cap::Capability::MapInto(netstack_domain));
-    cap::grant(app_domain, cap::Capability::Net(12345, 12350));
+    cap::grant(app_domain, cap::Capability::Net(12345, 12399));
 
     // 授权 (N9): 网络协议栈 (域 21) 可把 e1000e (域 22) 当作第二台网卡 —— 帧级 IPC 走同一个
     // `NetReq` 契约 (SendTo + MapInto)。协议栈因此能按网卡索引选出口, 上层 socket API 不变。

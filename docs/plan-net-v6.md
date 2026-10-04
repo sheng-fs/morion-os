@@ -124,7 +124,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 - 实现：`libnetv` 增 `IpAddr{V4,V6}`；`dns_build` 参数化 QTYPE；新增 `dns_parse_aaaa`（QTYPE 28 /
   RDATA 16）+ 确定性自证 `dns_selftest_aaaa`（`2001:db8::1`）；`getaddrinfo6`（真实 AAAA 查询）+
   双栈 `resolve`（先 A 后 AAAA）；app 侧 `net19_dns_aaaa`（确定性 + 真实 best-effort）。
-  端口门禁不变（DNS 仍走 v4 UDP，源端口 `DNS_LOCAL_PORT` 落在 app 的 `Net` 能力内）。
+  端口门禁不变（DNS 仍走 v4 UDP，源端口按域派生 = `12345 + 域号`，落在 app 的 `Net` 能力内）。
   **注**：socket 的 family 形参 / v6 收发（`sendto6` 等）随 V6.4 双栈落地，届时再接 `udp6_input`。
 
 ### V6.4 — 双栈

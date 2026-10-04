@@ -64,6 +64,9 @@ $QEMU \
   -drive file=build/exfat.img,if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
   -drive file=build/spare.img,if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -drive file=build/pt.img,if=none,id=n7,format=raw -device nvme-ns,drive=n7,bus=nvme0,nsid=7 \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
+  -netdev user,id=n1 -device e1000e,netdev=n1,mac=52:54:00:aa:bb:cc \
+  -netdev user,id=n2 -device e1000,netdev=n2,mac=52:54:00:dd:ee:ff \
   -display none -monitor unix:"$sock",server,nowait -serial file:"$log" -no-reboot \
   ${QEMU_EXTRA:-} -enable-kvm &
 qpid=$!

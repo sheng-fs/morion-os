@@ -241,6 +241,10 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  cat <file>     print file content");
             println("  run <file>     load a .mex program from a file and run it (new domain)");
             println("  wget [path]    fetch a page from the guest's built-in HTTP server (10.0.2.15:80)");
+            println("  net            show link status (kind / mac / ipv4 / gw / ipv6)");
+            println("  ping <ip|host> ICMP echo over IPv4 (IPv6 literal delegates to ping6)");
+            println("  ping6 <ip|host>  ICMPv6 echo over IPv6");
+            println("  dns <name>     resolve A and AAAA records (alias: nslookup)");
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -285,6 +289,10 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "cat" => shell_cat(st, arg),
         "run" => shell_run(st, arg),
         "wget" => shell_wget(arg),
+        "net" | "ifconfig" => shell_net(),
+        "ping" => shell_ping(arg),
+        "ping6" => shell_ping6(arg),
+        "dns" | "nslookup" => shell_dns(arg),
         "cd" => shell_cd(st, if arg.is_empty() { "/" } else { arg }),
         "mkdir" => shell_mkdir(st, arg),
         "touch" => shell_touch(st, arg),
@@ -401,6 +409,176 @@ fn shell_wget(arg: &str) {
     }
     println("");
     let _ = morion::net::tcp_close(sock);
+}
+
+// ---------------------------------------------------------------------------
+// 网络命令（net / ping / ping6 / dns）
+// ---------------------------------------------------------------------------
+
+/// 打印点分十进制 IPv4。
+fn print_ipv4(ip: [u8; 4]) {
+    print_u64(ip[0] as u64);
+    print(".");
+    print_u64(ip[1] as u64);
+    print(".");
+    print_u64(ip[2] as u64);
+    print(".");
+    print_u64(ip[3] as u64);
+}
+
+/// 打印一个 MAC（每字节 2 位 16 进制，冒号分隔）。
+fn print_mac(mac: [u8; 6]) {
+    let mut i = 0usize;
+    while i < 6 {
+        if i != 0 {
+            print(":");
+        }
+        print_hex((mac[i] >> 4) as u64);
+        print_hex((mac[i] & 0xF) as u64);
+        i += 1;
+    }
+}
+
+/// 打印 IPv6（8 组 16 进制，冒号分隔；与协议栈口径一致，不做 `::` 压缩）。
+fn print_ipv6(a: &[u8; 16]) {
+    let mut i = 0usize;
+    while i < 8 {
+        print_hex(((a[i * 2] as u64) << 8) | a[i * 2 + 1] as u64);
+        if i != 7 {
+            print(":");
+        }
+        i += 1;
+    }
+}
+
+/// `net` / `ifconfig` — 打印各网卡的链路状态（型号 / MAC / IPv4 / 网关 / IPv6）。
+fn shell_net() {
+    let mut infos = [morion::net::LinkInfo::zeroed(); 8];
+    let n = morion::net::link_infos(&mut infos);
+    if n == 0 {
+        println("net: no link (netstack unavailable?)");
+        return;
+    }
+    let mut i = 0usize;
+    while i < n {
+        let l = &infos[i];
+        print("nic");
+        print_u64(l.nic);
+        print(" ");
+        print(l.kind_name());
+        print(" ");
+        print(if l.is_up() { "up" } else { "down" });
+        print(" mac=");
+        print_mac(l.mac_bytes());
+        print(" ipv4=");
+        print_ipv4(l.ipv4());
+        print(" gw=");
+        print_ipv4(l.gw4());
+        if l.v6_up != 0 {
+            print(" ipv6=");
+            print_ipv6(&l.v6);
+            print(" router=");
+            print_ipv6(&l.v6_gw);
+        }
+        println("");
+        i += 1;
+    }
+}
+
+/// `ping6 <ipv6>`（或 `ping <ipv6>`）—— ICMPv6 echo，经协议栈走真实网卡。
+fn shell_ping6_addr(addr: &[u8; 16]) {
+    print("ping6 ");
+    print_ipv6(addr);
+    print(" ... ");
+    if morion::net::ping6(addr, 0) {
+        println("reply");
+    } else {
+        println("no reply");
+    }
+}
+
+/// `ping6 <ipv6>` / `ping6 <hostname>`。
+fn shell_ping6(arg: &str) {
+    if arg.is_empty() {
+        println("usage: ping6 <ipv6|hostname>");
+        return;
+    }
+    if let Some(a) = morion::net::parse_ipv6(arg) {
+        shell_ping6_addr(&a);
+        return;
+    }
+    let mut a = [0u8; 16];
+    if morion::net::getaddrinfo6(arg, &mut a) {
+        shell_ping6_addr(&a);
+    } else {
+        println("ping6: cannot resolve (need IPv6 literal or AAAA record)");
+    }
+}
+
+/// `ping <ipv4|ipv6|hostname>` — IPv4 走 ICMP echo；v6 字面量自动转 `ping6`。
+fn shell_ping(arg: &str) {
+    if arg.is_empty() {
+        println("usage: ping <ipv4|hostname>");
+        return;
+    }
+    if let Some(a6) = morion::net::parse_ipv6(arg) {
+        shell_ping6_addr(&a6);
+        return;
+    }
+    let addr = match morion::net::parse_ipv4(arg) {
+        Some(a) => a,
+        None => match morion::net::resolve(arg) {
+            Some(morion::net::IpAddr::V4(a)) => a,
+            Some(morion::net::IpAddr::V6(a)) => {
+                shell_ping6_addr(&a);
+                return;
+            }
+            None => {
+                println("ping: cannot resolve (need IPv4 literal or A record)");
+                return;
+            }
+        },
+    };
+    print("ping ");
+    print_ipv4(addr);
+    print(" ... ");
+    if morion::net::ping4(addr, 0) {
+        println("reply");
+    } else {
+        println("no reply");
+    }
+}
+
+/// `dns <name>` / `nslookup <name>` — 解析 A 与 AAAA 并打印。
+fn shell_dns(name: &str) {
+    if name.is_empty() {
+        println("usage: dns <name>");
+        return;
+    }
+    let mut v4 = [0u8; 4];
+    if morion::net::getaddrinfo(name, &mut v4) {
+        print("dns: ");
+        print(name);
+        print(" A = ");
+        print_ipv4(v4);
+        println("");
+    } else {
+        print("dns: ");
+        print(name);
+        println(" A = (none)");
+    }
+    let mut v6 = [0u8; 16];
+    if morion::net::getaddrinfo6(name, &mut v6) {
+        print("dns: ");
+        print(name);
+        print(" AAAA = ");
+        print_ipv6(&v6);
+        println("");
+    } else {
+        print("dns: ");
+        print(name);
+        println(" AAAA = (none)");
+    }
 }
 
 /// `uname` — 打印内核报告的整行 `MorionOS <release> <machine>`（V1）。

@@ -37,6 +37,10 @@ shell: type 'help' for commands
 | `cat` | `cat <file>` | 打印文件内容（最多 4096 字节） |
 | `run` | `run <file>` | **从文件加载并运行一个程序**（E1/E2）：`morion::exec::spawn_file` 读入镜像 → 内核 `SYS_SPAWN_ELF` 载入**新域**；不等待它结束 |
 | `wget` | `wget [path]` | 从**客户机内建 HTTP 服务**（`10.0.2.15:80`，独立服务 `httpd_srv` 域 23）取一页并打印：走完整 TCP 客户端路径（`tcp_socket` → `tcp_bind 12349` → `tcp_connect` → `tcp_send "GET <path> HTTP/1.0"` → `tcp_recv` → `tcp_close`），握手与数据经栈内**回环**与服务端完成，无需任何外部服务端；`path` 省略则默认 `/` |
+| `net` / `ifconfig` | `net` | 打印各网卡链路状态：`nic<i> <型号> <up|down> mac=… ipv4=… gw=… [ipv6=… router=…]`（经 `morion::net::link_infos`） |
+| `ping` | `ping <ipv4\|ipv6\|host>` | IPv4 走 ICMP echo（`morion::net::ping4`）；IPv6 字面量自动转 `ping6`；主机名先 `resolve`（先 A 后 AAAA） |
+| `ping6` | `ping6 <ipv6\|host>` | IPv6 走 ICMPv6 echo（`morion::net::ping6`）；主机名先查 AAAA |
+| `dns` / `nslookup` | `dns <name>` | 解析 `<name>` 的 A 与 AAAA 记录各打印一行（走 slirp 内置 DNS `10.0.2.3`） |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -81,6 +85,10 @@ commands:
   cat <file>     print file content
   run <file>     load a .mex program from a file and run it (new domain)
   wget [path]    fetch a page from the guest's built-in HTTP server (10.0.2.15:80)
+  net            show link status (kind / mac / ipv4 / gw / ipv6)
+  ping <ip|host> ICMP echo over IPv4 (IPv6 literal delegates to ping6)
+  ping6 <ip|host>  ICMPv6 echo over IPv6
+  dns <name>     resolve A and AAAA records (alias: nslookup)
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file
@@ -158,6 +166,61 @@ run: loaded /hello.mex -> new domain 14
 exec: 我是运行时被加载的独立 ELF 程序 (morion-hello), 我的域 = 14, 入口 = 0x8000000000
 [morion@morion /]$
 ```
+
+### `net` / `ifconfig`
+
+打印**每张网卡一行**链路状态（数据来自协议栈 `netstack_srv`，经 `NETS_OP_NETINFO`）：
+
+```text
+nic0 virtio-net up mac=52:54:00:12:34:56 ipv4=10.0.2.15 gw=10.0.2.2 ipv6=fec0:0:0:0:5054:ff:fe12:3456 router=fe80:0:0:0:0:0:0:2
+nic1 e1000e up mac=52:54:00:aa:bb:cc ipv4=10.0.2.15 gw=10.0.2.2
+```
+
+- 字段：`nic<i>` = 网卡索引（与 `socket_on(nic)` 一致）；型号按内核 NIC 表的 kind 报出（`virtio-net` / `e1000e` / `e1000`）；
+  `ipv4` / `gw` 是本机地址与网关；`ipv6` / `router` 仅在**该网卡完成 SLAAC（收到 RA）**后出现。
+- 不需要端口能力（只发一条 `NETINFO` 请求），只需 shell 持 `SendTo(netstack_srv)`（内核已授）。
+- 协议栈未起 / 没有链路：`net: no link (netstack unavailable?)`。
+
+### `ping <ipv4|ipv6|host>`
+
+ICMP echo（IPv4）/ ICMPv6 echo（IPv6）：
+
+```text
+[morion@morion /]$ ping 10.0.2.2
+ping 10.0.2.2 ... reply
+[morion@morion /]$ ping fe80::2
+ping6 fe80:0:0:0:0:0:0:2 ... reply
+```
+
+- 参数是 **IPv6 字面量**时自动转 `ping6`；否则先按 IPv4 字面量解析，失败再 `resolve`（先 A 后 AAAA），解析到 v6 也转 `ping6`。
+- 输出 `ping <addr> ... reply` / `... no reply`（`ping6` 同理，前缀为 `ping6`）；应答有 **1 秒**上限，超时打 `no reply`。
+- 解析失败：`ping: cannot resolve (need IPv4 literal or A record)`。缺参数：`ping: usage: ping <ipv4|hostname>`。
+- 语义：经协议栈走**真实网卡** —— v4 目的为网关本身或经网关转发（发送前需先学到网关 MAC）；v6 链路本地目的用链路本地源 + RA 记录的路由器 MAC，全局目的用 SLAAC 地址。
+
+### `ping6 <ipv6|host>`
+
+```text
+[morion@morion /]$ ping6 fe80::2
+ping6 fe80:0:0:0:0:0:0:2 ... reply
+```
+
+- 只做 IPv6；参数非字面量时先查 **AAAA** 记录。
+- 解析失败：`ping6: cannot resolve (need IPv6 literal or AAAA record)`；缺参数：`ping6: usage: ping6 <ipv6|hostname>`。
+
+### `dns <name>` / `nslookup <name>`
+
+解析 `A` 与 `AAAA` 各打一行：
+
+```text
+[morion@morion /]$ dns example.com
+dns: example.com A = 93.184.216.34
+dns: example.com AAAA = 2606:2800:220:1:248:1893:25c8:1946
+```
+
+- 走 slirp 内置 DNS `10.0.2.3`（UDP 53），源端口 = `12345 + 域号`（shell 域 8 → **12353**）——
+  内核端口归属表**一个端口只归一个域**，故 DNS 源端口按域派生（否则 app 先绑的端口会让 shell 绑不上）；
+  它落在 shell 的 `Net(12345,12399)` 能力内，`netstack_srv` 再用 `SYS_NET_OWNER` 核对端口归属。
+- 查不到该类型时打印 `(none)`（离线时可能两条都是 `(none)`）；缺参数：`dns: usage: dns <name>`。
 
 ### `cd [path]`
 

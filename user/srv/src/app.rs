@@ -3392,13 +3392,16 @@ pub fn run() {
     net_ok &= net5_udp_socket(); // N6: 端口能力门禁 + UDP 回环 + 真实收帧
     net_ok &= net11_udp_e1000e(); // N9.2: 经第二台真网卡 (e1000e) 出口
     net_ok &= net21_udp_e1000(); // DRV-B: 经第三台网卡 (e1000) 出口
+    net_ok &= net22_netinfo(); // 网络完善: 链路状态查询（shell `net`）
+    net_ok &= net23_ping4(); // 网络完善: IPv4 ICMP echo（shell `ping`）
+    net_ok &= net24_ping6(); // 网络完善: IPv6 ICMPv6 echo（shell `ping6`）
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
     net_ok &= net19_dns_aaaa(); // V6.3: DNS AAAA（应用侧 IPv6 地址面）
     net_ok &= net20_udp6(); // V6.4: 双栈 UDP socket（::1 回环 + v4-mapped）
     net_ok &= net13_http(); // N8.2: 回环 TCP + 客户机内建 HTTP 服务
     if net_ok {
-        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http + udp6)");
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http + udp6 + netinfo + ping)");
     } else {
         println("app: NET7 app socket FAILED");
     }
@@ -4041,6 +4044,65 @@ fn net21_udp_e1000() -> bool {
     true
 }
 
+/// NET-22（网络完善）: 链路状态查询（shell `net`）确定性自证。
+/// 断言 NIC0 在线、MAC 非零、本机 IPv4/网关正确；若已 SLAAC 则全局 v6 非零。
+fn net22_netinfo() -> bool {
+    let mut infos = [morion::net::LinkInfo::zeroed(); 8];
+    let n = morion::net::link_infos(&mut infos);
+    if n == 0 {
+        println("app: NET22 net status FAILED (no link)");
+        return false;
+    }
+    let l = &infos[0];
+    let ok = l.is_up()
+        && l.mac != 0
+        && l.ipv4() == [10, 0, 2, 15]
+        && l.gw4() == [10, 0, 2, 2]
+        && (l.v6_up == 0 || l.v6 != [0u8; 16]);
+    if ok {
+        print("app: NET22 net status OK (links=");
+        print_u64(n as u64);
+        print(", nic0=");
+        print(l.kind_name());
+        println(")");
+    } else {
+        println("app: NET22 net status FAILED");
+    }
+    ok
+}
+
+/// NET-23（网络完善）: IPv4 ICMP echo —— 经协议栈 ping 网关 `10.0.2.2`（slirp 应答）。
+fn net23_ping4() -> bool {
+    let ok = morion::net::ping4([10, 0, 2, 2], 0);
+    if ok {
+        println("app: NET23 ping OK (10.0.2.2 replied)");
+    } else {
+        println("app: NET23 ping FAILED (no reply from gw)");
+    }
+    ok
+}
+
+/// NET-24（网络完善）: IPv6 ICMPv6 echo —— ping 路由器（SLAAC 记录的 RA 源，链路本地）。
+fn net24_ping6() -> bool {
+    let mut infos = [morion::net::LinkInfo::zeroed(); 8];
+    if morion::net::link_infos(&mut infos) == 0 {
+        println("app: NET24 ping6 SKIPPED (no link)");
+        return true;
+    }
+    let l = &infos[0];
+    if l.v6_up == 0 {
+        println("app: NET24 ping6 SKIPPED (no ipv6)");
+        return true;
+    }
+    if morion::net::ping6(&l.v6_gw, 0) {
+        println("app: NET24 ping6 OK (router replied)");
+        true
+    } else {
+        println("app: NET24 ping6 FAILED (no reply from router)");
+        false
+    }
+}
+
 /// NET-12 (N7.2): TCP 客户端经 socket API 主动连接真实对端。
 ///
 /// slirp 网关上大概率没有监听端口, 故期望收到 **RST**（连接被拒）—— 这恰好端到端取证了
@@ -4067,7 +4129,7 @@ fn net12_tcp_client() -> bool {
 ///
 /// ① 确定性自证: 手工构造含 A 记录 `198.51.100.7` 的应答, 验证解析器能取出 (不依赖网络);
 /// ② 真实查询: 经 `libnetv::getaddrinfo` 向 slirp 内置 DNS (`10.0.2.3:53`) 查 `example.com`,
-///    走 UDP socket + 端口能力 (源端口 12347 落在 app 的 `Net` 能力 `[12345,12350]` 内)。
+///    走 UDP socket + 端口能力 (源端口 = `12345 + 域号` = 12352, 落在 app 的 `Net` 能力内)。
 fn net8_dns() -> bool {
     match morion::net::dns_selftest() {
         Some(ip) => {

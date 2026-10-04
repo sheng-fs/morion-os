@@ -194,6 +194,28 @@ pub const NETS_OP_TACCEPT: u64 = 12;
 /// 目的 IPv6 经**共享页**传：`buf[0..16]` = 目的地址（`::ffff:a.b.c.d` 表示 v4-mapped，
 /// 走 IPv4 路径），`buf[16..16+len]` = 负载。
 pub const NETS_OP_SENDTO6: u64 = 13;
+/// 查询链路状态（shell `net` 命令）；`sock` = 网卡索引（`u64::MAX` = 全部网卡）。
+/// 回复写入共享页 `buf` 的 `NetLinkInfo` 数组，返回条数。
+pub const NETS_OP_NETINFO: u64 = 14;
+/// IPv4 ICMP echo（shell `ping`）；`sock` = 网卡索引，`addr` = 目的 IPv4（packed）。回复 1/0。
+pub const NETS_OP_PING4: u64 = 15;
+/// IPv6 ICMPv6 echo（shell `ping6`）；目的 IPv6 在共享页 `buf[0..16]`，`sock` = 网卡索引。回复 1/0。
+pub const NETS_OP_PING6: u64 = 16;
+
+/// 一条链路的状态快照（`NETS_OP_NETINFO` 输出；逐字段与 `morion::net::LinkInfo` 对齐）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetLinkInfo {
+    pub nic: u64,
+    pub kind: u64, // NIC_KIND_*
+    pub up: u64,
+    pub v4: u64, // 本机 IPv4（packed a<<24 | b<<16 | c<<8 | d）
+    pub gw4: u64,
+    pub mac: u64, // 低 48 位有效
+    pub v6_up: u64,
+    pub v6: [u8; 16],
+    pub v6_gw: [u8; 16],
+}
 
 /// 单条 UDP 负载上界（一页共享页内，留出帧头余量）。
 pub const NETS_PAYLOAD_MAX: u64 = 1472;

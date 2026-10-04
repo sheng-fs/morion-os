@@ -58,6 +58,9 @@ const ETH_IPV6: u16 = 0x86DD;
 const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_UDP: u8 = 17;
 const ICMP_UNREACH: u8 = 3;
+/// ICMPv4 echo request / reply（shell `ping`）。
+const ICMP_ECHO_REQ: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
 
 /// IPv6 目的 = 所有路由器组播 `ff02::2` 及其对应的组播 MAC。
 const V6_ALL_ROUTERS: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
@@ -130,6 +133,8 @@ fn put_mac(a: u64, m: [u8; 6]) {
 struct Link {
     domain: u64,
     io: u64,
+    /// NIC 型号（`NIC_KIND_*`，来自 NIC 表；`net` 命令展示用）。
+    kind: u64,
     mac: u64,
     gw_mac: Option<[u8; 6]>,
     up: bool,
@@ -141,10 +146,11 @@ struct Link {
 }
 
 impl Link {
-    const fn down(domain: u64, io: u64) -> Link {
+    const fn down(domain: u64, io: u64, kind: u64) -> Link {
         Link {
             domain,
             io,
+            kind,
             mac: 0,
             gw_mac: None,
             up: false,
@@ -218,7 +224,7 @@ struct Stack {
 impl Stack {
     const fn zeroed() -> Stack {
         Stack {
-            links: [Link::down(0, 0); NIC_MAX],
+            links: [Link::down(0, 0, 0); NIC_MAX],
             nics: 0,
             socks: [Sock::new(); MAX_SOCKS],
             tcons: [TcpConn::new(); MAX_TCONS],
@@ -2708,6 +2714,235 @@ fn sock_close(st: &mut Stack, id: u64) -> u64 {
     1
 }
 
+// ---------------------------------------------------------------------------
+// Shell 支持 op：链路状态（`net`）+ ICMP echo（`ping` / `ping6`）
+// ---------------------------------------------------------------------------
+
+/// ping 的有界等待上限（毫秒）。
+const PING_TIMEOUT_MS: u64 = 1000;
+
+/// 请求里的网卡索引（越界钳到 0）。
+fn req_nic(st: &Stack, req: &NetSReq) -> usize {
+    let i = req.sock as usize;
+    if i < st.nics {
+        i
+    } else {
+        0
+    }
+}
+
+fn pack_ip4(ip: [u8; 4]) -> u64 {
+    ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16) | ((ip[2] as u64) << 8) | ip[3] as u64
+}
+fn unpack_ip4(v: u64) -> [u8; 4] {
+    [(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+}
+
+/// 构造 IPv4 ICMP echo request（目的 `dst`，负载从 `payload_va` 拷入）；返回帧长。
+#[allow(clippy::too_many_arguments)]
+fn build_echo4(
+    io: u64,
+    mac: [u8; 6],
+    dst_mac: [u8; 6],
+    dst: [u8; 4],
+    id: u16,
+    seq: u16,
+    payload_va: u64,
+    plen: u64,
+) -> u64 {
+    put_mac(io, dst_mac);
+    put_mac(io + 6, mac);
+    wr16be(io + 12, ETH_IPV4);
+    let ip = io + 14;
+    let total = 20 + 8 + plen;
+    wr8(ip, 0x45);
+    wr8(ip + 1, 0);
+    wr16be(ip + 2, total as u16);
+    wr16be(ip + 4, 0);
+    wr16be(ip + 6, 0x4000); // DF
+    wr8(ip + 8, 64);
+    wr8(ip + 9, IP_PROTO_ICMP);
+    wr16be(ip + 10, 0);
+    for (i, b) in OUR_IP.iter().enumerate() {
+        wr8(ip + 12 + i as u64, *b);
+        wr8(ip + 16 + i as u64, dst[i]);
+    }
+    wr16be(ip + 10, csum(ip, 20));
+    let ic = ip + 20;
+    wr8(ic, ICMP_ECHO_REQ);
+    wr8(ic + 1, 0);
+    wr16be(ic + 2, 0); // 算校验和前先清零
+    wr16be(ic + 4, id);
+    wr16be(ic + 6, seq);
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload_va as *const u8, (ic + 8) as *mut u8, plen as usize);
+    }
+    wr16be(ic + 2, csum(ic, 8 + plen));
+    14 + total
+}
+
+/// 判定共享页里的一帧是否为我们发出的 IPv4 ICMP echo 的应答（源 = `dst`，id/seq 匹配）。
+fn is_echo_reply4(io: u64, n: u64, dst: [u8; 4], id: u16, seq: u16) -> bool {
+    if n < 14 + 20 + 8 || rd16be(io + 12) != ETH_IPV4 {
+        return false;
+    }
+    let ip = io + 14;
+    let ihl = ((rd8(ip) & 0x0f) as u64) * 4;
+    if ihl < 20 || n < 14 + ihl + 8 || rd8(ip + 9) != IP_PROTO_ICMP {
+        return false;
+    }
+    let src = [rd8(ip + 12), rd8(ip + 13), rd8(ip + 14), rd8(ip + 15)];
+    if src != dst {
+        return false;
+    }
+    let ic = ip + ihl;
+    rd8(ic) == ICMP_ECHO_REPLY && rd16be(ic + 4) == id && rd16be(ic + 6) == seq
+}
+
+/// `NETS_OP_NETINFO`：把链路状态写入共享页 `buf`（`sock` = nic 或 `u64::MAX` = 全部），返回条数。
+fn sock_netinfo(st: &Stack, req: &NetSReq) -> u64 {
+    let all = req.sock == u64::MAX;
+    let ent = core::mem::size_of::<NetLinkInfo>() as u64;
+    let mut count = 0u64;
+    let mut i = 0usize;
+    while i < st.nics {
+        if all || i as u64 == req.sock {
+            let l = &st.links[i];
+            let info = NetLinkInfo {
+                nic: i as u64,
+                kind: l.kind,
+                up: if l.up { 1 } else { 0 },
+                v4: pack_ip4(OUR_IP),
+                gw4: pack_ip4(GW_IP),
+                mac: l.mac,
+                v6_up: if l.v6_up { 1 } else { 0 },
+                v6: l.v6_global,
+                v6_gw: l.v6_gw,
+            };
+            unsafe {
+                core::ptr::write_unaligned((req.buf + count * ent) as *mut NetLinkInfo, info);
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// `NETS_OP_PING4`：发 ICMP echo 到 `addr`，有界等待应答。回复 1（收到）/ 0。
+fn sock_ping4(st: &mut Stack, req: &NetSReq, now: u64) -> u64 {
+    let nic = req_nic(st, req);
+    if !st.links[nic].up {
+        return 0;
+    }
+    let dst = unpack_ip4(req.addr);
+    if dst == OUR_IP {
+        return 1; // ping 本机
+    }
+    if st.links[nic].gw_mac.is_none() {
+        arp_learn_gw(st, nic);
+    }
+    let gw = match st.links[nic].gw_mac {
+        Some(m) => m,
+        None => return 0,
+    };
+    let id = 0x4d4fu16;
+    let seq = 1u16;
+    let payload = b"morion-ping";
+    let len = build_echo4(
+        st.links[nic].io,
+        mac_bytes(st.links[nic].mac),
+        gw,
+        dst,
+        id,
+        seq,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    if !link_tx(&st.links[nic], len) {
+        return 0;
+    }
+    let mut waited = 0u64;
+    while waited < PING_TIMEOUT_MS {
+        while let Some(n) = link_rx(&st.links[nic]) {
+            if is_echo_reply4(st.links[nic].io, n, dst, id, seq) {
+                return 1;
+            }
+            handle_frame(st, nic, n, now);
+        }
+        sys_sleep(5);
+        waited += 5;
+    }
+    0
+}
+
+/// `NETS_OP_PING6`：目的 IPv6 在共享页 `buf[0..16]`；有界等 ICMPv6 echo reply。回复 1/0。
+fn sock_ping6(st: &mut Stack, req: &NetSReq, now: u64) -> u64 {
+    let nic = req_nic(st, req);
+    if !st.links[nic].up || !st.links[nic].v6_up {
+        return 0;
+    }
+    let dst = get_v6(req.buf);
+    let io = st.links[nic].io;
+    let mac = mac_bytes(st.links[nic].mac);
+    // 目的为链路本地（fe80::/10）时源也用链路本地，否则用 SLAAC 全局地址。
+    let link_local = dst[0] == 0xfe && (dst[1] & 0xc0) == 0x80;
+    let src = if link_local {
+        link_local_from_mac(mac)
+    } else {
+        link_v6_primary(st, nic)
+    };
+    if v6_eq(&dst, &src) {
+        return 1; // ping 本机
+    }
+    let gw_mac = match st.links[nic].gw6_mac {
+        Some(m) => m,
+        None => return 0, // 尚无路由器 MAC（未收到 RA/未解出）
+    };
+    // 链路本地目的只支持路由器本身（其余需 NDP 解析，暂不支持）。
+    if link_local && !v6_eq(&dst, &st.links[nic].v6_gw) {
+        return 0;
+    }
+    let id = 0x4d4fu16;
+    let seq = 1u16;
+    let payload = b"morion-ping6";
+    let len = build_echo6(
+        io,
+        mac,
+        gw_mac,
+        &src,
+        &dst,
+        id,
+        seq,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    if !link_tx(&st.links[nic], len) {
+        return 0;
+    }
+    let mut waited = 0u64;
+    while waited < PING_TIMEOUT_MS {
+        while let Some(n) = link_rx(&st.links[nic]) {
+            if rd16be(io + 12) == ETH_IPV6 {
+                if let Some(info) = ipv6_parse(io, n) {
+                    if info.next == IP6_PROTO_ICMPV6
+                        && rd8(info.payload_off) == ICMPV6_ECHO_REPLY
+                        && rd16be(info.payload_off + 4) == id
+                        && rd16be(info.payload_off + 6) == seq
+                        && v6_eq(&info.src, &dst)
+                    {
+                        return 1;
+                    }
+                }
+            }
+            handle_frame(st, nic, n, now);
+        }
+        sys_sleep(5);
+        waited += 5;
+    }
+    0
+}
+
 fn serve_app(st: &mut Stack, now: u64) {
     loop {
         let mut msg = Message {
@@ -2750,6 +2985,10 @@ fn serve_app(st: &mut Stack, now: u64) {
                 tcp_listen_internal(st, req.sock as usize, req.port as u16, msg.from)
             }
             NETS_OP_TACCEPT => tcp_accept_internal(st, req.sock, msg.from),
+            // Shell 支持（网络完善）：链路状态查询 + ICMP echo（IPv4/IPv6）。
+            NETS_OP_NETINFO => sock_netinfo(st, &req),
+            NETS_OP_PING4 => sock_ping4(st, &req, now),
+            NETS_OP_PING6 => sock_ping6(st, &req, now),
             _ => 0,
         };
         let _ = sys_reply(reply);
@@ -2782,7 +3021,7 @@ pub fn run() {
     let mut i = 0usize;
     while i < count {
         let e = tbl.entries[i];
-        st.links[i] = Link::down(e.domain, e.io_vaddr);
+        st.links[i] = Link::down(e.domain, e.io_vaddr, e.kind);
         if sys_alloc_page(e.io_vaddr) != 1 || sys_share_page(e.io_vaddr, e.domain) != 1 {
             print("netstack: cannot share IO page (nic");
             print_u64(i as u64);

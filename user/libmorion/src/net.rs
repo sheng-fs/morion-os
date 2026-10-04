@@ -25,7 +25,74 @@ const NETS_OP_TCLOSE: u64 = 10;
 const NETS_OP_TLISTEN: u64 = 11;
 const NETS_OP_TACCEPT: u64 = 12;
 const NETS_OP_SENDTO6: u64 = 13;
+const NETS_OP_NETINFO: u64 = 14;
+const NETS_OP_PING4: u64 = 15;
+const NETS_OP_PING6: u64 = 16;
 const NETS_PAYLOAD_MAX: u64 = 1472;
+
+/// 一条链路的状态快照（与 `common::NetLinkInfo` 逐字段一致；shell `net` 命令用）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinkInfo {
+    pub nic: u64,
+    pub kind: u64, // NIC_KIND_*
+    pub up: u64,
+    pub v4: u64, // packed a<<24 | b<<16 | c<<8 | d
+    pub gw4: u64,
+    pub mac: u64, // 低 48 位有效
+    pub v6_up: u64,
+    pub v6: [u8; 16],
+    pub v6_gw: [u8; 16],
+}
+
+impl LinkInfo {
+    /// 全零快照（数组初始化用）。
+    pub const fn zeroed() -> LinkInfo {
+        LinkInfo {
+            nic: 0,
+            kind: 0,
+            up: 0,
+            v4: 0,
+            gw4: 0,
+            mac: 0,
+            v6_up: 0,
+            v6: [0; 16],
+            v6_gw: [0; 16],
+        }
+    }
+    /// `kind` → 可读型号名。
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            1 => "virtio-net",
+            2 => "e1000e",
+            3 => "e1000",
+            _ => "nic",
+        }
+    }
+    pub fn is_up(&self) -> bool {
+        self.up != 0
+    }
+    pub fn ipv4(&self) -> [u8; 4] {
+        [
+            (self.v4 >> 24) as u8,
+            (self.v4 >> 16) as u8,
+            (self.v4 >> 8) as u8,
+            self.v4 as u8,
+        ]
+    }
+    pub fn gw4(&self) -> [u8; 4] {
+        [
+            (self.gw4 >> 24) as u8,
+            (self.gw4 >> 16) as u8,
+            (self.gw4 >> 8) as u8,
+            self.gw4 as u8,
+        ]
+    }
+    pub fn mac_bytes(&self) -> [u8; 6] {
+        let b = self.mac.to_le_bytes();
+        [b[0], b[1], b[2], b[3], b[4], b[5]]
+    }
+}
 
 /// 与 netstack_srv 传递负载的共享页**基址**（同址共享）。
 ///
@@ -254,7 +321,18 @@ pub const fn ip4(a: u8, b: u8, c: u8, d: u8) -> u32 {
 const NET_DNS: u32 = ip4(10, 0, 2, 3);
 /// DNS 服务端口与本地源端口（源端口须落在应用的 `Net` 能力范围内）。
 const DNS_PORT: u16 = 53;
-const DNS_LOCAL_PORT: u16 = 12347;
+/// DNS 客户端源端口**基址**：实际端口按域派生 = `base + domain_id()`。
+///
+/// 内核的端口归属表**一个端口只归一个域**（`kernel/src/net.rs`），若所有客户端都用同一个
+/// 源端口，先绑的域会把端口占住（引导期域不会销毁 → 归属不清），别的域再也绑不上 ——
+/// 表现为「app 能解析、shell 不能」。故源端口按域错开；调用方（app / shell）的 `Net` 能力
+/// 范围须覆盖 `base + 自己的域号`。
+const DNS_LOCAL_PORT_BASE: u16 = 12345;
+
+/// 本域的 DNS 源端口（`base + domain_id`）。
+fn dns_local_port() -> u16 {
+    DNS_LOCAL_PORT_BASE + crate::syscall::domain_id() as u16
+}
 /// 查询 id（固定值，便于解析时校验；同时用于自证）。
 const DNS_ID: u16 = 0x4D4F;
 
@@ -395,7 +473,7 @@ pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
         return false;
     }
     let mut ok = false;
-    if bind(sock, DNS_LOCAL_PORT) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
+    if bind(sock, dns_local_port()) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
         let mut rbuf = [0u8; 512];
         let mut i = 0;
         while i < 50 {
@@ -491,7 +569,7 @@ pub fn getaddrinfo6(name: &str, out_ip: &mut [u8; 16]) -> bool {
         return false;
     }
     let mut ok = false;
-    if bind(sock, DNS_LOCAL_PORT) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
+    if bind(sock, dns_local_port()) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
         let mut rbuf = [0u8; 512];
         let mut i = 0;
         while i < 50 {
@@ -522,4 +600,165 @@ pub fn resolve(name: &str) -> Option<IpAddr> {
         return Some(IpAddr::V6(v6));
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// 链路状态 / ICMP echo / 地址字面量解析（shell `net` / `ping` / `ping6`）
+// ---------------------------------------------------------------------------
+
+/// 查询网卡 `nic` 的链路状态（`NETS_OP_NETINFO`）。
+pub fn link_info(nic: u64) -> Option<LinkInfo> {
+    if !ensure() {
+        return None;
+    }
+    if call(NETS_OP_NETINFO, nic, 0, 0, 0) == 0 {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_unaligned(share_vaddr() as *const LinkInfo) })
+}
+
+/// 查询**所有**网卡的链路状态（按序写入 `out`，返回条数）。
+pub fn link_infos(out: &mut [LinkInfo]) -> usize {
+    if !ensure() {
+        return 0;
+    }
+    let n = call(NETS_OP_NETINFO, u64::MAX, 0, 0, 0) as usize;
+    let m = n.min(out.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(share_vaddr() as *const LinkInfo, out.as_mut_ptr(), m);
+    }
+    m
+}
+
+/// IPv4 ICMP echo（`ping`）。返回是否收到应答。
+pub fn ping4(addr: [u8; 4], nic: u64) -> bool {
+    if !ensure() {
+        return false;
+    }
+    let a = ((addr[0] as u64) << 24)
+        | ((addr[1] as u64) << 16)
+        | ((addr[2] as u64) << 8)
+        | addr[3] as u64;
+    call(NETS_OP_PING4, nic, 0, a, 0) == 1
+}
+
+/// IPv6 ICMPv6 echo（`ping6`）。返回是否收到应答。
+pub fn ping6(addr: &[u8; 16], nic: u64) -> bool {
+    if !ensure() {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr.as_ptr(), share_vaddr() as *mut u8, 16);
+    }
+    call(NETS_OP_PING6, nic, 0, 0, 0) == 1
+}
+
+/// 解析点分十进制 IPv4 字面量（恰好 4 段、每段 0..=255）。
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut part = 0usize;
+    let mut val = 0u32;
+    let mut digits = 0usize;
+    for c in s.bytes() {
+        match c {
+            b'0'..=b'9' => {
+                val = val * 10 + (c - b'0') as u32;
+                if val > 255 {
+                    return None;
+                }
+                digits += 1;
+            }
+            b'.' => {
+                if digits == 0 || part >= 3 {
+                    return None;
+                }
+                out[part] = val as u8;
+                part += 1;
+                val = 0;
+                digits = 0;
+            }
+            _ => return None,
+        }
+    }
+    if digits == 0 || part != 3 {
+        return None;
+    }
+    out[3] = val as u8;
+    Some(out)
+}
+
+/// 把一段冒号分隔的 16 进制组解析进 `out`（从 `start` 起），返回写到的下标。
+fn parse_hex_groups(s: &str, out: &mut [u16], start: usize) -> Option<usize> {
+    let mut n = start;
+    if s.is_empty() {
+        return Some(n);
+    }
+    for g in s.split(':') {
+        if g.is_empty() || n >= out.len() {
+            return None;
+        }
+        let mut v: u32 = 0;
+        let mut d = 0;
+        for c in g.bytes() {
+            let x = match c {
+                b'0'..=b'9' => (c - b'0') as u32,
+                b'a'..=b'f' => (c - b'a' + 10) as u32,
+                b'A'..=b'F' => (c - b'A' + 10) as u32,
+                _ => return None,
+            };
+            v = v * 16 + x;
+            d += 1;
+            if d > 4 {
+                return None;
+            }
+        }
+        out[n] = v as u16;
+        n += 1;
+    }
+    Some(n)
+}
+
+/// 解析 IPv6 字面量（支持 `::` 压缩与末尾内嵌 IPv4，如 `::ffff:10.0.2.15`）。
+pub fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
+    // 末尾内嵌 IPv4（点分）→ 先用两组 u16 表示，稍后写入末尾。
+    let mut work = s;
+    let mut v4_tail: Option<[u8; 4]> = None;
+    if let Some(pos) = s.rfind(':') {
+        let last = &s[pos + 1..];
+        if last.contains('.') {
+            v4_tail = Some(parse_ipv4(last)?);
+            work = &s[..pos];
+        }
+    }
+    let mut groups = [0u16; 8];
+    let (left, right, compress) = match work.find("::") {
+        Some(i) => (&work[..i], &work[i + 2..], true),
+        None => (work, "", false),
+    };
+    let nl = parse_hex_groups(left, &mut groups, 0)?;
+    let v4s = usize::from(v4_tail.is_some()) * 2;
+    if compress {
+        let mut rg = [0u16; 8];
+        let nr = parse_hex_groups(right, &mut rg, 0)?;
+        let used = nl + nr + v4s;
+        if used > 8 {
+            return None;
+        }
+        let rstart = nl + (8 - used);
+        for (k, g) in rg[..nr].iter().enumerate() {
+            groups[rstart + k] = *g;
+        }
+    } else if nl + v4s != 8 {
+        return None;
+    }
+    if let Some(v4) = v4_tail {
+        groups[6] = ((v4[0] as u16) << 8) | v4[1] as u16;
+        groups[7] = ((v4[2] as u16) << 8) | v4[3] as u16;
+    }
+    let mut out = [0u8; 16];
+    for (i, g) in groups.iter().enumerate() {
+        out[i * 2] = (*g >> 8) as u8;
+        out[i * 2 + 1] = *g as u8;
+    }
+    Some(out)
 }
