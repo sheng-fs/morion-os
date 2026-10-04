@@ -4084,10 +4084,11 @@ fn contains(h: &[u8], n: &[u8]) -> bool {
     false
 }
 
-/// NET-13 (N8.2): 经**回环 TCP** 从客户机内建 HTTP 服务 (`10.0.2.15:80`) 取一个页面。
+/// NET-13 (N8.2): 经**回环 TCP** 从客户机内建 HTTP 服务 (`10.0.2.15:80`, 独立服务 httpd_srv)
+/// 取一个页面。
 ///
 /// 这是 N8.2 的端到端验收：真实 TCP 三次握手（被动打开）+ 请求/响应 + FIN，全部在客户机内
-/// 完成（netstack 内建 HTTP 服务即"环境"），无需任何外部服务端。
+/// 完成（httpd_srv 监听 :80 即"环境"），无需任何外部服务端。
 fn net13_http() -> bool {
     const CPORT: u16 = 12348;
     let sock = morion::net::tcp_socket();

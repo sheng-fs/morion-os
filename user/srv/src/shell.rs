@@ -348,7 +348,7 @@ fn print_bytes(b: &[u8]) {
     }
 }
 
-/// `wget <path>` — 从客户机**内建 HTTP 服务**（`10.0.2.15:80`，见 netstack_srv）取一个页面并打印。
+/// `wget <path>` — 从客户机**内建 HTTP 服务**（`10.0.2.15:80`，见独立服务 httpd_srv）取一个页面并打印。
 ///
 /// 走完整的 TCP 客户端路径（socket/bind/connect/send/recv/close），握手与数据经栈内**回环**
 /// 与服务端完成 —— 无需任何外部服务端。

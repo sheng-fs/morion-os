@@ -292,6 +292,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 域 22 — e1000e_srv (第二台真网卡 Intel 82574L 驱动, N9): 仍走通用设备授权; 第一版全轮询,
     // 不申请中断向量。与 virtio-net 并列, 证明"驱动 ≠ 栈"——同一套帧级 IPC、换硬件模型。
     let e1000e_domain = domain::create();
+    // 域 23 — httpd_srv (客户机内建 HTTP 服务, 从 netstack_srv 拆出): 无设备, 经 netstack
+    // 的 TCP 原语在 :80 监听并回固定响应; 端口能力 `Net(80)` 由内核显式授予。
+    let httpd_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -620,6 +623,12 @@ pub extern "C" fn kernel_main() -> ! {
     // `NetReq` 契约 (SendTo + MapInto)。协议栈因此能按网卡索引选出口, 上层 socket API 不变。
     cap::grant(netstack_domain, cap::Capability::SendTo(e1000e_domain));
     cap::grant(netstack_domain, cap::Capability::MapInto(e1000e_domain));
+
+    // 授权 (N8.2 拆分): httpd_srv (域 23) 经 netstack 用 TCP 原语 (SendTo + MapInto), 并持
+    // 一条 `Net(80)` 端口能力 —— 监听 :80 时协议栈会用 `SYS_NET_OWNER` 核对归属, 越权不可伪造。
+    cap::grant(httpd_domain, cap::Capability::SendTo(netstack_domain));
+    cap::grant(httpd_domain, cap::Capability::MapInto(netstack_domain));
+    cap::grant(httpd_domain, cap::Capability::Net(80, 80));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。

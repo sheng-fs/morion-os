@@ -69,7 +69,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv httpd_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built

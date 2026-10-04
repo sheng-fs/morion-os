@@ -22,10 +22,21 @@ const NETS_OP_TCONNECT: u64 = 7;
 const NETS_OP_TSEND: u64 = 8;
 const NETS_OP_TRECV: u64 = 9;
 const NETS_OP_TCLOSE: u64 = 10;
+const NETS_OP_TLISTEN: u64 = 11;
+const NETS_OP_TACCEPT: u64 = 12;
 const NETS_PAYLOAD_MAX: u64 = 1472;
 
-/// 与 netstack_srv 传递负载的共享页（同址共享）。
-const SHARE_VADDR: u64 = 0x0000_0080_001B_0000;
+/// 与 netstack_srv 传递负载的共享页**基址**（同址共享）。
+///
+/// 每个客户端域实际用**各自的一页** = 基址 + `domain_id * 4 KiB`。netstack 按请求里的
+/// `buf` 在**同址**读写，若多个客户端用同一个 VA，后共享者的页会覆盖前者 —— netstack
+/// 于是读到/写到别的域的页。libvfs 用 `RESULT_BUF` / `SHELL_RESULT_BUF` 区分是同一道理。
+const SHARE_BASE: u64 = 0x0000_0080_001B_0000;
+
+/// 本域的负载共享页虚拟地址（按域派生，保证 netstack 的多个客户端互不覆盖）。
+fn share_vaddr() -> u64 {
+    SHARE_BASE + crate::syscall::domain_id() * 0x1000
+}
 
 /// 套接字服务请求（与 `common::NetSReq` 逐字节一致）。
 #[repr(C)]
@@ -47,7 +58,8 @@ fn ensure() -> bool {
         if INITED {
             return true;
         }
-        if sys_alloc_page(SHARE_VADDR) != 1 || sys_share_page(SHARE_VADDR, NETSTACK_DOMAIN) != 1 {
+        let va = share_vaddr();
+        if sys_alloc_page(va) != 1 || sys_share_page(va, NETSTACK_DOMAIN) != 1 {
             return false;
         }
         INITED = true;
@@ -62,7 +74,7 @@ fn call(op: u64, sock: u64, port: u64, addr: u64, len: u64) -> u64 {
         port,
         addr,
         len,
-        buf: SHARE_VADDR,
+        buf: share_vaddr(),
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -101,7 +113,7 @@ pub fn sendto(sock: u64, port: u16, addr: u32, payload: &[u8]) -> bool {
     }
     let n = payload.len().min(NETS_PAYLOAD_MAX as usize);
     unsafe {
-        core::ptr::copy_nonoverlapping(payload.as_ptr(), SHARE_VADDR as *mut u8, n);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), share_vaddr() as *mut u8, n);
     }
     call(NETS_OP_SENDTO, sock, port as u64, addr as u64, n as u64) == 1
 }
@@ -117,7 +129,7 @@ pub fn recvfrom(sock: u64, out: &mut [u8]) -> u64 {
     }
     let n = r.min(out.len() as u64).min(NETS_PAYLOAD_MAX);
     unsafe {
-        core::ptr::copy_nonoverlapping(SHARE_VADDR as *const u8, out.as_mut_ptr(), n as usize);
+        core::ptr::copy_nonoverlapping(share_vaddr() as *const u8, out.as_mut_ptr(), n as usize);
     }
     n
 }
@@ -161,7 +173,7 @@ pub fn tcp_send(sock: u64, payload: &[u8]) -> bool {
     }
     let n = payload.len().min(NETS_PAYLOAD_MAX as usize);
     unsafe {
-        core::ptr::copy_nonoverlapping(payload.as_ptr(), SHARE_VADDR as *mut u8, n);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), share_vaddr() as *mut u8, n);
     }
     call(NETS_OP_TSEND, sock, 0, 0, n as u64) == 1
 }
@@ -177,7 +189,7 @@ pub fn tcp_recv(sock: u64, out: &mut [u8]) -> u64 {
     }
     let n = r.min(out.len() as u64).min(NETS_PAYLOAD_MAX);
     unsafe {
-        core::ptr::copy_nonoverlapping(SHARE_VADDR as *const u8, out.as_mut_ptr(), n as usize);
+        core::ptr::copy_nonoverlapping(share_vaddr() as *const u8, out.as_mut_ptr(), n as usize);
     }
     n
 }
@@ -188,6 +200,23 @@ pub fn tcp_close(sock: u64) -> bool {
         return false;
     }
     call(NETS_OP_TCLOSE, sock, 0, 0, 0) == 1
+}
+
+/// 在 NIC 0 上建 TCP 监听者（被动打开）：先经内核登记端口归属（需 `Net` 能力），再让协议栈
+/// 监听。返回监听者 id（>0）/ 0，可反复喂给 [`tcp_accept`]。
+pub fn tcp_listen(port: u16) -> u64 {
+    if !ensure() || sys_net_bind(port) != 1 {
+        return 0;
+    }
+    call(NETS_OP_TLISTEN, 0, port as u64, 0, 0)
+}
+
+/// 接受一个已建立的连接（`listener` 为 [`tcp_listen`] 返回的 id）。返回服务端连接 id（>0）/ 0。
+pub fn tcp_accept(listener: u64) -> u64 {
+    if !ensure() {
+        return 0;
+    }
+    call(NETS_OP_TACCEPT, listener, 0, 0, 0)
 }
 
 /// 把 IPv4 地址编码成 `a<<24 | b<<16 | c<<8 | d`（`sendto` 的 `addr` 用）。

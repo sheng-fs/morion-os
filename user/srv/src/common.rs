@@ -150,6 +150,10 @@ pub const NETS_OP_TSEND: u64 = 8;
 pub const NETS_OP_TRECV: u64 = 9;
 /// 关 TCP 连接; 回复 1。
 pub const NETS_OP_TCLOSE: u64 = 10;
+/// 建 TCP 监听者（被动打开）; 请求 `sock` = 网卡索引, `port` = 监听端口; 回复连接 id（>0）/ 0。
+pub const NETS_OP_TLISTEN: u64 = 11;
+/// 接受一个已建立的服务端连接; 请求 `sock` = 监听者 id; 回复服务端连接 id（>0）/ 0。
+pub const NETS_OP_TACCEPT: u64 = 12;
 
 /// 单条 UDP 负载上界（一页共享页内，留出帧头余量）。
 pub const NETS_PAYLOAD_MAX: u64 = 1472;

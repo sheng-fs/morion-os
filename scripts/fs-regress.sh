@@ -244,7 +244,12 @@ grep -qE 'app: NET8 dns parser OK, A=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET8 dns OK, A=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET7 app socket OK' "$log" 2>/dev/null || net_bad=1
 # N8.2 (回环 TCP + 客户机内建 HTTP): 应用对 10.0.2.15:80 发起真实 HTTP GET, 返回 200 + body。
+# HTTP 服务此时已拆成**独立服务域** httpd_srv (域 23) —— 启动即打印监听行。
+grep -qE 'httpd: listening on :80' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET13 http OK' "$log" 2>/dev/null || net_bad=1
+# R1 取证 (IPv6): 自派生链路本地 fe80:: + slirp 应答 RS 回 RA (前缀 fec0::/64)。
+grep -qE 'NET16 ipv6 ll=fe80:' "$log" 2>/dev/null || net_bad=1
+grep -qE 'NET16 ipv6 ra rx' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。

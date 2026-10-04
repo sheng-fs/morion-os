@@ -4655,7 +4655,7 @@ struct Cred {
 /// 低权身份 `1000:1000`。**域号会复用**, 但本映射是按域号**现算**的确定性函数
 /// (不缓存用户可选身份), 复用后仍是同一档身份, 不存在"继承旧身份"问题。
 /// 目标形态改由认证服务签发 `Cred` 时, 才需要随域销毁失效的凭证表。
-const MFS_BOOT_DOMAINS: u64 = 23;
+const MFS_BOOT_DOMAINS: u64 = 24;
 const MFS_UID_ROOT: u16 = 0;
 const MFS_GID_ROOT: u16 = 0;
 const MFS_UID_USER: u16 = 1000;

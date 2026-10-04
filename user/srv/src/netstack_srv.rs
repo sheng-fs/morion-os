@@ -40,9 +40,18 @@ const PAY_MAX: usize = NETS_PAYLOAD_MAX as usize;
 
 const ETH_IPV4: u16 = 0x0800;
 const ETH_ARP: u16 = 0x0806;
+const ETH_IPV6: u16 = 0x86DD;
 const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_UDP: u8 = 17;
 const ICMP_UNREACH: u8 = 3;
+
+/// IPv6 目的 = 所有路由器组播 `ff02::2` 及其对应的组播 MAC。
+const V6_ALL_ROUTERS: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+const V6_MAC_ALL_ROUTERS: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x02];
+const IP6_PROTO_ICMPV6: u8 = 58;
+const ICMPV6_RS: u8 = 133;
+const ICMPV6_RA: u8 = 134;
+const ICMPV6_NA: u8 = 136;
 
 // ---------------------------------------------------------------------------
 // 字节序 / 校验和（在 u64 虚拟地址上操作）
@@ -267,6 +276,157 @@ fn build_udp(
     14 + 20 + 8 + plen
 }
 
+// ---------------------------------------------------------------------------
+// IPv6（R1 取证：RS / RA）
+//
+// 本段只为**取证** slirp 的 IPv6 行为（是否有 RA、前缀、DNSv6 地址），据此校准 V6.1 的 SLAAC。
+// 只发一个路由请求、打印收到的通告，**不建地址/邻居状态**。
+// ---------------------------------------------------------------------------
+
+/// 由 MAC 派生 EUI-64 链路本地地址 `fe80::/64`（RFC 4291 附录 A：中间插 `ff:fe`，首字节反转 U/L 位）。
+fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
+    [
+        0xfe,
+        0x80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
+}
+
+/// IPv6 伪首部 + 之上的 16 位反码校验和（RFC 8200 §8.1，供 ICMPv6 用）。
+fn csum_v6(src: &[u8; 16], dst: &[u8; 16], next: u8, seg: u64, len: u64) -> u16 {
+    let ph = [0u8; 40];
+    let p = ph.as_ptr() as u64;
+    let mut i = 0u64;
+    while i < 16 {
+        wr8(p + i, src[i as usize]);
+        wr8(p + 16 + i, dst[i as usize]);
+        i += 1;
+    }
+    wr32be(p + 32, len as u32);
+    wr8(p + 39, next);
+    let s = csum_acc(p, 40, 0);
+    let s = csum_acc(seg, len, s);
+    !csum_fold(s)
+}
+
+/// 在某链路共享页里拼一个 IPv6 路由请求（RS：目的 `ff02::2`，带「源链路层地址」选项）；返回帧长。
+fn build_rs(l: &Link) -> u64 {
+    let f = l.io;
+    let src = link_local_from_mac(mac_bytes(l.mac));
+    put_mac(f, V6_MAC_ALL_ROUTERS);
+    put_mac(f + 6, mac_bytes(l.mac));
+    wr16be(f + 12, ETH_IPV6);
+    let ip = f + 14;
+    wr8(ip, 0x60); // version 6
+    wr16be(ip + 4, 16); // payload length = ICMPv6(8) + SLLAO(8)
+    wr8(ip + 6, IP6_PROTO_ICMPV6);
+    wr8(ip + 7, 255); // hop limit
+    let mut i = 0u64;
+    while i < 16 {
+        wr8(ip + 8 + i, src[i as usize]);
+        wr8(ip + 24 + i, V6_ALL_ROUTERS[i as usize]);
+        i += 1;
+    }
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_RS);
+    wr16be(ic + 2, 0);
+    wr8(ic + 8, 1); // 选项：类型 1 = 源链路层地址
+    wr8(ic + 9, 1); // 长度 1 → 8 字节
+    put_mac(ic + 10, mac_bytes(l.mac));
+    let c = csum_v6(&src, &V6_ALL_ROUTERS, IP6_PROTO_ICMPV6, ic, 16);
+    wr16be(ic + 2, c);
+    14 + 40 + 16
+}
+
+/// 以 `hhhh:hhhh:…` 打印 VA 处的 16 字节 IPv6 地址（取证用）。
+fn print_v6(a: u64) {
+    let mut i = 0u64;
+    while i < 8 {
+        print_hex(rd16be(a + i * 2) as u64);
+        if i != 7 {
+            print(":");
+        }
+        i += 1;
+    }
+}
+
+/// 取证：解析收到的 IPv6 帧里的 ICMPv6，把 RA（含前缀选项）/ NA 打印出来。
+fn ipv6_handle(io: u64, n: u64) {
+    if n < 14 + 40 {
+        return;
+    }
+    let ip = io + 14;
+    if (rd8(ip) >> 4) != 6 || rd8(ip + 6) != IP6_PROTO_ICMPV6 {
+        return;
+    }
+    let plen = rd16be(ip + 4) as u64;
+    if plen < 4 || n < 14 + 40 + plen {
+        return;
+    }
+    let ic = ip + 40;
+    let end = ic + plen;
+    let ty = rd8(ic);
+    if ty == ICMPV6_RA {
+        print("NET16 ipv6 ra rx, prefix=");
+        // RA 定长部分 16 字节，其后是选项；Prefix Information = 类型 3，前缀在选项 +16。
+        let mut o = ic + 16;
+        while o + 8 <= end {
+            let ot = rd8(o);
+            let ol = (rd8(o + 1) as u64) * 8;
+            if ol < 8 {
+                break;
+            }
+            if ot == 3 && ol >= 32 {
+                print_v6(o + 16);
+                print(" ");
+            }
+            o += ol;
+        }
+        println("(rs/ra probe) OK");
+    } else if ty == ICMPV6_NA {
+        println("NET16 ipv6 na rx");
+    }
+}
+
+/// R1 取证驱动：发一个 IPv6 路由请求，有界收包（400ms），打印链路本地地址与收到的 RA/NA。
+fn ipv6_probe(st: &mut Stack, nic: usize) {
+    let io = st.links[nic].io;
+    let src = link_local_from_mac(mac_bytes(st.links[nic].mac));
+    print("NET16 ipv6 ll=");
+    print_v6(src.as_ptr() as u64);
+    println(" (rs/ra probe)");
+    let len = build_rs(&st.links[nic]);
+    let _ = link_tx(&st.links[nic], len);
+    let mut got = false;
+    let mut tries = 0u64;
+    while tries < 40 {
+        if let Some(n) = link_rx(&st.links[nic]) {
+            if rd16be(io + 12) == ETH_IPV6 {
+                ipv6_handle(io, n);
+                got = true;
+            }
+        }
+        sys_sleep(10);
+        tries += 1;
+    }
+    if !got {
+        println("NET16 ipv6 ra timeout (no RA in 400ms)");
+    }
+}
+
 /// 学某网卡的网关 MAC（发 ARP 请求 + 有界收包）。取不到则保持 `None`。
 fn arp_learn_gw(st: &mut Stack, nic: usize) {
     let mut tries = 0u64;
@@ -304,6 +464,11 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
                 ]);
             }
         }
+        return;
+    }
+    if et == ETH_IPV6 {
+        // R1: 只取证（打印 RA/NA），不建状态；V6.1 起改由 NDP 处理。
+        ipv6_handle(f, n);
         return;
     }
     if et != ETH_IPV4 || n < 34 {
@@ -590,6 +755,8 @@ const TCP_ROLE_SERVER: u8 = 2;
 #[derive(Clone, Copy)]
 struct TcpConn {
     used: bool,
+    /// 拥有该连接的域 (发起 `TSOCKET`/`TLISTEN` 的域); 其它域不得操作它。
+    owner: u64,
     /// [`TCP_ROLE_CLIENT`] / [`TCP_ROLE_LISTENER`] / [`TCP_ROLE_SERVER`]。
     role: u8,
     state: TcpState,
@@ -622,6 +789,7 @@ impl TcpConn {
     const fn new() -> TcpConn {
         TcpConn {
             used: false,
+            owner: 0,
             role: TCP_ROLE_CLIENT,
             state: TcpState::Closed,
             nic: 0,
@@ -1066,7 +1234,7 @@ fn tcp_selftest(io: u64) -> bool {
 // TCP socket 操作（N7.2：应用经 libnetv 调用）
 // ---------------------------------------------------------------------------
 
-fn tcp_open(st: &mut Stack, nic: usize) -> u64 {
+fn tcp_open(st: &mut Stack, nic: usize, from: u64) -> u64 {
     if nic >= NIC_COUNT {
         return 0;
     }
@@ -1075,6 +1243,7 @@ fn tcp_open(st: &mut Stack, nic: usize) -> u64 {
         if !st.tcons[i].used {
             st.tcons[i] = TcpConn::new();
             st.tcons[i].used = true;
+            st.tcons[i].owner = from;
             st.tcons[i].nic = nic;
             return (i + 1) as u64;
         }
@@ -1083,9 +1252,12 @@ fn tcp_open(st: &mut Stack, nic: usize) -> u64 {
     0
 }
 
-/// 建一个监听者（被动打开）。返回连接 id（>0）/ 0。内核端口门禁由调用方负责。
-fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16) -> u64 {
-    if nic >= NIC_COUNT {
+/// 建一个监听者（被动打开）。返回连接 id（>0）/ 0。
+///
+/// 端口归属必须是发起域（内核已按其 `Net` 能力登记）—— 与 `tcp_bind` 同一道门禁，
+/// 否则任何域都能监听任意端口。
+fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16, from: u64) -> u64 {
+    if nic >= NIC_COUNT || sys_net_owner(port) != from {
         return 0;
     }
     let mut i = 0;
@@ -1093,6 +1265,7 @@ fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16) -> u64 {
         if !st.tcons[i].used {
             let mut c = TcpConn::new();
             c.used = true;
+            c.owner = from;
             c.role = TCP_ROLE_LISTENER;
             c.state = TcpState::Listen;
             c.nic = nic;
@@ -1106,8 +1279,15 @@ fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16) -> u64 {
     0
 }
 
-/// 接受一个已建立的服务端连接（属于监听端口 `port`），返回其 id（>0）/ 0。
-fn tcp_accept_internal(st: &mut Stack, port: u16) -> u64 {
+/// 接受一个属于监听者 `id` 的已建立服务端连接，返回其 id（>0）/ 0。
+///
+/// 只有**监听者的归属域**能 accept（`listener.owner == from`）；被接受的连接随后归该域
+/// 所有（写 `owner`），故 `TSEND`/`TRECV`/`TCLOSE` 也须来自同一域。
+fn tcp_accept_internal(st: &mut Stack, id: u64, from: u64) -> u64 {
+    let (port, nic) = match tcp_slot(st, id) {
+        Some(c) if c.role == TCP_ROLE_LISTENER && c.owner == from => (c.local_port, c.nic),
+        _ => return 0,
+    };
     let mut i = 0;
     while i < MAX_TCONS {
         let c = &st.tcons[i];
@@ -1116,41 +1296,15 @@ fn tcp_accept_internal(st: &mut Stack, port: u16) -> u64 {
             && c.state == TcpState::Established
             && !c.accepted
             && c.local_port == port
+            && c.nic == nic
         {
             st.tcons[i].accepted = true;
+            st.tcons[i].owner = from;
             return (i + 1) as u64;
         }
         i += 1;
     }
     0
-}
-
-/// 内建 HTTP 服务的固定响应（`Content-Length` 与 body 一致：`hello from morion-guest-httpd\n` = 30 字节）。
-const HTTP_PORT: u16 = 80;
-const HTTP_RESP: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 30\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from morion-guest-httpd\n";
-
-/// 内建 HTTP 服务：对被接受、已建立且已收到数据的服务端连接回一个固定响应并关闭。
-///
-/// 这是客户机内的"**环境**" —— 应用/shell 的 `wget` 可对 `10.0.2.15:80` 发起真实 HTTP `GET`，
-/// 数据经上述**回环 TCP** 走完整协议栈（握手/收发/FIN），无需任何外部服务端。
-fn http_serve(st: &mut Stack, now: u64) {
-    let mut i = 0;
-    while i < MAX_TCONS {
-        let ready = st.tcons[i].used
-            && st.tcons[i].role == TCP_ROLE_SERVER
-            && st.tcons[i].state == TcpState::Established
-            && st.tcons[i].rx_len > 0;
-        if ready {
-            let nic = st.tcons[i].nic;
-            let io = st.links[nic].io;
-            st.tcons[i].rx_len = 0; // 消费请求，避免重复响应
-            let fl = tcp_send(&mut st.tcons[i], io, HTTP_RESP, now);
-            tcp_emit_deliver(st, nic, fl, now);
-            let fin = tcp_close(&mut st.tcons[i], io, now);
-            tcp_emit_deliver(st, nic, fin, now);
-        }
-        i += 1;
-    }
 }
 
 fn tcp_slot(st: &mut Stack, id: u64) -> Option<&mut TcpConn> {
@@ -1165,12 +1319,20 @@ fn tcp_slot(st: &mut Stack, id: u64) -> Option<&mut TcpConn> {
     }
 }
 
+/// 取连接槽并要求归属域为 `from`（越权 / 不存在返回 `None`）。
+fn tcp_slot_owned(st: &mut Stack, id: u64, from: u64) -> Option<&mut TcpConn> {
+    match tcp_slot(st, id) {
+        Some(c) if c.owner == from => Some(c),
+        _ => None,
+    }
+}
+
 /// 绑本地端口（端口归属必须是发起域，内核已按其 `Net` 能力登记）。
 fn tcp_bind(st: &mut Stack, id: u64, port: u16, from: u64) -> u64 {
     if sys_net_owner(port) != from {
         return 0;
     }
-    match tcp_slot(st, id) {
+    match tcp_slot_owned(st, id, from) {
         Some(c) if c.local_port == 0 => {
             c.local_port = port;
             1
@@ -1180,8 +1342,8 @@ fn tcp_bind(st: &mut Stack, id: u64, port: u16, from: u64) -> u64 {
 }
 
 /// 主动连接：需已绑本地端口、网卡已学网关 MAC。发 SYN。
-fn tcp_connect_op(st: &mut Stack, id: u64, addr: u64, port: u64, now: u64) -> u64 {
-    let nic = match tcp_slot(st, id) {
+fn tcp_connect_op(st: &mut Stack, id: u64, addr: u64, port: u64, now: u64, from: u64) -> u64 {
+    let nic = match tcp_slot_owned(st, id, from) {
         Some(c) => c.nic,
         None => return 0,
     };
@@ -1214,11 +1376,11 @@ fn tcp_connect_op(st: &mut Stack, id: u64, addr: u64, port: u64, now: u64) -> u6
     }
 }
 
-fn tcp_send_op(st: &mut Stack, id: u64, buf: u64, len: u64, now: u64) -> u64 {
+fn tcp_send_op(st: &mut Stack, id: u64, buf: u64, len: u64, now: u64, from: u64) -> u64 {
     if buf == 0 || len == 0 || len > TCP_MSS as u64 || sys_virt_to_phys(buf) == 0 {
         return 0;
     }
-    let nic = match tcp_slot(st, id) {
+    let nic = match tcp_slot_owned(st, id, from) {
         Some(c) => c.nic,
         None => return 0,
     };
@@ -1233,11 +1395,11 @@ fn tcp_send_op(st: &mut Stack, id: u64, buf: u64, len: u64, now: u64) -> u64 {
     }
 }
 
-fn tcp_recv_op(st: &mut Stack, id: u64, buf: u64) -> u64 {
+fn tcp_recv_op(st: &mut Stack, id: u64, buf: u64, from: u64) -> u64 {
     if buf == 0 || sys_virt_to_phys(buf) == 0 {
         return 0;
     }
-    match tcp_slot(st, id) {
+    match tcp_slot_owned(st, id, from) {
         Some(c) if c.rx_len > 0 => {
             unsafe {
                 core::ptr::copy_nonoverlapping(c.rx.as_ptr(), buf as *mut u8, c.rx_len as usize);
@@ -1250,8 +1412,8 @@ fn tcp_recv_op(st: &mut Stack, id: u64, buf: u64) -> u64 {
     }
 }
 
-fn tcp_close_op(st: &mut Stack, id: u64, now: u64) -> u64 {
-    let nic = match tcp_slot(st, id) {
+fn tcp_close_op(st: &mut Stack, id: u64, now: u64, from: u64) -> u64 {
+    let nic = match tcp_slot_owned(st, id, from) {
         Some(c) => c.nic,
         None => return 0,
     };
@@ -1545,13 +1707,17 @@ fn serve_app(st: &mut Stack, now: u64) {
             NETS_OP_SENDTO => sock_sendto(st, &req),
             NETS_OP_RECVFROM => sock_recvfrom(st, &req),
             NETS_OP_CLOSE => sock_close(st, req.sock),
-            // TCP（N7.2）：`sock` 字段对 TSOCKET 是网卡索引, 其余是连接 id。
-            NETS_OP_TSOCKET => tcp_open(st, req.sock as usize),
+            // TCP（N7.2）：`sock` 字段对 TSOCKET/TLISTEN 是网卡索引, 其余是连接/监听者 id。
+            NETS_OP_TSOCKET => tcp_open(st, req.sock as usize, msg.from),
             NETS_OP_TBIND => tcp_bind(st, req.sock, req.port as u16, msg.from),
-            NETS_OP_TCONNECT => tcp_connect_op(st, req.sock, req.addr, req.port, now),
-            NETS_OP_TSEND => tcp_send_op(st, req.sock, req.buf, req.len, now),
-            NETS_OP_TRECV => tcp_recv_op(st, req.sock, req.buf),
-            NETS_OP_TCLOSE => tcp_close_op(st, req.sock, now),
+            NETS_OP_TCONNECT => tcp_connect_op(st, req.sock, req.addr, req.port, now, msg.from),
+            NETS_OP_TSEND => tcp_send_op(st, req.sock, req.buf, req.len, now, msg.from),
+            NETS_OP_TRECV => tcp_recv_op(st, req.sock, req.buf, msg.from),
+            NETS_OP_TCLOSE => tcp_close_op(st, req.sock, now, msg.from),
+            NETS_OP_TLISTEN => {
+                tcp_listen_internal(st, req.sock as usize, req.port as u16, msg.from)
+            }
+            NETS_OP_TACCEPT => tcp_accept_internal(st, req.sock, msg.from),
             _ => 0,
         };
         let _ = sys_reply(reply);
@@ -1624,6 +1790,9 @@ pub fn run() {
         println("netstack: nic1 absent (no e1000e)");
     }
 
+    // R1 取证: 探测 slirp 的 IPv6（发 RS → 收 RA），据此校准 V6.1 的 SLAAC 前缀/DNSv6。
+    ipv6_probe(st, 0);
+
     // N7: TCP 连接状态机 + 重传的确定性自证（不依赖真实对端）。
     if tcp_selftest(st.links[0].io) {
         println("NET6 tcp conn OK (state machine + retransmit + checksum)");
@@ -1631,10 +1800,8 @@ pub fn run() {
         println("NET6 tcp conn FAILED");
     }
 
-    // 内建 HTTP 服务（客户机"环境"）：在 `OUR_IP:80` 起监听者，配合回环 TCP 供 wget 取用。
-    if tcp_listen_internal(st, 0, HTTP_PORT) == 0 {
-        println("netstack: http listener FAILED");
-    }
+    // 内建 HTTP 已拆成独立服务 httpd_srv（域 23）：它自己 `tcp_listen(80)` + `tcp_accept`，
+    // 协议栈只提供 TCP 原语，不再内含任何应用层服务。
 
     // 主循环: 服务应用请求 + 排空各网卡 RX + 推进 TCP 重传定时器。
     let mut now = 0u64;
@@ -1659,7 +1826,6 @@ pub fn run() {
             nic += 1;
         }
         tcp_tick_all(st, now);
-        http_serve(st, now);
         sys_sleep(10);
     }
 }

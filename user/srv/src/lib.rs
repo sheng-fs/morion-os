@@ -46,6 +46,8 @@ pub mod fat32_srv;
 pub mod gfx;
 #[cfg(feature = "svc-gfx_srv")]
 pub mod gfx_srv;
+#[cfg(feature = "svc-httpd_srv")]
+pub mod httpd_srv;
 #[cfg(feature = "svc-init")]
 pub mod init;
 #[cfg(feature = "svc-iso9660_srv")]
