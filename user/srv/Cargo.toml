@@ -47,6 +47,7 @@ default = [
     "svc-xhci_srv",
     "svc-iso9660_srv",
     "svc-netstack_srv",
+    "svc-e1000e_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -70,6 +71,7 @@ svc-ahci_srv = []
 svc-xhci_srv = []
 svc-iso9660_srv = []
 svc-netstack_srv = []
+svc-e1000e_srv = []
 
 [[bin]]
 name = "sender"
@@ -180,6 +182,11 @@ required-features = ["svc-iso9660_srv"]
 name = "netstack_srv"
 path = "src/bin/netstack_srv.rs"
 required-features = ["svc-netstack_srv"]
+
+[[bin]]
+name = "e1000e_srv"
+path = "src/bin/e1000e_srv.rs"
+required-features = ["svc-e1000e_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。

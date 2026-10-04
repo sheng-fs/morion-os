@@ -46,7 +46,7 @@ use morion::syscall::*;
 ///
 /// 域号是 ABI (见内核对域布局的注释)，与 `kernel/src/main.rs` 建域顺序一致。盘上镜像名只
 /// 在内存镜像不可用时用作回退路径。
-const SUPERVISED: [(u64, &str); 12] = [
+const SUPERVISED: [(u64, &str); 13] = [
     (2, "pager"),
     (3, "echo"),
     (4, "kbd"),
@@ -59,6 +59,7 @@ const SUPERVISED: [(u64, &str); 12] = [
     (15, "gfx_srv"),
     (16, "net_srv"),
     (21, "netstack_srv"),
+    (22, "e1000e_srv"),
 ];
 
 /// 巡检周期 (ms)。
@@ -75,8 +76,8 @@ const SERVICE_DIR: &str = "/system/services/";
 const POLICY: [(u64, &[u64]); 4] = [
     // 造进程: 仅 app(7) / shell(8) / init(14) —— 其余域一概不该有。
     (CAP_KIND_SPAWN, &[7, 8, 14]),
-    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19)。
-    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19]),
+    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22)。
+    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19, 22]),
     // 帧缓冲: 全局唯一凭证, 仅 gfx_srv(15)。
     (CAP_KIND_FB, &[15]),
     // I/O 端口: 仅 block(5, IDE PIT) / mfs(11) / exfat(13) (CMOS RTC)。

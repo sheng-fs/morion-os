@@ -289,6 +289,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 域 21 — netstack_srv (用户态网络协议栈, N6): 无设备, 经帧级 IPC 调 net_srv(域 16)
     // 收发以太帧; 对应用提供 UDP socket 并落实端口能力门禁。
     let netstack_domain = domain::create();
+    // 域 22 — e1000e_srv (第二台真网卡 Intel 82574L 驱动, N9): 仍走通用设备授权; 第一版全轮询,
+    // 不申请中断向量。与 virtio-net 并列, 证明"驱动 ≠ 栈"——同一套帧级 IPC、换硬件模型。
+    let e1000e_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -472,6 +475,33 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // 探测 Intel e1000e (82574L) 网卡并授权给域 22（N9: 第二台真网卡, 仍走通用设备授权）。
+    // 与 virtio-net 完全不同的硬件模型: BAR0 是 MMIO 寄存器窗口 (控制/状态 + RX/TX 描述符环),
+    // 无 virtio 能力链表。第一版**全轮询**（本内核只有 MSI-X 通路, e1000e 常规用 INTx/MSI),
+    // 故不申请向量。BAR0 需覆盖到 RAL/RAH (0x5400+), 取 8 页; DMA 8 页: RX/TX 环 + 收包缓冲。
+    match arch::pci::find_e1000e(&pci_devices) {
+        Some((bus, dev, func, bar0)) => {
+            device::grant(device::GrantRequest {
+                domain: e1000e_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar0,
+                bar_pages: 8,
+                dma_pages: 8,
+                msix_vectors: 0,
+                label: "e1000e",
+            });
+            video::print("[OK] e1000e BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(e1000e_domain);
+            video::println("[OK] no e1000e controller, e1000e_srv idle");
+        }
+    }
+
     // 探测 virtio-blk 并通用地授权给域 17（驱动路线 D3: 第二个真实驱动, 仍不改内核设备逻辑）。
     // virtio-blk 的 modern 配置同样在 BAR4（MSI-X 表在 BAR1）。DMA 8 页: 请求队列环 + 请求/数据缓冲。
     match arch::pci::find_virtio_blk(&pci_devices) {
@@ -580,6 +610,11 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(app_domain, cap::Capability::SendTo(netstack_domain));
     cap::grant(app_domain, cap::Capability::MapInto(netstack_domain));
     cap::grant(app_domain, cap::Capability::Net(12345, 12345));
+
+    // 授权 (N9): 网络协议栈 (域 21) 可把 e1000e (域 22) 当作第二台网卡 —— 帧级 IPC 走同一个
+    // `NetReq` 契约 (SendTo + MapInto)。协议栈因此能按网卡索引选出口, 上层 socket API 不变。
+    cap::grant(netstack_domain, cap::Capability::SendTo(e1000e_domain));
+    cap::grant(netstack_domain, cap::Capability::MapInto(e1000e_domain));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。

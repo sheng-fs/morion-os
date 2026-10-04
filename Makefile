@@ -69,7 +69,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -374,6 +374,8 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device nvme-ns,drive=nvme0n8,bus=nvme0,nsid=8 \
 		-netdev user,id=n0 \
 		-device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
+		-netdev user,id=n1 \
+		-device e1000e,netdev=n1,mac=52:54:00:aa:bb:cc \
 		-drive file=$(VBLK_IMG),if=none,id=vblk0,format=raw \
 		-device virtio-blk-pci,drive=vblk0 \
 		-drive file=$(AHCI_IMG),if=none,id=ahci0,format=raw \
