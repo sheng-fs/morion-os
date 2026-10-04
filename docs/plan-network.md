@@ -1,6 +1,6 @@
 # 网络能力 + 网卡驱动 开发规划（N5 起）
 
-> 状态：**规划稿**（未实现）。承接驱动路线 N0–N4（`net_srv` virtio-net 驱动 + 最小协议栈自测）。
+> 状态：**已实现**（N5–N9 + N8.2 拆分全部落地，见 §9）。承接驱动路线 N0–N4（`net_srv` virtio-net 驱动 + 最小协议栈自测）。
 > 本规划把网络工作拆成两条并行主线：**网卡驱动层**（换/加真网卡、多网卡抽象）与
 > **网络能力层**（协议栈服务 + socket API + 能力门禁），目标是让**应用真正能用网络**。
 > 相关：`docs/roadmap-driver.md`（N 小节 + §8 风险）、`docs/architecture.md` §「网络协议栈——用户态多服务架构」、
@@ -139,3 +139,28 @@ net_srv (域 16, 纯 NIC 驱动)
 - `docs/app-dev-guide.md` — `net.access` 能力命名、服务域表
 - `docs/dev-workflow.md` — 加一个服务要同步的 10 处接线
 - `docs/plan-fs-streams.md` / `docs/design-iso9660-installer.md` — 同风格的规划/设计稿范例
+- [plan-net-v6.md](plan-net-v6.md) — 下一批规划：驱动矩阵 + IPv6（N10 起）
+
+---
+
+## 9. 完成情况（N5–N9 + N8.2 拆分，全部落地）
+
+| 阶段 | 内容 | 关键 marker / 取证 |
+|---|---|---|
+| N5 | 驱动/栈解耦：`net_srv` 收敛为**纯帧级网卡驱动**（`NETW`：`NET_OP_TX/RX/INFO`） | `NET1..NET4` 逐字不变 |
+| N6 | 新增 `netstack_srv`（域 21）+ UDP socket + `Capability::Net{lo,hi}` 端口门禁 | `netstack: up (frame link to net_srv OK)` / `app: NET5 udp socket OK` |
+| N6.5/N6.6 | 应用面 socket + 栈内回环 + **virtio-net 12 字节头修复** | `netstack: nic rx (icmp unreachable) OK` |
+| N7.1 | TCP 连接状态机 + RTO 重传 + 伪首部校验和 | `NET6 tcp conn OK` / `netstack: tcp peer refused (RST) OK` |
+| N7.2 | TCP socket API（客户端）；协议栈状态移入 `static`（避 32 KiB 用户栈溢出） | `app: NET12 tcp client OK` |
+| N8 | DNS 最小 A 记录解析（UDP 53 → `10.0.2.3`）+ 应用面汇总 | `app: NET8 dns OK, A=…` / `app: NET7 app socket OK` |
+| N9.1 | 第二台真网卡 `e1000e_srv`（域 22）：MMIO + RX/TX 环，MAC 读 RAL/RAH | `NET9 e1000e OK, MAC=…, ARP reply OK` |
+| N9.2 | 多网卡出口：`netstack_srv` 按**网卡索引**选出口，上层 socket API 不变 | `netstack: nic1 up (e1000e OK)` / `app: NET11 udp via e1000e (nic1) OK` |
+| N8.2 | 回环 TCP 服务端（被动打开）+ 客户机内建 HTTP + shell `wget` | `app: NET13 http OK` |
+| N8.2 拆分 | 内建 HTTP → **独立服务 `httpd_srv`（域 23）**；协议栈只留 TCP 原语；连接引入**归属域**；`net.rs` 负载共享页**按域派生** | `httpd: listening on :80` / `app: NET13 http OK` / `cap-audit: domains=24 caps=107 violations=0` |
+
+**与规划稿的差异（最终落地）**：
+1. 应用接口 = **IPC + `libnetv`**（`user/libmorion/src/net.rs`），内核不新增网络语义（D2 倾向 b）。
+2. 端口能力 = `Capability::Net(lo,hi)` 闭区间；`bind` 经内核登记、协议栈用 `SYS_NET_OWNER` 核对（D3 倾向 b）。
+3. HTTP 服务端原内建于 `netstack_srv`，N8.2 拆分后为**独立服务域 `httpd_srv`** —— 对应「加服务的 10 处接线」已逐条同步（`dev-workflow.md`）。
+4. 第二网卡选型 = **e1000e**（D4 倾向 a）；多网卡于 N9.2 落地（D6 倾向 b 的扩展）。
+5. 完整变更记录见 [dev-reference.md](dev-reference.md) 阶段 90–99。

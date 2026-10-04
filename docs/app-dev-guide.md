@@ -63,7 +63,7 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 
 | | 载体 | 载入时机 | 现状 |
 |---|---|---|---|
-| **系统服务程序**（`user/srv/`，18 个程序各自一个 `[[bin]]`；含监督者 `init`、图形服务 `gfx_srv` 与两个设备驱动服务 `net_srv` / `virtio_blk_srv`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
+| **系统服务程序**（`user/srv/`，24 个程序各自一个 `[[bin]]`；含监督者 `init`、图形服务 `gfx_srv`、设备驱动服务 `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` / `e1000e_srv`、网络协议栈 `netstack_srv` 与客户机 HTTP 服务 `httpd_srv`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
 | **运行时程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
 
 两者都是**独立 ELF**，走同一条加载链（`elf::parse` + `exec`）—— 差别只在"什么时候、载入哪个域"：
@@ -122,12 +122,19 @@ match morion::exec::spawn_file("/hello.mex") {
 | 15 | gfx_srv | 图形服务（G1）：`sys_fb_info`/`sys_fb_map`/`sys_fb_takeover` 接管帧缓冲，提供 `fill/rect/blit` 绘制原语与文本终端（UTF-8、汉字按 2 列排版），经共享表面与客户端交互 |
 | 16 | net_srv | virtio-net 用户态驱动（N0–N3）：取设备授权后自解析能力链表，走 virtio-modern 传输层建 RX/TX 队列，MSI-X 中断化 |
 | 17 | virtio_blk_srv | virtio-blk 用户态驱动（D3）：三段式描述符链读写块设备，单请求队列 + MSI-X 中断 |
+| 18 | ahci_srv | SATA/AHCI 用户态驱动（D4/03b）：命令列表/FIS/PRDT，`IDENTIFY` + `READ/WRITE DMA EXT`，全轮询；自测后经 `BLOCK_OP_ATTACH` 挂进 block_srv 卷层 |
+| 19 | xhci_srv | USB/xHCI 存储驱动（03c）：枚举 → bulk 端点 → SCSI `INQUIRY`/`READ(10)`，接 U 盘 |
+| 20 | iso9660_srv | ISO9660 只读文件服务（03c 续）：解析卷描述符/目录树，挂 `/cdrom`（安装介质） |
+| 21 | netstack_srv | 用户态 TCP/IP 协议栈 + socket 服务（N5–N8.2）：ARP/IPv4/ICMP/UDP/TCP + 端口能力门禁；经帧级 IPC 调网卡驱动（NIC0/NIC1） |
+| 22 | e1000e_srv | 第二台真网卡 Intel 82574L 驱动（N9）：MMIO + 传统 RX/TX 描述符环，全轮询 |
+| 23 | httpd_srv | 客户机内建 HTTP 服务（N8.2 拆分）：`tcp_listen(80)` + `tcp_accept` 回固定响应 |
 
-> 新增一个服务/程序（E2b 起）：在 `user/srv/src/` 加一个服务模块（`pub fn run()`）+ `bin/<name>.rs`
-> 入口（打印 `[up] <name> (domain N)` 后调 `run()`）+ `Cargo.toml` 里的 `[[bin]]`/`svc-<name>` feature；
-> 内核侧在 `kernel/src/main.rs` 的 `SERVICE_ELFS` 表加一行 `(域号, include_bytes!(..))`，并按域号
-> `domain::create()` → `cap::grant(..)` 授权；Makefile 的 `SRV_NAMES` 加该名字。目前仍手工接线，
-> 后续会由「进程管理器」服务统一创建。
+> 新增一个服务/程序（E2b 起，完整清单见 [dev-workflow.md](dev-workflow.md)「加一个服务的 10 处接线」）：
+> 在 `user/srv/src/` 加服务模块（`pub fn run()`）+ `bin/<name>.rs` 入口（`announce("<name>", domain_id)`
+> 后调 `run()`）+ `Cargo.toml` 的 `[[bin]]`/`svc-<name>` feature + `lib.rs` 的 `pub mod`；
+> 内核侧在 `kernel/src/main.rs` `domain::create()` 建固定域并 `cap::grant(..)` 授权、扩 `domain::BOOT_DOMAINS`；
+> 引导器 `boot/src/main.rs` 的 `SERVICE_FILES` 加 `(域号, "<name>")`；Makefile `SRV_NAMES`；
+> `init.rs` 的 `SUPERVISED`、`mfs_srv.rs` 的 `MFS_BOOT_DOMAINS` 同步。仍手工接线，后续由「进程管理器」统一创建。
 
 ---
 
@@ -376,11 +383,17 @@ let bytes = unsafe { core::slice::from_raw_parts(page as *const u8, 12) };
 | mfs_srv (11) | MorionFS 原创文件系统，挂载于 `/mfs` | `recv` VFS tag → 4 KiB 块 + CRC32 + COW 写时复制 → 经 block_srv 访问 MFS 卷；**目录项存 inode 号**，号到块的映射由 inode 表（索引块 `MFIX` → 表块 `MFIT`）给出，故多个名字可共享同一对象（硬链接）；目录是 ext2 风格**变长目录项**（名字 ≤255 字节、大小写敏感，条目区满后挂 `MFXI` 扩展目录块）；节点带**元数据**（`mode`/`owner`/`nlink`/`mtime`/`ctime`/`atime`，时间取自 CMOS RTC；`mode` 只存储与显示、不强制）；额外支持 `LINK`（硬链接）、`TRNC`（truncate，扩展为稀疏）、`RENM`（rename，可跨目录）、`CHMD`（chmod）；另有快照 tag `MSNP/MSNL/MSNR`、空间回收 `MSGC`（mark & sweep，回收不可达的 COW 旧块）与用量查询 `MSST`（回复 `(总块数 << 32) | 空闲块数`）；**多卷**：内存态只有一份，按请求 tag 的卷编码（fd 类请求由 fd 绑定的卷）**切卷重载**，非主卷挂到 `/usb<卷号>`，空白卷/已有 MFS 卷可用 **`MKFS`**（`vfs::mfs_mkfs(vol)`）显式格式化（会**擦除**该卷；护栏拒绝 FAT/exFAT/ext2 卷） |
 | ext2_srv (12) | ext2 只读兼容，挂载于 `/ext2` | `recv` VFS tag → 只服务 `OPEN/READ/READDIR/STAT/CLOSE`（写类 tag 回 `u64::MAX`）→ 解析超级块 / 块组描述符 / inode 块映射 / 目录项 → 经 block_srv 访问 ext2 卷 |
 | exfat_srv (13) | exFAT（读 + 写），挂载于 `/usb` | `recv` VFS tag → `OPEN/READ/READDIR/STAT/CLOSE` + `CREAT/WRITE/MKDIR/UNLINK/RMDIR/TRUNCATE`（`RENM`/`CHMD`/`LINK` 回 `u64::MAX`）→ 解析引导区 + boot checksum / FAT 链 / entry set（含 set checksum 与 NameHash 生成）/ 分配位图 / upcase 表 → 经 block_srv 访问 exFAT 卷 |
-| shell (8) | 命令行解释器 | `morion::console::readline` 取行 → 命令 `help / echo / uname / version / pwd / ls ([-l]) / cat / run / cd / mkdir / touch / rm / mv / ln / ln -s / chmod / truncate / stat / lstat / readlink / mkfs.mfs / mfs.primary / df / part.create / part.del / part.wipe / part.reload / clear`（含 cwd 相对路径）→ libvfs(先查 mount_srv 路由, 再 `sys_call` 目标服务) |
+| shell (8) | 命令行解释器 | `morion::console::readline` 取行 → 命令 `help / echo / uname / version / pwd / ls ([-l]) / cat / run / wget / cd / mkdir / touch / rm / mv / ln / ln -s / chmod / truncate / stat / lstat / readlink / mkfs.mfs / mfs.primary / df / part.create / part.del / part.wipe / part.reload / clear`（含 cwd 相对路径）→ libvfs(先查 mount_srv 路由, 再 `sys_call` 目标服务)；`wget` 走 libnetv 的 TCP 客户端到客户机内建 HTTP 服务 |
 | init (14) | 服务监督者 | 每 40 ms 用 `sys_domain_alive` 巡检长期驻留的服务域；发现无存活任务即**原地重启**（优先 `SYS_SPAWN_ELF_MODULE` 引导模块内存镜像，失败回退 `SYS_SPAWN_ELF_AT` 盘上镜像），**域号不变** |
 | gfx_srv (15) | 图形服务（屏幕归用户态） | `sys_fb_info`/`sys_fb_map`/`sys_fb_takeover` 接管帧缓冲；`GFX_TAG` 请求（`FILL/RECT/BLIT/TEXT/CLEAR/MOVE/QUERY`）→ 逐笔绘制并回读校验；客户端经共享表面（`SYS_SHARE_PAGE`）传像素与文本 |
 | net_srv (16) | virtio-net 用户态驱动 | `DeviceGrant::load()` 取授权 + `sys_device_config_read` 自解析能力链表 → virtio-modern 传输层与 RX/TX 队列；MSI-X 中断化（`sys_irq_poll` / `sys_irq_wait`） |
 | virtio_blk_srv (17) | virtio-blk 用户态驱动 | 同款 virtio-modern；三段式描述符链（header → data → status）读写块设备，单请求队列 + MSI-X 中断 |
+| ahci_srv (18) | SATA/AHCI 用户态驱动 | `DeviceGrant::load()` 取授权 → `GHC.AE` 启动 → 选端口（`PxSSTS.DET`/`PxSIG`）→ `IDENTIFY` + `READ/WRITE DMA EXT`；全轮询。自测通过后用 `BLOCK_OP_ATTACH` 把盘挂进 block_srv 卷层（`backend=ahci`，经共享暂存页互拷） |
+| xhci_srv (19) | USB/xHCI 存储驱动 | 枚举端口/设备 → 配置 bulk 端点 → SCSI `INQUIRY`/`READ(10)` 读写；自测后经 block_srv 卷层（`backend=xhci`）对外提供读写 |
+| iso9660_srv (20) | ISO9660 只读文件服务，挂 `/cdrom` | `recv` VFS tag → 解析卷描述符(LBA 16)/路径表/目录记录 → 经 block_srv 读安装盘；只服务 `OPEN/READ/READDIR/STAT/CLOSE` |
+| netstack_srv (21) | 用户态网络协议栈 + socket 服务 | `NETS_REQ_TAG("NSTK")` 请求（UDP socket + TCP socket + `TLISTEN/TACCEPT`）→ ARP/IPv4/ICMP/UDP/TCP → 经帧级 IPC（`net_srv`/`e1000e_srv`）收发裸以太帧；端口归属用 `SYS_NET_OWNER` 核对，连接带**归属域** |
+| e1000e_srv (22) | e1000e（Intel 82574L）用户态驱动 | `DeviceGrant::load()` → MMIO 复位 → 从 RAL/RAH 读 MAC → 建传统 RX/TX 描述符环 → 与 `netstack_srv` 做帧级 IPC（同一个 `NetReq` 契约） |
+| httpd_srv (23) | 客户机内建 HTTP 服务 | `morion::net::tcp_listen(80)` + `tcp_accept` 循环 → 收请求、回固定响应、关连接；内核授 `Net(80,80)` |
 
 > libvfs 对每个路径先向 mount_srv 查询，再由 fd 高 32 位的服务域字段路由后续
 > `read/write/readdir/close`。应用只看到单一根 `/`：`/tmp/**` 落到 tmpfs_srv、

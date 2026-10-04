@@ -36,6 +36,7 @@ shell: type 'help' for commands
 | `ls` | `ls [path]` | 列目录，默认当前目录 |
 | `cat` | `cat <file>` | 打印文件内容（最多 4096 字节） |
 | `run` | `run <file>` | **从文件加载并运行一个程序**（E1/E2）：`morion::exec::spawn_file` 读入镜像 → 内核 `SYS_SPAWN_ELF` 载入**新域**；不等待它结束 |
+| `wget` | `wget [path]` | 从**客户机内建 HTTP 服务**（`10.0.2.15:80`，独立服务 `httpd_srv` 域 23）取一页并打印：走完整 TCP 客户端路径（`tcp_socket` → `tcp_bind 12349` → `tcp_connect` → `tcp_send "GET <path> HTTP/1.0"` → `tcp_recv` → `tcp_close`），握手与数据经栈内**回环**与服务端完成，无需任何外部服务端；`path` 省略则默认 `/` |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -79,6 +80,7 @@ commands:
   ls [-l] [path] list directory (-l: long form)
   cat <file>     print file content
   run <file>     load a .mex program from a file and run it (new domain)
+  wget [path]    fetch a page from the guest's built-in HTTP server (10.0.2.15:80)
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file

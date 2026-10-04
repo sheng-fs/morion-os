@@ -60,7 +60,7 @@ OUT_DIR=build bash scripts/fs-regress.sh /tmp/regress.log
 **判据**（缺一不可）：
 
 - `SELFTEST DONE` ≥ 1；`FAILED` / `PANIC` = 0
-- `[OK] 19 service ELFs loaded`
+- `[OK] 24 service ELFs loaded`
 - **`irq_cmds == cmds` 且 `poll_cmds = 0`**（**不要硬比历史数字**：`cmds` 的绝对值会随块层
   缓存 / 预读、新增自测而变化；判的是**两者相等**且**没有退化成轮询**）
 - `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`
@@ -94,7 +94,7 @@ OUT_DIR=build/nogui bash scripts/fs-regress.sh /tmp/nogui.log
 - **`dd` 写镜像必须 `conv=notrunc`**，否则整盘被截断（曾导致 `rw=BAD`）。
 - **`BOOT_DOMAINS` 与各全局表长度必须一致**：域 id 是 `irq`/`cap`/`ipc`/`pager` 等表的**下标**，
   加了域却忘了改 `BOOT_DOMAINS`（或反过来）会**越界 panic**。同理别漏 `boot/src/main.rs` 里
-  `SERVICE_FILES` 的**长度常量**（现在 19）。
+  `SERVICE_FILES` 的**长度常量**（现在 24）。
 - **DMAR 表体**：重映射结构从偏移 **48** 起（表头 36 + `Host Address Width` 1 + `Flags` 1 + 保留 10），
   按 36 解析会出现"表找到了但 `drhd=0 rmrr=0`"。
 - **VT-d 上下文项 `TT`（bits 3:2）**：`0b00` = translated（走二级页表）、`0b01` = Device TLB、
@@ -131,17 +131,20 @@ OUT_DIR=build/nogui bash scripts/fs-regress.sh /tmp/nogui.log
 
 ---
 
-## 4. 加一个用户态服务要同步改的地方（**9 处**，漏一个就编不过或越界）
+## 4. 加一个用户态服务要同步改的地方（**10 处**，漏一个就编不过或越界）
 
 1. `user/srv/src/<name>.rs`（实现）
-2. `user/srv/src/bin/<name>.rs`（入口，打印 `[up] <name> (domain N)`）
-3. `user/srv/Cargo.toml`：`features` 加 `svc-<name>` + `[[bin]]` 加一条
+2. `user/srv/src/bin/<name>.rs`（`#![no_std]`/`#![no_main]` 入口，`announce("<name>", domain_id)` 后调 `run()`）
+3. `user/srv/Cargo.toml`：`features` 加 `svc-<name>`（**并把它加进 `default`**）+ `[[bin]]` 加一条
 4. `user/srv/src/lib.rs`：模块 `#[cfg(feature = "svc-<name>")]` 门控
 5. `Makefile`：`SRV_NAMES` 加名字
-6. `boot/src/main.rs`：`SERVICE_FILES` 表加 ELF 路径 —— **以及它的长度常量**
+6. `boot/src/main.rs`：`SERVICE_FILES` 表加 `(域号, "<name>")` —— **以及它的长度常量**
 7. `kernel/src/domain.rs`：`BOOT_DOMAINS` +1（含文件头注释与单测）
 8. `kernel/src/main.rs`：建域 + 能力授权 +（如需要）设备声明
-9. 如果服务要用设备：`kernel/src/arch/pci.rs` 加按类查找 + `libdevice`（`grant`/`mmio`/`msix`/`virtio`）
+9. `user/srv/src/init.rs`：`SUPERVISED` 加一条（要纳入监督的话）
+10. `user/srv/src/mfs_srv.rs`：`MFS_BOOT_DOMAINS` 对齐 `BOOT_DOMAINS`（该常量按引导域数判身份，漏改会让新域被当成非引导域）
+
+> 若服务要用设备：另加 `kernel/src/arch/pci.rs` 的按类查找 + `libdevice`（`grant`/`mmio`/`msix`/`virtio`）。
 
 > **加服务 = 动公共文件**，在多会话并行时会直接破坏"文件互斥"。并行轮次里**不要**顺手加服务。
 
