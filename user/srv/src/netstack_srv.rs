@@ -51,6 +51,7 @@ const V6_MAC_ALL_ROUTERS: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x02];
 const IP6_PROTO_ICMPV6: u8 = 58;
 const ICMPV6_RS: u8 = 133;
 const ICMPV6_RA: u8 = 134;
+const ICMPV6_NS: u8 = 135;
 const ICMPV6_NA: u8 = 136;
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,11 @@ struct Link {
     mac: u64,
     gw_mac: Option<[u8; 6]>,
     up: bool,
+    /// IPv6（V6.1）：SLAAC 全局地址、路由器地址、路由器 MAC、是否已配置。
+    v6_global: [u8; 16],
+    v6_gw: [u8; 16],
+    gw6_mac: Option<[u8; 6]>,
+    v6_up: bool,
 }
 
 impl Link {
@@ -122,6 +128,10 @@ impl Link {
             mac: 0,
             gw_mac: None,
             up: false,
+            v6_global: [0; 16],
+            v6_gw: [0; 16],
+            gw6_mac: None,
+            v6_up: false,
         }
     }
 }
@@ -305,18 +315,77 @@ fn link_local_from_mac(mac: [u8; 6]) -> [u8; 16] {
     ]
 }
 
-/// IPv6 伪首部 + 之上的 16 位反码校验和（RFC 8200 §8.1，供 ICMPv6 用）。
-fn csum_v6(src: &[u8; 16], dst: &[u8; 16], next: u8, seg: u64, len: u64) -> u16 {
-    let ph = [0u8; 40];
-    let p = ph.as_ptr() as u64;
-    let mut i = 0u64;
-    while i < 16 {
-        wr8(p + i, src[i as usize]);
-        wr8(p + 16 + i, dst[i as usize]);
+/// 由 MAC 派生 EUI-64 接口标识（RFC 4291 附录 A：中间插 `ff:fe`，首字节反转 U/L 位）。
+fn eui64_iid(mac: [u8; 6]) -> [u8; 8] {
+    [
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]
+}
+
+/// 由 RA 前缀（`/64`）+ EUI-64 组成全局地址（SLAAC）。
+fn global_from_prefix(prefix: &[u8; 16], mac: [u8; 6]) -> [u8; 16] {
+    let mut a = *prefix;
+    let iid = eui64_iid(mac);
+    let mut i = 0;
+    while i < 8 {
+        a[8 + i] = iid[i];
         i += 1;
     }
-    wr32be(p + 32, len as u32);
-    wr8(p + 39, next);
+    a
+}
+
+/// 16 字节地址相等。
+fn v6_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    let mut i = 0;
+    while i < 16 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// 全零地址（`::`）。
+fn v6_is_zero(a: &[u8; 16]) -> bool {
+    v6_eq(a, &[0u8; 16])
+}
+
+/// 写一个 16 字节 IPv6 地址到共享页。
+fn put_v6(a: u64, v: &[u8; 16]) {
+    let mut i = 0u64;
+    while i < 16 {
+        wr8(a + i, v[i as usize]);
+        i += 1;
+    }
+}
+
+/// 从共享页读一个 16 字节 IPv6 地址。
+fn get_v6(a: u64) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    let mut i = 0u64;
+    while i < 16 {
+        v[i as usize] = rd8(a + i);
+        i += 1;
+    }
+    v
+}
+
+/// IPv6 伪首部 + 之上的 16 位反码校验和（RFC 8200 §8.1，供 ICMPv6 用）。
+fn csum_v6(src: &[u8; 16], dst: &[u8; 16], next: u8, seg: u64, len: u64) -> u16 {
+    let mut ph = [0u8; 40];
+    ph[..16].copy_from_slice(src);
+    ph[16..32].copy_from_slice(dst);
+    ph[32..36].copy_from_slice(&(len as u32).to_be_bytes());
+    ph[39] = next;
+    let p = ph.as_ptr() as u64;
     let s = csum_acc(p, 40, 0);
     let s = csum_acc(seg, len, s);
     !csum_fold(s)
@@ -330,7 +399,7 @@ fn build_rs(l: &Link) -> u64 {
     put_mac(f + 6, mac_bytes(l.mac));
     wr16be(f + 12, ETH_IPV6);
     let ip = f + 14;
-    wr8(ip, 0x60); // version 6
+    wr32be(ip, 0x6000_0000); // version 6, 流量类别/流标签 = 0
     wr16be(ip + 4, 16); // payload length = ICMPv6(8) + SLLAO(8)
     wr8(ip + 6, IP6_PROTO_ICMPV6);
     wr8(ip + 7, 255); // hop limit
@@ -342,7 +411,9 @@ fn build_rs(l: &Link) -> u64 {
     }
     let ic = ip + 40;
     wr8(ic, ICMPV6_RS);
-    wr16be(ic + 2, 0);
+    wr8(ic + 1, 0); // code
+    wr16be(ic + 2, 0); // 校验和字段须先清零再计算
+    wr32be(ic + 4, 0); // reserved
     wr8(ic + 8, 1); // 选项：类型 1 = 源链路层地址
     wr8(ic + 9, 1); // 长度 1 → 8 字节
     put_mac(ic + 10, mac_bytes(l.mac));
@@ -363,67 +434,207 @@ fn print_v6(a: u64) {
     }
 }
 
-/// 取证：解析收到的 IPv6 帧里的 ICMPv6，把 RA（含前缀选项）/ NA 打印出来。
-fn ipv6_handle(io: u64, n: u64) {
+/// 拼一个 IPv6 邻居请求（NS：目的 `dst`，目标 `target`，带「源链路层地址」选项）；返回帧长。
+fn build_ns(
+    io: u64,
+    mac: [u8; 6],
+    src: &[u8; 16],
+    dst_mac: [u8; 6],
+    dst: &[u8; 16],
+    target: &[u8; 16],
+) -> u64 {
+    put_mac(io, dst_mac);
+    put_mac(io + 6, mac);
+    wr16be(io + 12, ETH_IPV6);
+    let ip = io + 14;
+    wr32be(ip, 0x6000_0000); // version 6, 流量类别/流标签 = 0
+    wr16be(ip + 4, 32); // payload = NS 头(24) + SLLAO(8)
+    wr8(ip + 6, IP6_PROTO_ICMPV6);
+    wr8(ip + 7, 255);
+    put_v6(ip + 8, src);
+    put_v6(ip + 24, dst);
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_NS);
+    wr8(ic + 1, 0); // code
+    wr16be(ic + 2, 0); // 校验和字段须先清零再计算
+    wr32be(ic + 4, 0); // reserved
+    put_v6(ic + 8, target);
+    wr8(ic + 24, 1); // 选项：源链路层地址
+    wr8(ic + 25, 1);
+    put_mac(ic + 26, mac);
+    let c = csum_v6(src, dst, IP6_PROTO_ICMPV6, ic, 32);
+    wr16be(ic + 2, c);
+    14 + 40 + 32
+}
+
+/// 在 `io` 处构造一个邻居通告（NA，回应 NS）；返回帧长。
+fn build_na(
+    io: u64,
+    mac: [u8; 6],
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    dst_mac: [u8; 6],
+    target: &[u8; 16],
+) -> u64 {
+    put_mac(io, dst_mac);
+    put_mac(io + 6, mac);
+    wr16be(io + 12, ETH_IPV6);
+    let ip = io + 14;
+    wr32be(ip, 0x6000_0000); // version 6, 流量类别/流标签 = 0
+    wr16be(ip + 4, 32); // payload = NA 头(24) + TLLAO(8)
+    wr8(ip + 6, IP6_PROTO_ICMPV6);
+    wr8(ip + 7, 255);
+    put_v6(ip + 8, src);
+    put_v6(ip + 24, dst);
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_NA);
+    wr8(ic + 1, 0); // code
+    wr16be(ic + 2, 0); // 校验和字段须先清零再计算
+    wr32be(ic + 4, 0x6000_0000); // flags: Solicited + Override, 其余保留位 0
+    put_v6(ic + 8, target);
+    wr8(ic + 24, 2); // 选项：目标链路层地址
+    wr8(ic + 25, 1);
+    put_mac(ic + 26, mac);
+    let c = csum_v6(src, dst, IP6_PROTO_ICMPV6, ic, 32);
+    wr16be(ic + 2, c);
+    14 + 40 + 32
+}
+
+/// 在 ICMPv6 选项列表（自 `ic + 16` 起）里找类型为 `want` 的选项，返回 `(选项 VA, 选项长度)`。
+fn first_opt(ic: u64, plen: u64, want: u8) -> Option<(u64, u64)> {
+    let mut o = ic + 16;
+    let end = ic + plen;
+    while o + 8 <= end {
+        let ot = rd8(o);
+        let ol = (rd8(o + 1) as u64) * 8;
+        if ol < 8 {
+            break;
+        }
+        if ot == want {
+            return Some((o, ol));
+        }
+        o += ol;
+    }
+    None
+}
+
+/// 取选项里的链路层地址（选项 +2 起的 6 字节）。
+fn opt_mac(o: u64) -> [u8; 6] {
+    [
+        rd8(o + 2),
+        rd8(o + 3),
+        rd8(o + 4),
+        rd8(o + 5),
+        rd8(o + 6),
+        rd8(o + 7),
+    ]
+}
+
+/// 处理收到的 IPv6 帧（ICMPv6）：RA → SLAAC；NS → 回 NA；NA → 记录路由器。
+/// 若需回帧，帧已在 `io` 处构造好，返回其长度；否则返回 0。
+fn icmpv6_input(st: &mut Stack, nic: usize, io: u64, n: u64) -> u64 {
     if n < 14 + 40 {
-        return;
+        return 0;
     }
     let ip = io + 14;
     if (rd8(ip) >> 4) != 6 || rd8(ip + 6) != IP6_PROTO_ICMPV6 {
-        return;
+        return 0;
     }
     let plen = rd16be(ip + 4) as u64;
     if plen < 4 || n < 14 + 40 + plen {
-        return;
+        return 0;
     }
+    let src = get_v6(ip + 8);
     let ic = ip + 40;
-    let end = ic + plen;
-    let ty = rd8(ic);
-    if ty == ICMPV6_RA {
-        print("NET16 ipv6 ra rx, prefix=");
-        // RA 定长部分 16 字节，其后是选项；Prefix Information = 类型 3，前缀在选项 +16。
-        let mut o = ic + 16;
-        while o + 8 <= end {
-            let ot = rd8(o);
-            let ol = (rd8(o + 1) as u64) * 8;
-            if ol < 8 {
-                break;
+    let mac = mac_bytes(st.links[nic].mac);
+    match rd8(ic) {
+        ICMPV6_RA => {
+            // 选项：前缀信息(3) → 前缀在选项 +16；源链路层地址(1) → 路由器 MAC。
+            let prefix = match first_opt(ic, plen, 3) {
+                Some((o, ol)) if ol >= 32 => get_v6(o + 16),
+                _ => [0u8; 16],
+            };
+            print("NET16 ipv6 ra rx, prefix=");
+            print_v6(prefix.as_ptr() as u64);
+            println("");
+            if !v6_is_zero(&prefix) {
+                st.links[nic].v6_global = global_from_prefix(&prefix, mac);
+                st.links[nic].v6_gw = src;
+                st.links[nic].gw6_mac = first_opt(ic, plen, 1).map(|(o, _)| opt_mac(o));
+                st.links[nic].v6_up = true;
             }
-            if ot == 3 && ol >= 32 {
-                print_v6(o + 16);
-                print(" ");
-            }
-            o += ol;
+            0
         }
-        println("(rs/ra probe) OK");
-    } else if ty == ICMPV6_NA {
-        println("NET16 ipv6 na rx");
+        ICMPV6_NS => {
+            let target = get_v6(ic + 8);
+            let ll = link_local_from_mac(mac);
+            if v6_eq(&target, &ll) || v6_eq(&target, &st.links[nic].v6_global) {
+                // 回应 NA：源 = 被问地址，目的 = 请求方；目的 MAC 取其 SLLAO（无则用本机 MAC）。
+                let dst_mac = first_opt(ic, plen, 1)
+                    .map(|(o, _)| opt_mac(o))
+                    .unwrap_or(mac);
+                build_na(io, mac, &target, &src, dst_mac, &target)
+            } else {
+                0
+            }
+        }
+        ICMPV6_NA => {
+            if v6_eq(&src, &st.links[nic].v6_gw) {
+                if let Some((o, _)) = first_opt(ic, plen, 2) {
+                    st.links[nic].gw6_mac = Some(opt_mac(o));
+                }
+            }
+            0
+        }
+        _ => 0,
     }
 }
 
-/// R1 取证驱动：发一个 IPv6 路由请求，有界收包（400ms），打印链路本地地址与收到的 RA/NA。
+/// NDP 确定性自证：构造一个针对本机链路本地地址的 NS，投进 `icmpv6_input`，应产出 NA
+/// （校验类型 + 校验和自洽）。不依赖真实对端。
+fn ndp_selftest(st: &mut Stack, nic: usize) -> bool {
+    let io = st.links[nic].io;
+    let mac = mac_bytes(st.links[nic].mac);
+    let ll = link_local_from_mac(mac);
+    let ns_len = build_ns(io, mac, &ll, mac, &ll, &ll);
+    let out = icmpv6_input(st, nic, io, ns_len);
+    if out != 14 + 40 + 32 || rd8(io + 14 + 40) != ICMPV6_NA {
+        return false;
+    }
+    let na = io + 14 + 40;
+    let s = get_v6(io + 14 + 8);
+    let d = get_v6(io + 14 + 24);
+    csum_v6(&s, &d, IP6_PROTO_ICMPV6, na, out - 54) == 0
+}
+
+/// V6.1 取证/驱动：发 RS → 收 RA → SLAAC；打印链路本地、全局地址与路由器 MAC。
 fn ipv6_probe(st: &mut Stack, nic: usize) {
     let io = st.links[nic].io;
-    let src = link_local_from_mac(mac_bytes(st.links[nic].mac));
+    let ll = link_local_from_mac(mac_bytes(st.links[nic].mac));
     print("NET16 ipv6 ll=");
-    print_v6(src.as_ptr() as u64);
+    print_v6(ll.as_ptr() as u64);
     println(" (rs/ra probe)");
     let len = build_rs(&st.links[nic]);
     let _ = link_tx(&st.links[nic], len);
-    let mut got = false;
     let mut tries = 0u64;
-    while tries < 40 {
+    while tries < 40 && !st.links[nic].v6_up {
         if let Some(n) = link_rx(&st.links[nic]) {
             if rd16be(io + 12) == ETH_IPV6 {
-                ipv6_handle(io, n);
-                got = true;
+                let _ = icmpv6_input(st, nic, io, n);
             }
         }
         sys_sleep(10);
         tries += 1;
     }
-    if !got {
-        println("NET16 ipv6 ra timeout (no RA in 400ms)");
+    if st.links[nic].v6_up {
+        print("NET16 ipv6 slaac OK (g=");
+        print_v6(st.links[nic].v6_global.as_ptr() as u64);
+        if st.links[nic].gw6_mac.is_some() {
+            print(", gw mac learned");
+        }
+        println(")");
+    } else {
+        println("NET16 ipv6 slaac timeout (no RA in 400ms)");
     }
 }
 
@@ -467,8 +678,11 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
         return;
     }
     if et == ETH_IPV6 {
-        // R1: 只取证（打印 RA/NA），不建状态；V6.1 起改由 NDP 处理。
-        ipv6_handle(f, n);
+        // V6.1: NDP（RA→SLAAC / NS→NA）；若需回应，帧已就地构造好，直接发回。
+        let out = icmpv6_input(st, nic, f, n);
+        if out > 0 {
+            let _ = link_tx(&st.links[nic], out);
+        }
         return;
     }
     if et != ETH_IPV4 || n < 34 {
@@ -1790,7 +2004,13 @@ pub fn run() {
         println("netstack: nic1 absent (no e1000e)");
     }
 
-    // R1 取证: 探测 slirp 的 IPv6（发 RS → 收 RA），据此校准 V6.1 的 SLAAC 前缀/DNSv6。
+    // V6.1: NDP 确定性自证（构造 NS → 处理器产出 NA，校验类型与校验和）。
+    if ndp_selftest(st, 0) {
+        println("NET16 ndp self-test OK (ns->na)");
+    } else {
+        println("NET16 ndp self-test FAILED");
+    }
+    // V6.1: 发 RS 收 RA → SLAAC（前缀 fec0::/64 + EUI-64），并从 RA 的 SLLAO 记路由器 MAC。
     ipv6_probe(st, 0);
 
     // N7: TCP 连接状态机 + 重传的确定性自证（不依赖真实对端）。

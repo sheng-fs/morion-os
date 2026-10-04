@@ -250,6 +250,9 @@ grep -qE 'app: NET13 http OK' "$log" 2>/dev/null || net_bad=1
 # R1 取证 (IPv6): 自派生链路本地 fe80:: + slirp 应答 RS 回 RA (前缀 fec0::/64)。
 grep -qE 'NET16 ipv6 ll=fe80:' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET16 ipv6 ra rx' "$log" 2>/dev/null || net_bad=1
+# V6.1: SLAAC (RA 前缀 + EUI-64 全局地址) + NDP 确定性自证 (NS→NA)。
+grep -qE 'NET16 ipv6 slaac OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'NET16 ndp self-test OK' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。

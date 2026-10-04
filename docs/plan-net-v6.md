@@ -96,7 +96,8 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 - **地址**：IPv6 地址表（每链路 `{ll, global}`）；**link-local `fe80::/64`（EUI-64 由 MAC 派生）** 必做；**SLAAC**（收 RA → 取前缀 + 接口 id）必做（R1 实测前缀 `fec0::/64`）。
 - **NDP**：NS / NA / RS / RA 替代 ARP（邻居缓存复用现有老化逻辑）；DAD（重复地址检测，最小）。
 - **抽象**：引入 `IpAddr`(v4/v6) 落到 conn / socket，替换现有的裸 `u64` IPv4 表示（内部可延后，先做对外）。
-- marker：`NET16 ipv6 slaac/ndp OK (ll=fe80::…, g=fec0::…)`。**R1 已过**：`NET16 ipv6 ll=fe80::5054:ff:fe12:3456` + `NET16 ipv6 ra rx, prefix=fec0::/64`。
+- marker：`NET16 ipv6 slaac OK (ll=fe80::…, g=fec0::…)` + `NET16 ndp self-test OK (ns->na)`。**已过**。
+- 实现：`Link` 增 `v6_global/v6_gw/gw6_mac/v6_up`；`icmpv6_input` 处理 **RA→SLAAC**（前缀 + EUI-64 组全局地址）/ **NS→NA** / **NA→记路由器**；RA 的 SLLAO 选项直取路由器 MAC（免一次 NS/NA）。踩坑：ICMPv6 构造器算校验和前**必须先清零校验和字段**（否则残留上一帧字节，真机拒收）。
 
 ### V6.2 — 传输
 - **ICMPv6**：echo request/reply + 最小错误（端口不可达等）。
@@ -130,7 +131,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 ## 6. 执行顺序（每步独立可回归 + 逐条提交）
 
 1. ✅ **R1 取证（已完成）**：发 RS → slirp 回 RA，**前缀 `fec0::/64`**；自派生链路本地 `fe80::5054:ff:fe12:3456`。证据 marker `NET16 ipv6 ll=… / ra rx, prefix=…`（已入 `scripts/fs-regress.sh` 判据）。
-2. **V6.1** 地址 + NDP（`NET16`）。
+2. ✅ **V6.1 地址 + SLAAC + NDP（已完成）**：`NET16 ipv6 slaac OK (g=fec0:0:0:0:5054:ff:fe12:3456, gw mac learned)` + `NET16 ndp self-test OK (ns->na)`。
 3. **V6.2** ICMPv6 + UDPv6 + TCPv6（`NET17`/`NET18`）。
 4. **V6.3** AAAA + 应用面（`NET19`）。
 5. **DRV-A** NIC 表驱动化（回归逐字不变）。
