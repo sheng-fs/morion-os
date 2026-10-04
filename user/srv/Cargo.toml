@@ -46,6 +46,7 @@ default = [
     "svc-ahci_srv",
     "svc-xhci_srv",
     "svc-iso9660_srv",
+    "svc-netstack_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -68,6 +69,7 @@ svc-virtio_blk_srv = []
 svc-ahci_srv = []
 svc-xhci_srv = []
 svc-iso9660_srv = []
+svc-netstack_srv = []
 
 [[bin]]
 name = "sender"
@@ -173,6 +175,11 @@ required-features = ["svc-xhci_srv"]
 name = "iso9660_srv"
 path = "src/bin/iso9660_srv.rs"
 required-features = ["svc-iso9660_srv"]
+
+[[bin]]
+name = "netstack_srv"
+path = "src/bin/netstack_srv.rs"
+required-features = ["svc-netstack_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。

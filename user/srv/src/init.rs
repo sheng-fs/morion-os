@@ -46,7 +46,7 @@ use morion::syscall::*;
 ///
 /// 域号是 ABI (见内核对域布局的注释)，与 `kernel/src/main.rs` 建域顺序一致。盘上镜像名只
 /// 在内存镜像不可用时用作回退路径。
-const SUPERVISED: [(u64, &str); 11] = [
+const SUPERVISED: [(u64, &str); 12] = [
     (2, "pager"),
     (3, "echo"),
     (4, "kbd"),
@@ -58,6 +58,7 @@ const SUPERVISED: [(u64, &str); 11] = [
     (13, "exfat_srv"),
     (15, "gfx_srv"),
     (16, "net_srv"),
+    (21, "netstack_srv"),
 ];
 
 /// 巡检周期 (ms)。

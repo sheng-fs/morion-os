@@ -286,6 +286,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 域 20 — iso9660_srv (ISO9660 只读文件服务, 03c 续: 安装介质): 无设备, 经 block_srv 卷层
     // 读 CD/安装盘 (把 .iso 当裸块设备), 挂载于 /cdrom。
     let iso9660_domain = domain::create();
+    // 域 21 — netstack_srv (用户态网络协议栈, N6): 无设备, 经帧级 IPC 调 net_srv(域 16)
+    // 收发以太帧; 对应用提供 UDP socket 并落实端口能力门禁。
+    let netstack_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -566,6 +569,11 @@ pub extern "C" fn kernel_main() -> ! {
     // 缓冲页共享给它 (与 ext2_srv 同款: 只需 iso9660 → SendTo/MapInto block)。
     cap::grant(iso9660_domain, cap::Capability::SendTo(block_domain));
     cap::grant(iso9660_domain, cap::Capability::MapInto(block_domain));
+
+    // 授权 (N6): 网络协议栈 (域 21) 经帧级 IPC 调 net_srv (域 16) 收发帧, 并把收发帧的
+    // 共享页映射进 net_srv (SendTo + MapInto)。回复方向不需要能力 (ipc::reply 直接投递)。
+    cap::grant(netstack_domain, cap::Capability::SendTo(net_domain));
+    cap::grant(netstack_domain, cap::Capability::MapInto(net_domain));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。

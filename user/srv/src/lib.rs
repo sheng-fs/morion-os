@@ -56,6 +56,8 @@ pub mod mfs_srv;
 pub mod mount_srv;
 #[cfg(feature = "svc-net_srv")]
 pub mod net_srv;
+#[cfg(feature = "svc-netstack_srv")]
+pub mod netstack_srv;
 #[cfg(feature = "svc-pager")]
 pub mod pager;
 #[cfg(feature = "svc-receiver")]
