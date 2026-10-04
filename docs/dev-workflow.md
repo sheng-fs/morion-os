@@ -19,7 +19,7 @@ cd /home/jinjun/文档/morion-os
 
 # 最小自检（约 1 分钟）
 cargo fmt --all -- --check && make check && make clippy
-cargo test --lib -p morion-kernel          # 期望 34 passed
+cargo test --lib -p morion-kernel          # 期望 36 passed
 ```
 
 **都是踩过的坑**：
@@ -60,7 +60,7 @@ OUT_DIR=build bash scripts/fs-regress.sh /tmp/regress.log
 **判据**（缺一不可）：
 
 - `SELFTEST DONE` ≥ 1；`FAILED` / `PANIC` = 0
-- `[OK] 25 service ELFs loaded`
+- `[OK] 26 service ELFs loaded`
 - **`irq_cmds == cmds` 且 `poll_cmds = 0`**（**不要硬比历史数字**：`cmds` 的绝对值会随块层
   缓存 / 预读、新增自测而变化；判的是**两者相等**且**没有退化成轮询**）
 - `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`
@@ -94,7 +94,7 @@ OUT_DIR=build/nogui bash scripts/fs-regress.sh /tmp/nogui.log
 - **`dd` 写镜像必须 `conv=notrunc`**，否则整盘被截断（曾导致 `rw=BAD`）。
 - **`BOOT_DOMAINS` 与各全局表长度必须一致**：域 id 是 `irq`/`cap`/`ipc`/`pager` 等表的**下标**，
   加了域却忘了改 `BOOT_DOMAINS`（或反过来）会**越界 panic**。同理别漏 `boot/src/main.rs` 里
-  `SERVICE_FILES` 的**长度常量**（现在 25）。
+  `SERVICE_FILES` 的**长度常量**（现在 26）。
 - **DMAR 表体**：重映射结构从偏移 **48** 起（表头 36 + `Host Address Width` 1 + `Flags` 1 + 保留 10），
   按 36 解析会出现"表找到了但 `drhd=0 rmrr=0`"。
 - **VT-d 上下文项 `TT`（bits 3:2）**：`0b00` = translated（走二级页表）、`0b01` = Device TLB、

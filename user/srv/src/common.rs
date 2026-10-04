@@ -125,6 +125,9 @@ pub struct NetReq {
 /// netstack_srv 域号（用户态网络协议栈，N6）。
 pub const NETSTACK_DOMAIN: u64 = 21;
 
+/// wifi_srv 域号（无线 station 服务，W1；plan §3.4 抽象层）。
+pub const WIFI_DOMAIN: u64 = 25;
+
 // ---------------------------------------------------------------------------
 // DRV-A — 内核写给协议栈的只读 NIC 表（表驱动网卡接线）
 // ---------------------------------------------------------------------------
@@ -141,6 +144,9 @@ pub const NIC_KIND_VIRTIO_NET: u64 = 1;
 pub const NIC_KIND_E1000E: u64 = 2;
 /// 网卡型号：Intel e1000 82540EM（e1000_srv，域 24，DRV-B）。
 pub const NIC_KIND_E1000: u64 = 3;
+/// 网卡型号：无线 station（wifi_srv，域 25）——**关联成功后**才以该型号出现在 NIC 表里
+/// （plan §3.4 的抽象：无线关联成功即暴露为一条普通以太链路，与有线驱动同契约）。
+pub const NIC_KIND_WIFI: u64 = 4;
 
 /// 一条网卡接线：驱动服务域 + 帧共享页 VA + 型号。
 #[repr(C)]
@@ -230,6 +236,60 @@ pub struct NetSReq {
     pub addr: u64, // sendto: 目的 IPv4（`a<<24 | b<<16 | c<<8 | d`）
     pub len: u64,  // sendto: 负载长度
     pub buf: u64,  // 共享页 va（sendto 负载输入 / recvfrom 负载输出）
+}
+
+// ---------------------------------------------------------------------------
+// L2 链路接口 —— 驱动层 ↔ 协议栈的**统一契约**（plan §3.4 ①）
+// ---------------------------------------------------------------------------
+//
+// 不论 virtio-net / e1000e / e1000（有线）还是 wifi_srv（无线），对协议栈都只暴露
+// **同一条「以太链路」**：`NET_REQ_TAG` + `NetReq{op,len,buf}`，三种 op：
+//   - `NET_OP_TX`   把协议栈共享页里的裸以太帧发出（`len` = 帧长）；
+//   - `NET_OP_RX`   从网卡收一帧写回共享页（回复 = 帧长，0 = 无帧）；
+//   - `NET_OP_INFO` 回该链路的 MAC（低 48 位）。
+// 上层（`netstack_srv`）**只见链路、不知 L2 种类**（`Link.kind` 仅用于展示）。
+// 无线 station 在**关联成功后**把自己注册成 NIC 表里的一条 `NIC_KIND_WIFI` 条目，
+// 此后与有线驱动完全同契约 —— 这就是 §3.4 ② 的模型：协议栈无需区分有线 / 无线。
+
+// ---------------------------------------------------------------------------
+// 无线控制面 IPC（客户端 ↔ wifi_srv）：状态 / 扫描 / 关联（plan §3.4 ③ 的契约）
+// ---------------------------------------------------------------------------
+/// 无线控制面请求/回复 tag（"WIFI"）。
+pub const WIFI_REQ_TAG: u64 = 0x5749_4649;
+/// `WIFI_OP_*`：读状态 / 扫描 / 关联 / 断开。
+pub const WIFI_OP_STATUS: u64 = 0;
+pub const WIFI_OP_SCAN: u64 = 1;
+pub const WIFI_OP_ASSOC: u64 = 2;
+pub const WIFI_OP_DISCONNECT: u64 = 3;
+
+/// 无线控制面请求（与 `morion::wifi::WifiReq` 逐字节一致）。负载经共享页 `buf` 传递。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WifiReq {
+    pub op: u64,  // WIFI_OP_*
+    pub len: u64, // assoc: psk 长度（ssid 固定 32 字节，在 buf[0..32]）
+    pub buf: u64, // 共享页 va
+}
+
+/// 无线状态快照（`WIFI_OP_STATUS` 输出到共享页）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WifiStatus {
+    pub radio: u64,      // 1 = 本机有可用 radio（真驱动）；抽象层恒 0
+    pub firmware: u64,   // 固件是否已加载
+    pub associated: u64, // 是否已关联（关联成功才成为一条 Link）
+    pub ssid_len: u64,
+    pub ssid: [u8; 32],
+}
+
+/// 单条扫描结果（`WIFI_OP_SCAN` 输出数组元素）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WifiBss {
+    pub ssid_len: u64,
+    pub rssi: u64,
+    pub channel: u64,
+    pub ssid: [u8; 32],
 }
 
 /// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。**直通**实现 (不经写背缓存)。

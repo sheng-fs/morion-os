@@ -970,7 +970,7 @@ struct ServiceModule {
 
 /// 服务清单: `(固定域号, 文件名)`。域号是 ABI（libvfs / shell 写死了服务域号），
 /// 故这里与 `kernel/src/main.rs` 建域的顺序必须一致。
-const SERVICE_FILES: [(u64, &str); 25] = [
+const SERVICE_FILES: [(u64, &str); 26] = [
     (0, "sender"),
     (1, "receiver"),
     (2, "pager"),
@@ -996,6 +996,7 @@ const SERVICE_FILES: [(u64, &str); 25] = [
     (22, "e1000e_srv"),
     (23, "httpd_srv"),
     (24, "e1000_srv"),
+    (25, "wifi_srv"),
 ];
 
 /// 服务 ELF 在 ESP 里的目录。

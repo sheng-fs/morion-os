@@ -245,6 +245,9 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  ping <ip|host> ICMP echo over IPv4 (IPv6 literal delegates to ping6)");
             println("  ping6 <ip|host>  ICMPv6 echo over IPv6");
             println("  dns <name>     resolve A and AAAA records (alias: nslookup)");
+            println(
+                "  wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)",
+            );
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -293,6 +296,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "ping" => shell_ping(arg),
         "ping6" => shell_ping6(arg),
         "dns" | "nslookup" => shell_dns(arg),
+        "wifi" => shell_wifi(arg),
         "cd" => shell_cd(st, if arg.is_empty() { "/" } else { arg }),
         "mkdir" => shell_mkdir(st, arg),
         "touch" => shell_touch(st, arg),
@@ -578,6 +582,92 @@ fn shell_dns(name: &str) {
         print("dns: ");
         print(name);
         println(" AAAA = (none)");
+    }
+}
+
+/// 打印一段 ASCII 字节（非 ASCII 段跳过）。
+fn print_ascii(b: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(b) {
+        print(s);
+    }
+}
+
+/// `wifi [status|scan|connect <ssid> [psk]]` —— 无线 station（`wifi_srv`，域 25）。
+///
+/// 本轮是**抽象层**（plan §3.4）：无 radio 时 status 报 `radio=0`、scan 返 0 条、
+/// connect 恒失败。真机接入前后命令接口不变。
+fn shell_wifi(arg: &str) {
+    let (cmd, rest) = match arg.split_once(' ') {
+        Some((c, r)) => (c, r.trim()),
+        None => (arg, ""),
+    };
+    match cmd {
+        "" | "status" => shell_wifi_status(),
+        "scan" => shell_wifi_scan(),
+        "connect" => shell_wifi_connect(rest),
+        _ => println("usage: wifi [status|scan|connect <ssid> [psk]]"),
+    }
+}
+
+fn shell_wifi_status() {
+    match morion::wifi::status() {
+        Some(st) => {
+            print("wifi: radio=");
+            print_u64(st.radio);
+            print(" firmware=");
+            print_u64(st.firmware);
+            print(" associated=");
+            print_u64(st.associated);
+            if st.associated != 0 {
+                print(" ssid=");
+                print_ascii(st.ssid_str());
+            }
+            println("");
+            if st.radio == 0 {
+                println("wifi: no wireless radio on this machine (abstraction layer only)");
+            }
+        }
+        None => println("wifi: wifi_srv unreachable"),
+    }
+}
+
+fn shell_wifi_scan() {
+    let mut bss = [morion::wifi::WifiBss::zeroed(); 16];
+    let n = morion::wifi::scan(&mut bss);
+    if n == 0 {
+        println("wifi: 0 BSS (no radio / abstraction layer only)");
+        return;
+    }
+    let mut i = 0usize;
+    while i < n {
+        let b = &bss[i];
+        print("wifi: ssid=");
+        print_ascii(b.ssid_str());
+        print(" rssi=");
+        print_u64(b.rssi);
+        print(" ch=");
+        print_u64(b.channel);
+        println("");
+        i += 1;
+    }
+}
+
+fn shell_wifi_connect(rest: &str) {
+    let (ssid, psk) = match rest.split_once(' ') {
+        Some((s, p)) => (s.trim(), p.trim()),
+        None => (rest.trim(), ""),
+    };
+    if ssid.is_empty() {
+        println("usage: wifi connect <ssid> [psk]");
+        return;
+    }
+    print("wifi: connecting ");
+    print(ssid);
+    print(" ... ");
+    if morion::wifi::assoc(ssid.as_bytes(), psk.as_bytes()) {
+        println("associated");
+    } else {
+        println("failed (no radio / abstraction layer only)");
     }
 }
 

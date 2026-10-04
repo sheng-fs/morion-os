@@ -3395,13 +3395,14 @@ pub fn run() {
     net_ok &= net22_netinfo(); // 网络完善: 链路状态查询（shell `net`）
     net_ok &= net23_ping4(); // 网络完善: IPv4 ICMP echo（shell `ping`）
     net_ok &= net24_ping6(); // 网络完善: IPv6 ICMPv6 echo（shell `ping6`）
+    net_ok &= net25_wifi(); // W1: 无线抽象层（wifi_srv 控制面契约）
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
     net_ok &= net19_dns_aaaa(); // V6.3: DNS AAAA（应用侧 IPv6 地址面）
     net_ok &= net20_udp6(); // V6.4: 双栈 UDP socket（::1 回环 + v4-mapped）
     net_ok &= net13_http(); // N8.2: 回环 TCP + 客户机内建 HTTP 服务
     if net_ok {
-        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http + udp6 + netinfo + ping)");
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http + udp6 + netinfo + ping + wifi)");
     } else {
         println("app: NET7 app socket FAILED");
     }
@@ -4100,6 +4101,26 @@ fn net24_ping6() -> bool {
     } else {
         println("app: NET24 ping6 FAILED (no reply from router)");
         false
+    }
+}
+
+/// NET-25（W1 无线抽象层）: `wifi_srv` 控制面契约连通 —— status 往返 + 无 radio 语义。
+/// 抽象层无硬件: 断言 `radio=0` 且 `associated=0`（真机接入后本判据会更新）。
+fn net25_wifi() -> bool {
+    match morion::wifi::status() {
+        Some(st) => {
+            let ok = st.radio == 0 && st.associated == 0;
+            if ok {
+                println("app: NET25 wifi abstraction OK (status round-trip, radio=0)");
+            } else {
+                println("app: NET25 wifi abstraction FAILED (unexpected status)");
+            }
+            ok
+        }
+        None => {
+            println("app: NET25 wifi abstraction FAILED (wifi_srv unreachable)");
+            false
+        }
     }
 }
 

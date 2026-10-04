@@ -41,6 +41,7 @@ shell: type 'help' for commands
 | `ping` | `ping <ipv4\|ipv6\|host>` | IPv4 走 ICMP echo（`morion::net::ping4`）；IPv6 字面量自动转 `ping6`；主机名先 `resolve`（先 A 后 AAAA） |
 | `ping6` | `ping6 <ipv6\|host>` | IPv6 走 ICMPv6 echo（`morion::net::ping6`）；主机名先查 AAAA |
 | `dns` / `nslookup` | `dns <name>` | 解析 `<name>` 的 A 与 AAAA 记录各打印一行（走 slirp 内置 DNS `10.0.2.3`） |
+| `wifi` | `wifi [status\|scan\|connect <ssid> [psk]]` | 无线 station（`wifi_srv`，域 25）。本轮是**抽象层**：无 radio 时 `status` 报 `radio=0`、`scan` 返 0 条、`connect` 恒失败。真机接入前后命令接口不变 |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -89,6 +90,7 @@ commands:
   ping <ip|host> ICMP echo over IPv4 (IPv6 literal delegates to ping6)
   ping6 <ip|host>  ICMPv6 echo over IPv6
   dns <name>     resolve A and AAAA records (alias: nslookup)
+  wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file
@@ -221,6 +223,26 @@ dns: example.com AAAA = 2606:2800:220:1:248:1893:25c8:1946
   内核端口归属表**一个端口只归一个域**，故 DNS 源端口按域派生（否则 app 先绑的端口会让 shell 绑不上）；
   它落在 shell 的 `Net(12345,12399)` 能力内，`netstack_srv` 再用 `SYS_NET_OWNER` 核对端口归属。
 - 查不到该类型时打印 `(none)`（离线时可能两条都是 `(none)`）；缺参数：`dns: usage: dns <name>`。
+
+### `wifi [status|scan|connect <ssid> [psk]]`
+
+无线 station 控制（`wifi_srv`，域 25）。**本轮是抽象层**（plan-net-v6 §3.4）—— QEMU 无 802.11 设备、本机无 radio 时：
+
+```text
+[morion@morion /]$ wifi status
+wifi: radio=0 firmware=0 associated=0
+wifi: no wireless radio on this machine (abstraction layer only)
+[morion@morion /]$ wifi scan
+wifi: 0 BSS (no radio / abstraction layer only)
+[morion@morion /]$ wifi connect MySSID secret
+wifi: connecting MySSID ... failed (no radio / abstraction layer only)
+```
+
+- `status`：读 `WIFI_OP_STATUS`（`radio/firmware/associated`，已关联时附 `ssid`）。
+- `scan`：列 `WIFI_OP_SCAN` 返回的 BSS（`ssid/rssi/ch`），抽象层恒 0 条。
+- `connect <ssid> [psk]`：`WIFI_OP_ASSOC`（WPA2-PSK），抽象层恒失败；`psk` 缺省为空。
+- 服务不可达（域 25 未起）：`wifi: wifi_srv unreachable`。
+- 真机接入（vfio 直通 + 固件 + 802.11/WPA 栈）后**命令接口不变**：届时 `radio=1`、`scan` 列出真实 BSS、`connect` 走四步握手。
 
 ### `cd [path]`
 

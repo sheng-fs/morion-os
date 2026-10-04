@@ -39,6 +39,7 @@ pub mod gfx;
 pub mod net;
 pub mod syscall;
 pub mod vfs;
+pub mod wifi;
 
 extern "C" {
     /// 程序主函数：由程序自己定义（`#[no_mangle] pub extern "C" fn morion_main(domain_id: u64)`）。

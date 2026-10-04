@@ -91,6 +91,8 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 
 **明确标注：无线驱动本体不可本机回归**，待真机条件（选定芯片，倾向 Intel iwlwifi AX200/AX210）再单独立项。
 
+**已实现（W1，阶段 107）**：三条抽象均落地并可回归 —— ① `common.rs` 固化 L2 链路契约（`NET_REQ_TX/RX/INFO`，加 `NIC_KIND_WIFI=4`）；② `wifi_srv`（域 25，无设备、纳入监督）定义「关联成功即以 `NIC_KIND_WIFI` 注册为 NIC 表一条 `Link`」的模型；③ 控制面 `WIFI_REQ_TAG="WIFI"` + `WIFI_OP_STATUS/SCAN/ASSOC/DISCONNECT`（`WifiReq/WifiStatus/WifiBss`）**空实现**。用户侧 `morion::wifi` + shell `wifi`。取证 `WIFI0` + `NET25`。
+
 ---
 
 ## 4. IPv6 线（可回归，主攻）
@@ -162,7 +164,8 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 6. ✅ **DRV-B `e1000_srv`（已完成，`NET15`）**：MMIO 82540EM，与 e1000e 共用 `intel_nic` 核心；rtl8139(PIO) 待内核 I/O-BAR 授权通路后再做（`NET14` 顺延）。
 7. **DRV-C** `virtio_input` → `virtio_gpu_srv`。
 8. ✅ **V6.4 双栈收口（已完成）**：`sendto6` + v4-mapped（`app: NET20 udp6 socket OK`）。
-9. 无线抽象层（WIRELESS 契约 + 空实现）。
+9. ✅ **无线抽象层 W1（已完成，`WIFI0`/`NET25`）**：`wifi_srv`（域 25）+ 固化 L2 链路契约 + `WIFI_OP_STATUS/SCAN/ASSOC/DISCONNECT` 控制面契约（空实现）；`morion::wifi` + shell `wifi`；`app: NET25 wifi abstraction OK`。
+10. ✅ **网络完善（已完成，`NET22/23/24`）**：shell 网络命令 `net`/`ping`/`ping6`/`dns` + 协议栈 op `NETS_OP_NETINFO/PING4/PING6`；并修「DNS 源端口全局独属」→ 按域派生。
 
 > 每步：`cargo fmt --all && make fmt && make check && make clippy`（0 warning）→ `cargo test --lib -p morion-kernel` → `make OUT_DIR=build QEMU=/bin/true run-nvme` → `OUT_DIR=build bash scripts/fs-regress.sh`。
 

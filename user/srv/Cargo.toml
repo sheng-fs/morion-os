@@ -50,6 +50,7 @@ default = [
     "svc-e1000e_srv",
     "svc-e1000_srv",
     "svc-httpd_srv",
+    "svc-wifi_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -76,6 +77,7 @@ svc-netstack_srv = []
 svc-e1000e_srv = []
 svc-e1000_srv = []
 svc-httpd_srv = []
+svc-wifi_srv = []
 
 [[bin]]
 name = "sender"
@@ -201,6 +203,11 @@ required-features = ["svc-e1000_srv"]
 name = "httpd_srv"
 path = "src/bin/httpd_srv.rs"
 required-features = ["svc-httpd_srv"]
+
+[[bin]]
+name = "wifi_srv"
+path = "src/bin/wifi_srv.rs"
+required-features = ["svc-wifi_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。

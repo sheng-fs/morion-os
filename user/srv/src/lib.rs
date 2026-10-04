@@ -78,5 +78,7 @@ pub mod shell;
 pub mod tmpfs_srv;
 #[cfg(feature = "svc-virtio_blk_srv")]
 pub mod virtio_blk_srv;
+#[cfg(feature = "svc-wifi_srv")]
+pub mod wifi_srv;
 #[cfg(feature = "svc-xhci_srv")]
 pub mod xhci_srv;

@@ -299,6 +299,10 @@ pub extern "C" fn kernel_main() -> ! {
     // 与 e1000e 同属 8254x 家族 (共用用户态驱动核心); 全轮询, 不申请中断向量。
     // DRV-A 之后加它**不改协议栈** —— 只需往 NIC 表追加一条。
     let e1000_domain = domain::create();
+    // 域 25 — wifi_srv (无线 station 服务, W1; plan-net-v6 §3.4 抽象层): 无设备。
+    // 本轮只固化「驱动↔协议栈」的 L2 链路契约 + 802.11 控制面 IPC (WIFI_OP_SCAN/ASSOC/STATUS)
+    // 的**空实现**; 真机接入 (vfio 直通 + 固件 + 802.11/WPA 栈) 后 radio 后端替换, 契约不变。
+    let wifi_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -714,6 +718,16 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(httpd_domain, cap::Capability::SendTo(netstack_domain));
     cap::grant(httpd_domain, cap::Capability::MapInto(netstack_domain));
     cap::grant(httpd_domain, cap::Capability::Net(80, 80));
+
+    // 授权 (W1 无线抽象层): wifi_srv (域 25) 的控制面与 L2 契约 ——
+    //   * shell/app 调 `WIFI_OP_STATUS/SCAN/ASSOC` (SendTo + 共享结果页 MapInto);
+    //   * netstack 预留「无线关联成功后把 wifi_srv 当一条普通以太链路」的通路 (同一 L2 契约)。
+    cap::grant(shell_domain, cap::Capability::SendTo(wifi_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(wifi_domain));
+    cap::grant(app_domain, cap::Capability::SendTo(wifi_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(wifi_domain));
+    cap::grant(netstack_domain, cap::Capability::SendTo(wifi_domain));
+    cap::grant(netstack_domain, cap::Capability::MapInto(wifi_domain));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。
