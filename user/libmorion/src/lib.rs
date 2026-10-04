@@ -36,6 +36,7 @@
 pub mod console;
 pub mod exec;
 pub mod gfx;
+pub mod net;
 pub mod syscall;
 pub mod vfs;
 

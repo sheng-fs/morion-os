@@ -575,6 +575,12 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(netstack_domain, cap::Capability::SendTo(net_domain));
     cap::grant(netstack_domain, cap::Capability::MapInto(net_domain));
 
+    // 授权 (N6.6): app(域 7) 用网络 —— 可向 netstack 发请求并共享负载页, 且持一条 Net
+    // 端口能力 (自测端口 12345; 绑其它端口会被内核拒 —— 越权取证的负例)。
+    cap::grant(app_domain, cap::Capability::SendTo(netstack_domain));
+    cap::grant(app_domain, cap::Capability::MapInto(netstack_domain));
+    cap::grant(app_domain, cap::Capability::Net(12345, 12345));
+
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。
     // 域号已按 0..13 建好, 故直接按模块表里的域号载入 —— 每个服务跑自己的 ELF、进自己的

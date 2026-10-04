@@ -213,6 +213,19 @@ cap_bad=0
 echo "== 能力审计 (② cap-audit) =="
 grep -nE 'cap-audit:' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
+# 网络能力 (N5–N6): net_srv 帧级 NIC 驱动自测 (NET1 ARP / NET2 ipv4+icmp / NET3 DHCP / NET4 TCP)
+# + netstack_srv 协议栈起来 (frame link) + N6.6 应用经 libnetv 的 UDP socket 端到端
+# (端口能力门禁拒绝越权 + 回环收发 + 真实 TX 触发 ICMP 不可达回程)。任一缺即判失败。
+net_bad=0
+echo "== 网络能力自测 (N5/N6: NET1..NET4 + netstack + NET5) =="
+grep -nE 'NET1|NET2|NET3|NET4|netstack:|app: NET5' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'NET1 virtio-net up, MAC=.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'NET3 dhcp OK, ip=' "$log" 2>/dev/null || net_bad=1
+grep -qE 'NET2 ipv4/icmp OK.*udp TX 10.0.2.2:9999 -> icmp unreachable' "$log" 2>/dev/null || net_bad=1
+grep -qE 'NET4 tcp OK, handshake\+data selftest OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: up \(frame link to net_srv OK\)' "$log" 2>/dev/null || net_bad=1
+grep -qE 'app: NET5 udp socket OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: nic rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。
@@ -221,4 +234,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${iso_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${iso_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ] && [ "${net_bad:-0}" -eq 0 ]

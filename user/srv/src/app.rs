@@ -3386,6 +3386,9 @@ pub fn run() {
         return;
     }
 
+    // NET-5 (N6): 应用经 libnetv 用 UDP socket —— 端口能力门禁 + 回环收发 + 真实收帧。
+    net5_udp_socket();
+
     // 34. FS-31 自测 (01 健壮性收口): 最小 fsck 对账口径的稳定性。
     //     客户机内无法制造「已分配但不可达」的 inode 泄漏 (那要在目录项插入与 inode 登记
     //     之间掉电), 故本自测断言**对一份结构一致的卷**: 报泄漏 inode = 0、可回收块 = 0;
@@ -3900,6 +3903,52 @@ fn fs29_supervisor_restart() -> Option<()> {
     }
     println("app: FS29 supervisor restart OK (echo exited, revived at domain 3)");
     Some(())
+}
+
+/// NET-5 (N6): 应用侧 UDP socket 自测 —— 端口能力门禁 + 回环收发 + 真实收帧。
+///
+/// 覆盖三件事:
+///   ① 越权 `bind(80)` 必须被内核拒绝 (app 的 `Net` 能力只覆盖 12345);
+///   ② 合法 `bind(12345)` 后 `sendto` 到本机地址 → netstack 回环直接投递回同一 socket,
+///      `recvfrom` 能取回**逐字节一致**的负载;
+///   ③ `sendto` 到网关 `10.0.2.2:9999` 走真实 TX 路径, 帧经 net_srv/网卡发出后触发
+///      ICMP 端口不可达 —— 收帧路径 (网卡→net_srv→netstack) 因此也被走通。
+fn net5_udp_socket() {
+    const PORT: u16 = 12345;
+    // ① 越权端口: 内核门禁应先于协议栈拒绝。
+    if sys_net_bind(80) != 0 {
+        println("app: NET5 over-privileged bind not denied FAILED");
+        return;
+    }
+    // ② 建 socket 并绑定合法端口。
+    let sock = morion::net::socket();
+    if sock == 0 || !morion::net::bind(sock, PORT) {
+        println("app: NET5 socket/bind FAILED");
+        return;
+    }
+    let msg = b"MORION-N6";
+    if !morion::net::sendto(sock, PORT, morion::net::ip4(10, 0, 2, 15), msg) {
+        println("app: NET5 sendto(loopback) FAILED");
+        return;
+    }
+    let mut buf = [0u8; 32];
+    let n = morion::net::recvfrom(sock, &mut buf);
+    if n as usize != msg.len() || buf[..n as usize] != msg[..] {
+        println("app: NET5 loopback recv mismatch FAILED");
+        return;
+    }
+    // ③ 真实 TX: 触发链路发帧 (回程 ICMP 不可达由 netstack 打印)。
+    let _ = morion::net::sendto(
+        sock,
+        9999,
+        morion::net::ip4(10, 0, 2, 2),
+        b"MORION-N6-PROBE",
+    );
+    // 让出 CPU 一个巡检周期, 给 netstack 收到回程 ICMP 不可达帧并打取证 marker 的机会 ——
+    // 否则 app 会立刻跑到 SELFTEST DONE, 回归在 netstack 排空 RX 前就停止抓日志。
+    sys_sleep(300);
+    let _ = morion::net::close(sock);
+    println("app: NET5 udp socket OK (cap-gate denial + loopback recv + tx probe)");
 }
 
 /// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。

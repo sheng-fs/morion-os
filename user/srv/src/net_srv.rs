@@ -873,10 +873,17 @@ fn net_tx(nic: &Nic, grant: &DeviceGrant, req: &NetReq) -> u64 {
     }
     let tx_va = grant.dma_vaddr + IP_TX_BUF_PAGE * PAGE;
     let tx_pa = grant.dma_paddr + IP_TX_BUF_PAGE * PAGE;
+    // virtio-net 要求每帧前置 12 字节头（无 offload: flags/gso 全 0）；协议栈交来的是**裸以太帧**
+    // （RX 侧已把头部剥掉），故这里清零头再拷到其后 —— 否则设备会把以太头当成 virtio 头, 帧被丢弃。
     unsafe {
-        core::ptr::copy_nonoverlapping(req.buf as *const u8, tx_va as *mut u8, req.len as usize);
+        core::ptr::write_bytes(tx_va as *mut u8, 0, VNET_HDR_LEN as usize);
+        core::ptr::copy_nonoverlapping(
+            req.buf as *const u8,
+            (tx_va + VNET_HDR_LEN) as *mut u8,
+            req.len as usize,
+        );
     }
-    nic.send(tx_pa, req.len);
+    nic.send(tx_pa, VNET_HDR_LEN + req.len);
     1
 }
 

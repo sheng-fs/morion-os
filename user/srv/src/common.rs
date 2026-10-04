@@ -122,6 +122,37 @@ pub struct NetReq {
     pub buf: u64, // 共享页虚拟地址 (调用方与本服务同址)
 }
 
+/// netstack_srv 域号（用户态网络协议栈，N6）。
+pub const NETSTACK_DOMAIN: u64 = 21;
+
+/// 套接字服务请求 tag（N6.5）: 应用经 `libnetv` 与 netstack_srv 交互。
+pub const NETS_REQ_TAG: u64 = 0x4E53_544B; // "NSTK"
+/// 建 socket; 回复 socket id（>0）/ 0。
+pub const NETS_OP_SOCKET: u64 = 0;
+/// 绑端口（需内核 `Net` 能力）; 回复 1/0。
+pub const NETS_OP_BIND: u64 = 1;
+/// 发 UDP; 回复 1/0。
+pub const NETS_OP_SENDTO: u64 = 2;
+/// 收 UDP; 回复负载长度（无数据 0），负载写入 `buf` 共享页。
+pub const NETS_OP_RECVFROM: u64 = 3;
+/// 关 socket; 回复 1。
+pub const NETS_OP_CLOSE: u64 = 4;
+
+/// 单条 UDP 负载上界（一页共享页内，留出帧头余量）。
+pub const NETS_PAYLOAD_MAX: u64 = 1472;
+
+/// 套接字服务请求（N6.5）。负载经**共享页** `buf` 传递（同址共享）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetSReq {
+    pub op: u64,   // NETS_OP_*
+    pub sock: u64, // socket id
+    pub port: u64, // bind: 本地端口; sendto: 目的端口
+    pub addr: u64, // sendto: 目的 IPv4（`a<<24 | b<<16 | c<<8 | d`）
+    pub len: u64,  // sendto: 负载长度
+    pub buf: u64,  // 共享页 va（sendto 负载输入 / recvfrom 负载输出）
+}
+
 /// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。**直通**实现 (不经写背缓存)。
 pub fn block_raw_read(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     let req = BlockReq {
