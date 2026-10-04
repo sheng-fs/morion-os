@@ -31,6 +31,10 @@ use libdevice::msix;
 use libdevice::virtio::{self, Vq};
 use morion::syscall::*;
 
+use crate::common::{
+    Message, NetReq, NET_FRAME_MAX, NET_OP_INFO, NET_OP_RX, NET_OP_TX, NET_REQ_TAG,
+};
+
 /// virtio-net 特性位：`VIRTIO_NET_F_MAC`（feature word 0 bit 5）。
 const FEAT_NET_MAC: u32 = 1 << 5;
 
@@ -714,6 +718,7 @@ struct Nic {
     rx: Vq,
     tx: Vq,
     rx_size: u16,
+    mac: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     irq_mask: u64,
@@ -730,6 +735,7 @@ impl Nic {
         rx: Vq,
         tx: Vq,
         rx_size: u16,
+        mac: u64,
         dma_vaddr: u64,
         dma_paddr: u64,
         irq_mask: u64,
@@ -740,6 +746,7 @@ impl Nic {
             rx,
             tx,
             rx_size,
+            mac,
             dma_vaddr,
             dma_paddr,
             irq_mask,
@@ -749,6 +756,11 @@ impl Nic {
         nic.post_rx_buffers();
         nic.caps.driver_ok();
         nic
+    }
+
+    /// 本网卡 MAC（低 48 位有效），供 `NET_OP_INFO` 报给协议栈。
+    fn mac(&self) -> u64 {
+        self.mac
     }
 
     /// 投满 RX 缓冲（每个描述符一格缓冲；设备收包时写进对应格）。批量投完再敲一次门铃。
@@ -819,6 +831,75 @@ impl Nic {
             sys_sleep(20);
             (20, false)
         }
+    }
+}
+
+/// 服务帧级 IPC 请求 (N6): `TX`(发帧) / `RX`(收帧) / `INFO`(取 MAC)。
+///
+/// 帧数据经客户端**共享页**传递（同址共享, 故这里可直接按 `req.buf` 读写）。本函数**非阻塞**，
+/// 循环取到空邮箱为止；供 `run()` 主循环每轮调用 —— net_srv 由此从"只会自测"变成"帧级驱动
+/// 服务", 协议栈 `netstack_srv` 即可在其上实现 IP/TCP/UDP。
+fn serve_net_ipc(nic: &mut Nic, grant: &DeviceGrant) {
+    loop {
+        let mut msg = Message {
+            from: 0,
+            to: 0,
+            tag: 0,
+            payload: [0; PAYLOAD_LEN],
+        };
+        if sys_try_recv(&mut msg as *mut Message as *mut u8) == u64::MAX {
+            return; // 邮箱空
+        }
+        if msg.tag != NET_REQ_TAG {
+            let _ = sys_reply(0);
+            continue;
+        }
+        let req: NetReq =
+            unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const NetReq) };
+        let reply = match req.op {
+            NET_OP_TX => net_tx(nic, grant, &req),
+            NET_OP_RX => net_rx(nic, &req),
+            NET_OP_INFO => nic.mac(),
+            _ => 0,
+        };
+        let _ = sys_reply(reply);
+    }
+}
+
+/// `NET_OP_TX`: 把共享页里的帧拷进 NIC 的 TX 缓冲发出; 成功 1, 参数非法 0。
+fn net_tx(nic: &Nic, grant: &DeviceGrant, req: &NetReq) -> u64 {
+    if req.buf == 0 || req.len == 0 || req.len > NET_FRAME_MAX || sys_virt_to_phys(req.buf) == 0 {
+        return 0;
+    }
+    let tx_va = grant.dma_vaddr + IP_TX_BUF_PAGE * PAGE;
+    let tx_pa = grant.dma_paddr + IP_TX_BUF_PAGE * PAGE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(req.buf as *const u8, tx_va as *mut u8, req.len as usize);
+    }
+    nic.send(tx_pa, req.len);
+    1
+}
+
+/// `NET_OP_RX`: 排空 RX 取一帧写进共享页; 回复帧长（无帧 0）, 参数非法 0。
+fn net_rx(nic: &mut Nic, req: &NetReq) -> u64 {
+    if req.buf == 0 || sys_virt_to_phys(req.buf) == 0 {
+        return 0;
+    }
+    match nic.poll_rx() {
+        Some(f) => {
+            let n = f.len.min(NET_FRAME_MAX);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    f.eth_va as *const u8,
+                    req.buf as *mut u8,
+                    n as usize,
+                );
+            }
+            nic.recycle(f.id);
+            nic.kick_rx();
+            n
+        }
+        None => 0,
     }
 }
 
@@ -1442,6 +1523,7 @@ pub fn run() {
         rx,
         tx,
         rx_size,
+        mac,
         g.dma_vaddr,
         g.dma_paddr,
         irq_mask,
@@ -1535,8 +1617,19 @@ pub fn run() {
     let mut tcp_ms: u64 = 0;
     let mut tcp_done = false;
     loop {
+        // N6: 先服务帧级 IPC（协议栈的收发帧请求）。
+        serve_net_ipc(&mut nic, &g);
+
+        // 自测未完成才为自测消费 RX; 完成后收到的帧留给 NET_OP_RX 请求取走。
         let mut drained = 0u32;
-        while let Some(f) = nic.poll_rx() {
+        loop {
+            // 自测完成后不再为自测消费 RX（帧留给 NET_OP_RX 请求取走）。
+            if net2_done && tcp_done {
+                break;
+            }
+            let Some(f) = nic.poll_rx() else {
+                break;
+            };
             rx_frames += 1;
             drained += 1;
             let buf_va = f.buf_va;

@@ -96,6 +96,32 @@ pub struct BlockReq {
     pub buf: u64,   // 数据缓冲页虚拟地址; opcode=2 时为卷描述符输出页
 }
 
+/// 帧级网卡请求 tag (N6): net_srv 据此识别"收发一帧"请求。
+pub const NET_REQ_TAG: u64 = 0x4E45_5457; // "NETW"
+
+/// 发一帧: 帧在 `buf` 页里 (长 `len` 字节), net_srv 拷进 NIC 的 TX 缓冲发出去; 成功回复 1。
+pub const NET_OP_TX: u64 = 0;
+/// 收一帧: net_srv 排空 RX; 有帧则写进 `buf` 页并回复**帧长**, 无帧回复 0。
+pub const NET_OP_RX: u64 = 1;
+/// 取网卡 MAC: 回复 = MAC (低 48 位; 全 0 表示无网卡)。
+pub const NET_OP_INFO: u64 = 2;
+
+/// 单帧最大字节数 (以太帧上界 ~1518; 取 2 KiB 对齐, 共享页一页足够)。
+pub const NET_FRAME_MAX: u64 = 2048;
+
+/// 帧级网卡请求 (N6): 帧数据经**共享页**传递 (同址共享), 本结构只带元数据。
+///
+/// net_srv (域 16) 是**帧级驱动服务** —— 只收发以太帧、不含 IP/TCP 语义; 协议栈在
+/// `netstack_srv`。`buf` 是调用方 `sys_alloc_page` 后 `sys_share_page` 共享过来的一页
+/// (4 KiB, 足够一帧): TX 时内含待发帧, RX 时由 net_srv 写入收到的帧。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetReq {
+    pub op: u64,  // NET_OP_*
+    pub len: u64, // TX: 待发帧长; RX/INFO: 忽略
+    pub buf: u64, // 共享页虚拟地址 (调用方与本服务同址)
+}
+
 /// 带卷号的读 (卷号由卷层分配, 0 = 第一个卷)。**直通**实现 (不经写背缓存)。
 pub fn block_raw_read(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     let req = BlockReq {
