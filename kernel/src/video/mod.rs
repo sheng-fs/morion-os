@@ -384,6 +384,9 @@ pub fn print(s: &str) {
 
     // 镜像到 COM1 串口, 供 headless 调试捕获。
     serial_write(s);
+    // Phase 0 / P0.1: 同时进**环形日志缓冲**, 供真机 (无串口) 经 shell `dmesg` 取出。
+    // 放在「显示已被接管」的提前返回**之前** —— 接管后仍要留住日志。
+    crate::klog::capture_bytes(s.as_bytes());
 
     // 显示已被用户态接管: 不再碰帧缓冲, 输出到此为止 (串口已写)。
     if is_taken_over() {

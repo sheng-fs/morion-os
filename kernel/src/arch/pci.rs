@@ -364,3 +364,69 @@ pub fn disable_intx(bus: u8, dev: u8, func: u8) {
 pub fn enable_msix(bus: u8, dev: u8, func: u8, cap_ptr: u8) {
     config_update_word(bus, dev, func, cap_ptr + 2, 0x4000, 0x8000);
 }
+
+// ---------------------------------------------------------------------------
+// PCI 设备表导出 (Phase 0 / P0.3: shell `lspci`)
+// ---------------------------------------------------------------------------
+// 启动期枚举结果留一份**只读快照**, 供 `SYS_PCI_INFO` 按索引取用 —— shell 的
+// `lspci` 因此能在任何时候重列硬件 (不依赖启动日志是否已被滚掉)。
+//
+// 真机意义: 笔记本的两块网卡 (Intel AX210 `8086:2725`、Realtek RTL8111 `10EC:8168`)
+// 本内核都没有驱动 —— `lspci` 让"内核看得见它们"成为可带走的证据。
+
+/// 快照容量 (枚举到的设备数上限; 真机通常 < 32)。
+pub const PCI_MAX: usize = 64;
+
+static mut PCI_TABLE: [Option<PciDevice>; PCI_MAX] = [None; PCI_MAX];
+static mut PCI_COUNT: usize = 0;
+
+/// 保存启动期枚举结果 (在 `main.rs` 枚举之后调用一次; 超出 `PCI_MAX` 的部分丢弃)。
+pub fn publish(devices: &[PciDevice]) {
+    unsafe {
+        let n = devices.len().min(PCI_MAX);
+        for i in 0..n {
+            PCI_TABLE[i] = Some(devices[i]);
+        }
+        PCI_COUNT = n;
+    }
+}
+
+/// `SYS_PCI_INFO`: `a1` = 索引、`a2` = 用户缓冲 (3 个 u64 = 24 字节)。
+///
+/// 记录布局 (用 u64 数组而非结构体, 避免对齐跨内核/用户不一致):
+/// - `[0]` = `vendor | device << 16`
+/// - `[1]` = `class | subclass << 8 | progif << 16 | bus << 24 | dev << 32 | func << 40`
+/// - `[2]` = BAR0 物理基址 (`0` = 无 / I/O 空间)
+///
+/// 返回 `1` 成功、`0` 越界或参数非法。
+pub fn syscall_info(a1: u64, a2: u64) -> u64 {
+    let idx = a1 as usize;
+    if idx >= unsafe { PCI_COUNT } || a2 == 0 {
+        return 0;
+    }
+    let d = match unsafe { PCI_TABLE[idx] } {
+        Some(d) => d,
+        None => return 0,
+    };
+    const REC_BYTES: u64 = 3 * 8;
+    if !crate::memory::paging::is_user_address(a2)
+        || !crate::memory::paging::is_user_address(a2 + REC_BYTES - 1)
+    {
+        return 0;
+    }
+    let bar0 = read_bar(d.bus, d.dev, d.func, 0).unwrap_or(0);
+    let rec: [u64; 3] = [
+        (d.vendor as u64) | ((d.device as u64) << 16),
+        (d.class as u64)
+            | ((d.subclass as u64) << 8)
+            | ((d.progif as u64) << 16)
+            | ((d.bus as u64) << 24)
+            | ((d.dev as u64) << 32)
+            | ((d.func as u64) << 40),
+        bar0,
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(rec.as_ptr(), a2 as *mut u64, 3);
+    }
+    1
+}

@@ -248,6 +248,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println(
                 "  wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)",
             );
+            println("  lspci          list PCI devices seen by the kernel (vendor:device:class)");
+            println("  dmesg [path]   print console log (kernel + services); with path, write it to a file");
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -297,6 +299,8 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "ping6" => shell_ping6(arg),
         "dns" | "nslookup" => shell_dns(arg),
         "wifi" => shell_wifi(arg),
+        "lspci" => shell_lspci(),
+        "dmesg" => shell_dmesg(st, arg),
         "cd" => shell_cd(st, if arg.is_empty() { "/" } else { arg }),
         "mkdir" => shell_mkdir(st, arg),
         "touch" => shell_touch(st, arg),
@@ -486,6 +490,150 @@ fn shell_net() {
         }
         println("");
         i += 1;
+    }
+}
+
+/// 打印固定 `digits` 位十六进制 (PCI id / class 用; 小写, 补前导零)。
+fn print_hex_pad(mut v: u64, digits: usize) {
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    for _ in 0..digits {
+        let d = (v & 0xF) as u8;
+        i -= 1;
+        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        v >>= 4;
+    }
+    print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
+///
+/// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
+/// 机器的唯一办法）。带 `path`: 把日志写入该文件（如 `dmesg /boot.log`），供真机
+/// 拔盘取走。日志环形缓冲满后挤掉最老字节，故保留的是**最近的** 64 KiB。
+fn shell_dmesg(st: &ShellState, arg: &str) {
+    static mut BUF: [u8; 4096] = [0u8; 4096];
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let total = sys_log_total();
+    if total == 0 {
+        println("dmesg: log is empty");
+        return;
+    }
+    if arg.is_empty() {
+        let mut off = 0u64;
+        let mut got = 0u64;
+        loop {
+            let n = sys_log_read(off, buf);
+            if n == 0 {
+                break;
+            }
+            // 只在**合法 UTF-8 前缀**上操作: 4 KiB 分块可能把一个多字节字符 (如中文)
+            // 切成两半, 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
+            // 用 `valid_up_to` 取合法前缀, 剩余字节下一轮再读 (off 只推进这么多)。
+            let used = match core::str::from_utf8(&buf[..n]) {
+                Ok(s) => s.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if used == 0 {
+                break; // 防御: 只读到半个字符时不再前进
+            }
+            let s = unsafe { core::str::from_utf8_unchecked(&buf[..used]) };
+            sys_puts(s);
+            off += used as u64;
+            got += used as u64;
+        }
+        // 日志尾部可能不带换行, 补一个, 免得后续提示符黏在最后一行。
+        println("");
+        print("dmesg: ");
+        print_u64(got);
+        println(" bytes");
+        return;
+    }
+    let path = match resolve_in_cwd(st.cwd_str(), arg) {
+        Some(p) => p,
+        None => {
+            println("dmesg: path too long");
+            return;
+        }
+    };
+    // 覆盖写: `creat` 对已存在的文件是"打开且不截断", 会留下旧尾巴, 故先删。
+    vfs::unlink(path);
+    let fd = vfs::creat(path);
+    if fd == u64::MAX {
+        print("dmesg: cannot create ");
+        println(path);
+        return;
+    }
+    let mut off = 0u64; // 日志绝对偏移
+    let mut woff = 0u64; // 文件内偏移
+    loop {
+        let n = sys_log_read(off, buf);
+        if n == 0 {
+            break;
+        }
+        let w = vfs::write(fd, woff, &buf[..n]);
+        if w != n as u64 {
+            println("dmesg: write FAILED (dumped prefix only)");
+            break;
+        }
+        off += n as u64;
+        woff += w;
+    }
+    vfs::close(fd);
+    print("dmesg: wrote ");
+    print_u64(woff);
+    print(" bytes to ");
+    println(path);
+}
+
+/// `lspci` — 列出启动期枚举到的 PCI 设备（Phase 0 / P0.3）。
+///
+/// 真机意义: 让「内核看得见、但还没有驱动的硬件」（如 Intel AX210 `8086:2725`、
+/// Realtek RTL8111 `10ec:8168`）成为可带走的日志证据。
+fn shell_lspci() {
+    let mut i = 0u64;
+    let mut n = 0u64;
+    while let Some(rec) = sys_pci_info(i) {
+        let ids = rec[0];
+        let loc = rec[1];
+        let bar0 = rec[2];
+        let vendor = (ids & 0xFFFF) as u32;
+        let device = ((ids >> 16) & 0xFFFF) as u32;
+        let class = (loc & 0xFF) as u32;
+        let subclass = ((loc >> 8) & 0xFF) as u32;
+        let progif = ((loc >> 16) & 0xFF) as u32;
+        let bus = ((loc >> 24) & 0xFF) as u32;
+        let dev = ((loc >> 32) & 0xFF) as u32;
+        let func = ((loc >> 40) & 0xFF) as u32;
+        print_hex_pad(bus as u64, 2);
+        print(":");
+        print_hex_pad(dev as u64, 2);
+        print(".");
+        print_hex_pad(func as u64, 1);
+        print("  vend=");
+        print_hex_pad(vendor as u64, 4);
+        print(" dev=");
+        print_hex_pad(device as u64, 4);
+        print(" class=");
+        print_hex_pad(class as u64, 2);
+        print(":");
+        print_hex_pad(subclass as u64, 2);
+        print(":");
+        print_hex_pad(progif as u64, 2);
+        if bar0 != 0 {
+            print(" bar0=0x");
+            print_hex(bar0);
+        }
+        println("");
+        i += 1;
+        n += 1;
+    }
+    if n == 0 {
+        println("lspci: no PCI devices recorded");
+    } else {
+        print("lspci: ");
+        print_u64(n);
+        println(" device(s)");
     }
 }
 

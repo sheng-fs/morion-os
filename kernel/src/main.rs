@@ -169,6 +169,8 @@ pub extern "C" fn kernel_main() -> ! {
     video::println("");
     video::println("Stage 4.5: PCI enumeration");
     let pci_devices = arch::pci::enumerate();
+    // Phase 0 / P0.3: 留一份只读快照, 供 shell `lspci` 随时重列 (真机取证用)。
+    arch::pci::publish(&pci_devices);
     video::print("[OK] PCI devices found: ");
     video::print_u64(pci_devices.len() as u64);
     video::println("");

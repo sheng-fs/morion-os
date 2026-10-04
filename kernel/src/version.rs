@@ -28,12 +28,27 @@ pub const IS_NOGUI: bool = option_env!("MORION_NOGUI").is_some();
 /// 日常镜像一个字节都不放宽 —— 别人的分区仍然绝不自动吞。
 pub const IS_INSTALL: bool = option_env!("MORION_INSTALL").is_some();
 
-/// 变体后缀：无图形 `-nogui` / 安装盘 `-install`；两者都置位时按此顺序拼接。
-pub const VARIANT: &str = match (IS_NOGUI, IS_INSTALL) {
-    (false, false) => "",
-    (true, false) => "-nogui",
-    (false, true) => "-install",
-    (true, true) => "-nogui-install",
+/// 是否**安全模式**构建（Phase 0 / P0.2）：由 `Makefile` 注入的 `MORION_SAFE` 决定
+/// （`make SAFE=1 ...`）。
+///
+/// 安全模式 = **真机启动专用**：真机上内核会把本机盘当卷挂上，而 `app` 自测会创建/删除
+/// 文件、拍快照、做分区写 —— 等于对着真实系统盘动手。该变体里 `app` 自测整体跳过
+/// （判定在 `app`，读的是用户态的 `morion::syscall::SAFE_MODE`，同一约定）。
+pub const IS_SAFE: bool = option_env!("MORION_SAFE").is_some();
+
+/// 变体后缀：无图形 `-nogui` / 安装盘 `-install` / 安全模式 `-safe`，可组合。
+///
+/// 直接枚举 8 种组合（而非拼接字符串）：const 上下文里比较 `&str` 需要 `const_cmp`，
+/// 而 `bool` 的结构匹配是常量求值本来就支持的。
+pub const VARIANT: &str = match (IS_NOGUI, IS_INSTALL, IS_SAFE) {
+    (false, false, false) => "",
+    (false, false, true) => "-safe",
+    (true, false, false) => "-nogui",
+    (true, false, true) => "-nogui-safe",
+    (false, true, false) => "-install",
+    (false, true, true) => "-install-safe",
+    (true, true, false) => "-nogui-install",
+    (true, true, true) => "-nogui-install-safe",
 };
 
 /// 构建号：`Makefile` 注入的 `MORION_BUILD`（git 短哈希，无 git 时用日期）；

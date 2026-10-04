@@ -158,6 +158,15 @@ pub const SYS_NET_BIND: u64 = 56;
 /// 查询网络端口归属域 (N6): `a1` = 端口, 返回归属域号 (`u64::MAX` = 未绑定)。
 /// 供 `netstack_srv` 在收到应用的 `bind` 请求时核对 `msg.from` (见 [`crate::net::owner`])。
 pub const SYS_NET_OWNER: u64 = 57;
+/// 控制台日志累计字节数 (Phase 0 / P0.1): 无参, 返回 [`crate::klog`] 的绝对总量。
+/// shell `dmesg` 据此知道要读多少 (环形缓冲的真实长度)。
+pub const SYS_LOG_TOTAL: u64 = 58;
+/// 读控制台日志 (Phase 0 / P0.1): `a1` = 用户缓冲、`a2` = 长度、`a3` = 起始绝对偏移,
+/// 返回写入字节数 (见 [`crate::klog::handle_read`])。
+pub const SYS_LOG_READ: u64 = 59;
+/// 读一台 PCI 设备记录 (Phase 0 / P0.3, shell `lspci`): `a1` = 索引、`a2` = 用户缓冲
+/// (3 个 u64), 返回 1/0 (见 [`crate::arch::pci::syscall_info`])。
+pub const SYS_PCI_INFO: u64 = 60;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -886,6 +895,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 只读查询端口归属域 (供 netstack 核对 bind 请求的调用者)。
             crate::net::owner(a1 as u16)
         }
+        SYS_LOG_TOTAL => crate::klog::total(),
+        SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
+        SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
         _ => 0,
     }
 }

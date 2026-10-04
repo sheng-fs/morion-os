@@ -31,16 +31,23 @@ IOMMU_ARG     := $(if $(IOMMU),-device intel-iommu,)
 #   INSTALL=1    —— 安装盘变体: release 串带 `-install`, 且 `mkfs.mfs` **默认允许格式化非空白卷**
 #                   (发行版装机 = 先 U 盘启动、再把系统装到本机盘上, 那时盘上原有文件系统正是
 #                   要被覆盖的东西; 逐条 `--force` 只会把安装脚本写得很脆)。日常镜像不受影响。
+#   SAFE=1       —— 安全模式变体 (Phase 0): release 串带 `-safe`, 且 `app` 自测**整体跳过** ——
+#                   真机启动时内核会把本机盘当卷挂上, 自测的创建/删除文件、拍快照、分区写等于
+#                   对着真实系统盘动手。首次真机启动用这个变体。
 # 读它们的唯一来源: kernel/src/version.rs 与 user/libmorion/src/syscall.rs。
 MORION_BUILD  ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d)
 NOGUI         ?=
 INSTALL       ?=
+SAFE          ?=
 export MORION_BUILD
 ifneq ($(NOGUI),)
 export MORION_NOGUI := 1
 endif
 ifneq ($(INSTALL),)
 export MORION_INSTALL := 1
+endif
+ifneq ($(SAFE),)
+export MORION_SAFE := 1
 endif
 NASM          := nasm
 MKDIR         := mkdir -p
@@ -60,7 +67,8 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # 变体用**独立输出子目录** (放在已忽略的 build/ 里), 免得与常规构建的镜像 /
 # 指纹互相污染 —— 切换变体不需要 `make clean` (`NOGUI=1 make iso` → 产物落在 build/nogui/)。
 # 同时置 `INSTALL=1 NOGUI=1` 时优先落 build/install (安装盘大概率还要图形, 该组合很少用)。
-OUT_DIR       ?= $(if $(INSTALL),build/install,$(if $(NOGUI),build/nogui,build))
+# `SAFE=1` (真机安全模式) 优先级最高, 单独落 `build/safe/`。
+OUT_DIR       ?= $(if $(SAFE),build/safe,$(if $(INSTALL),build/install,$(if $(NOGUI),build/nogui,build)))
 ISO_DIR       := $(OUT_DIR)/iso
 KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
@@ -78,6 +86,8 @@ SRV_STAMP     := $(SRV_DIR)/.built
 HELLO_ELF     := $(OUT_DIR)/user/hello.elf
 EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
+# 可引导 U 盘镜像 (Phase 0 / P0.4): 与 ISO 同源, 但额外叠了 GPT/ESP 混合布局。
+USB_IMAGE     := $(OUT_DIR)/morion-usb.img
 
 # QEMU 配置
 QEMU_MEM      ?= 2G
@@ -307,6 +317,35 @@ $(ISO_IMAGE):
 
 	@echo "  ✓ ISO 镜像: $(ISO_IMAGE)"
 	@ls -lh $(ISO_IMAGE) 2>/dev/null || echo "  ! ISO 生成失败, 请安装 xorriso 与 mtools"
+
+# ============================================================
+# 可引导 U 盘镜像 (Phase 0 / P0.4)
+# ============================================================
+# 标准 ISO 是 El Torito 结构: `-cdrom` 启动没问题, 但**真机把 U 盘当磁盘看** —— 固件只在
+# 磁盘上找 ESP (FAT 分区), 所以直接 dd 一个 ISO 通常**起不来**。
+#
+# 这里不碰 ISO, 另做一个**标准 GPT + ESP 磁盘镜像**: 把 `iso` 规则已经建好的 ESP
+# (`$(EFIBOOT_IMG)`, 64 MiB FAT32, 内含 BOOTX64.EFI + 内核 + 全部服务 ELF) **原样写进
+# 一块 GPT 磁盘的 EFI 系统分区**。真机 UEFI 按磁盘方式找到它并启动。
+# (不采用 `-isohybrid-gpt-basdat`: 它要求 El Torito 载入映像 ≤ 32 MiB, 而 64 MiB 的 ESP
+#  是 FAT32 的最小可用尺寸, 缩小会被 mformat 拒绝。)
+#
+# 真机首启建议配安全模式: `make SAFE=1 usbimg` → build/safe/morion-usb.img
+.PHONY: usbimg
+usbimg: iso
+	@echo "==> 生成可引导 U 盘镜像 (GPT + ESP)..."
+	@esp_secs=$$(stat -c %s $(EFIBOOT_IMG) | awk '{print int($$1/512)}'); \
+	rm -f $(USB_IMAGE); \
+	dd if=/dev/zero of=$(USB_IMAGE) bs=1M count=80 status=none; \
+	sgdisk -n 1:2048:+$$esp_secs -t 1:ef00 -c 1:MORIONOS $(USB_IMAGE) >/dev/null; \
+	dd if=$(EFIBOOT_IMG) of=$(USB_IMAGE) bs=1M seek=1 conv=notrunc status=none; \
+	sync
+	@ls -lh $(USB_IMAGE)
+	@sgdisk -p $(USB_IMAGE) 2>/dev/null | sed -n '4,20p' || true
+	@echo ""
+	@echo "  写入 U 盘 (⚠ 会清空目标盘, 先用 lsblk 确认设备名, 别写错盘!):"
+	@echo "    sudo dd if=$(USB_IMAGE) of=/dev/sdX bs=4M status=progress conv=fsync"
+	@echo "  真机启动前请进 BIOS **关闭 Secure Boot** (MorionOS 的引导器未签名)。"
 
 # ============================================================
 # 运行 (QEMU)

@@ -24,6 +24,7 @@ pub mod exec;
 pub mod ipc;
 pub mod irq;
 pub mod key;
+pub mod klog;
 pub mod memory;
 pub mod net;
 pub mod pager;

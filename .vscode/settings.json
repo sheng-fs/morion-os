@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.check.command": "custom",
+  "rust-analyzer.check.overrideCommand": ["bash", "scripts/ra-check.sh"]
+}

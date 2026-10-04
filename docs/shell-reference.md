@@ -30,7 +30,7 @@ shell: type 'help' for commands
 | --- | --- | --- |
 | `help` | `help` | 打印命令列表与挂载点 |
 | `echo` | `echo <text>` | 原样打印 `<text>`（可含空格） |
-| `uname` | `uname` | 打印内核报告的整行系统标识 `MorionOS <release> <machine>`（如 `MorionOS 0.4.0 x86_64`）；串由内核 [`kernel/src/version.rs`](../../kernel/src/version.rs) 单一维护，经 `SYS_UNAME(51)` 取得；无图形变体（`make NOGUI=1`）下 release 带 `-nogui` 后缀（如 `0.4.0-nogui`） |
+| `uname` | `uname` | 打印内核报告的整行系统标识 `MorionOS <release> <machine>`（如 `MorionOS 0.4.0 x86_64`）；串由内核 [`kernel/src/version.rs`](../../kernel/src/version.rs) 单一维护，经 `SYS_UNAME(51)` 取得；变体后缀：`-nogui`（`make NOGUI=1`）、`-install`（`make INSTALL=1`）、`-safe`（`make SAFE=1`，Phase 0 真机安全模式，跳过 `app` 自测），可组合（如 `0.4.0-nogui-safe`） |
 | `version` | `version` | 打印 `MorionOS v<release> (build <构建号>)`，如 `MorionOS v0.4.0 (build 3183f3f)`；`<构建号>` = 构建时 git 短哈希，由 Makefile 注入 |
 | `pwd` | `pwd` | 打印当前工作目录 |
 | `ls` | `ls [path]` | 列目录，默认当前目录 |
@@ -42,6 +42,8 @@ shell: type 'help' for commands
 | `ping6` | `ping6 <ipv6\|host>` | IPv6 走 ICMPv6 echo（`morion::net::ping6`）；主机名先查 AAAA |
 | `dns` / `nslookup` | `dns <name>` | 解析 `<name>` 的 A 与 AAAA 记录各打印一行（走 slirp 内置 DNS `10.0.2.3`） |
 | `wifi` | `wifi [status\|scan\|connect <ssid> [psk]]` | 无线 station（`wifi_srv`，域 25）。本轮是**抽象层**：无 radio 时 `status` 报 `radio=0`、`scan` 返 0 条、`connect` 恒失败。真机接入前后命令接口不变 |
+| `lspci` | `lspci` | 列出启动期枚举到的 PCI 设备（Phase 0 / P0.3）：`bb:dd.f  vend=… dev=… class=…[:…:…] [bar0=0x…]`，经 `SYS_PCI_INFO(60)` 读内核只读快照。真机取证用：能看到"内核认得、但还没有驱动"的硬件 |
+| `dmesg` | `dmesg [path]` | 打印 / 导出控制台日志（Phase 0 / P0.1）：不带参数原样打印（含**内核引导日志**）；带 `path` 则写入文件（如 `dmesg /boot.log`）。日志在内核 64 KiB 环形缓冲里，满了挤掉最老 —— 真机（无串口）靠它把日志带出机器 |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -91,6 +93,8 @@ commands:
   ping6 <ip|host>  ICMPv6 echo over IPv6
   dns <name>     resolve A and AAAA records (alias: nslookup)
   wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)
+  lspci          list PCI devices seen by the kernel (vendor:device:class)
+  dmesg [path]   print console log (kernel + services); with path, write it to a file
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file
@@ -243,6 +247,39 @@ wifi: connecting MySSID ... failed (no radio / abstraction layer only)
 - `connect <ssid> [psk]`：`WIFI_OP_ASSOC`（WPA2-PSK），抽象层恒失败；`psk` 缺省为空。
 - 服务不可达（域 25 未起）：`wifi: wifi_srv unreachable`。
 - 真机接入（vfio 直通 + 固件 + 802.11/WPA 栈）后**命令接口不变**：届时 `radio=1`、`scan` 列出真实 BSS、`connect` 走四步握手。
+
+### `lspci`
+
+列出**启动期枚举到**的 PCI 设备（Phase 0 / P0.3，plan-net-real.md）。数据来自内核启动期留的只读快照（`pci::publish`），经 `SYS_PCI_INFO(60)` 按索引读出：
+
+```text
+[morion@morion /]$ lspci
+00:00.0  vend=8086 dev=29c0 class=06:00:00
+00:03.0  vend=1af4 dev=1000 class=02:00:00
+00:04.0  vend=8086 dev=10d3 class=02:00:00 bar0=0x81080000
+00:05.0  vend=8086 dev=100e class=02:00:00 bar0=0x81040000
+lspci: 9 device(s)
+```
+
+- 字段：`bb:dd.f` = 总线 / 设备 / 功能；`vend`/`dev` = 厂商 / 设备 id（4 位十六进制）；`class` = 类 / 子类 / 编程接口；`bar0` = BAR0 物理基址（`0` / 省略 = 无或 I/O 空间）。
+- 真机取证意义：能看到"**内核认得、但还没有驱动**"的硬件（如无线 `8086:2725`、有线 `10ec:8168`），这正是"看得见 vs 能驱动"的分界证据。
+- 无设备：`lspci: no PCI devices recorded`。
+
+### `dmesg [path]`
+
+打印 / 导出**控制台日志**（Phase 0 / P0.1，plan-net-real.md）。内核把**所有**控制台输出（内核与用户态 —— 用户输出经 `SYS_PUTS` 汇入 `video::print`）额外追加进一个 **64 KiB 环形缓冲**；`dmesg` 经 `SYS_LOG_TOTAL(58)` / `SYS_LOG_READ(59)` 把它读出来。
+
+- 不带参数：原样打印全部日志（含**内核引导日志**：PCI 枚举、ACPI/VT-d 探测等），末尾报已打印字节数。
+- 带 `path`：把日志**写入该文件**（如 `dmesg /boot.log`），走既有 FAT32 写路径；覆盖写（先删旧文件）。
+
+真机（笔记本）**没有串口**，这是把日志带出机器的唯一办法：
+
+```text
+真机流程 = U 盘启动 → dmesg /boot.log → 拔盘插到宿主机 → 取 boot.log 交给开发
+```
+
+- 环形缓冲满了**挤掉最老**字节，故保留的是**最近的** 64 KiB；`dmesg` 报的字节数是当前缓冲里的长度。
+- 写文件时逐 4 KiB 页读、逐页写（复用 `vfs::write` 的共享写页）；失败会打印 `dmesg: write FAILED (dumped prefix only)`。
 
 ### `cd [path]`
 

@@ -167,6 +167,9 @@ UEFI 固件
 | 52 | `SYS_DEVICE_INFO` | `rdi=设备选择` | **查询本域可用设备**（D1b）：`rdi = u64::MAX` 表示"本域已绑定设备"（`DEVICE_SELF`），否则按 `pci_addr`（bus / dev / func 打包）**精确匹配**；返回打包的 `vendor` / `device` / `class`（一个 `u64`），无设备或不属于本域返回 `0`。实现在 [`device::syscall_info`](../../kernel/src/device.rs) |
 | 53 | `SYS_DEVICE_GRANT` | `rdi=设备选择` | **申请本域设备授权**（D1b）：定位本域设备 → **能力门禁**（须持有该设备 BAR 的 `Mmio` 凭证，否则打印 `dev: device grant denied (no Mmio capability)` 并返回 `0`）→ 幂等确认描述页 `magic` → 返回描述页在本域的虚拟地址（`DEVICE_CFG_VADDR`）。设备资源仍在 boot 期由声明式 `device::grant` 备好。实现在 [`device::syscall_grant`](../../kernel/src/device.rs) |
 | 54 | `SYS_CAP_AUDIT` | `rdi=目标域, rsi=槽号` | **能力审计**（②）：只读地取出 `目标域` 第 `槽号` 个能力槽，供监督者按最小权限策略核对引导期授权。**门禁 `Capability::Spawn`**（只有监督者该调，非持有者返回 `0`）。返回编码：高 8 位 = `种类 + 1`、低 56 位 = 参数（`IoPort` 为 `(base << 16) | len`）；`0` = 空槽，`u64::MAX` = 域/槽越界（**表尾哨兵**，勿与空槽混淆）。编码/打包见 [`cap::pack_audit`](../../kernel/src/cap.rs)，使用方 = `init` 监督者的引导期审计（marker `cap-audit:`） |
+| 58 | `SYS_LOG_TOTAL` | — | **控制台日志累计字节数**（Phase 0 / P0.1）：返回 [`klog`](../../kernel/src/klog.rs) 环形缓冲的绝对写入总量。真机（笔记本）没有串口，日志靠这条路带出机器 |
+| 59 | `SYS_LOG_READ` | `rdi=缓冲指针, rsi=长度, rdx=起始绝对偏移` | **读控制台日志**（Phase 0 / P0.1）：把环形缓冲里从 `起始绝对偏移` 起的字节写入用户缓冲，返回实际字节数（`0` = 读到头 / 越界）。缓冲满时挤掉最老字节，故 `起始偏移` 早于 `total - 64 KiB` 会被夹到最老处。使用方 = shell `dmesg` |
+| 60 | `SYS_PCI_INFO` | `rdi=索引, rsi=用户缓冲(3 个 u64)` | **读一台 PCI 设备记录**（Phase 0 / P0.3）：`[0]=vendor\|device<<16`、`[1]=class\|subclass<<8\|progif<<16\|bus<<24\|dev<<32\|func<<40`、`[2]=BAR0`。启动期枚举快照（[`pci::publish`](../../kernel/src/arch/pci.rs)），返回 `1` / 越界 `0`。使用方 = shell `lspci` |
 
 ### MSR 配置（`syscall::init()`）
 

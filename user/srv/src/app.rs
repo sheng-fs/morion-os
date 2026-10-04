@@ -136,6 +136,14 @@ const HELLO_MEX: &str = "/hello.mex";
 /// 域 7 — 测试应用: 经 libvfs 走通 read/write/readdir + FS-2/FS-3 全链路自测。
 /// 成功路径完全静默 (只保留失败信息), 避免刷屏打断 shell 提示符。
 pub fn run() {
+    // Phase 0 / P0.2 安全模式 (真机启动专用): **一步都不碰磁盘就返回**。
+    // 真机上内核会把**本机盘**当卷挂上, 而下面的自测会创建/删除文件、拍快照、做分区写
+    // (`/` 很可能就是本机盘的 ESP) —— 那等于对着你的真实系统盘动手。安全模式只报一行,
+    // 让"首次真机启动"变成只读动作 (用户随后在 shell 里手动 `lspci` / `dmesg` 取证)。
+    if SAFE_MODE {
+        println("app: SAFE mode (real-hardware) - self-test skipped, no disk writes");
+        return;
+    }
     // 分配结果页并共享给各文件服务 (同地址映射), 供其写入文件/目录内容。
     if sys_alloc_page(vfs::RESULT_BUF) != 1 {
         println("app: alloc result buf FAILED");

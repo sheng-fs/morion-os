@@ -107,6 +107,12 @@ pub const SYS_TRY_RECV: u64 = 55;
 pub const SYS_NET_BIND: u64 = 56;
 /// 查询网络端口归属域 (N6): 返回归属域号 (`u64::MAX` = 未绑定)。
 pub const SYS_NET_OWNER: u64 = 57;
+/// 控制台日志累计字节数 (Phase 0 / P0.1): 无参, 返回日志环形缓冲的绝对总量。
+pub const SYS_LOG_TOTAL: u64 = 58;
+/// 读控制台日志 (Phase 0 / P0.1): `a1` = 缓冲、`a2` = 长度、`a3` = 起始绝对偏移。
+pub const SYS_LOG_READ: u64 = 59;
+/// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
+pub const SYS_PCI_INFO: u64 = 60;
 
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
@@ -119,6 +125,14 @@ pub const NOGUI: bool = option_env!("MORION_NOGUI").is_some();
 /// `mfs_srv` 对**非空白卷**的格式化护栏默认放开 (装机要覆盖的正是盘上原有的文件系统)。
 /// 日常镜像为 `false`, 护栏一字不放宽。
 pub const INSTALL_MODE: bool = option_env!("MORION_INSTALL").is_some();
+
+/// 本程序是否属于**安全模式**构建 (Phase 0 / P0.2): 由 `Makefile` 注入的 `MORION_SAFE` 决定。
+///
+/// 安全模式 = **真机启动专用**镜像: 真机上内核会把**本机盘**当卷挂上, 而 `app` 自测会
+/// 创建/删除文件、拍快照、做分区写 —— 那等于对着你的真实系统盘动手。安全模式下 `app`
+/// 自测整体跳过 (只报一行), 把"首次真机启动"的数据风险降到最低。
+/// 与内核 `version.rs` 的 `IS_SAFE` 同一约定。
+pub const SAFE_MODE: bool = option_env!("MORION_SAFE").is_some();
 
 #[inline(always)]
 unsafe fn syscall(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -488,6 +502,34 @@ pub fn sys_net_owner(port: u16) -> u64 {
 /// 非 0 = 打包的能力, `0` = 空槽, `u64::MAX` = 越界 (表尾)。需 `Capability::Spawn`。
 pub fn sys_cap_audit(domain: u64, slot: u64) -> u64 {
     unsafe { syscall(SYS_CAP_AUDIT, domain, slot, 0) }
+}
+
+/// 控制台日志累计字节数 (Phase 0 / P0.1): 环形缓冲的绝对总量。
+pub fn sys_log_total() -> u64 {
+    unsafe { syscall(SYS_LOG_TOTAL, 0, 0, 0) }
+}
+
+/// 从绝对偏移 `start` 起把控制台日志读进 `dst`, 返回实际读取字节数 (0 = 读到头)。
+pub fn sys_log_read(start: u64, dst: &mut [u8]) -> usize {
+    unsafe {
+        syscall(
+            SYS_LOG_READ,
+            dst.as_mut_ptr() as u64,
+            dst.len() as u64,
+            start,
+        ) as usize
+    }
+}
+
+/// 读第 `i` 台 PCI 设备记录 `[ids, 位置+class, bar0]`; 越界返回 `None` (Phase 0 / P0.3)。
+pub fn sys_pci_info(i: u64) -> Option<[u64; 3]> {
+    let mut rec = [0u64; 3];
+    let ok = unsafe { syscall(SYS_PCI_INFO, i, rec.as_mut_ptr() as u64, 0) };
+    if ok == 0 {
+        None
+    } else {
+        Some(rec)
+    }
 }
 
 pub fn sys_puts(s: &str) {
