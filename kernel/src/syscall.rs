@@ -148,6 +148,17 @@ pub const SYS_DEVICE_GRANT: u64 = 53;
 /// [`crate::cap::pack_audit`]; 非 `Spawn` 持有者一律拒绝 (返回 `0`)。
 pub const SYS_CAP_AUDIT: u64 = 54;
 
+/// 非阻塞接收 (N6): 邮箱为空立即返回 `u64::MAX`, 否则把完整消息写回 `a1` 并返回 tag。
+///
+/// 供"既要轮询硬件、又要接 IPC"的驱动/网络服务使用 (见 [`crate::ipc::try_receive`])。
+pub const SYS_TRY_RECV: u64 = 55;
+/// 绑定网络端口 (N6): `a1` = 端口。调用者须持覆盖该端口的 [`crate::cap::Capability::Net`]
+/// 能力, 成功登记归属并返回 1 (见 [`crate::net::bind`])。
+pub const SYS_NET_BIND: u64 = 56;
+/// 查询网络端口归属域 (N6): `a1` = 端口, 返回归属域号 (`u64::MAX` = 未绑定)。
+/// 供 `netstack_srv` 在收到应用的 `bind` 请求时核对 `msg.from` (见 [`crate::net::owner`])。
+pub const SYS_NET_OWNER: u64 = 57;
+
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -847,6 +858,33 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                     None => u64::MAX, // 域/槽越界: 审计者据此判定表尾
                 }
             }
+        }
+        SYS_TRY_RECV => {
+            // 非阻塞收: 有消息就把完整消息写回 `a1` 并返回 tag; 邮箱空返回 u64::MAX。
+            match crate::ipc::try_receive() {
+                Some(msg) => {
+                    if a1 != 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                &msg as *const crate::ipc::Message as *const u8,
+                                a1 as *mut u8,
+                                core::mem::size_of::<crate::ipc::Message>(),
+                            );
+                        }
+                    }
+                    msg.tag
+                }
+                None => u64::MAX,
+            }
+        }
+        SYS_NET_BIND => {
+            // 绑定端口: 需覆盖该端口的 `Net` 能力 (不可伪造), 成功后登记归属。
+            let me = crate::scheduler::current_domain();
+            crate::net::bind(me, a1 as u16) as u64
+        }
+        SYS_NET_OWNER => {
+            // 只读查询端口归属域 (供 netstack 核对 bind 请求的调用者)。
+            crate::net::owner(a1 as u16)
         }
         _ => 0,
     }

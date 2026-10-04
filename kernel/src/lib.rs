@@ -25,6 +25,7 @@ pub mod ipc;
 pub mod irq;
 pub mod key;
 pub mod memory;
+pub mod net;
 pub mod pager;
 pub mod scheduler;
 pub mod syscall;

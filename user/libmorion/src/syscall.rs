@@ -101,6 +101,13 @@ pub const SYS_UNAME: u64 = 51;
 /// (`IoPort` 为 `(base << 16) | len`)。见 [`sys_cap_audit`]。
 pub const SYS_CAP_AUDIT: u64 = 54;
 
+/// 非阻塞接收 (N6): 邮箱空返回 `u64::MAX`, 否则把完整消息写回 `buf` 并返回 tag。
+pub const SYS_TRY_RECV: u64 = 55;
+/// 绑定网络端口 (N6): 需覆盖该端口的 `Net` 能力; 成功返回 1。
+pub const SYS_NET_BIND: u64 = 56;
+/// 查询网络端口归属域 (N6): 返回归属域号 (`u64::MAX` = 未绑定)。
+pub const SYS_NET_OWNER: u64 = 57;
+
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
 /// 与内核 `version.rs` 的 `IS_NOGUI` 同一约定 —— `shell` 据此决定要不要开屏幕镜像。
@@ -173,6 +180,12 @@ pub fn sys_recv() -> u64 {
 /// 返回消息 tag。
 pub fn sys_recv_msg(buf: *mut u8) -> u64 {
     unsafe { syscall(SYS_RECV, buf as u64, 0, 0) }
+}
+
+/// **非阻塞**接收一条消息 (N6): 邮箱为空立即返回 `u64::MAX`, 否则把完整消息
+/// (24 字节头 + `PAYLOAD_LEN` payload) 写入 `buf` 并返回消息 tag。
+pub fn sys_try_recv(buf: *mut u8) -> u64 {
+    unsafe { syscall(SYS_TRY_RECV, buf as u64, 0, 0) }
 }
 
 pub fn sys_call(to: u64, tag: u64) -> u64 {
@@ -448,6 +461,8 @@ pub const CAP_KIND_SPAWN: u64 = 4;
 pub const CAP_KIND_FB: u64 = 5;
 /// `IoPort` (D0): `arg = (base << 16) | len`。
 pub const CAP_KIND_IO_PORT: u64 = 6;
+/// `Net` (N6): `arg = (port_lo << 16) | port_hi`（闭区间）。
+pub const CAP_KIND_NET: u64 = 7;
 
 /// 「能力随 IPC 传递」: 把自己**持有**的能力委派给目标域 `to`, 成功返回 1。
 ///
@@ -455,6 +470,18 @@ pub const CAP_KIND_IO_PORT: u64 = 6;
 /// `kind` 取 `CAP_KIND_*`, `arg` 是该能力的参数 (目标域 id / IRQ 号 / 页对齐 MMIO 基址)。
 pub fn sys_cap_send(to: u64, kind: u64, arg: u64) -> u64 {
     unsafe { syscall(SYS_CAP_SEND, to, kind, arg) }
+}
+
+/// 绑定网络端口 (N6): 调用者须持覆盖 `port` 的 [`CAP_KIND_NET`] 能力; 成功返回 1。
+///
+/// 绑定登记在内核侧, 供 `netstack_srv` 用 [`sys_net_owner`] 核对 `bind` 请求的发起域。
+pub fn sys_net_bind(port: u16) -> u64 {
+    unsafe { syscall(SYS_NET_BIND, port as u64, 0, 0) }
+}
+
+/// 查询端口 `port` 的归属域 (N6): 返回域号, 未绑定返回 `u64::MAX`。
+pub fn sys_net_owner(port: u16) -> u64 {
+    unsafe { syscall(SYS_NET_OWNER, port as u64, 0, 0) }
 }
 
 /// 能力审计 (②): 读域 `domain` 第 `slot` 个能力槽。返回编码见 [`SYS_CAP_AUDIT`]:

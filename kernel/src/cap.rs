@@ -28,6 +28,13 @@ pub enum Capability {
     /// 与 `Mmio` 同样是**默认不授予**的资源凭证：此前端口 syscall 是**无门禁**的，
     /// 任何域都能读写任意端口（D0 之前的真实缺口）。
     IoPort(u16, u16),
+    /// 绑定网络端口闭区间 `[port_lo, port_hi]` 的能力（N6）。
+    ///
+    /// 与 `IoPort` 同型（区间能力），但端口空间是 16 位、且这里是**闭区间**：网络里
+    /// "绑一个端口"即 `lo == hi`，给一段（如 `1024..=65535`）则一次授权覆盖非特权端口段。
+    /// `SYS_NET_BIND` 用它判定调用者能否绑定某端口；`netstack_srv` 收 `bind` 请求时用
+    /// `SYS_NET_OWNER` 核对归属域（`msg.from`），二者配合实现不可伪造的端口门禁。
+    Net(u16, u16),
     /// 访问**帧缓冲**的能力（`SYS_FB_INFO` / `SYS_FB_MAP` / `SYS_FB_TAKEOVER`）。
     ///
     /// 无参数 —— 帧缓冲是全局唯一资源。与 `Mmio` 的区别：MMIO 能力按「页对齐物理基址」
@@ -57,6 +64,8 @@ pub const CAP_KIND_FB: u64 = 5;
 /// `IoPort` 是**二维**的 (base, len)，而 `SYS_CAP_SEND` 只有一个 `arg`，故编码成
 /// `(base << 16) | len`（各占 16 位）。
 pub const CAP_KIND_IO_PORT: u64 = 6;
+/// `Net` (N6): 与 `IoPort` 同型, `arg = (port_lo << 16) | port_hi`（闭区间）。
+pub const CAP_KIND_NET: u64 = 7;
 
 /// 把 `SYS_CAP_SEND` 的 `(kind, arg)` 解码成 `Capability`; 未知 `kind` 或
 /// `arg` 越界返回 `None`。
@@ -83,6 +92,16 @@ pub fn decode(kind: u64, arg: u64) -> Option<Capability> {
                 None
             }
         }
+        // `Net`: `(lo << 16) | hi`（闭区间）。要求 hi 占低 16 位且 `lo <= hi`。
+        CAP_KIND_NET if arg >> 32 == 0 => {
+            let lo = (arg >> 16) as u16;
+            let hi = (arg & 0xFFFF) as u16;
+            if lo <= hi {
+                Some(Capability::Net(lo, hi))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -101,6 +120,7 @@ pub fn pack_audit(cap: Capability) -> u64 {
         Capability::Spawn => (CAP_KIND_SPAWN, 0),
         Capability::Fb => (CAP_KIND_FB, 0),
         Capability::IoPort(base, len) => (CAP_KIND_IO_PORT, ((base as u64) << 16) | len as u64),
+        Capability::Net(lo, hi) => (CAP_KIND_NET, ((lo as u64) << 16) | hi as u64),
     };
     ((kind + 1) << 56) | arg
 }
@@ -245,6 +265,25 @@ pub fn has_port(domain: u64, port: u16) -> bool {
 /// 纯函数（不碰全局表、不关中断），故可直接单测。
 fn port_in_range(base: u16, len: u16, port: u16) -> bool {
     port >= base && (port as u32) < base as u32 + len as u32
+}
+
+/// 域 `domain` 是否持有**覆盖网络端口 `port`** 的能力（N6）。
+///
+/// 与 [`has_port`] 同型；`Net` 是**闭区间** `[lo, hi]`（`lo == hi` = 单个端口）。
+/// 这是 `SYS_NET_BIND` 的门禁判据。
+pub fn has_net_port(domain: u64, port: u16) -> bool {
+    let table = CAP_TABLE.lock();
+    table.get(domain as usize).is_some_and(|slots| {
+        slots.iter().any(|slot| match slot {
+            Some(Capability::Net(lo, hi)) => net_port_in_range(*lo, *hi, port),
+            _ => false,
+        })
+    })
+}
+
+/// `port` 是否落在闭区间 `[lo, hi]`（`Net` 的匹配判据；纯函数, 可单测）。
+fn net_port_in_range(lo: u16, hi: u16, port: u16) -> bool {
+    port >= lo && port <= hi
 }
 
 /// 能力审计 (②): 只读地取出域 `domain` 第 `slot` 个能力槽的内容。
@@ -471,6 +510,34 @@ mod tests {
         assert_eq!(
             decode(CAP_KIND_IO_PORT, arg),
             Some(Capability::IoPort(0x70, 2))
+        );
+    }
+
+    /// N6: `Net` 是**闭区间** `[lo, hi]`（与 `IoPort` 的半开区间不同）；`decode` 用
+    /// `(lo << 16) | hi` 编码，`lo > hi` 或超 32 位一律拒绝。
+    #[test]
+    fn net_port_range_and_encoding() {
+        assert!(net_port_in_range(1024, 65535, 1024)); // 下界含
+        assert!(net_port_in_range(1024, 65535, 65535)); // 上界**含**（闭区间）
+        assert!(!net_port_in_range(1024, 65535, 1023));
+        assert!(net_port_in_range(7, 7, 7)); // 单端口
+        assert!(!net_port_in_range(7, 7, 8));
+
+        assert_eq!(
+            decode(CAP_KIND_NET, (53 << 16) | 53),
+            Some(Capability::Net(53, 53))
+        );
+        assert_eq!(
+            decode(CAP_KIND_NET, (1024 << 16) | 65535),
+            Some(Capability::Net(1024, 65535))
+        );
+        assert_eq!(decode(CAP_KIND_NET, (1024 << 16) | 80), None); // lo > hi
+        assert_eq!(decode(CAP_KIND_NET, 1 << 32), None); // 超 32 位
+
+        // 审计打包: 种类 7 → 包成 `8 << 56`，闭区间编码自洽。
+        assert_eq!(
+            pack_audit(Capability::Net(1024, 65535)),
+            (8 << 56) | (1024 << 16) | 65535
         );
     }
 }

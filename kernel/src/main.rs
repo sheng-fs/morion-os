@@ -6,7 +6,7 @@
 #![no_main]
 
 use morion_kernel::{
-    arch, bootinfo, cap, device, domain, exec, ipc, memory, pager, scheduler, syscall, video,
+    arch, bootinfo, cap, device, domain, exec, ipc, memory, net, pager, scheduler, syscall, video,
 };
 
 extern crate alloc;
@@ -293,6 +293,7 @@ pub extern "C" fn kernel_main() -> ! {
     let boot_domains = domain::BOOT_DOMAINS as usize;
     ipc::init(boot_domains);
     cap::init(boot_domains);
+    net::init();
     pager::init(boot_domains, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。

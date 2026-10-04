@@ -176,8 +176,34 @@ pub fn receive() -> Message {
     }
 }
 
-/// 同步调用: 发送请求到 `to` 并阻塞等待回复, 返回回复消息。
+/// 从当前域邮箱接收消息 (**非阻塞**)。
 ///
+/// 与 [`receive`] 的区别: 邮箱为空时**立即返回 `None`**, 不阻塞当前任务。用于驱动/网络
+/// 服务这类"既要轮询硬件、又要接 IPC"的循环 (N6: `net_srv` 一边排空 RX、一边服务送帧请求)。
+pub fn try_receive() -> Option<Message> {
+    x86_64::instructions::interrupts::disable();
+    let me = crate::scheduler::current_domain();
+
+    let got = {
+        let mut boxes = MAILBOXES.lock();
+        boxes[me as usize].pop_front()
+    };
+
+    match got {
+        Some(msg) => {
+            // 与 `receive` 一致: 记录回复目标, 供后续 `reply` 路由回调用者。
+            crate::scheduler::set_current_reply_target(msg.from);
+            x86_64::instructions::interrupts::enable();
+            Some(msg)
+        }
+        None => {
+            x86_64::instructions::interrupts::enable();
+            None
+        }
+    }
+}
+
+/// 同步调用: 发送请求到 `to` 并阻塞等待回复, 返回回复消息。
 /// 需 `Capability::SendTo(to)`。失败时返回 `tag == u64::MAX` 的空消息 —— 三种情形:
 /// 无能力、目标域**已无存活任务** (服务崩了 / 正被监督者重启), 或等待期间目标域死掉。
 ///
