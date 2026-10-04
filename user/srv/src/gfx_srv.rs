@@ -54,6 +54,15 @@ const CONSOLE: usize = 0;
 /// 单次 `GFX_OP_TEXT` 允许的最大字节数 (客户端共享页就是一页)。
 const MAX_TEXT_BYTES: usize = 4096;
 
+/// 客户端共享**连续区间** (表面 / 文本缓冲) 允许的最大字节数。
+///
+/// 两个作用: ① 几何字段相乘 (如 `h * stride * 4`) 在 u64 里可能回绕, 这里给"表面大小"
+/// 设上界, 让校验用**受检算术**算末址; ② 给"逐页校验映射"设上界 —— 最多 4096 次
+/// `SYS_VIRT_TO_PHYS` (16 MiB / 4 KiB), 校验代价可控。
+const MAX_MAPPED_BYTES: u64 = 16 * 1024 * 1024;
+/// 页大小 (与内核一致)。
+const PAGE_BYTES: u64 = 4096;
+
 /// 控制台窗口底色 (深蓝黑); 也是终端背景。
 const BG: u32 = 0x10_18_28;
 /// **桌面背景色** (合成器底色): 没有窗口覆盖处显示它。故意与控制台底色不同,
@@ -369,9 +378,8 @@ impl Compositor {
         if req.buf == 0 || w == 0 || h == 0 || stride < w {
             return 0;
         }
-        // 表面必须已映射进本域 (合并时读它才不会缺页)。
-        let last = req.buf + (h as u64 - 1) * stride as u64 * 4 + (w as u64 - 1) * 4;
-        if sys_virt_to_phys(req.buf) == 0 || sys_virt_to_phys(last) == 0 {
+        // 表面必须**整块**已映射进本域 (合成时读它才不会缺页)。只查首尾会被回绕/跳页绕过。
+        if !surface_fully_mapped(req.buf, w as u64, h as u64, stride as u64) {
             return GFX_REPLY_NO_SESSION;
         }
         let slot = match (1..MAX_WINDOWS).find(|&i| !self.wins[i].used) {
@@ -548,6 +556,53 @@ fn handle(comp: &mut Compositor, tag: u64, payload: *const u8) -> (u64, bool) {
     (reply, req.op == GFX_OP_EXIT)
 }
 
+/// 校验客户端共享的**连续区间** `[buf, buf+size)` **整段**都已映射进本域。
+///
+/// ⚠️ 只查首尾两个地址会被两条路径绕过, 随后读到未映射页即**用户态缺页 → 本服务崩溃**:
+/// ① **回绕**: 客户端把 `w/h/stride` 设成极大值, `(h-1)*stride*4` 在 u64 里回绕, 使"尾地址"
+///    落回首页, 首尾都"映射" → 假通过;
+/// ② **跳页**: 客户端只 `SYS_SHARE_PAGE` 首尾两页、跳过中间页, 尾地址仍落在已映射页 → 假通过。
+///
+/// 故这里: 用**受检**加法求末址 (溢出即拒) + **逐页**要求 `SYS_VIRT_TO_PHYS != 0`;
+/// `size` 受 [`MAX_MAPPED_BYTES`] 约束, 逐页次数因此有上界。
+fn range_fully_mapped(buf: u64, size: u64) -> bool {
+    if buf == 0 || size == 0 || size > MAX_MAPPED_BYTES {
+        return false;
+    }
+    let Some(end) = buf.checked_add(size) else {
+        return false;
+    };
+    let mut p = buf & !(PAGE_BYTES - 1);
+    while p < end {
+        if sys_virt_to_phys(p) == 0 {
+            return false;
+        }
+        let Some(next) = p.checked_add(PAGE_BYTES) else {
+            return false;
+        };
+        p = next;
+    }
+    true
+}
+
+/// 校验矩形表面 `w×h` (行距 `stride` 像素, 4 字节/像素) 整块已在映射内。
+///
+/// 末字节偏移 (不含) = `(h-1)*stride*4 + w*4` —— 全程走受检算术, 任一步溢出即拒
+/// (即堵死上面的「回绕」路径)。
+fn surface_fully_mapped(buf: u64, w: u64, h: u64, stride: u64) -> bool {
+    if w == 0 || h == 0 || stride < w {
+        return false;
+    }
+    let size = (h - 1)
+        .checked_mul(stride)
+        .and_then(|r| r.checked_mul(4))
+        .and_then(|r| w.checked_mul(4).and_then(|wb| r.checked_add(wb)));
+    match size {
+        Some(s) => range_fully_mapped(buf, s),
+        None => false,
+    }
+}
+
 /// 把客户端共享过来的文本写进终端 (落笔逐像素回读校验 + 合成回读); 成功返回 1。
 ///
 /// 文本页由客户端 `SYS_SHARE_PAGE` **同址**共享过来, 故这里可直接按 `req.buf` 读。读之前
@@ -559,8 +614,8 @@ fn text(comp: &mut Compositor, req: &GfxReq) -> u64 {
     if req.buf == 0 || len == 0 || len > MAX_TEXT_BYTES {
         return 0;
     }
-    let last = req.buf + len as u64 - 1;
-    if sys_virt_to_phys(req.buf) == 0 || sys_virt_to_phys(last) == 0 {
+    // 文本缓冲必须**整段**已映射 (只查首尾会被跳页共享绕过 → 缺页崩溃)。
+    if !range_fully_mapped(req.buf, len as u64) {
         return GFX_REPLY_NO_SESSION;
     }
     let bytes = unsafe { core::slice::from_raw_parts(req.buf as *const u8, len) };
@@ -583,8 +638,8 @@ fn blit_to_screen(fb: &Fb, req: &GfxReq) -> u64 {
         return 0;
     }
     let src = req.buf;
-    let last = src + (sh - 1) * sstride * 4 + (sw - 1) * 4;
-    if sys_virt_to_phys(src) == 0 || sys_virt_to_phys(last) == 0 {
+    // 表面必须**整块**已映射 (只查首尾会被回绕/跳页绕过 → 缺页崩溃)。
+    if !surface_fully_mapped(src, sw, sh, sstride) {
         return GFX_REPLY_NO_SESSION;
     }
 
