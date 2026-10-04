@@ -16,6 +16,8 @@
 use libdevice::grant::DeviceGrant;
 use libdevice::mmio::{fence, rd32, rd8, wr16, wr32, wr8};
 use morion::syscall::*;
+// 显式从公共模块引入 `PAYLOAD_LEN`（不依赖 `crate::common` 的私有 glob 再导出）。
+use morion::syscall::PAYLOAD_LEN;
 
 use crate::common::{
     Message, NetReq, NET_FRAME_MAX, NET_OP_INFO, NET_OP_RX, NET_OP_TX, NET_REQ_TAG,
