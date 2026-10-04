@@ -103,7 +103,15 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 - **ICMPv6**：echo request/reply + 最小错误（端口不可达等）。
 - **UDPv6**：复用现有 UDP，仅换寻址 + 伪首部（v6 伪首部长度/格式不同）。
 - **TCPv6**：**复用现有 TCP 状态机**，只换地址比较、伪首部校验和、MSS/默认值。
-- marker：`NET17 udp6 OK` / `NET18 tcp6 OK`。
+- marker：`NET17 icmpv6 echo OK` + `NET17 udp6 OK` / `NET18 tcp6 OK`。**已过**。
+- 实现：新增 IPv6 分用 `ipv6_input`（ICMPv6→处理器 / UDP→投递+错误 / TCP→状态机）；
+  `build_echo6`/`echo6_reply`（echo 请求就地在 `icmpv6_input` 内改写成应答）；
+  `build_udp6`（**v6 下 UDP 校验和必需**，不可置 0）+ `udp6_input`（校验→`deliver`，无人接收回
+  `icmpv6_port_unreach`，调用包先挪到页内 scratch 再原地构造）；`tcp_build6`/`tcp_parse6`
+  与 v4 共用 `tcp_handle`/`tcp_tick`——`TcpConn` 增 `family/remote6/local6`，`tcp_seg` 按
+  `family` 分派，`tcp_input` 收 `SrcId`(V4/V6) 做地址匹配。三项均有**确定性自证**
+  （`echo6_selftest`/`udp6_selftest`/`tcp6_selftest`），另加真实链路 ping6（slirp 回
+  `NET17 ipv6 echo OK (router replied)`）。
 
 ### V6.3 — 应用面
 - libnetv：`IpAddr` + `getaddrinfo` 支持 **AAAA**（与现有 A 并列）；socket API 增加 family 参数（或新 `*6` 变体）。
@@ -132,7 +140,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 
 1. ✅ **R1 取证（已完成）**：发 RS → slirp 回 RA，**前缀 `fec0::/64`**；自派生链路本地 `fe80::5054:ff:fe12:3456`。证据 marker `NET16 ipv6 ll=… / ra rx, prefix=…`（已入 `scripts/fs-regress.sh` 判据）。
 2. ✅ **V6.1 地址 + SLAAC + NDP（已完成）**：`NET16 ipv6 slaac OK (g=fec0:0:0:0:5054:ff:fe12:3456, gw mac learned)` + `NET16 ndp self-test OK (ns->na)`。
-3. **V6.2** ICMPv6 + UDPv6 + TCPv6（`NET17`/`NET18`）。
+3. ✅ **V6.2 传输（已完成）**：ICMPv6 echo（`NET17 icmpv6 echo OK`，另 slirp 回 `NET17 ipv6 echo OK (router replied)`）+ UDPv6（`NET17 udp6 OK`）+ TCPv6（`NET18 tcp6 OK`）。
 4. **V6.3** AAAA + 应用面（`NET19`）。
 5. **DRV-A** NIC 表驱动化（回归逐字不变）。
 6. **DRV-B** `rtl8139_srv`（`NET14`）→ 视情况 `e1000_srv`（`NET15`）。

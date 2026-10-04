@@ -53,6 +53,12 @@ const ICMPV6_RS: u8 = 133;
 const ICMPV6_RA: u8 = 134;
 const ICMPV6_NS: u8 = 135;
 const ICMPV6_NA: u8 = 136;
+const ICMPV6_ECHO_REQ: u8 = 128;
+const ICMPV6_ECHO_REPLY: u8 = 129;
+const ICMPV6_DEST_UNREACH: u8 = 1;
+const ICMPV6_CODE_PORT_UNREACH: u8 = 4;
+/// 构造回帧时的临时暂存偏移（调用包拷到这里，避免覆盖正在解析的帧）。
+const SCRATCH_OFF: u64 = 1600;
 
 // ---------------------------------------------------------------------------
 // 字节序 / 校验和（在 u64 虚拟地址上操作）
@@ -586,6 +592,17 @@ fn icmpv6_input(st: &mut Stack, nic: usize, io: u64, n: u64) -> u64 {
             }
             0
         }
+        ICMPV6_ECHO_REQ => {
+            // 目的须是本机地址（ll 或 SLAAC 全局）才应答。
+            let dst = get_v6(ip + 24);
+            let ll = link_local_from_mac(mac);
+            if v6_eq(&dst, &ll) || v6_eq(&dst, &st.links[nic].v6_global) {
+                echo6_reply(io, mac, plen)
+            } else {
+                0
+            }
+        }
+        ICMPV6_ECHO_REPLY => 0,
         _ => 0,
     }
 }
@@ -638,6 +655,413 @@ fn ipv6_probe(st: &mut Stack, nic: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// V6.2 — IPv6 传输：ICMPv6 echo / 最小错误 + UDPv6 + TCPv6（复用 v4 状态机）
+// ---------------------------------------------------------------------------
+
+/// 解析出的 IPv6 报文（V6.2）。
+struct Ipv6Info {
+    src: [u8; 16],
+    dst: [u8; 16],
+    next: u8,
+    payload_off: u64,
+    payload_len: u64,
+}
+
+/// 解析以太帧里的 IPv6 报文（校验版本/负载长度，暂不处理扩展头）。
+fn ipv6_parse(eth_va: u64, eth_len: u64) -> Option<Ipv6Info> {
+    if eth_len < 14 + 40 || rd16be(eth_va + 12) != ETH_IPV6 {
+        return None;
+    }
+    let ip = eth_va + 14;
+    if (rd8(ip) >> 4) != 6 {
+        return None;
+    }
+    let plen = rd16be(ip + 4) as u64;
+    if 14 + 40 + plen > eth_len {
+        return None;
+    }
+    Some(Ipv6Info {
+        src: get_v6(ip + 8),
+        dst: get_v6(ip + 24),
+        next: rd8(ip + 6),
+        payload_off: ip + 40,
+        payload_len: plen,
+    })
+}
+
+/// 本链路用于 IPv6 的源地址：SLAAC 全局地址（已配置）否则 EUI-64 链路本地。
+fn link_v6_primary(st: &Stack, nic: usize) -> [u8; 16] {
+    if st.links[nic].v6_up && !v6_is_zero(&st.links[nic].v6_global) {
+        st.links[nic].v6_global
+    } else {
+        link_local_from_mac(mac_bytes(st.links[nic].mac))
+    }
+}
+
+/// 构造一个 ICMPv6 echo request（目的 `dst`，负载从 `payload_va` 拷入）；返回帧长。
+#[allow(clippy::too_many_arguments)]
+fn build_echo6(
+    io: u64,
+    mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    id: u16,
+    seq: u16,
+    payload_va: u64,
+    plen: u64,
+) -> u64 {
+    put_mac(io, dst_mac);
+    put_mac(io + 6, mac);
+    wr16be(io + 12, ETH_IPV6);
+    let ip = io + 14;
+    let icmp_len = 8 + plen;
+    wr32be(ip, 0x6000_0000);
+    wr16be(ip + 4, icmp_len as u16);
+    wr8(ip + 6, IP6_PROTO_ICMPV6);
+    wr8(ip + 7, 64);
+    put_v6(ip + 8, src);
+    put_v6(ip + 24, dst);
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_ECHO_REQ);
+    wr8(ic + 1, 0);
+    wr16be(ic + 2, 0);
+    wr16be(ic + 4, id);
+    wr16be(ic + 6, seq);
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload_va as *const u8, (ic + 8) as *mut u8, plen as usize);
+    }
+    wr16be(ic + 2, csum_v6(src, dst, IP6_PROTO_ICMPV6, ic, icmp_len));
+    14 + 40 + icmp_len
+}
+
+/// 就地把收到的 echo request 改写成 echo reply（交换 L2/L3 源目 + 重算校验和）；返回帧长。
+fn echo6_reply(io: u64, mac: [u8; 6], plen: u64) -> u64 {
+    let ip = io + 14;
+    let peer_mac = [
+        rd8(io + 6),
+        rd8(io + 7),
+        rd8(io + 8),
+        rd8(io + 9),
+        rd8(io + 10),
+        rd8(io + 11),
+    ];
+    let src = get_v6(ip + 8);
+    let dst = get_v6(ip + 24);
+    put_mac(io, peer_mac);
+    put_mac(io + 6, mac);
+    put_v6(ip + 8, &dst);
+    put_v6(ip + 24, &src);
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_ECHO_REPLY);
+    wr8(ic + 1, 0);
+    wr16be(ic + 2, 0);
+    wr16be(ic + 2, csum_v6(&dst, &src, IP6_PROTO_ICMPV6, ic, plen));
+    14 + 40 + plen
+}
+
+/// 构造 UDPv6 数据报（IPv6 下 UDP 校验和**必需**，不可置 0）；返回帧长。
+#[allow(clippy::too_many_arguments)]
+fn build_udp6(
+    io: u64,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    sport: u16,
+    dport: u16,
+    payload_va: u64,
+    plen: u64,
+) -> u64 {
+    put_mac(io, dst_mac);
+    put_mac(io + 6, src_mac);
+    wr16be(io + 12, ETH_IPV6);
+    let ip = io + 14;
+    let udp_len = 8 + plen;
+    wr32be(ip, 0x6000_0000);
+    wr16be(ip + 4, udp_len as u16);
+    wr8(ip + 6, IP_PROTO_UDP);
+    wr8(ip + 7, 64);
+    put_v6(ip + 8, src);
+    put_v6(ip + 24, dst);
+    let udp = ip + 40;
+    wr16be(udp, sport);
+    wr16be(udp + 2, dport);
+    wr16be(udp + 4, udp_len as u16);
+    wr16be(udp + 6, 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            payload_va as *const u8,
+            (udp + 8) as *mut u8,
+            plen as usize,
+        );
+    }
+    wr16be(udp + 6, csum_v6(src, dst, IP_PROTO_UDP, udp, udp_len));
+    14 + 40 + udp_len
+}
+
+/// UDPv6 校验和（含 IPv6 伪首部）。段内已含校验和时结果为 0（合法）。
+fn udp6_csum(src: &[u8; 16], dst: &[u8; 16], seg: u64, len: u64) -> u16 {
+    csum_v6(src, dst, IP_PROTO_UDP, seg, len)
+}
+
+/// 构造 ICMPv6「目的不可达 / 端口不可达」，body 携带调用包（IPv6 头 + 前 8 字节）；返回帧长。
+fn icmpv6_port_unreach(st: &Stack, nic: usize, io: u64, info: &Ipv6Info) -> u64 {
+    let our = info.dst;
+    let peer = info.src;
+    let peer_mac = [
+        rd8(io + 6),
+        rd8(io + 7),
+        rd8(io + 8),
+        rd8(io + 9),
+        rd8(io + 10),
+        rd8(io + 11),
+    ];
+    let mac = mac_bytes(st.links[nic].mac);
+    // 调用包（尽量大到 48 字节：IPv6 头 + 前 8 字节负载）先挪到 scratch，再原地构造回帧。
+    let orig = 40 + info.payload_len;
+    let ih = orig.min(48);
+    let scratch = io + SCRATCH_OFF;
+    let mut i = 0u64;
+    while i < ih {
+        wr8(scratch + i, rd8(io + 14 + i));
+        i += 1;
+    }
+    put_mac(io, peer_mac);
+    put_mac(io + 6, mac);
+    wr16be(io + 12, ETH_IPV6);
+    let ip = io + 14;
+    let plen = 8 + ih; // ICMP 头(4) + 未用(4) + 调用包
+    wr32be(ip, 0x6000_0000);
+    wr16be(ip + 4, plen as u16);
+    wr8(ip + 6, IP6_PROTO_ICMPV6);
+    wr8(ip + 7, 64);
+    put_v6(ip + 8, &our);
+    put_v6(ip + 24, &peer);
+    let ic = ip + 40;
+    wr8(ic, ICMPV6_DEST_UNREACH);
+    wr8(ic + 1, ICMPV6_CODE_PORT_UNREACH);
+    wr16be(ic + 2, 0);
+    wr32be(ic + 4, 0);
+    let mut j = 0u64;
+    while j < ih {
+        wr8(ic + 8 + j, rd8(scratch + j));
+        j += 1;
+    }
+    wr16be(ic + 2, csum_v6(&our, &peer, IP6_PROTO_ICMPV6, ic, plen));
+    14 + 40 + plen
+}
+
+/// 处理收到的 UDPv6：校验（必需）→ 投递到本机 socket；无人接收则回 ICMPv6 端口不可达。
+/// 返回需回发的帧长（0 = 无回帧）。
+fn udp6_input(st: &mut Stack, nic: usize, io: u64, info: &Ipv6Info) -> u64 {
+    if info.payload_len < 8 {
+        return 0;
+    }
+    let udp = info.payload_off;
+    let ulen = rd16be(udp + 4) as u64;
+    if ulen < 8 || ulen > info.payload_len {
+        return 0;
+    }
+    if udp6_csum(&info.src, &info.dst, udp, ulen) != 0 {
+        return 0;
+    }
+    let ll = link_local_from_mac(mac_bytes(st.links[nic].mac));
+    if !v6_eq(&info.dst, &ll) && !v6_eq(&info.dst, &st.links[nic].v6_global) {
+        return 0; // 非本机地址
+    }
+    let dport = rd16be(udp + 2);
+    if deliver(st, nic, dport, udp + 8, ulen - 8) {
+        return 0;
+    }
+    icmpv6_port_unreach(st, nic, io, info)
+}
+
+/// V6.2 IPv6 分用：ICMPv6 → 处理器；UDP → 投递/错误；TCP → 复用 v4 状态机。
+/// 返回需回发的帧长（ICMPv6/错误帧）。
+fn ipv6_input(st: &mut Stack, nic: usize, io: u64, n: u64, now: u64) -> u64 {
+    let info = match ipv6_parse(io, n) {
+        Some(i) => i,
+        None => return 0,
+    };
+    match info.next {
+        IP6_PROTO_ICMPV6 => icmpv6_input(st, nic, io, n),
+        IP_PROTO_UDP => udp6_input(st, nic, io, &info),
+        IP_PROTO_TCP => {
+            if let Some(seg) = tcp_parse6(&info) {
+                let len = tcp_input(st, nic, SrcId::V6(info.src), &seg, now);
+                tcp_emit_deliver(st, nic, len, now);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// V6.2 确定性自证：echo request → 处理器产出 echo reply（类型/id/seq/负载/校验和）。
+fn echo6_selftest(st: &mut Stack, nic: usize) -> bool {
+    let io = st.links[nic].io;
+    let mac = mac_bytes(st.links[nic].mac);
+    let ll = link_local_from_mac(mac);
+    let payload = b"MORION-V6.2";
+    let len = build_echo6(
+        io,
+        mac,
+        mac,
+        &ll,
+        &ll,
+        0x4d4f,
+        1,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    let out = icmpv6_input(st, nic, io, len);
+    if out != len {
+        return false;
+    }
+    let ic = io + 14 + 40;
+    if rd8(ic) != ICMPV6_ECHO_REPLY || rd16be(ic + 4) != 0x4d4f || rd16be(ic + 6) != 1 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < payload.len() {
+        if rd8(ic + 8 + i as u64) != payload[i] {
+            return false;
+        }
+        i += 1;
+    }
+    let s = get_v6(io + 14 + 8);
+    let d = get_v6(io + 14 + 24);
+    csum_v6(&s, &d, IP6_PROTO_ICMPV6, ic, out - 54) == 0
+}
+
+/// V6.2 确定性自证：UDPv6 校验和合法 + 投递到 socket；未绑端口 → ICMPv6 端口不可达。
+fn udp6_selftest(st: &mut Stack, nic: usize) -> bool {
+    let io = st.links[nic].io;
+    let mac = mac_bytes(st.links[nic].mac);
+    let ll = link_local_from_mac(mac);
+    let payload = b"MORION-V6.2-UDP";
+    let id = sock_alloc(st, nic);
+    if id == 0 {
+        return false;
+    }
+    st.socks[id as usize - 1].port = 0xbee0;
+    let len = build_udp6(
+        io,
+        mac,
+        mac,
+        &ll,
+        &ll,
+        0x4d50,
+        0xbee0,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    let info = match ipv6_parse(io, len) {
+        Some(i) => i,
+        None => return false,
+    };
+    if udp6_input(st, nic, io, &info) != 0 {
+        return false; // 已投递 → 不应有回帧
+    }
+    let s = &st.socks[id as usize - 1];
+    if s.len != payload.len() as u64 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < payload.len() {
+        if s.data[i] != payload[i] {
+            return false;
+        }
+        i += 1;
+    }
+    st.socks[id as usize - 1].len = 0;
+    // 未绑端口 → 生成 ICMPv6 端口不可达。
+    let len = build_udp6(
+        io,
+        mac,
+        mac,
+        &ll,
+        &ll,
+        0x4d50,
+        0xdead,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    let info = match ipv6_parse(io, len) {
+        Some(i) => i,
+        None => return false,
+    };
+    let out = udp6_input(st, nic, io, &info);
+    if out == 0 || rd8(io + 14 + 40) != ICMPV6_DEST_UNREACH {
+        return false;
+    }
+    if rd8(io + 14 + 40 + 1) != ICMPV6_CODE_PORT_UNREACH {
+        return false;
+    }
+    let s = get_v6(io + 14 + 8);
+    let d = get_v6(io + 14 + 24);
+    let ok = csum_v6(&s, &d, IP6_PROTO_ICMPV6, io + 14 + 40, out - 54) == 0;
+    let _ = sock_close(st, id);
+    ok
+}
+
+/// V6.2 链路取证：向路由器（RA 源）发 echo request，收 echo reply（best-effort）。
+fn icmpv6_probe(st: &mut Stack, nic: usize) {
+    if !st.links[nic].v6_up {
+        println("NET17 ipv6 echo skip (no v6)");
+        return;
+    }
+    let io = st.links[nic].io;
+    let mac = mac_bytes(st.links[nic].mac);
+    let ll = link_local_from_mac(mac);
+    let gw = st.links[nic].v6_gw;
+    let gw_mac = match st.links[nic].gw6_mac {
+        Some(m) => m,
+        None => {
+            println("NET17 ipv6 echo skip (no gw mac)");
+            return;
+        }
+    };
+    let payload = b"morion-ping6";
+    let len = build_echo6(
+        io,
+        mac,
+        gw_mac,
+        &ll,
+        &gw,
+        0x4d4f,
+        1,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+    );
+    let _ = link_tx(&st.links[nic], len);
+    let mut tries = 0u64;
+    while tries < 40 {
+        if let Some(n) = link_rx(&st.links[nic]) {
+            if rd16be(io + 12) == ETH_IPV6 {
+                match ipv6_parse(io, n) {
+                    Some(info)
+                        if info.next == IP6_PROTO_ICMPV6
+                            && rd8(info.payload_off) == ICMPV6_ECHO_REPLY
+                            && rd16be(info.payload_off + 4) == 0x4d4f =>
+                    {
+                        println("NET17 ipv6 echo OK (router replied)");
+                        return;
+                    }
+                    _ => {
+                        let _ = icmpv6_input(st, nic, io, n);
+                    }
+                }
+            }
+        }
+        sys_sleep(10);
+        tries += 1;
+    }
+    println("NET17 ipv6 echo timeout (no reply)");
+}
+
 /// 学某网卡的网关 MAC（发 ARP 请求 + 有界收包）。取不到则保持 `None`。
 fn arp_learn_gw(st: &mut Stack, nic: usize) {
     let mut tries = 0u64;
@@ -678,8 +1102,8 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
         return;
     }
     if et == ETH_IPV6 {
-        // V6.1: NDP（RA→SLAAC / NS→NA）；若需回应，帧已就地构造好，直接发回。
-        let out = icmpv6_input(st, nic, f, n);
+        // V6.2: IPv6 分用（ICMPv6 NDP/echo、UDPv6、TCPv6）；若需回帧，帧已就地构造好，直接发回。
+        let out = ipv6_input(st, nic, f, n, now);
         if out > 0 {
             let _ = link_tx(&st.links[nic], out);
         }
@@ -701,7 +1125,7 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
     if proto == IP_PROTO_TCP {
         if let Some(info) = ipv4_parse(f, n) {
             if let Some(seg) = tcp_parse(&info) {
-                let len = tcp_input(st, nic, info.src, &seg, now);
+                let len = tcp_input(st, nic, SrcId::V4(info.src), &seg, now);
                 tcp_emit_deliver(st, nic, len, now);
             }
         }
@@ -728,8 +1152,8 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
     }
 }
 
-/// 把负载投递给**绑在该网卡**上、绑定 `dport` 的 socket。
-fn deliver(st: &mut Stack, nic: usize, dport: u16, src_va: u64, len: u64) {
+/// 把负载投递给**绑在该网卡**上、绑定 `dport` 的 socket；投递成功返回 `true`。
+fn deliver(st: &mut Stack, nic: usize, dport: u16, src_va: u64, len: u64) -> bool {
     for s in st.socks.iter_mut() {
         if s.used && s.nic == nic && s.port == dport && len <= PAY_MAX as u64 {
             unsafe {
@@ -740,9 +1164,10 @@ fn deliver(st: &mut Stack, nic: usize, dport: u16, src_va: u64, len: u64) {
                 );
             }
             s.len = len;
-            return;
+            return true;
         }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +1236,13 @@ fn tcp_csum(src: [u8; 4], dst: [u8; 4], seg: u64, len: u64) -> u16 {
     let s = csum_acc(ph.as_ptr() as u64, 12, 0);
     let s = csum_acc(seg, len, s);
     !csum_fold(s)
+}
+
+/// TCP 段的 L3 来源（v4/v6 双栈共用同一状态机时的地址身份）。
+#[derive(Clone, Copy)]
+enum SrcId {
+    V4([u8; 4]),
+    V6([u8; 16]),
 }
 
 /// 解析出的 IPv4 报文。
@@ -946,6 +1378,85 @@ fn tcp_build(
     14 + 20 + seg_len
 }
 
+/// 拼一个 v6 的 TCP 段（以太 + IPv6 + TCP，无扩展头），返回帧长。
+#[allow(clippy::too_many_arguments)]
+fn tcp_build6(
+    io: u64,
+    src_mac: u64,
+    dst_mac: [u8; 6],
+    src_ip: &[u8; 16],
+    dst_ip: &[u8; 16],
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> u64 {
+    let f = io;
+    put_mac(f, dst_mac);
+    put_mac(f + 6, mac_bytes(src_mac));
+    wr16be(f + 12, ETH_IPV6);
+    let ip = f + 14;
+    let seg_len = 20 + payload.len() as u64;
+    wr32be(ip, 0x6000_0000);
+    wr16be(ip + 4, seg_len as u16);
+    wr8(ip + 6, IP_PROTO_TCP);
+    wr8(ip + 7, 64);
+    put_v6(ip + 8, src_ip);
+    put_v6(ip + 24, dst_ip);
+    let tcp = ip + 40;
+    wr16be(tcp, sport);
+    wr16be(tcp + 2, dport);
+    wr32be(tcp + 4, seq);
+    wr32be(tcp + 8, ack);
+    wr8(tcp + 12, 5 << 4); // data offset = 5
+    wr8(tcp + 13, flags);
+    wr16be(tcp + 14, window);
+    wr16be(tcp + 16, 0); // checksum（回填）
+    wr16be(tcp + 18, 0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), (tcp + 20) as *mut u8, payload.len());
+    }
+    wr16be(
+        tcp + 16,
+        csum_v6(src_ip, dst_ip, IP_PROTO_TCP, tcp, seg_len),
+    );
+    14 + 40 + seg_len
+}
+
+/// 解析 IPv6 报文里的 TCP 段（校验数据偏移与 v6 伪首部校验和）。
+fn tcp_parse6(info: &Ipv6Info) -> Option<TcpSeg> {
+    if info.next != IP_PROTO_TCP || info.payload_len < 20 {
+        return None;
+    }
+    let tcp = info.payload_off;
+    let doff = (rd8(tcp + 12) >> 4) as u64 * 4;
+    if doff < 20 || doff > info.payload_len {
+        return None;
+    }
+    if csum_v6(&info.src, &info.dst, IP_PROTO_TCP, tcp, info.payload_len) != 0 {
+        return None;
+    }
+    Some(TcpSeg {
+        sport: rd16be(tcp),
+        dport: rd16be(tcp + 2),
+        seq: rd32be(tcp + 4),
+        ack: rd32be(tcp + 8),
+        flags: rd8(tcp + 13),
+        window: rd16be(tcp + 14),
+        payload_off: tcp + doff,
+        payload_len: info.payload_len - doff,
+    })
+}
+
+/// 从 `io` 页解析一个 v6 TCP 段（自带以太/IPv6 头）。
+fn parse_seg_io6(io: u64, fl: u64) -> Option<TcpSeg> {
+    let info = ipv6_parse(io, fl)?;
+    tcp_parse6(&info)
+}
+
 /// TCP 连接状态（含主动/被动打开子集）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TcpState {
@@ -980,6 +1491,12 @@ struct TcpConn {
     local_port: u16,
     remote_ip: [u8; 4],
     remote_port: u16,
+    /// L3 协议族：4 或 6（v4/v6 共用同一状态机）。
+    family: u8,
+    /// v6 对端地址（`family == 6` 时有效）。
+    remote6: [u8; 16],
+    /// v6 本端地址（`family == 6` 时有效）。
+    local6: [u8; 16],
     /// 最老的未确认序号。
     snd_una: u32,
     /// 下一个要发的序号。
@@ -1012,6 +1529,9 @@ impl TcpConn {
             local_port: 0,
             remote_ip: [0; 4],
             remote_port: 0,
+            family: 4,
+            remote6: [0; 16],
+            local6: [0; 16],
             snd_una: 0,
             snd_nxt: 0,
             rcv_nxt: 0,
@@ -1027,22 +1547,39 @@ impl TcpConn {
     }
 }
 
-/// 用连接的寻址信息构造一个段（`seq`/`ack` 由调用方给出）。
+/// 用连接的寻址信息构造一个段（`seq`/`ack` 由调用方给出）。v4/v6 由 `conn.family` 决定。
 fn tcp_seg(conn: &TcpConn, io: u64, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> u64 {
-    tcp_build(
-        io,
-        conn.mac,
-        conn.dst_mac,
-        OUR_IP,
-        conn.remote_ip,
-        conn.local_port,
-        conn.remote_port,
-        seq,
-        ack,
-        flags,
-        TCP_WINDOW,
-        payload,
-    )
+    if conn.family == 6 {
+        tcp_build6(
+            io,
+            conn.mac,
+            conn.dst_mac,
+            &conn.local6,
+            &conn.remote6,
+            conn.local_port,
+            conn.remote_port,
+            seq,
+            ack,
+            flags,
+            TCP_WINDOW,
+            payload,
+        )
+    } else {
+        tcp_build(
+            io,
+            conn.mac,
+            conn.dst_mac,
+            OUR_IP,
+            conn.remote_ip,
+            conn.local_port,
+            conn.remote_port,
+            seq,
+            ack,
+            flags,
+            TCP_WINDOW,
+            payload,
+        )
+    }
 }
 
 /// 主动连接：发 SYN，进入 SynSent。返回 SYN 帧长。
@@ -1444,6 +1981,170 @@ fn tcp_selftest(io: u64) -> bool {
     parse_seg_io(io, fl).is_none()
 }
 
+/// N18 确定性自证：用 v6 段驱动**同一套** TCP 状态机（连接 → 收发 → 重传 → 关闭），
+/// 校验 v6 伪首部校验和与寻址。不依赖真实对端。
+fn tcp6_selftest(io: u64, our: [u8; 16], peer: [u8; 16]) -> bool {
+    let peer_mac = [0x02u8, 0, 0, 0, 0, 2];
+    let mac = 0x5634_1200_5452u64;
+    let isn = 0x4d4f_0600u32;
+    let peer_isn = 0x1234_5606u32;
+    let mut c = TcpConn::new();
+    c.used = true;
+    c.family = 6;
+    c.mac = mac;
+    c.dst_mac = peer_mac;
+    c.local6 = our;
+    c.remote6 = peer;
+    c.local_port = 0x4d60;
+    c.remote_port = 12346;
+
+    // 1) 主动连接 → SYN。
+    let fl = tcp_connect(&mut c, io, isn, 0);
+    let s = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    if s.flags != TCP_SYN || s.seq != isn || s.dport != 12346 {
+        return false;
+    }
+
+    // 2) 合成对端 SYN-ACK → ESTABLISHED 并回 ACK。
+    let fl = tcp_build6(
+        io,
+        mac,
+        peer_mac,
+        &peer,
+        &our,
+        12346,
+        c.local_port,
+        peer_isn,
+        isn.wrapping_add(1),
+        TCP_SYN | TCP_ACK,
+        TCP_WINDOW,
+        &[],
+    );
+    let synack = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    let r = tcp_handle(&mut c, io, &synack, 0);
+    if c.state != TcpState::Established || r == 0 {
+        return false;
+    }
+    let a = match parse_seg_io6(io, r) {
+        Some(x) => x,
+        None => return false,
+    };
+    if a.flags & TCP_ACK == 0 || a.ack != peer_isn.wrapping_add(1) {
+        return false;
+    }
+
+    // 3) 对端来数据 → 回 ACK，数据逐字节一致。
+    let data = b"MORION-N18";
+    let fl = tcp_build6(
+        io,
+        mac,
+        peer_mac,
+        &peer,
+        &our,
+        12346,
+        c.local_port,
+        peer_isn.wrapping_add(1),
+        isn.wrapping_add(1),
+        TCP_PSH | TCP_ACK,
+        TCP_WINDOW,
+        data,
+    );
+    let dseg = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    if tcp_handle(&mut c, io, &dseg, 0) == 0 || c.rx_len != data.len() as u64 {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < data.len() {
+        if c.rx[i] != data[i] {
+            return false;
+        }
+        i += 1;
+    }
+
+    // 4) 主动发数据 → PSH|ACK，载荷一致。
+    let out = b"MORION-N18-OUT";
+    let fl = tcp_send(&mut c, io, out, 0);
+    let oseg = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    if oseg.flags != (TCP_PSH | TCP_ACK) || oseg.payload_len != out.len() as u64 {
+        return false;
+    }
+    let mut j = 0usize;
+    while j < out.len() {
+        if rd8(oseg.payload_off + j as u64) != out[j] {
+            return false;
+        }
+        j += 1;
+    }
+
+    // 5) 未确认 → 到 RTO 重传同一段。
+    let fl2 = tcp_tick(&mut c, io, TCP_RTO_MS);
+    let rseg = match parse_seg_io6(io, fl2) {
+        Some(x) => x,
+        None => return false,
+    };
+    if rseg.flags != (TCP_PSH | TCP_ACK) || rseg.payload_len != out.len() as u64 {
+        return false;
+    }
+
+    // 6) 对端 FIN → 回 ACK 并进入 CloseWait。
+    let fl = tcp_build6(
+        io,
+        mac,
+        peer_mac,
+        &peer,
+        &our,
+        12346,
+        c.local_port,
+        c.rcv_nxt,
+        c.snd_nxt,
+        TCP_FIN | TCP_ACK,
+        TCP_WINDOW,
+        &[],
+    );
+    let fseg = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    if tcp_handle(&mut c, io, &fseg, 0) == 0 || c.state != TcpState::CloseWait {
+        return false;
+    }
+
+    // 7) v6 伪首部校验和拦截：篡改一个载荷字节 → 解析失败。
+    let fl = tcp_build6(
+        io,
+        mac,
+        peer_mac,
+        &our,
+        &peer,
+        c.local_port,
+        12346,
+        1000,
+        2000,
+        TCP_PSH | TCP_ACK,
+        TCP_WINDOW,
+        b"ABCDEF",
+    );
+    let tampered = match parse_seg_io6(io, fl) {
+        Some(x) => x,
+        None => return false,
+    };
+    let p = tampered.payload_off;
+    wr8(p, rd8(p) ^ 0xff);
+    parse_seg_io6(io, fl).is_none()
+}
+
 // ---------------------------------------------------------------------------
 // TCP socket 操作（N7.2：应用经 libnetv 调用）
 // ---------------------------------------------------------------------------
@@ -1643,19 +2344,25 @@ fn tcp_close_op(st: &mut Stack, id: u64, now: u64, from: u64) -> u64 {
     1
 }
 
+/// 段是否属于连接 `c`（网卡 + 本地/远端端口 + L3 源地址，v4/v6 按 `family` 区分）。
+fn tcp_match(c: &TcpConn, nic: usize, src: SrcId, seg: &TcpSeg) -> bool {
+    if !c.used || c.nic != nic || c.local_port != seg.dport || c.remote_port != seg.sport {
+        return false;
+    }
+    match (c.family, src) {
+        (4, SrcId::V4(a)) => c.remote_ip == a,
+        (6, SrcId::V6(a)) => v6_eq(&c.remote6, &a),
+        _ => false,
+    }
+}
+
 /// 处理某网卡收到的一个 TCP 段；若有回应段，构造在链路共享页并返回帧长。
-fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64) -> u64 {
+fn tcp_input(st: &mut Stack, nic: usize, src: SrcId, seg: &TcpSeg, now: u64) -> u64 {
     let io = st.links[nic].io;
     let mut idx = usize::MAX;
     let mut i = 0;
     while i < MAX_TCONS {
-        let c = &st.tcons[i];
-        if c.used
-            && c.nic == nic
-            && c.local_port == seg.dport
-            && c.remote_ip == src_ip
-            && c.remote_port == seg.sport
-        {
+        if tcp_match(&st.tcons[i], nic, src, seg) {
             idx = i;
             break;
         }
@@ -1703,9 +2410,23 @@ fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64
         c.state = TcpState::SynRcvd;
         c.nic = nic;
         c.mac = st.links[nic].mac;
-        c.dst_mac = st.links[nic].gw_mac.unwrap_or([0; 6]);
         c.local_port = seg.dport;
-        c.remote_ip = src_ip;
+        match src {
+            SrcId::V4(a) => {
+                c.family = 4;
+                c.remote_ip = a;
+                c.dst_mac = st.links[nic].gw_mac.unwrap_or([0; 6]);
+            }
+            SrcId::V6(a) => {
+                c.family = 6;
+                c.remote6 = a;
+                c.local6 = link_v6_primary(st, nic);
+                c.dst_mac = st.links[nic]
+                    .gw6_mac
+                    .or(st.links[nic].gw_mac)
+                    .unwrap_or([0; 6]);
+            }
+        }
         c.remote_port = seg.sport;
         c.rcv_nxt = seg.seq.wrapping_add(1);
         c.snd_una = 0x4d4f_9000u32 ^ (si as u32).wrapping_mul(0x0101);
@@ -1769,7 +2490,7 @@ fn lo_pump(st: &mut Stack, nic: usize, mut len: u64, now: u64) {
             Some(s) => s,
             None => break,
         };
-        len = tcp_input(st, nic, info.src, &seg, now);
+        len = tcp_input(st, nic, SrcId::V4(info.src), &seg, now);
     }
 }
 
@@ -2012,6 +2733,28 @@ pub fn run() {
     }
     // V6.1: 发 RS 收 RA → SLAAC（前缀 fec0::/64 + EUI-64），并从 RA 的 SLLAO 记路由器 MAC。
     ipv6_probe(st, 0);
+
+    // V6.2: ICMPv6 echo 确定性自证 + 真实链路 ping6 取证（best-effort）。
+    if echo6_selftest(st, 0) {
+        println("NET17 icmpv6 echo OK (req->reply)");
+    } else {
+        println("NET17 icmpv6 echo FAILED");
+    }
+    icmpv6_probe(st, 0);
+    // V6.2: UDPv6（必需校验和 + 投递 + 端口不可达）确定性自证。
+    if udp6_selftest(st, 0) {
+        println("NET17 udp6 OK (checksum + deliver + port-unreach)");
+    } else {
+        println("NET17 udp6 FAILED");
+    }
+    // V6.2: TCPv6 复用同一套状态机 + v6 伪首部确定性自证。
+    let our6 = link_local_from_mac(mac_bytes(st.links[0].mac));
+    let peer6 = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    if tcp6_selftest(st.links[0].io, our6, peer6) {
+        println("NET18 tcp6 OK (state machine + v6 pseudo-header)");
+    } else {
+        println("NET18 tcp6 FAILED");
+    }
 
     // N7: TCP 连接状态机 + 重传的确定性自证（不依赖真实对端）。
     if tcp_selftest(st.links[0].io) {
