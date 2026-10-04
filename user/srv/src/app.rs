@@ -3394,9 +3394,10 @@ pub fn run() {
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
     net_ok &= net19_dns_aaaa(); // V6.3: DNS AAAA（应用侧 IPv6 地址面）
+    net_ok &= net20_udp6(); // V6.4: 双栈 UDP socket（::1 回环 + v4-mapped）
     net_ok &= net13_http(); // N8.2: 回环 TCP + 客户机内建 HTTP 服务
     if net_ok {
-        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http)");
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + dns6 + http + udp6)");
     } else {
         println("app: NET7 app socket FAILED");
     }
@@ -4104,6 +4105,42 @@ fn net19_dns_aaaa() -> bool {
         }
         None => println("app: NET19 dns real NO-ANSWER (offline?)"),
     }
+    true
+}
+
+/// NET-20 (V6.4): 双栈 UDP socket —— 同一个 socket 既能发 IPv6（`::1` 回环），也能发 v4-mapped。
+fn net20_udp6() -> bool {
+    let port: u16 = 12348; // 落在 app 的 Net 能力 [12345,12350] 内
+    let sock = morion::net::socket();
+    if sock == 0 || !morion::net::bind(sock, port) {
+        println("app: NET20 udp6 socket/bind FAILED");
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    // ① IPv6 回环 `::1`。
+    let lo6 = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    if !morion::net::sendto6(sock, port, &lo6, b"MORION-V6.4") {
+        println("app: NET20 udp6 sendto6(::1) FAILED");
+        return false;
+    }
+    let n = morion::net::recvfrom(sock, &mut buf);
+    if n != 11 || !contains(&buf[..n as usize], b"MORION-V6.4") {
+        println("app: NET20 udp6 ::1 loopback FAILED");
+        return false;
+    }
+    // ② v4-mapped `::ffff:10.0.2.15` → 走 IPv4 回环。
+    let m = morion::net::v4_mapped([10, 0, 2, 15]);
+    if !morion::net::sendto6(sock, port, &m, b"MORION-V6.4-MAPPED") {
+        println("app: NET20 udp6 sendto6(v4-mapped) FAILED");
+        return false;
+    }
+    let n = morion::net::recvfrom(sock, &mut buf);
+    if n != 18 || !contains(&buf[..n as usize], b"MORION-V6.4-MAPPED") {
+        println("app: NET20 udp6 v4-mapped FAILED");
+        return false;
+    }
+    let _ = morion::net::close(sock);
+    println("app: NET20 udp6 socket OK (::1 loopback + v4-mapped dual-stack)");
     true
 }
 

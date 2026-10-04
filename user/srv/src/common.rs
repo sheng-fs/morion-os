@@ -154,6 +154,11 @@ pub const NETS_OP_TCLOSE: u64 = 10;
 pub const NETS_OP_TLISTEN: u64 = 11;
 /// 接受一个已建立的服务端连接; 请求 `sock` = 监听者 id; 回复服务端连接 id（>0）/ 0。
 pub const NETS_OP_TACCEPT: u64 = 12;
+/// 发 UDP（IPv6 / 双栈，V6.4）; 回复 1/0。
+///
+/// 目的 IPv6 经**共享页**传：`buf[0..16]` = 目的地址（`::ffff:a.b.c.d` 表示 v4-mapped，
+/// 走 IPv4 路径），`buf[16..16+len]` = 负载。
+pub const NETS_OP_SENDTO6: u64 = 13;
 
 /// 单条 UDP 负载上界（一页共享页内，留出帧头余量）。
 pub const NETS_PAYLOAD_MAX: u64 = 1472;

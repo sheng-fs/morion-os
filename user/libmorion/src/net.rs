@@ -24,6 +24,7 @@ const NETS_OP_TRECV: u64 = 9;
 const NETS_OP_TCLOSE: u64 = 10;
 const NETS_OP_TLISTEN: u64 = 11;
 const NETS_OP_TACCEPT: u64 = 12;
+const NETS_OP_SENDTO6: u64 = 13;
 const NETS_PAYLOAD_MAX: u64 = 1472;
 
 /// 与 netstack_srv 传递负载的共享页**基址**（同址共享）。
@@ -116,6 +117,27 @@ pub fn sendto(sock: u64, port: u16, addr: u32, payload: &[u8]) -> bool {
         core::ptr::copy_nonoverlapping(payload.as_ptr(), share_vaddr() as *mut u8, n);
     }
     call(NETS_OP_SENDTO, sock, port as u64, addr as u64, n as u64) == 1
+}
+
+/// 发 UDP 到 IPv6 地址 `addr`（V6.4 双栈）：目的地址（16 字节）写在共享页前 16 字节，负载紧随其后。
+/// `::ffff:a.b.c.d`（[`v4_mapped`]）走 IPv4 路径；`::1` / 本机 v6 地址走栈内回环。
+pub fn sendto6(sock: u64, port: u16, addr: &[u8; 16], payload: &[u8]) -> bool {
+    if !ensure() {
+        return false;
+    }
+    let n = payload.len().min(NETS_PAYLOAD_MAX as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(addr.as_ptr(), share_vaddr() as *mut u8, 16);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), (share_vaddr() + 16) as *mut u8, n);
+    }
+    call(NETS_OP_SENDTO6, sock, port as u64, 0, n as u64) == 1
+}
+
+/// 把 IPv4 编码成 v4-mapped IPv6 地址 `::ffff:a.b.c.d`（供 [`sendto6`] 的双栈路径）。
+pub const fn v4_mapped(ip: [u8; 4]) -> [u8; 16] {
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ip[0], ip[1], ip[2], ip[3],
+    ]
 }
 
 /// 收 UDP：有数据则拷进 `out` 并返回长度（无数据返回 0）。

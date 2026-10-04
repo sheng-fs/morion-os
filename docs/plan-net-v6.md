@@ -126,6 +126,13 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 
 ### V6.4 — 双栈
 - socket 默认双栈（v4-mapped `::ffff:a.b.c.d`）；`socket_on(nic)` + family 可指定出口与协议族。
+- marker：`app: NET20 udp6 socket OK`。**已过**。
+- 实现：`netstack_srv` 加 `NETS_OP_SENDTO6`（目的 IPv6 经共享页 `buf[0..16]` 传，负载在
+  `buf[16..16+len]`）与 `sock_sendto6` —— `::1`/本机 v6 地址走栈内回环 `deliver`；
+  **v4-mapped `::ffff:a.b.c.d` 取出 IPv4 走原 v4 路径**（回环或经网关 TX）；其余经 `build_udp6`
+  发出。libnetv 加 `sendto6(sock, port, &[u8;16], payload)` + `v4_mapped([u8;4])`；同一个 socket
+  因此**对 v4/v6 双栈**（`socket()` 不变）。app 自测 `net20_udp6`：同一 socket 先 `::1` 回环、
+  再 `::ffff:10.0.2.15` 回环，逐字节校验。端口门禁不变。
 
 ---
 
@@ -151,7 +158,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 5. **DRV-A** NIC 表驱动化（回归逐字不变）。
 6. **DRV-B** `rtl8139_srv`（`NET14`）→ 视情况 `e1000_srv`（`NET15`）。
 7. **DRV-C** `virtio_input` → `virtio_gpu_srv`。
-8. **V6.4** 双栈收口。
+8. ✅ **V6.4 双栈收口（已完成）**：`sendto6` + v4-mapped（`app: NET20 udp6 socket OK`）。
 9. 无线抽象层（WIRELESS 契约 + 空实现）。
 
 > 每步：`cargo fmt --all && make fmt && make check && make clippy`（0 warning）→ `cargo test --lib -p morion-kernel` → `make OUT_DIR=build QEMU=/bin/true run-nvme` → `OUT_DIR=build bash scripts/fs-regress.sh`。

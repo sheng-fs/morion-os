@@ -2586,6 +2586,88 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
     }
 }
 
+/// 若 `a` 是 v4-mapped 地址 `::ffff:a.b.c.d`，取出其中的 IPv4。
+fn v4_mapped(a: &[u8; 16]) -> Option<[u8; 4]> {
+    let mut i = 0;
+    while i < 10 {
+        if a[i] != 0 {
+            return None;
+        }
+        i += 1;
+    }
+    if a[10] != 0xff || a[11] != 0xff {
+        return None;
+    }
+    Some([a[12], a[13], a[14], a[15]])
+}
+
+/// 环回地址 `::1`。
+fn v6_is_loopback(a: &[u8; 16]) -> bool {
+    let mut i = 0;
+    while i < 15 {
+        if a[i] != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    a[15] == 1
+}
+
+/// `NETS_OP_SENDTO6`（V6.4 双栈）：目的 IPv6 在 `buf[0..16]`，负载在 `buf[16..16+len]`。
+/// `::1` / 本机 v6 地址 → 栈内回环投递；`::ffff:a.b.c.d`（v4-mapped）→ 按 IPv4 走；
+/// 其余 → 经网卡发 UDPv6（需已学路由器 MAC）。上层 socket 因此**对 v4/v6 双栈**。
+fn sock_sendto6(st: &mut Stack, req: &NetSReq) -> u64 {
+    if req.buf == 0 || req.len > PAY_MAX as u64 || sys_virt_to_phys(req.buf) == 0 {
+        return 0;
+    }
+    let (sport, nic) = match sock_slot(st, req.sock) {
+        Some(s) => (s.port, s.nic),
+        None => return 0,
+    };
+    if nic >= NIC_COUNT || !st.links[nic].up {
+        return 0;
+    }
+    let dst6 = get_v6(req.buf);
+    let dport = req.port as u16;
+    let pl = req.buf + 16;
+    if let Some(v4) = v4_mapped(&dst6) {
+        if v4 == OUR_IP {
+            deliver(st, nic, dport, pl, req.len);
+            return 1;
+        }
+        return match st.links[nic].gw_mac {
+            Some(gm) => {
+                let len = build_udp(&st.links[nic], gm, v4, sport, dport, pl, req.len);
+                if link_tx(&st.links[nic], len) {
+                    1
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+    }
+    let ll = link_local_from_mac(mac_bytes(st.links[nic].mac));
+    if v6_is_loopback(&dst6) || v6_eq(&dst6, &ll) || v6_eq(&dst6, &st.links[nic].v6_global) {
+        deliver(st, nic, dport, pl, req.len);
+        return 1;
+    }
+    match st.links[nic].gw6_mac {
+        Some(gm) => {
+            let src = link_v6_primary(st, nic);
+            let io = st.links[nic].io;
+            let mac = mac_bytes(st.links[nic].mac);
+            let len = build_udp6(io, mac, gm, &src, &dst6, sport, dport, pl, req.len);
+            if link_tx(&st.links[nic], len) {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
 /// `NETS_OP_RECVFROM`: 有数据则拷进共享页 `buf`，回复长度。
 fn sock_recvfrom(st: &mut Stack, req: &NetSReq) -> u64 {
     if req.buf == 0 || sys_virt_to_phys(req.buf) == 0 {
@@ -2640,6 +2722,7 @@ fn serve_app(st: &mut Stack, now: u64) {
             }
             NETS_OP_BIND => sock_bind(st, req.sock, req.port as u16, msg.from),
             NETS_OP_SENDTO => sock_sendto(st, &req),
+            NETS_OP_SENDTO6 => sock_sendto6(st, &req),
             NETS_OP_RECVFROM => sock_recvfrom(st, &req),
             NETS_OP_CLOSE => sock_close(st, req.sock),
             // TCP（N7.2）：`sock` 字段对 TSOCKET/TLISTEN 是网卡索引, 其余是连接/监听者 id。
