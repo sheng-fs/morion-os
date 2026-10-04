@@ -295,6 +295,10 @@ pub extern "C" fn kernel_main() -> ! {
     // 域 23 — httpd_srv (客户机内建 HTTP 服务, 从 netstack_srv 拆出): 无设备, 经 netstack
     // 的 TCP 原语在 :80 监听并回固定响应; 端口能力 `Net(80)` 由内核显式授予。
     let httpd_domain = domain::create();
+    // 域 24 — e1000_srv (第三台网卡 Intel 82540EM, 驱动路线 DRV-B): 仍走通用设备授权;
+    // 与 e1000e 同属 8254x 家族 (共用用户态驱动核心); 全轮询, 不申请中断向量。
+    // DRV-A 之后加它**不改协议栈** —— 只需往 NIC 表追加一条。
+    let e1000_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -515,6 +519,34 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // 探测 Intel e1000 (82540EM) 网卡并授权给域 24（DRV-B: 第三台网卡, 仍走通用设备授权）。
+    // 与 e1000e 同属 8254x 家族、寄存器模型一致 —— 用户态驱动共用 `intel_nic` 核心。
+    // 第一版**全轮询**（同 e1000e，不申请向量）。BAR0 是 MMIO 寄存器窗口, 取 8 页; DMA 8 页。
+    let mut e1000_found = false;
+    match arch::pci::find_e1000(&pci_devices) {
+        Some((bus, dev, func, bar0)) => {
+            device::grant(device::GrantRequest {
+                domain: e1000_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar0,
+                bar_pages: 8,
+                dma_pages: 8,
+                msix_vectors: 0,
+                label: "e1000",
+            });
+            video::print("[OK] e1000 BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+            e1000_found = true;
+        }
+        None => {
+            device::grant_empty(e1000_domain);
+            video::println("[OK] no e1000 controller, e1000_srv idle");
+        }
+    }
+
     // DRV-A: 把探测到的网卡组装成 NIC 表，只读映射进协议栈（域 21）。协议栈从此**不硬编码**
     // 网卡域号 / IO 页 VA / 网卡数量 —— 第 i 条 IO 页 = USER_BASE + 0x1A_0000 + i*4KiB
     // （与历史约定一致，回归逐字不变）。加一台网卡只需在这里追加一条。
@@ -538,6 +570,14 @@ pub extern "C" fn kernel_main() -> ! {
                 domain: e1000e_domain,
                 io_vaddr: net::nic_io_vaddr(n as u64),
                 kind: net::NIC_KIND_E1000E,
+            };
+            n += 1;
+        }
+        if e1000_found {
+            nics[n] = net::NicEntry {
+                domain: e1000_domain,
+                io_vaddr: net::nic_io_vaddr(n as u64),
+                kind: net::NIC_KIND_E1000,
             };
             n += 1;
         }
@@ -660,6 +700,10 @@ pub extern "C" fn kernel_main() -> ! {
     // `NetReq` 契约 (SendTo + MapInto)。协议栈因此能按网卡索引选出口, 上层 socket API 不变。
     cap::grant(netstack_domain, cap::Capability::SendTo(e1000e_domain));
     cap::grant(netstack_domain, cap::Capability::MapInto(e1000e_domain));
+
+    // 授权 (DRV-B): 协议栈 (域 21) 也可把 e1000 (域 24) 当第三台网卡 —— 同一套帧级 IPC。
+    cap::grant(netstack_domain, cap::Capability::SendTo(e1000_domain));
+    cap::grant(netstack_domain, cap::Capability::MapInto(e1000_domain));
 
     // 授权 (N8.2 拆分): httpd_srv (域 23) 经 netstack 用 TCP 原语 (SendTo + MapInto), 并持
     // 一条 `Net(80)` 端口能力 —— 监听 :80 时协议栈会用 `SYS_NET_OWNER` 核对归属, 越权不可伪造。

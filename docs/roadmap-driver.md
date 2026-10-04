@@ -36,13 +36,13 @@
 
 | 项 | 现状 |
 | --- | --- |
-| 用户态驱动 | **7 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N4）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层）、**USB/xHCI**（[xhci_srv.rs](../user/srv/src/xhci_srv.rs)，域 19，03c，SCSI READ(10) 读写 U 盘）、**e1000e 网卡**（[e1000e_srv.rs](../user/srv/src/e1000e_srv.rs)，域 22，N9，第二台真网卡） |
+| 用户态驱动 | **8 个**：NVMe 块设备（[block_srv.rs](../user/srv/src/block_srv.rs)，域 5）、键盘（[kbd.rs](../user/srv/src/kbd.rs)，域 4 —— 内核读 PS/2 scancode → IRQ1 投递 → 用户态解码）、virtio-net 网卡（[net_srv.rs](../user/srv/src/net_srv.rs)，域 16，N0–N4）、virtio-blk（[virtio_blk_srv.rs](../user/srv/src/virtio_blk_srv.rs)，域 17，D3）、**AHCI/SATA**（[ahci_srv.rs](../user/srv/src/ahci_srv.rs)，域 18，D4，读+写并经 IPC 接进块服务卷层）、**USB/xHCI**（[xhci_srv.rs](../user/srv/src/xhci_srv.rs)，域 19，03c，SCSI READ(10) 读写 U 盘）、**e1000e 网卡**（[e1000e_srv.rs](../user/srv/src/e1000e_srv.rs)，域 22，N9，第二台真网卡）、**e1000 网卡**（[e1000_srv.rs](../user/srv/src/e1000_srv.rs)，域 24，DRV-B，第三台真网卡 Intel 82540EM，与 e1000e 共用 `intel_nic` 核心） |
 | PCI / MSI-X | [arch/pci.rs](../kernel/src/arch/pci.rs)：bus/dev/func 枚举、能力链表遍历、MSI-X 定位/使能 |
 | MMIO 授权 | `Capability::Mmio(页对齐物理基址)` + `SYS_MAP_MMIO(21)`（4 KiB 页 + `NO_CACHE` + `NO_EXECUTE`） |
 | 中断 | `SYS_REGISTER_IRQ(14)` / `SYS_IRQ_POLL(34)` / `SYS_MSIX_ENABLE(35)` / `SYS_IRQ_WAIT(36)`（含多向量 `wait_any`） |
 | 域 / 能力 | `SYS_SPAWN_ELF(37)` / `SYS_SPAWN_ELF_AT(41)` / `SYS_SPAWN_ELF_MODULE(43)` / `SYS_DOMAIN_*` / `SYS_FRAME_FREE(40)`；能力系统**可随 IPC 传递**（移交句柄 + 委派） |
 | 设备保留帧 | [frame_allocator::pin_range](../kernel/src/memory/frame_allocator.rs)（G6 引入）：登记"任何路径不得释放"的保留区间 |
-| 服务自愈 | `init` 监督 14 个服务（含 `net_srv` / `netstack_srv` / `e1000e_srv` / `httpd_srv`）；「同域重启」`restart_in_place` 可用。**② 起** `SYS_SHARE_PAGE` 幂等/异帧重映射（客户端重启后重新共享不再撞 `PageAlreadyMapped`）—— 服务重启的共享会话得以重建。`block_srv` / `virtio_blk_srv` 因内核侧设备映射未登记为保留而暂不监督 |
+| 服务自愈 | `init` 监督 15 个服务（含 `net_srv` / `netstack_srv` / `e1000e_srv` / `httpd_srv` / `e1000_srv`）；「同域重启」`restart_in_place` 可用。**② 起** `SYS_SHARE_PAGE` 幂等/异帧重映射（客户端重启后重新共享不再撞 `PageAlreadyMapped`）—— 服务重启的共享会话得以重建。`block_srv` / `virtio_blk_srv` 因内核侧设备映射未登记为保留而暂不监督 |
 | 能力审计 | **② 起**：`SYS_CAP_AUDIT(54)`（持 `Spawn` 域只读枚举某域能力槽）+ `init` 引导期按最小权限策略核对（`Spawn`/`Mmio`/`Fb`/`IoPort` 持有者白名单 + 正向必需项），启动日志 `cap-audit: domains=… caps=… violations=…` + `cap-audit: OK`；回归判据 `cap-audit: OK`（见 `scripts/fs-regress.sh`） |
 
 **缺口**

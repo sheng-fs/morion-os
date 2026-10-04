@@ -70,6 +70,8 @@ marker：`netstack: links=1 (virtio-net)` 与 `links=2 (virtio-net+e1000e)` 由�
 
 marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 出口做端到端（DHCP + ping + `wget`）。
 
+**已实现（e1000 先行，marker `NET15`）**：`rtl8139` 是 **PIO（I/O 端口）** 设备，而内核 `pci::read_bar` 明确不支持 I/O BAR、也没有设备级 I/O 端口授权路径 —— 需先补一套「I/O BAR + `Capability::IoPort` + DMA」的授权通路（独立于本线，留作后续）。故 DRV-B 先落 **MMIO** 的 `e1000`（82540EM），与 e1000e（82574L）同属 8254x 家族 → 用户态驱动**共用同一核心** `user/srv/src/intel_nic.rs`，`e1000_srv`/`e1000e_srv` 只是两个薄壳（型号名 + marker）。内核侧只加：`pci::find_e1000`（8086:100E）、域 24、`device::grant`、NIC 表追加一条、netstack→e1000 的 `SendTo/MapInto` + `cap-audit` MMIO 白名单加 24。取证：`NET15 e1000(82540EM) OK … ARP reply OK` + `netstack: nic2 up (e1000 OK)` + `app: NET21 udp via e1000 (nic2) OK` + `netstack: nic2 rx (icmp unreachable) OK`。**协议栈/socket API 一字未改**（DRV-A 的收益）。踩坑：复位后**首帧可能被 82540EM 丢弃** → 驱动自测改为像 `arp_learn_gw` 一样重试，并补 `CTRL.SLU`（Set Link Up）。
+
 ### 3.3 DRV-C — 非网络设备驱动（拓宽设备面）
 
 | 驱动 | QEMU 设备 | 价值 |
@@ -157,7 +159,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 3. ✅ **V6.2 传输（已完成）**：ICMPv6 echo（`NET17 icmpv6 echo OK`，另 slirp 回 `NET17 ipv6 echo OK (router replied)`）+ UDPv6（`NET17 udp6 OK`）+ TCPv6（`NET18 tcp6 OK`）。
 4. ✅ **V6.3 应用面（已完成）**：`IpAddr` + DNS AAAA（确定性解析器自证 + 双栈 `resolve`），`app: NET19 dns AAAA OK`。
 5. ✅ **DRV-A NIC 表驱动化（已完成）**：只读 NIC 表页 + 运行期 `Link[]`（回归逐字不变，新增 `netstack: links=2 (virtio-net+e1000e)`）。
-6. **DRV-B** `rtl8139_srv`（`NET14`）→ 视情况 `e1000_srv`（`NET15`）。
+6. ✅ **DRV-B `e1000_srv`（已完成，`NET15`）**：MMIO 82540EM，与 e1000e 共用 `intel_nic` 核心；rtl8139(PIO) 待内核 I/O-BAR 授权通路后再做（`NET14` 顺延）。
 7. **DRV-C** `virtio_input` → `virtio_gpu_srv`。
 8. ✅ **V6.4 双栈收口（已完成）**：`sendto6` + v4-mapped（`app: NET20 udp6 socket OK`）。
 9. 无线抽象层（WIRELESS 契约 + 空实现）。

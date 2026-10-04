@@ -48,6 +48,7 @@ default = [
     "svc-iso9660_srv",
     "svc-netstack_srv",
     "svc-e1000e_srv",
+    "svc-e1000_srv",
     "svc-httpd_srv",
 ]
 svc-sender = []
@@ -73,6 +74,7 @@ svc-xhci_srv = []
 svc-iso9660_srv = []
 svc-netstack_srv = []
 svc-e1000e_srv = []
+svc-e1000_srv = []
 svc-httpd_srv = []
 
 [[bin]]
@@ -189,6 +191,11 @@ required-features = ["svc-netstack_srv"]
 name = "e1000e_srv"
 path = "src/bin/e1000e_srv.rs"
 required-features = ["svc-e1000e_srv"]
+
+[[bin]]
+name = "e1000_srv"
+path = "src/bin/e1000_srv.rs"
+required-features = ["svc-e1000_srv"]
 
 [[bin]]
 name = "httpd_srv"

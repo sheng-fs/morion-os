@@ -139,6 +139,8 @@ pub const NIC_MAX: usize = 8;
 pub const NIC_KIND_VIRTIO_NET: u64 = 1;
 /// 网卡型号：Intel e1000e（e1000e_srv，域 22）。
 pub const NIC_KIND_E1000E: u64 = 2;
+/// 网卡型号：Intel e1000 82540EM（e1000_srv，域 24，DRV-B）。
+pub const NIC_KIND_E1000: u64 = 3;
 
 /// 一条网卡接线：驱动服务域 + 帧共享页 VA + 型号。
 #[repr(C)]

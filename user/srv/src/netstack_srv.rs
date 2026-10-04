@@ -29,6 +29,7 @@ fn kind_hw_name(kind: u64) -> &'static str {
     match kind {
         NIC_KIND_VIRTIO_NET => "virtio-net",
         NIC_KIND_E1000E => "e1000e",
+        NIC_KIND_E1000 => "e1000",
         _ => "nic",
     }
 }
@@ -38,6 +39,7 @@ fn kind_svc_name(kind: u64) -> &'static str {
     match kind {
         NIC_KIND_VIRTIO_NET => "net_srv",
         NIC_KIND_E1000E => "e1000e",
+        NIC_KIND_E1000 => "e1000",
         _ => "nic",
     }
 }

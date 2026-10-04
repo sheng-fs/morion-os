@@ -3391,6 +3391,7 @@ pub fn run() {
     let mut net_ok = true;
     net_ok &= net5_udp_socket(); // N6: 端口能力门禁 + UDP 回环 + 真实收帧
     net_ok &= net11_udp_e1000e(); // N9.2: 经第二台真网卡 (e1000e) 出口
+    net_ok &= net21_udp_e1000(); // DRV-B: 经第三台网卡 (e1000) 出口
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
     net_ok &= net19_dns_aaaa(); // V6.3: DNS AAAA（应用侧 IPv6 地址面）
@@ -4000,6 +4001,43 @@ fn net11_udp_e1000e() -> bool {
     sys_sleep(300);
     let _ = morion::net::close(sock);
     println("app: NET11 udp via e1000e (nic1) OK (loopback + tx probe)");
+    true
+}
+
+/// NET-21 (DRV-B): 经第三台网卡 (e1000/82540EM, NIC2) 用**同一套** socket API 收发。
+///
+/// 同 NET-11，但出口换成 NIC2 —— 证明 DRV-A 表驱动之后，**再加一台网卡不必改协议栈/socket API**。
+///   ① `socket_on(2)` 建在 NIC2 上，`bind(12345)` 复用 app 已有的端口能力；
+///   ② 回环发本机地址 → NIC2 路径投递回同一 socket，逐字节一致；
+///   ③ `sendto` 到网关 `10.0.2.2:9999` 走 e1000 真实 TX，触发 ICMP 不可达 → `netstack: nic2 rx …`。
+fn net21_udp_e1000() -> bool {
+    const PORT: u16 = 12345;
+    let sock = morion::net::socket_on(2);
+    if sock == 0 || !morion::net::bind(sock, PORT) {
+        println("app: NET21 e1000 socket/bind FAILED");
+        return false;
+    }
+    let msg = b"MORION-DRVB";
+    if !morion::net::sendto(sock, PORT, morion::net::ip4(10, 0, 2, 15), msg) {
+        println("app: NET21 e1000 sendto(loopback) FAILED");
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    let n = morion::net::recvfrom(sock, &mut buf);
+    if n as usize != msg.len() || buf[..n as usize] != msg[..] {
+        println("app: NET21 e1000 loopback recv mismatch FAILED");
+        return false;
+    }
+    // 真实 TX via e1000: 触发链路发帧 (回程 ICMP 不可达由 netstack 的 nic2 路径打印)。
+    let _ = morion::net::sendto(
+        sock,
+        9999,
+        morion::net::ip4(10, 0, 2, 2),
+        b"MORION-DRVB-PROBE",
+    );
+    sys_sleep(300);
+    let _ = morion::net::close(sock);
+    println("app: NET21 udp via e1000 (nic2) OK (loopback + tx probe)");
     true
 }
 

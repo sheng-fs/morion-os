@@ -36,6 +36,8 @@ pub fn announce(name: &str, domain_id: u64) {
 }
 #[cfg(feature = "svc-ahci_srv")]
 pub mod ahci_srv;
+#[cfg(feature = "svc-e1000_srv")]
+pub mod e1000_srv;
 #[cfg(feature = "svc-e1000e_srv")]
 pub mod e1000e_srv;
 #[cfg(feature = "svc-ext2_srv")]
@@ -50,6 +52,8 @@ pub mod gfx_srv;
 pub mod httpd_srv;
 #[cfg(feature = "svc-init")]
 pub mod init;
+#[cfg(any(feature = "svc-e1000e_srv", feature = "svc-e1000_srv"))]
+pub mod intel_nic;
 #[cfg(feature = "svc-iso9660_srv")]
 pub mod iso9660_srv;
 #[cfg(feature = "svc-kbd")]

@@ -121,6 +121,7 @@ $QEMU \
   -drive file="$OUT_DIR/iso.img",if=none,id=n8,format=raw,readonly=on -device nvme-ns,drive=n8,bus=nvme0,nsid=8 \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
   -netdev user,id=n1 -device e1000e,netdev=n1,mac=52:54:00:aa:bb:cc \
+  -netdev user,id=n2 -device e1000,netdev=n2,mac=52:54:00:dd:ee:ff \
   -drive file="$OUT_DIR/vblk.img",if=none,id=vblk0,format=raw \
   -device virtio-blk-pci,drive=vblk0 \
   -drive file="$OUT_DIR/ahci.img",if=none,id=ahci0,format=raw \
@@ -219,7 +220,7 @@ grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
 # (端口能力门禁拒绝越权 + 回环收发 + 真实 TX 触发 ICMP 不可达回程)。任一缺即判失败。
 net_bad=0
 echo "== 网络能力自测 (N5/N6: NET1..NET4 + netstack + NET5) =="
-grep -nE 'NET1|NET2|NET3|NET4|NET6|NET7|NET8|NET9|NET11|NET12|NET13|NET16|NET17|NET18|NET19|NET20|netstack:|app: NET5|e1000e:' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'NET1|NET2|NET3|NET4|NET6|NET7|NET8|NET9|NET11|NET12|NET13|NET15|NET16|NET17|NET18|NET19|NET20|NET21|netstack:|app: NET5|e1000e:|e1000:' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'NET1 virtio-net up, MAC=.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET3 dhcp OK, ip=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET2 ipv4/icmp OK.*udp TX 10.0.2.2:9999 -> icmp unreachable' "$log" 2>/dev/null || net_bad=1
@@ -234,7 +235,13 @@ grep -qE 'NET9 e1000e OK.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic1 up \(e1000e OK\)' "$log" 2>/dev/null || net_bad=1
 # DRV-A: NIC 接线**表驱动** —— 协议栈从内核写入的只读 NIC 表读取网卡清单（域号/IO 页/型号），
 # 不再硬编码；两条既有拉起行（net_srv / e1000e）逐字不变。
-grep -qE 'netstack: links=2 \(virtio-net\+e1000e\)' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: links=3 \(virtio-net\+e1000e\+e1000\)' "$log" 2>/dev/null || net_bad=1
+# DRV-B: 第三台网卡 e1000 (Intel 82540EM) —— 驱动自测 (ARP 应答) + 协议栈把它当 NIC2 出口
+# (同 NIC1 的 socket API, 真实 TX 触发 ICMP 不可达回程)。
+grep -qE 'NET15 e1000\(82540EM\) OK.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: nic2 up \(e1000 OK\)' "$log" 2>/dev/null || net_bad=1
+grep -qE 'app: NET21 udp via e1000 \(nic2\) OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: nic2 rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET11 udp via e1000e \(nic1\) OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic1 rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 # N7 (TCP 完整化): netstack 的 TCP 连接状态机 + 重传的确定性自证。
