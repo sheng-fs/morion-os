@@ -35,6 +35,7 @@ const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 
 const MAX_SOCKS: usize = 4;
+const MAX_TCONS: usize = 4;
 const PAY_MAX: usize = NETS_PAYLOAD_MAX as usize;
 
 const ETH_IPV4: u16 = 0x0800;
@@ -170,7 +171,25 @@ impl Sock {
 struct Stack {
     links: [Link; NIC_COUNT],
     socks: [Sock; MAX_SOCKS],
+    tcons: [TcpConn; MAX_TCONS],
 }
+
+impl Stack {
+    const fn zeroed() -> Stack {
+        Stack {
+            links: [
+                Link::down(NET_DOMAIN, IO0_VADDR),
+                Link::down(E1000E_DOMAIN, IO1_VADDR),
+            ],
+            socks: [Sock::new(); MAX_SOCKS],
+            tcons: [TcpConn::new(); MAX_TCONS],
+        }
+    }
+}
+
+/// 整个协议栈状态放**静态区**：4 条 TCP 连接 + 4 个 UDP socket 的缓冲合计近 18 KiB，
+/// 放 `run()` 的栈帧会超出 32 KiB 用户栈（N7.2 实测溢出 → 触发 pager `map_anon` 失败）。
+static mut STACK: Stack = Stack::zeroed();
 
 fn idle() -> ! {
     loop {
@@ -256,7 +275,7 @@ fn arp_learn_gw(st: &mut Stack, nic: usize) {
         let _ = link_tx(&st.links[nic], len);
         for _ in 0..5 {
             if let Some(n) = link_rx(&st.links[nic]) {
-                handle_frame(st, nic, n);
+                handle_frame(st, nic, n, 0);
             }
             sys_sleep(10);
         }
@@ -265,7 +284,7 @@ fn arp_learn_gw(st: &mut Stack, nic: usize) {
 }
 
 /// 处理某网卡收到的一帧（帧在链路共享页，长 `n`）。
-fn handle_frame(st: &mut Stack, nic: usize, n: u64) {
+fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
     if n < 14 {
         return;
     }
@@ -300,6 +319,17 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64) {
     }
     let proto = rd8(ip + 9);
     let dst_ip = [rd8(ip + 16), rd8(ip + 17), rd8(ip + 18), rd8(ip + 19)];
+    if proto == IP_PROTO_TCP {
+        if let Some(info) = ipv4_parse(f, n) {
+            if let Some(seg) = tcp_parse(&info) {
+                let len = tcp_input(st, nic, info.src, &seg, now);
+                if len > 0 {
+                    let _ = link_tx(&st.links[nic], len);
+                }
+            }
+        }
+        return;
+    }
     if proto == IP_PROTO_ICMP {
         let ic = ip + ihl;
         if n > 14 + ihl && rd8(ic) == ICMP_UNREACH {
@@ -992,6 +1022,188 @@ fn tcp_selftest(io: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// TCP socket 操作（N7.2：应用经 libnetv 调用）
+// ---------------------------------------------------------------------------
+
+fn tcp_open(st: &mut Stack, nic: usize) -> u64 {
+    if nic >= NIC_COUNT {
+        return 0;
+    }
+    let mut i = 0;
+    while i < MAX_TCONS {
+        if !st.tcons[i].used {
+            st.tcons[i] = TcpConn::new();
+            st.tcons[i].used = true;
+            st.tcons[i].nic = nic;
+            return (i + 1) as u64;
+        }
+        i += 1;
+    }
+    0
+}
+
+fn tcp_slot(st: &mut Stack, id: u64) -> Option<&mut TcpConn> {
+    if id == 0 || id as usize > MAX_TCONS {
+        return None;
+    }
+    let c = &mut st.tcons[id as usize - 1];
+    if c.used {
+        Some(c)
+    } else {
+        None
+    }
+}
+
+/// 绑本地端口（端口归属必须是发起域，内核已按其 `Net` 能力登记）。
+fn tcp_bind(st: &mut Stack, id: u64, port: u16, from: u64) -> u64 {
+    if sys_net_owner(port) != from {
+        return 0;
+    }
+    match tcp_slot(st, id) {
+        Some(c) if c.local_port == 0 => {
+            c.local_port = port;
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// 主动连接：需已绑本地端口、网卡已学网关 MAC。发 SYN。
+fn tcp_connect_op(st: &mut Stack, id: u64, addr: u64, port: u64, now: u64) -> u64 {
+    let nic = match tcp_slot(st, id) {
+        Some(c) => c.nic,
+        None => return 0,
+    };
+    let dst_mac = match st.links[nic].gw_mac {
+        Some(m) => m,
+        None => return 0,
+    };
+    let remote = [
+        ((addr >> 24) & 0xff) as u8,
+        ((addr >> 16) & 0xff) as u8,
+        ((addr >> 8) & 0xff) as u8,
+        (addr & 0xff) as u8,
+    ];
+    let io = st.links[nic].io;
+    let c = &mut st.tcons[id as usize - 1];
+    if c.local_port == 0 || c.state != TcpState::Closed {
+        return 0;
+    }
+    c.remote_ip = remote;
+    c.remote_port = port as u16;
+    c.mac = st.links[nic].mac;
+    c.dst_mac = dst_mac;
+    let isn = 0x4d4f_0000u32 ^ (id as u32).wrapping_mul(0x0101_0101);
+    let len = tcp_connect(c, io, isn, now);
+    if link_tx(&st.links[nic], len) {
+        1
+    } else {
+        0
+    }
+}
+
+fn tcp_send_op(st: &mut Stack, id: u64, buf: u64, len: u64, now: u64) -> u64 {
+    if buf == 0 || len == 0 || len > TCP_MSS as u64 || sys_virt_to_phys(buf) == 0 {
+        return 0;
+    }
+    let nic = match tcp_slot(st, id) {
+        Some(c) => c.nic,
+        None => return 0,
+    };
+    let io = st.links[nic].io;
+    let payload = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let fl = tcp_send(&mut st.tcons[id as usize - 1], io, payload, now);
+    if fl > 0 && link_tx(&st.links[nic], fl) {
+        1
+    } else {
+        0
+    }
+}
+
+fn tcp_recv_op(st: &mut Stack, id: u64, buf: u64) -> u64 {
+    if buf == 0 || sys_virt_to_phys(buf) == 0 {
+        return 0;
+    }
+    match tcp_slot(st, id) {
+        Some(c) if c.rx_len > 0 => {
+            unsafe {
+                core::ptr::copy_nonoverlapping(c.rx.as_ptr(), buf as *mut u8, c.rx_len as usize);
+            }
+            let n = c.rx_len;
+            c.rx_len = 0;
+            n
+        }
+        _ => 0,
+    }
+}
+
+fn tcp_close_op(st: &mut Stack, id: u64, now: u64) -> u64 {
+    let nic = match tcp_slot(st, id) {
+        Some(c) => c.nic,
+        None => return 0,
+    };
+    let io = st.links[nic].io;
+    let fl = tcp_close(&mut st.tcons[id as usize - 1], io, now);
+    if fl > 0 && link_tx(&st.links[nic], fl) {
+        1
+    } else {
+        // 已经关闭 / 处于不可关状态：直接释放槽位。
+        if id != 0 && (id as usize) <= MAX_TCONS {
+            st.tcons[id as usize - 1] = TcpConn::new();
+        }
+        1
+    }
+}
+
+/// 处理某网卡收到的一个 TCP 段；若有回应段，构造在链路共享页并返回帧长。
+fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64) -> u64 {
+    let io = st.links[nic].io;
+    let mut idx = usize::MAX;
+    let mut i = 0;
+    while i < MAX_TCONS {
+        let c = &st.tcons[i];
+        if c.used
+            && c.nic == nic
+            && c.local_port == seg.dport
+            && c.remote_ip == src_ip
+            && c.remote_port == seg.sport
+        {
+            idx = i;
+            break;
+        }
+        i += 1;
+    }
+    if idx == usize::MAX {
+        return 0;
+    }
+    let was = st.tcons[idx].state;
+    let len = tcp_handle(&mut st.tcons[idx], io, seg, now);
+    if was == TcpState::SynSent
+        && st.tcons[idx].state == TcpState::Closed
+        && seg.flags & TCP_RST != 0
+    {
+        println("netstack: tcp peer refused (RST) OK");
+    }
+    len
+}
+
+/// 推进所有 TCP 连接的重传定时器；需重传则发帧。
+fn tcp_tick_all(st: &mut Stack, now: u64) {
+    let mut i = 0;
+    while i < MAX_TCONS {
+        if st.tcons[i].used && st.tcons[i].state != TcpState::Closed {
+            let nic = st.tcons[i].nic;
+            let io = st.links[nic].io;
+            let len = tcp_tick(&mut st.tcons[i], io, now);
+            if len > 0 {
+                let _ = link_tx(&st.links[nic], len);
+            }
+        }
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 套接字服务（应用侧 IPC）
 // ---------------------------------------------------------------------------
 
@@ -1095,7 +1307,7 @@ fn sock_close(st: &mut Stack, id: u64) -> u64 {
     1
 }
 
-fn serve_app(st: &mut Stack) {
+fn serve_app(st: &mut Stack, now: u64) {
     loop {
         let mut msg = Message {
             from: 0,
@@ -1125,6 +1337,13 @@ fn serve_app(st: &mut Stack) {
             NETS_OP_SENDTO => sock_sendto(st, &req),
             NETS_OP_RECVFROM => sock_recvfrom(st, &req),
             NETS_OP_CLOSE => sock_close(st, req.sock),
+            // TCP（N7.2）：`sock` 字段对 TSOCKET 是网卡索引, 其余是连接 id。
+            NETS_OP_TSOCKET => tcp_open(st, req.sock as usize),
+            NETS_OP_TBIND => tcp_bind(st, req.sock, req.port as u16, msg.from),
+            NETS_OP_TCONNECT => tcp_connect_op(st, req.sock, req.addr, req.port, now),
+            NETS_OP_TSEND => tcp_send_op(st, req.sock, req.buf, req.len, now),
+            NETS_OP_TRECV => tcp_recv_op(st, req.sock, req.buf),
+            NETS_OP_TCLOSE => tcp_close_op(st, req.sock, now),
             _ => 0,
         };
         let _ = sys_reply(reply);
@@ -1137,13 +1356,10 @@ fn serve_app(st: &mut Stack) {
 
 /// 域 21 — netstack_srv 入口。
 pub fn run() {
-    let mut st = Stack {
-        links: [
-            Link::down(NET_DOMAIN, IO0_VADDR),
-            Link::down(E1000E_DOMAIN, IO1_VADDR),
-        ],
-        socks: [Sock::new(); MAX_SOCKS],
-    };
+    // 状态在静态区（见 STACK 说明），不进栈帧。
+    let st: &mut Stack = unsafe { &mut *core::ptr::addr_of_mut!(STACK) };
+    st.links[0] = Link::down(NET_DOMAIN, IO0_VADDR);
+    st.links[1] = Link::down(E1000E_DOMAIN, IO1_VADDR);
 
     // NIC 0：virtio-net（必需）。分配帧页并共享给 net_srv。
     if sys_alloc_page(IO0_VADDR) != 1 || sys_share_page(IO0_VADDR, NET_DOMAIN) != 1 {
@@ -1171,7 +1387,7 @@ pub fn run() {
     }
     st.links[0].mac = mac0;
     st.links[0].up = true;
-    arp_learn_gw(&mut st, 0);
+    arp_learn_gw(st, 0);
 
     print("netstack: up (frame link to net_srv OK), nic mac=0x");
     print_hex(mac0);
@@ -1187,7 +1403,7 @@ pub fn run() {
     if mac1 != 0 {
         st.links[1].mac = mac1;
         st.links[1].up = true;
-        arp_learn_gw(&mut st, 1);
+        arp_learn_gw(st, 1);
         print("netstack: nic1 up (e1000e OK), mac=0x");
         print_hex(mac1);
         if st.links[1].gw_mac.is_some() {
@@ -1207,9 +1423,11 @@ pub fn run() {
         println("NET6 tcp conn FAILED");
     }
 
-    // 主循环: 服务应用请求 + 排空各网卡 RX。
+    // 主循环: 服务应用请求 + 排空各网卡 RX + 推进 TCP 重传定时器。
+    let mut now = 0u64;
     loop {
-        serve_app(&mut st);
+        now = now.wrapping_add(10);
+        serve_app(st, now);
         let mut nic = 0;
         while nic < NIC_COUNT {
             if st.links[nic].up {
@@ -1218,7 +1436,7 @@ pub fn run() {
                     let got = link_rx(&st.links[nic]);
                     match got {
                         Some(len) => {
-                            handle_frame(&mut st, nic, len);
+                            handle_frame(st, nic, len, now);
                             n += 1;
                         }
                         None => break,
@@ -1227,6 +1445,7 @@ pub fn run() {
             }
             nic += 1;
         }
+        tcp_tick_all(st, now);
         sys_sleep(10);
     }
 }

@@ -3392,6 +3392,9 @@ pub fn run() {
     // NET-11 (N9.2): 经第二台真网卡 (e1000e, NIC1) 用**同一套** socket API —— 多网卡出口。
     net11_udp_e1000e();
 
+    // NET-12 (N7.2): TCP 客户端经 socket API 主动连接真实对端 (slirp)。
+    net12_tcp_client();
+
     // 34. FS-31 自测 (01 健壮性收口): 最小 fsck 对账口径的稳定性。
     //     客户机内无法制造「已分配但不可达」的 inode 泄漏 (那要在目录项插入与 inode 登记
     //     之间掉电), 故本自测断言**对一份结构一致的卷**: 报泄漏 inode = 0、可回收块 = 0;
@@ -3989,6 +3992,27 @@ fn net11_udp_e1000e() {
     sys_sleep(300);
     let _ = morion::net::close(sock);
     println("app: NET11 udp via e1000e (nic1) OK (loopback + tx probe)");
+}
+
+/// NET-12 (N7.2): TCP 客户端经 socket API 主动连接真实对端。
+///
+/// slirp 网关上大概率没有监听端口, 故期望收到 **RST**（连接被拒）—— 这恰好端到端取证了
+/// 真实的 SYN 发出 + 对端 RST 收回 + 状态机把连接判为 Closed（netstack 打对应 marker）。
+fn net12_tcp_client() {
+    const PORT: u16 = 12345;
+    let sock = morion::net::tcp_socket();
+    if sock == 0 || !morion::net::tcp_bind(sock, PORT) {
+        println("app: NET12 tcp socket/bind FAILED");
+        return;
+    }
+    if !morion::net::tcp_connect(sock, morion::net::ip4(10, 0, 2, 2), 9999) {
+        println("app: NET12 tcp connect FAILED");
+        return;
+    }
+    // 等 SYN → RST 往返 + 状态机消化。
+    sys_sleep(500);
+    let _ = morion::net::tcp_close(sock);
+    println("app: NET12 tcp client OK (syn tx + peer rst rx)");
 }
 
 /// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。

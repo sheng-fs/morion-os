@@ -138,6 +138,19 @@ pub const NETS_OP_RECVFROM: u64 = 3;
 /// 关 socket; 回复 1。
 pub const NETS_OP_CLOSE: u64 = 4;
 
+/// 建 TCP 连接（N7.2）; 请求 `sock` 字段 = 网卡索引; 回复连接 id（>0）/ 0。
+pub const NETS_OP_TSOCKET: u64 = 5;
+/// 绑 TCP 本地端口（需内核 `Net` 能力）; 回复 1/0。
+pub const NETS_OP_TBIND: u64 = 6;
+/// 主动连接; `addr` = 目的 IPv4, `port` = 目的端口; 回复 1/0。
+pub const NETS_OP_TCONNECT: u64 = 7;
+/// 发 TCP 数据; `len` = 负载长度, `buf` = 负载共享页; 回复 1/0。
+pub const NETS_OP_TSEND: u64 = 8;
+/// 收 TCP 数据; `buf` = 输出共享页; 回复字节数（无 0）。
+pub const NETS_OP_TRECV: u64 = 9;
+/// 关 TCP 连接; 回复 1。
+pub const NETS_OP_TCLOSE: u64 = 10;
+
 /// 单条 UDP 负载上界（一页共享页内，留出帧头余量）。
 pub const NETS_PAYLOAD_MAX: u64 = 1472;
 

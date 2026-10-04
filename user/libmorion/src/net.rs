@@ -16,6 +16,12 @@ const NETS_OP_BIND: u64 = 1;
 const NETS_OP_SENDTO: u64 = 2;
 const NETS_OP_RECVFROM: u64 = 3;
 const NETS_OP_CLOSE: u64 = 4;
+const NETS_OP_TSOCKET: u64 = 5;
+const NETS_OP_TBIND: u64 = 6;
+const NETS_OP_TCONNECT: u64 = 7;
+const NETS_OP_TSEND: u64 = 8;
+const NETS_OP_TRECV: u64 = 9;
+const NETS_OP_TCLOSE: u64 = 10;
 const NETS_PAYLOAD_MAX: u64 = 1472;
 
 /// 与 netstack_srv 传递负载的共享页（同址共享）。
@@ -122,6 +128,66 @@ pub fn close(sock: u64) -> bool {
         return false;
     }
     call(NETS_OP_CLOSE, sock, 0, 0, 0) == 1
+}
+
+/// 建一个 TCP 连接（NIC 0=virtio-net）；失败返回 0。
+pub fn tcp_socket() -> u64 {
+    if !ensure() {
+        return 0;
+    }
+    call(NETS_OP_TSOCKET, 0, 0, 0, 0)
+}
+
+/// 绑 TCP 本地端口 `port`：先经内核登记归属（需 `Net` 能力），再让协议栈生效。
+pub fn tcp_bind(sock: u64, port: u16) -> bool {
+    if !ensure() || sys_net_bind(port) != 1 {
+        return false;
+    }
+    call(NETS_OP_TBIND, sock, port as u64, 0, 0) == 1
+}
+
+/// 主动连接 `addr:port`（`addr` 用 [`ip4`] 编码）；成功仅表示 SYN 已发出。
+pub fn tcp_connect(sock: u64, addr: u32, port: u16) -> bool {
+    if !ensure() {
+        return false;
+    }
+    call(NETS_OP_TCONNECT, sock, port as u64, addr as u64, 0) == 1
+}
+
+/// 发 TCP 数据（`payload` 拷进共享页）。
+pub fn tcp_send(sock: u64, payload: &[u8]) -> bool {
+    if !ensure() {
+        return false;
+    }
+    let n = payload.len().min(NETS_PAYLOAD_MAX as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), SHARE_VADDR as *mut u8, n);
+    }
+    call(NETS_OP_TSEND, sock, 0, 0, n as u64) == 1
+}
+
+/// 收 TCP 数据：有则拷进 `out` 并返回长度（无返回 0）。
+pub fn tcp_recv(sock: u64, out: &mut [u8]) -> u64 {
+    if !ensure() {
+        return 0;
+    }
+    let r = call(NETS_OP_TRECV, sock, 0, 0, 0);
+    if r == 0 || r == u64::MAX {
+        return 0;
+    }
+    let n = r.min(out.len() as u64).min(NETS_PAYLOAD_MAX);
+    unsafe {
+        core::ptr::copy_nonoverlapping(SHARE_VADDR as *const u8, out.as_mut_ptr(), n as usize);
+    }
+    n
+}
+
+/// 关闭 TCP 连接。
+pub fn tcp_close(sock: u64) -> bool {
+    if !ensure() {
+        return false;
+    }
+    call(NETS_OP_TCLOSE, sock, 0, 0, 0) == 1
 }
 
 /// 把 IPv4 地址编码成 `a<<24 | b<<16 | c<<8 | d`（`sendto` 的 `addr` 用）。
