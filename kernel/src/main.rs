@@ -458,6 +458,8 @@ pub extern "C" fn kernel_main() -> ! {
     // 探测 virtio 网卡并**通用地**授权给 net 域（驱动路线 N1: PCI 查找 + 设备声明）:
     // 与 NVMe 走同一条 `device::grant` 路径 —— 加这台新设备没给内核加任何设备专属逻辑。
     // virtio-modern 的配置结构在 BAR4（MSI-X 表在 BAR1, 见 N2）。
+    // DRV-A: 记录命中标志，探测完两台网卡后组装 NIC 表交给协议栈（表驱动）。
+    let mut net_found = false;
     match arch::pci::find_net(&pci_devices) {
         Some((bus, dev, func, bar4)) => {
             device::grant(device::GrantRequest {
@@ -476,6 +478,7 @@ pub extern "C" fn kernel_main() -> ! {
             video::print("[OK] virtio-net modern BAR4=0x");
             video::print_hex(bar4);
             video::println("");
+            net_found = true;
         }
         None => {
             device::grant_empty(net_domain);
@@ -487,6 +490,7 @@ pub extern "C" fn kernel_main() -> ! {
     // 与 virtio-net 完全不同的硬件模型: BAR0 是 MMIO 寄存器窗口 (控制/状态 + RX/TX 描述符环),
     // 无 virtio 能力链表。第一版**全轮询**（本内核只有 MSI-X 通路, e1000e 常规用 INTx/MSI),
     // 故不申请向量。BAR0 需覆盖到 RAL/RAH (0x5400+), 取 8 页; DMA 8 页: RX/TX 环 + 收包缓冲。
+    let mut e1000e_found = false;
     match arch::pci::find_e1000e(&pci_devices) {
         Some((bus, dev, func, bar0)) => {
             device::grant(device::GrantRequest {
@@ -503,11 +507,44 @@ pub extern "C" fn kernel_main() -> ! {
             video::print("[OK] e1000e BAR0=0x");
             video::print_hex(bar0);
             video::println("");
+            e1000e_found = true;
         }
         None => {
             device::grant_empty(e1000e_domain);
             video::println("[OK] no e1000e controller, e1000e_srv idle");
         }
+    }
+
+    // DRV-A: 把探测到的网卡组装成 NIC 表，只读映射进协议栈（域 21）。协议栈从此**不硬编码**
+    // 网卡域号 / IO 页 VA / 网卡数量 —— 第 i 条 IO 页 = USER_BASE + 0x1A_0000 + i*4KiB
+    // （与历史约定一致，回归逐字不变）。加一台网卡只需在这里追加一条。
+    {
+        let mut nics = [net::NicEntry {
+            domain: 0,
+            io_vaddr: 0,
+            kind: 0,
+        }; net::NIC_MAX];
+        let mut n = 0usize;
+        if net_found {
+            nics[n] = net::NicEntry {
+                domain: net_domain,
+                io_vaddr: net::nic_io_vaddr(n as u64),
+                kind: net::NIC_KIND_VIRTIO_NET,
+            };
+            n += 1;
+        }
+        if e1000e_found {
+            nics[n] = net::NicEntry {
+                domain: e1000e_domain,
+                io_vaddr: net::nic_io_vaddr(n as u64),
+                kind: net::NIC_KIND_E1000E,
+            };
+            n += 1;
+        }
+        net::publish_nic_table(netstack_domain, &nics[..n]);
+        video::print("[OK] NIC table published to netstack: nics=");
+        video::print_u64(n as u64);
+        video::println("");
     }
 
     // 探测 virtio-blk 并通用地授权给域 17（驱动路线 D3: 第二个真实驱动, 仍不改内核设备逻辑）。

@@ -20,15 +20,27 @@
 use crate::common::*;
 use morion::syscall::*;
 
-/// NIC 0：net_srv（virtio-net，域 16）。
-const NET_DOMAIN: u64 = 16;
-/// NIC 1：e1000e_srv（e1000e，域 22，N9）。
-const E1000E_DOMAIN: u64 = 22;
-/// 各网卡收发帧的共享页（同址共享）。
-const IO0_VADDR: u64 = 0x0000_0080_001A_0000;
-const IO1_VADDR: u64 = 0x0000_0080_001A_1000;
-/// 网卡数量。
-const NIC_COUNT: usize = 2;
+// DRV-A: 网卡接线**表驱动** —— 内核把探测到的 NIC 表（域号 + IO 页 VA + 型号）写进
+// [`NIC_TABLE_VADDR`] 只读页（见 `common.rs`），协议栈启动时读取；不再硬编码
+// 「网卡域号 / IO 页 VA / 网卡数量」。加一台网卡只需内核探测后往表里追加一条。
+
+/// NIC 型号 → 硬件名（`netstack: links=N (...)` 用）。
+fn kind_hw_name(kind: u64) -> &'static str {
+    match kind {
+        NIC_KIND_VIRTIO_NET => "virtio-net",
+        NIC_KIND_E1000E => "e1000e",
+        _ => "nic",
+    }
+}
+
+/// NIC 型号 → 驱动服务名（拉起日志沿用既有措辞：virtio-net 的服务名即 `net_srv`）。
+fn kind_svc_name(kind: u64) -> &'static str {
+    match kind {
+        NIC_KIND_VIRTIO_NET => "net_srv",
+        NIC_KIND_E1000E => "e1000e",
+        _ => "nic",
+    }
+}
 
 /// 本机静态配置（与网卡驱动的 DHCP 回落值一致）。
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
@@ -194,7 +206,9 @@ impl Sock {
 }
 
 struct Stack {
-    links: [Link; NIC_COUNT],
+    links: [Link; NIC_MAX],
+    /// 实际网卡数（引导期由 NIC 表填入）。
+    nics: usize,
     socks: [Sock; MAX_SOCKS],
     tcons: [TcpConn; MAX_TCONS],
 }
@@ -202,10 +216,8 @@ struct Stack {
 impl Stack {
     const fn zeroed() -> Stack {
         Stack {
-            links: [
-                Link::down(NET_DOMAIN, IO0_VADDR),
-                Link::down(E1000E_DOMAIN, IO1_VADDR),
-            ],
+            links: [Link::down(0, 0); NIC_MAX],
+            nics: 0,
             socks: [Sock::new(); MAX_SOCKS],
             tcons: [TcpConn::new(); MAX_TCONS],
         }
@@ -2150,7 +2162,7 @@ fn tcp6_selftest(io: u64, our: [u8; 16], peer: [u8; 16]) -> bool {
 // ---------------------------------------------------------------------------
 
 fn tcp_open(st: &mut Stack, nic: usize, from: u64) -> u64 {
-    if nic >= NIC_COUNT {
+    if nic >= st.nics {
         return 0;
     }
     let mut i = 0;
@@ -2172,7 +2184,7 @@ fn tcp_open(st: &mut Stack, nic: usize, from: u64) -> u64 {
 /// 端口归属必须是发起域（内核已按其 `Net` 能力登记）—— 与 `tcp_bind` 同一道门禁，
 /// 否则任何域都能监听任意端口。
 fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16, from: u64) -> u64 {
-    if nic >= NIC_COUNT || sys_net_owner(port) != from {
+    if nic >= st.nics || sys_net_owner(port) != from {
         return 0;
     }
     let mut i = 0;
@@ -2559,7 +2571,7 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
         Some(s) => (s.port, s.nic),
         None => return 0,
     };
-    if nic >= NIC_COUNT || !st.links[nic].up {
+    if nic >= st.nics || !st.links[nic].up {
         return 0;
     }
     let dst = [
@@ -2624,7 +2636,7 @@ fn sock_sendto6(st: &mut Stack, req: &NetSReq) -> u64 {
         Some(s) => (s.port, s.nic),
         None => return 0,
     };
-    if nic >= NIC_COUNT || !st.links[nic].up {
+    if nic >= st.nics || !st.links[nic].up {
         return 0;
     }
     let dst6 = get_v6(req.buf);
@@ -2714,7 +2726,7 @@ fn serve_app(st: &mut Stack, now: u64) {
         let reply = match req.op {
             // SOCKET: `sock` 字段 = 请求的网卡索引（0/1）。
             NETS_OP_SOCKET => {
-                if (req.sock as usize) < NIC_COUNT {
+                if (req.sock as usize) < st.nics {
                     sock_alloc(st, req.sock as usize)
                 } else {
                     0
@@ -2750,63 +2762,97 @@ fn serve_app(st: &mut Stack, now: u64) {
 pub fn run() {
     // 状态在静态区（见 STACK 说明），不进栈帧。
     let st: &mut Stack = unsafe { &mut *core::ptr::addr_of_mut!(STACK) };
-    st.links[0] = Link::down(NET_DOMAIN, IO0_VADDR);
-    st.links[1] = Link::down(E1000E_DOMAIN, IO1_VADDR);
 
-    // NIC 0：virtio-net（必需）。分配帧页并共享给 net_srv。
-    if sys_alloc_page(IO0_VADDR) != 1 || sys_share_page(IO0_VADDR, NET_DOMAIN) != 1 {
-        println("netstack: cannot share IO page with net_srv, idle");
+    // DRV-A: 读内核写入的只读 NIC 表（域号 + IO 页 VA + 型号）。
+    let tbl = unsafe { &*(NIC_TABLE_VADDR as *const NicTable) };
+    if tbl.magic != NIC_TABLE_MAGIC {
+        println("netstack: no NIC table (kernel did not publish), idle");
         idle();
     }
-    // NIC 1：e1000e（可选）。页面照分配+共享；驱动给的 MAC 为 0 即视为不在。
-    let _ = sys_alloc_page(IO1_VADDR);
-    let _ = sys_share_page(IO1_VADDR, E1000E_DOMAIN);
+    let count = (tbl.count as usize).min(NIC_MAX);
+    if count == 0 {
+        println("netstack: no NIC, idle");
+        idle();
+    }
+    st.nics = count;
 
-    // 取 NIC 0 的 MAC（net_srv 可能还在跑自测，重试）。
-    let mut mac0 = 0u64;
-    let mut i = 0u64;
-    while i < 200 {
-        mac0 = link_call(&st.links[0], NET_OP_INFO, 0);
-        if mac0 != 0 {
-            break;
+    // 按表逐条分配帧页并同址共享给对应驱动域。
+    let mut i = 0usize;
+    while i < count {
+        let e = tbl.entries[i];
+        st.links[i] = Link::down(e.domain, e.io_vaddr);
+        if sys_alloc_page(e.io_vaddr) != 1 || sys_share_page(e.io_vaddr, e.domain) != 1 {
+            print("netstack: cannot share IO page (nic");
+            print_u64(i as u64);
+            println("), idle");
+            idle();
         }
-        sys_sleep(50);
         i += 1;
     }
-    if mac0 == 0 {
-        println("netstack: no NIC (net_srv gave no MAC), idle");
-        idle();
-    }
-    st.links[0].mac = mac0;
-    st.links[0].up = true;
-    arp_learn_gw(st, 0);
 
-    print("netstack: up (frame link to net_srv OK), nic mac=0x");
-    print_hex(mac0);
-    if st.links[0].gw_mac.is_some() {
-        print(", gw mac learned");
-    } else {
-        print(", gw mac timeout");
-    }
-    println("");
-
-    // NIC 1：e1000e（best-effort）。学网关 MAC 同时验证该网卡的 TX + RX 路径。
-    let mac1 = link_call(&st.links[1], NET_OP_INFO, 0);
-    if mac1 != 0 {
-        st.links[1].mac = mac1;
-        st.links[1].up = true;
-        arp_learn_gw(st, 1);
-        print("netstack: nic1 up (e1000e OK), mac=0x");
-        print_hex(mac1);
-        if st.links[1].gw_mac.is_some() {
+    // 逐个拉起网卡：NIC 0 等驱动自测完（重试），其余单次探测；取到 MAC 后学网关 MAC。
+    let mut i = 0usize;
+    while i < count {
+        let mut mac = 0u64;
+        let retries = if i == 0 { 200u64 } else { 1 };
+        let mut t = 0u64;
+        while t < retries {
+            mac = link_call(&st.links[i], NET_OP_INFO, 0);
+            if mac != 0 {
+                break;
+            }
+            if retries > 1 {
+                sys_sleep(50);
+            }
+            t += 1;
+        }
+        if mac == 0 {
+            if i == 0 {
+                // 第一台网卡缺失 → 协议栈无出口，退出到监督者重启（与旧行为一致）。
+                println("netstack: no NIC (net_srv gave no MAC), idle");
+                idle();
+            }
+            i += 1;
+            continue;
+        }
+        st.links[i].mac = mac;
+        st.links[i].up = true;
+        arp_learn_gw(st, i);
+        let svc = kind_svc_name(tbl.entries[i].kind);
+        if i == 0 {
+            print("netstack: up (frame link to ");
+            print(svc);
+            print(" OK), nic mac=0x");
+        } else {
+            print("netstack: nic");
+            print_u64(i as u64);
+            print(" up (");
+            print(svc);
+            print(" OK), mac=0x");
+        }
+        print_hex(mac);
+        if st.links[i].gw_mac.is_some() {
             print(", gw mac learned");
         } else {
             print(", gw mac timeout");
         }
         println("");
-    } else {
-        println("netstack: nic1 absent (no e1000e)");
+        i += 1;
     }
+
+    // DRV-A marker: 表驱动产出的网卡清单（加网卡只需内核往表里追加一条）。
+    print("netstack: links=");
+    print_u64(st.nics as u64);
+    print(" (");
+    let mut k = 0usize;
+    while k < st.nics {
+        if k != 0 {
+            print("+");
+        }
+        print(kind_hw_name(tbl.entries[k].kind));
+        k += 1;
+    }
+    println(")");
 
     // V6.1: NDP 确定性自证（构造 NS → 处理器产出 NA，校验类型与校验和）。
     if ndp_selftest(st, 0) {
@@ -2855,7 +2901,7 @@ pub fn run() {
         now = now.wrapping_add(10);
         serve_app(st, now);
         let mut nic = 0;
-        while nic < NIC_COUNT {
+        while nic < st.nics {
             if st.links[nic].up {
                 let mut n = 0;
                 while n < 8 {

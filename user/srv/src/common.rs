@@ -125,6 +125,39 @@ pub struct NetReq {
 /// netstack_srv 域号（用户态网络协议栈，N6）。
 pub const NETSTACK_DOMAIN: u64 = 21;
 
+// ---------------------------------------------------------------------------
+// DRV-A — 内核写给协议栈的只读 NIC 表（表驱动网卡接线）
+// ---------------------------------------------------------------------------
+
+/// NIC 表页虚拟地址（内核只读映射；逐字段与 `kernel/src/net.rs` 对齐）。
+pub const NIC_TABLE_VADDR: u64 = 0x0000_0080_0085_0000;
+/// NIC 表 magic（"NICTB01"）。
+pub const NIC_TABLE_MAGIC: u64 = 0x004E_4943_5442_3031;
+/// 表中网卡条目上限。
+pub const NIC_MAX: usize = 8;
+/// 网卡型号：virtio-net（net_srv，域 16）。
+pub const NIC_KIND_VIRTIO_NET: u64 = 1;
+/// 网卡型号：Intel e1000e（e1000e_srv，域 22）。
+pub const NIC_KIND_E1000E: u64 = 2;
+
+/// 一条网卡接线：驱动服务域 + 帧共享页 VA + 型号。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NicEntry {
+    pub domain: u64,
+    pub io_vaddr: u64,
+    pub kind: u64,
+}
+
+/// NIC 表（逐字段与 `kernel/src/net.rs::NicTable` 对齐）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NicTable {
+    pub magic: u64,
+    pub count: u64,
+    pub entries: [NicEntry; NIC_MAX],
+}
+
 /// 套接字服务请求 tag（N6.5）: 应用经 `libnetv` 与 netstack_srv 交互。
 pub const NETS_REQ_TAG: u64 = 0x4E53_544B; // "NSTK"
 /// 建 socket; 回复 socket id（>0）/ 0。请求里 `sock` 字段 = 出口网卡索引（N9.2: 0=virtio-net, 1=e1000e）。

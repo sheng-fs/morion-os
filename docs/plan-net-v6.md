@@ -55,7 +55,8 @@
 - 方案 b：内核给网卡域一条「自报」能力，netstack 逐个探测（`NET_OP_INFO` 取 MAC/型号）。
 - **倾向 a**：与现有「声明式设备授权」一致；netstack 只需把 `Link` 从常量换成运行期数组。
 
-marker：`netstack: links=1 (virtio-net)` 与 `links=2 (virtio-net+e1000e)` 由同一套代码产出（**回归应逐字不变**）。
+marker：`netstack: links=1 (virtio-net)` 与 `links=2 (virtio-net+e1000e)` 由同一套代码产出（**回归应逐字不变**）。**已过**。
+- 实现（方案 a 的具体化）：内核新增**只读 NIC 表页** `NIC_TABLE_VADDR = USER_BASE + 0x85_0000`（与 `DEVICE_CFG_VADDR` 同构，`kernel/src/net.rs`）：探测完两台网卡后组装 `NicTable{magic,count,entries[NicEntry{domain,io_vaddr,kind}]}`，写一帧并 `map_user_page(netstack, …, ReadOnly)`。`netstack_srv` 启动时读该表，按条目 `sys_alloc_page`+`sys_share_page(io, domain)` 建 `Link`，`nics` 为运行期值；`NIC_COUNT`/`NET_DOMAIN`/`E1000E_DOMAIN`/`IO0/1_VADDR` 全部删除。加网卡只需内核往表里追加一条。既有拉起行（`netstack: up (frame link to net_srv OK)` / `netstack: nic1 up (e1000e OK)`）**逐字不变**。
 
 ### 3.2 DRV-B — 再加可仿真网卡驱动（低风险、高可见度）
 
@@ -155,7 +156,7 @@ marker：`NET14 rtl8139 OK` / `NET15 e1000(82540EM) OK`，各配 `-netdev user` 
 2. ✅ **V6.1 地址 + SLAAC + NDP（已完成）**：`NET16 ipv6 slaac OK (g=fec0:0:0:0:5054:ff:fe12:3456, gw mac learned)` + `NET16 ndp self-test OK (ns->na)`。
 3. ✅ **V6.2 传输（已完成）**：ICMPv6 echo（`NET17 icmpv6 echo OK`，另 slirp 回 `NET17 ipv6 echo OK (router replied)`）+ UDPv6（`NET17 udp6 OK`）+ TCPv6（`NET18 tcp6 OK`）。
 4. ✅ **V6.3 应用面（已完成）**：`IpAddr` + DNS AAAA（确定性解析器自证 + 双栈 `resolve`），`app: NET19 dns AAAA OK`。
-5. **DRV-A** NIC 表驱动化（回归逐字不变）。
+5. ✅ **DRV-A NIC 表驱动化（已完成）**：只读 NIC 表页 + 运行期 `Link[]`（回归逐字不变，新增 `netstack: links=2 (virtio-net+e1000e)`）。
 6. **DRV-B** `rtl8139_srv`（`NET14`）→ 视情况 `e1000_srv`（`NET15`）。
 7. **DRV-C** `virtio_input` → `virtio_gpu_srv`。
 8. ✅ **V6.4 双栈收口（已完成）**：`sendto6` + v4-mapped（`app: NET20 udp6 socket OK`）。

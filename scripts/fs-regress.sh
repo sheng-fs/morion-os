@@ -232,6 +232,9 @@ grep -qE 'NET9 e1000e OK.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 # N9.2 (多网卡出口): 协议栈把 e1000e 当 NIC1 拉起 (同一套帧级 IPC), 应用经 NIC1 用同一套
 # socket API 收发 (回环 + 真实 TX 触发 ICMP 不可达回程)。上层 socket API 不变。
 grep -qE 'netstack: nic1 up \(e1000e OK\)' "$log" 2>/dev/null || net_bad=1
+# DRV-A: NIC 接线**表驱动** —— 协议栈从内核写入的只读 NIC 表读取网卡清单（域号/IO 页/型号），
+# 不再硬编码；两条既有拉起行（net_srv / e1000e）逐字不变。
+grep -qE 'netstack: links=2 \(virtio-net\+e1000e\)' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET11 udp via e1000e \(nic1\) OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic1 rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 # N7 (TCP 完整化): netstack 的 TCP 连接状态机 + 重传的确定性自证。
