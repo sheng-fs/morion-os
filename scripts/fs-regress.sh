@@ -103,6 +103,10 @@ if [ -n "${IOMMU:-}" ]; then
   echo "== QEMU 暴露 Intel VT-d (IOMMU=1): 校验 E1b DMA 重映射"
 fi
 
+# ISO9660 只读副本 (03c 续): `morion-os.iso` 同一文件不能既作 `-cdrom` 又被 QEMU 当块设备
+# 打开, 故拷一份接成 nvme-ns nsid=8 供域 20 的 iso9660_srv 读整盘 ISO9660。
+cp -f "$ISO" "$OUT_DIR/iso.img"
+
 $QEMU \
   -machine q35 ${iommu_arg} -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
   -cdrom "$ISO" \
@@ -114,6 +118,7 @@ $QEMU \
   -drive file="$OUT_DIR/exfat.img",if=none,id=n5,format=raw -device nvme-ns,drive=n5,bus=nvme0,nsid=5 \
   -drive file="$OUT_DIR/spare.img",if=none,id=n6,format=raw -device nvme-ns,drive=n6,bus=nvme0,nsid=6 \
   -drive file="$OUT_DIR/pt.img",if=none,id=n7,format=raw -device nvme-ns,drive=n7,bus=nvme0,nsid=7 \
+  -drive file="$OUT_DIR/iso.img",if=none,id=n8,format=raw,readonly=on -device nvme-ns,drive=n8,bus=nvme0,nsid=8 \
   -netdev user,id=n0 -device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
   -drive file="$OUT_DIR/vblk.img",if=none,id=vblk0,format=raw \
   -device virtio-blk-pci,drive=vblk0 \
@@ -196,6 +201,12 @@ grep -nE 'xhci:|USB1|USB2|block: usb volume' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'USB1 xhci OK.*sig=ok' "$log" 2>/dev/null || usb_bad=1
 grep -qE 'block: usb volume attached.*sig=ok' "$log" 2>/dev/null || usb_bad=1
 grep -qE 'USB2 usb volume rw OK.*rw=ok' "$log" 2>/dev/null || usb_bad=1
+# 03c 续: ISO9660 只读文件服务 (域 20) —— 把 morion-os.iso 的只读副本接成 nsid=8, 服务读整盘
+# ISO9660 并校验根下 EFIBOOT.IMG 的 FAT 引导签名 (0xEB/0xE9 跳转 + 尾 0x55AA) → `ISO1`。
+iso_bad=0
+echo "== ISO9660 只读驱动自测 (03c 续) =="
+grep -nE 'iso9660:|ISO1' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'ISO1 iso9660 OK.*read=ok' "$log" 2>/dev/null || iso_bad=1
 # ② 能力审计: init 监督者按最小权限策略核对引导期的能力授权 (Spawn / Mmio / Fb / IoPort)。
 # 判据是 `cap-audit: OK` —— 出现 VIOLATION / MISSING / FAILED 都判失败 (审计本身也读日志)。
 cap_bad=0
@@ -210,4 +221,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${iso_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ]

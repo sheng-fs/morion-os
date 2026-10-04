@@ -480,6 +480,8 @@ pub const VOL_KIND_FAT: u32 = 1; // FAT12/16/32 (引导扇区尾 0x55AA)
 pub const VOL_KIND_EXFAT: u32 = 2;
 pub const VOL_KIND_MFS: u32 = 3;
 pub const VOL_KIND_EXT2: u32 = 4;
+/// ISO9660 (CD/安装盘): 卷描述符 (LBA 16 起) 以 `"CD001"` 标识。**只读**。
+pub const VOL_KIND_ISO: u32 = 5;
 
 /// 块请求操作码 (`BlockReq.op` 低 8 位)。
 pub const BLOCK_OP_READ: u8 = 0;

@@ -45,6 +45,7 @@ default = [
     "svc-virtio_blk_srv",
     "svc-ahci_srv",
     "svc-xhci_srv",
+    "svc-iso9660_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -66,6 +67,7 @@ svc-net_srv = []
 svc-virtio_blk_srv = []
 svc-ahci_srv = []
 svc-xhci_srv = []
+svc-iso9660_srv = []
 
 [[bin]]
 name = "sender"
@@ -166,6 +168,11 @@ required-features = ["svc-ahci_srv"]
 name = "xhci_srv"
 path = "src/bin/xhci_srv.rs"
 required-features = ["svc-xhci_srv"]
+
+[[bin]]
+name = "iso9660_srv"
+path = "src/bin/iso9660_srv.rs"
+required-features = ["svc-iso9660_srv"]
 
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。

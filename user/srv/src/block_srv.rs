@@ -2100,6 +2100,7 @@ fn vol_kind_name(kind: u32) -> &'static str {
         VOL_KIND_EXFAT => "exfat",
         VOL_KIND_MFS => "mfs",
         VOL_KIND_EXT2 => "ext2",
+        VOL_KIND_ISO => "iso9660",
         _ => "unknown",
     }
 }
@@ -2203,7 +2204,40 @@ fn vol_probe_kind(
     ) {
         return VOL_KIND_UNKNOWN;
     }
-    vol_detect_kind(scratch)
+    let kind = vol_detect_kind(scratch);
+    if kind != VOL_KIND_UNKNOWN {
+        return kind;
+    }
+    // ISO9660 (03c 续): 卷首 8 扇区看不出 —— 卷描述符在第 **16 个 ISO 逻辑扇区** (每个
+    // 2048 字节), 即 512 字节 LBA **64** 起, 各以 `"CD001"` 标识 (偏移 1)。故补读一扇区探测。
+    if !nvme_rw_sectors(
+        OP_READ,
+        nsid,
+        cfg,
+        mmio,
+        isq_doorbell,
+        icq_doorbell,
+        start_lba + 64,
+        1,
+        scratch,
+        tail,
+        head,
+        phase,
+    ) {
+        return VOL_KIND_UNKNOWN;
+    }
+    let mut iso = true;
+    for (i, &c) in b"CD001".iter().enumerate() {
+        if unsafe { *scratch.add(1 + i) } != c {
+            iso = false;
+            break;
+        }
+    }
+    if iso {
+        VOL_KIND_ISO
+    } else {
+        VOL_KIND_UNKNOWN
+    }
 }
 
 /// 解析 GPT 分区表 (仅在检测到保护性 MBR 时进入): 逐个分区项登记卷。

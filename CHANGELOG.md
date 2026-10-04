@@ -64,6 +64,14 @@
   高 8 位 = 种类 + 1、低 56 位 = 参数，`0` = 空槽、`u64::MAX` = 表尾）+ `init` 监督者引导期按**最小权限
   策略**核对引导授权（`Spawn`/`Mmio`/`Fb`/`IoPort` 持有者白名单 + 正向必需项），启动日志
   `cap-audit: domains=20 caps=91 violations=0` + `cap-audit: OK`；回归新增判据 `cap-audit: OK`。
+- **ISO9660 只读文件服务（03c 续 / P11a）**：新增 `iso9660_srv`（域 20，只读 CD/安装介质）——
+  把 `.iso` 当**裸块设备**（QEMU 里作 `nvme-ns`）接进卷层，与"CD 硬件 (ATAPI)"解耦；新增
+  `VOL_KIND_ISO` 与卷探测（读第 16 个 ISO 逻辑扇区 = 512 字节 LBA 64 校验 `"CD001"`），
+  PVD→根目录/目录记录解析（`;N` 剥离、大小写不敏感、跳过 `.`/`..`）→ 按 extent 读文件；
+  实现 `OPEN/RDIR/READ/CLOSE/STAT`（写类拒绝），挂 `/cdrom`。测试用 `morion-os.iso` 只读副本接成
+  nvme-ns nsid=8，端到端 `ISO1 iso9660 OK, volid=MORION_OS, root_entries=3, read=ok`（读根下
+  `EFIBOOT.IMG` 校验 FAT 引导签名）；回归新增判据 `ISO1 … read=ok`。`BOOT_DOMAINS` 20 → 21。
+  安装器（P11b，整块裸拷 `efiboot.img` 到目标盘）见 [docs/design-iso9660-installer.md](docs/design-iso9660-installer.md)，未做。
 - **块层批量提交 / 等完成（02b-2）**：量化发现耗时主因是**每条 NVMe 命令的完成等待**（16384 条命令
   摊到 258 s ≈ 15.7 ms/条，不是每请求一跳 IPC），故改为「一次下发 K 条命令再统一等完成」。三层：
   ① `block_srv` 的 `nvme_batch_rw` —— 一条 I/O 队列排 k 条 SQE、只敲一次门铃、统一等完成（中断优先、

@@ -69,7 +69,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -136,6 +136,10 @@ USB_IMG       ?= $(OUT_DIR)/usb.img
 USB_MIB       ?= 1
 # 文件系统阶段: IDE 磁盘镜像 (Legacy PIO 读扇区验证)
 DISK_IMG      ?= $(OUT_DIR)/disk.img
+# ISO9660 测试盘 (03c 续 / 安装介质): `morion-os.iso` 的**只读副本** —— 同一文件不能既作
+# `-cdrom` 启动介质、又被 QEMU 当块设备打开。副本接成 nvme-ns nsid=8, 域 20 的 iso9660_srv
+# 从中读出整盘 ISO9660 (根下有 EFIBOOT.IMG 作自测判据)。
+ISO_IMG       ?= $(OUT_DIR)/iso.img
 
 # ============================================================
 # 默认目标
@@ -341,9 +345,10 @@ run-nokvm: iso
 #   另挂一台 virtio-blk ($(VBLK_IMG)) 给域 17 的 virtio_blk_srv (驱动路线 D3) 做块设备自测。
 #   再挂一台 AHCI/SATA 盘 ($(AHCI_IMG), q35 自带的 ich9-ahci) 给域 18 的 ahci_srv (D4) 做只读自测。
 #   另挂一台 xHCI 控制器 (qemu-xhci) + usb-storage 盘 ($(USB_IMG)) 给域 19 的 xhci_srv (03c)。
+#   nsid=8 -> $(ISO_IMG)   (morion-os.iso 的只读副本, 整盘 ISO9660, 挂 /cdrom, 域 20 的 iso9660_srv)。
 .PHONY: run-nvme
-run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG) $(USB_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试)..."
+run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG) $(USB_IMG) $(ISO_IMG)
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试, nsid8=ISO9660)..."
 	$(QEMU) \
 		-machine q35 \
 		$(IOMMU_ARG) \
@@ -365,6 +370,8 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-device nvme-ns,drive=nvme0n6,bus=nvme0,nsid=6 \
 		-drive file=$(PT_IMG),if=none,id=nvme0n7,format=raw \
 		-device nvme-ns,drive=nvme0n7,bus=nvme0,nsid=7 \
+		-drive file=$(ISO_IMG),if=none,id=nvme0n8,format=raw,readonly=on \
+		-device nvme-ns,drive=nvme0n8,bus=nvme0,nsid=8 \
 		-netdev user,id=n0 \
 		-device virtio-net-pci,netdev=n0,mac=52:54:00:12:34:56 \
 		-drive file=$(VBLK_IMG),if=none,id=vblk0,format=raw \
@@ -417,6 +424,12 @@ $(USB_IMG):
 	dd if=/dev/zero of=$(USB_IMG) bs=1M count=$(USB_MIB) status=none
 	printf 'MORION-USB-TST!!' | dd of=$(USB_IMG) bs=512 count=1 conv=notrunc,sync status=none
 	@echo "  ✓ USB 盘: $(USB_IMG)"
+
+# ISO9660 测试副本 (03c 续): 见 ISO_IMG 注释。ISO_IMAGE 是伪目标 (每轮重建), 故这里恒拷贝。
+$(ISO_IMG): $(ISO_IMAGE)
+	@echo "==> 生成 ISO9660 测试副本 ($(ISO_IMG))..."
+	cp -f $(ISO_IMAGE) $(ISO_IMG)
+	@echo "  ✓ ISO 副本: $(ISO_IMG)"
 
 # MorionFS 磁盘镜像: 空白 raw, mfs_srv 首次挂载时写入超级块完成格式化
 $(MFS_IMG):

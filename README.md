@@ -149,7 +149,7 @@
 
 | 服务 | 职责 | 状态 |
 |------|------|------|
-| 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2（读 + 有限写）、exFAT（读 + 写），通过 libvfs 统一接口 | ✅ 已实现（ext2 读 + 有限写 / exFAT 读写） |
+| 文件系统服务 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS、ext2（读 + 有限写）、exFAT（读 + 写）、ISO9660（只读，安装介质），通过 libvfs 统一接口 | ✅ 已实现（ext2 读 + 有限写 / exFAT 读写 / ISO9660 只读） |
 | 设备服务 | 块设备（NVMe / virtio-blk / AHCI-SATA / xHCI-USB 驱动）、键盘驱动、中断分发 | ✅ 部分实现 |
 | Shell 服务 | 命令行解释器 + 统一目录树 / 运行时挂载 | ✅ 已实现 |
 | 网络协议栈 | TCP/IP 用户态实现，支持零拷贝共享内存 | ⏳ 规划中 |
@@ -256,9 +256,10 @@
 │           ├── virtio_blk_srv.rs  # 域 17 virtio-blk 块设备驱动 (D3: 通用授权, 读签名/写读回自测)
 │           ├── ahci_srv.rs   #     域 18 AHCI/SATA 驱动 (D4: 通用授权, 全轮询; 03b: 读+写并经 IPC 接进块服务卷层)
 │           ├── xhci_srv.rs   #     域 19 xHCI/USB 存储驱动 (03c: 通用授权, 全轮询; BOT+SCSI 读+写并经 IPC 接进块服务卷层)
+│           ├── iso9660_srv.rs #    域 20 ISO9660 只读文件服务 (03c 续: 安装介质; 把 .iso 当裸块设备, 挂 /cdrom)
 │           ├── gfx/          #     图形服务内部: framebuffer 视图 + 字库 (font/glyphs/cjk.bin) + 终端
 │           ├── sender.rs / receiver.rs / pager.rs / echo.rs / kbd.rs  # 域 0..4 演示与键盘
-│           └── bin/          #     20 个入口 (每个写 morion_main → 对应模块 run())
+│           └── bin/          #     21 个入口 (每个写 morion_main → 对应模块 run())
 ├── kernel_test/              # 早期引导联调用测试内核 (临时保留)
 │   └── src/main.rs
 ├── resources/
@@ -392,7 +393,8 @@
 - [x] **USB 存储驱动（xHCI）**（`xhci_srv` 域 19，仍走通用设备授权、内核无设备专属逻辑：**03c** —— 控制器复位/端口复位/Enable Slot/Address Device/Configure Endpoint 全链路 + **BOT + SCSI 透明命令集**（INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10)），全轮询不申请中断；自测后 `BLOCK_OP_ATTACH` 挂进 `block_srv` 卷层，读/写经 IPC 转发，`USB1 … sig=ok` + `block: usb volume attached … sig=ok` + `USB2 … rw=ok`，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 03c）
 - [x] **权限与多用户（04b）**（MFS 元数据 `+32` 存 uid/gid、不升 magic；`mfs_srv` 内按发起域静态映射身份做 rwx 强制 + `chown` + `MFS_E*` 错误码；`exec::spawn_elf` 给运行期程序授最小文件系统能力，FS-34..37 端到端验证低权（uid 1000）拒绝路径，见 [docs/roadmap-fs.md](./docs/roadmap-fs.md)）
 - [x] **最小 IPv4 协议栈 + DHCP + 最小 TCP（N3b/N3c/N4）**（纯 `net_srv` 内、不加服务不改公共文件：IPv4 头构造/解析 + RFC 1071 校验和 + 拒分片；ICMP echo 发 request 收 reply + 收 request 回 reply；UDP 构造/发送。端到端 `NET2 ipv4/icmp OK, echo reply from 10.0.2.2, udp TX 10.0.2.2:9999 -> icmp unreachable, echo-reply path OK`；**N3c** DHCP 客户端 DISCOVER/OFFER/REQUEST/ACK，端到端 `NET3 dhcp OK, ip=… mask=… gw=… dns=…`；**N4** 最小 TCP（三次握手 + 单段数据）+ ARP 缓存老化，端到端 `NET4 tcp OK, handshake+data selftest OK, peer refused(RST)`；TCP 仅最小握手/单段（无重传/拥塞控制），见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 N3b/N3c/N4）
-- [ ] TCP/IP 协议栈、能力审计、策略引擎
+- [x] **ISO9660 只读文件服务（03c 续 / P11a）**（`iso9660_srv` 域 20，只读 CD/安装介质：PVD(`"CD001"`) → 根目录/目录记录解析 → 按 extent 读文件，挂 `/cdrom`；把 `morion-os.iso` 当裸块设备（nvme-ns）接进卷层，端到端 `ISO1 iso9660 OK, volid=MORION_OS, root_entries=3, read=ok`，见 [docs/roadmap-driver.md](./docs/roadmap-driver.md) 的 03c 续）
+- [ ] TCP/IP 协议栈、动态安全策略（策略引擎）
 
 ### 阶段五 — GUI 与生态（未开始）
 

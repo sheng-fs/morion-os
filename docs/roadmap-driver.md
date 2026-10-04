@@ -303,6 +303,28 @@
 - **风险（仍存，未做）**：真机 UNIT ATTENTION / 多 LUN / 热插拔（不做）；DMA 块须落在内核恒等
   映射区（< 4 GiB，与本仓库 VT-d 窗口一致）。
 
+### 03c 续 — ISO9660 只读文件服务（`iso9660_srv`）✅ P11a 已完成
+
+> 安装介质的文件系统层。设计稿见 [design-iso9660-installer.md](design-iso9660-installer.md)。
+> **第一阶段把 `.iso` 当裸块设备读**（与"CD 硬件 ATAPI"解耦；真机光驱通路顺延）。
+
+- **域 / 接线**：新服务 `iso9660_srv` 取**域 20**（`BOOT_DOMAINS` 20 → 21；`SERVICE_FILES`
+  长度同步 20 → 21），沿 9 处接线；`mfs_srv` 的 `MFS_BOOT_DOMAINS` 对齐常量同改 21。
+- **卷识别**：`common.rs` 新增 `VOL_KIND_ISO`；`block_srv::vol_probe_kind` 在原 8 扇区探测之后，
+  补读**第 16 个 ISO 逻辑扇区**（2048 B → **512 字节 LBA 64**）校验 `"CD001"`（偏移 1）→ `iso9660`。
+- **只读子集**：PVD（type=1）→ 逻辑块大小 / 根目录记录 / 卷标识；目录记录顺序遍历
+  （`;N` 版本后缀剥掉、名字大小写不敏感、跳过 `.`/`..`）；文件按 extent 读（块层扇区 = 逻辑块
+  × 每块扇区数）。写类请求一律拒绝。实现 `OPEN/RDIR/READ/CLOSE/STAT`，挂 `/cdrom`。
+- **测试装置**：`morion-os.iso` 的**只读副本**接成 nvme-ns **nsid=8**（同一文件不能既作 `-cdrom`
+  又被当块设备打开）；`Makefile` 加 `ISO_IMG` 规则，`fs-regress.sh` 每轮 `cp` 副本并挂 nsid=8。
+- **取证**：`iso9660_srv` 起后读整盘 ISO9660，打 `ISO1 iso9660 OK, volid=MORION_OS,
+  root_entries=3, read=ok`（读根下 `EFIBOOT.IMG` 校验 FAT 引导签名 `0xEB/0xE9` + 尾 `0x55AA`）；
+  卷表 `vol: … kind=iso9660`。判据 `ISO1 … read=ok` 已进 `fs-regress.sh`。
+- **落地坑**：ISO9660「扇区 16」是 **2048 字节**逻辑扇区 = 512 字节 LBA **64**（不是 LBA 16）；
+  另外卷类型新值须同步 `vol_kind_name`，否则日志仍显示 `unknown`（探测本身是对的）。
+- **未做（P11b 安装器）**：从 `/cdrom` 读 `efiboot.img` → 分区（GPT ESP）→ 整块裸拷到目标盘
+  → 使其可引导；见设计稿 §5。真机 ATAPI 光驱亦未做。
+
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
 - 与 D1 结合：`SYS_DEVICE_GRANT` 在飞地场景下把设备的 DMA 权限绑到一个 **IOVA 窗口**（只映射飞地自己的缓冲），其余一律**拒绝**。

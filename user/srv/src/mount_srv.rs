@@ -212,6 +212,8 @@ fn mounts_init() {
     mount_add("/mfs", vfs::MFS_DOMAIN, 0);
     mount_add("/ext2", vfs::EXT2_DOMAIN, 0);
     mount_add("/usb", vfs::EXFAT_DOMAIN, 0);
+    // ISO9660 安装盘 (03c 续): 只读, 挂 `/cdrom`。
+    mount_add("/cdrom", vfs::ISO9660_DOMAIN, 0);
 }
 
 /// 在挂载表中查最长匹配前缀, 返回 (服务域, 卷编码, 前缀长度)。

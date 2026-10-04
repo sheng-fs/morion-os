@@ -69,6 +69,8 @@ pub const MFS_DOMAIN: u64 = 11;
 pub const EXT2_DOMAIN: u64 = 12;
 /// exFAT 读写文件服务域 id, 挂载于 `/usb`。
 pub const EXFAT_DOMAIN: u64 = 13;
+/// ISO9660 只读文件服务域 id (03c 续 / 安装介质), 挂载于 `/cdrom`。
+pub const ISO9660_DOMAIN: u64 = 20;
 
 /// 结果页虚拟地址: app 分配并共享给 fat32_srv, fat32_srv 在此写入文件内容或
 /// 目录列表。`read` / `readdir` 返回的字节数即该页内的有效数据长度。

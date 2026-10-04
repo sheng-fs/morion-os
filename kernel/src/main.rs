@@ -283,6 +283,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 域 19 — xhci_srv (USB 存储驱动, 驱动路线 D4 续 03c): 仍走通用设备授权; 第一版全轮询
     // (轮询事件环), 不申请中断向量。
     let xhci_domain = domain::create();
+    // 域 20 — iso9660_srv (ISO9660 只读文件服务, 03c 续: 安装介质): 无设备, 经 block_srv 卷层
+    // 读 CD/安装盘 (把 .iso 当裸块设备), 挂载于 /cdrom。
+    let iso9660_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -407,7 +410,7 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
-    video::println("[OK] IPC + capability + pager initialized (17 domains)");
+    video::println("[OK] IPC + capability + pager initialized (21 domains)");
 
     // 探测 NVMe 控制器并把设备**通用地**授权给 block 域（D1: 通用设备授权）:
     // 内核只负责 BAR 映射 / DMA 分配 / MSI-X / 能力签发, NVMe 的队列排版与协议在驱动里。
@@ -557,6 +560,11 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(block_domain, cap::Capability::SendTo(xhci_domain));
     cap::grant(block_domain, cap::Capability::MapInto(xhci_domain));
     cap::grant(xhci_domain, cap::Capability::SendTo(block_domain));
+
+    // 授权 (03c 续): ISO9660 只读文件服务 (域 20) 经 IPC 调 block_srv 读安装盘, 并把
+    // 缓冲页共享给它 (与 ext2_srv 同款: 只需 iso9660 → SendTo/MapInto block)。
+    cap::grant(iso9660_domain, cap::Capability::SendTo(block_domain));
+    cap::grant(iso9660_domain, cap::Capability::MapInto(block_domain));
 
     // 逐个加载服务 ELF 并起任务 (E3b: 镜像来自引导器交来的**模块表** —— 引导器已把它们
     // 读进 `LOADER_DATA` 页, 那些帧不在内核帧分配器的空闲池里, 故生命周期与内核一致)。

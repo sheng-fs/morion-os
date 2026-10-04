@@ -46,6 +46,8 @@ pub mod gfx;
 pub mod gfx_srv;
 #[cfg(feature = "svc-init")]
 pub mod init;
+#[cfg(feature = "svc-iso9660_srv")]
+pub mod iso9660_srv;
 #[cfg(feature = "svc-kbd")]
 pub mod kbd;
 #[cfg(feature = "svc-mfs_srv")]

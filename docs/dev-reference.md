@@ -9,7 +9,7 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：20 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4/03b, SATA/AHCI 读写) / `xhci_srv` (03c, USB/xHCI 存储读写) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：21 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4/03b, SATA/AHCI 读写) / `xhci_srv` (03c, USB/xHCI 存储读写) / `iso9660_srv` (03c 续, ISO9660 只读文件服务, 挂 `/cdrom`) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
 | `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
@@ -258,7 +258,7 @@ UEFI 固件
 - `create() -> u64`（返回域 id；域表是 `Vec<Option<Domain>>`，**运行时也能建**）
 - `destroy(id: u64) -> bool`（**销毁域**：摘除域表槽位 → 释放用户地址空间 → 清能力/句柄、邮箱、分页器、中断注册 → 摘除并终止它的任务、唤醒等它的任务。槽位归还以便复用；**不允许自我销毁**，门禁在 `SYS_DOMAIN_DESTROY`）
 - `request_destroy(id)` / `reclaim_pending()`（**退出即回收**的延迟机制：`SYS_EXIT` 时任务仍跑在自己的内核栈与页表上，不能就地销毁，故 `request_destroy` 只登记，由 `reclaim_pending` 在**别的任务**上下文（时钟 `tick`）真正销毁）
-- `is_boot(id)` / `BOOT_DOMAINS = 20`（**白名单**：引导期服务域 `0..19` 退出时不自动销毁；它们的槽位始终被占用，故「id < 20 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号，**D4** 由 18 扩到 19 给 `ahci_srv`(18) 腾号，**03c** 由 19 扩到 20 给 `xhci_srv`(19) 腾号）
+- `is_boot(id)` / `BOOT_DOMAINS = 21`（**白名单**：引导期服务域 `0..20` 退出时不自动销毁；它们的槽位始终被占用，故「id < 21 即引导域」是稳定不变量。**N0** 由 16 扩到 17 给 `net_srv`(16) 腾号，**D3** 由 17 扩到 18 给 `virtio_blk_srv`(17) 腾号，**D4** 由 18 扩到 19 给 `ahci_srv`(18) 腾号，**03c** 由 19 扩到 20 给 `xhci_srv`(19) 腾号，**03c 续** 由 20 扩到 21 给 `iso9660_srv`(20) 腾号）
 - `pml4_of(id: u64) -> u64`（返回该域 PML4 物理地址）
 - `is_alive(id: u64) -> bool` / `alive_count() -> usize`（自测取证用）
 - **域 id 必须复用**（`slot_for` 优先取第一个空槽）：域 id 是各全局表的下标（`cap`/`ipc`/`pager` 是 `Vec`，`irq::ANY_MASK` 是 `[u64; 64]`），单调增长会让反复"加载→销毁"迟早越界
@@ -418,7 +418,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv / 19 xhci_srv`（共 20 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv / 19 xhci_srv / 20 iso9660_srv`（共 21 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 服务监督者 init（E3c）
 
@@ -520,7 +520,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | `make iso` | 构建完整 ISO（`build/morion-os.iso`） |
 | `make run` | QEMU 运行（KVM） |
 | `make run-nokvm` | QEMU 运行（无 KVM） |
-| `make run-nvme` | **文件系统验证主用**：q35 + NVMe 单控制器**七** namespace（nsid1 `nvme.img` FAT32 / nsid2 `mfs.img` MorionFS / nsid3 `ext2.img` ext2 只读 / nsid4 `parts.img` MBR 分区测试盘 / nsid5 `exfat.img` exFAT 读写 / nsid6 `spare.img` 空白盘供 `mkfs.mfs` 自测 / nsid7 `pt.img` 分区表读写自测盘） |
+| `make run-nvme` | **文件系统验证主用**：q35 + NVMe 单控制器**八** namespace（nsid1 `nvme.img` FAT32 / nsid2 `mfs.img` MorionFS / nsid3 `ext2.img` ext2 只读 / nsid4 `parts.img` MBR 分区测试盘 / nsid5 `exfat.img` exFAT 读写 / nsid6 `spare.img` 空白盘供 `mkfs.mfs` 自测 / nsid7 `pt.img` 分区表读写自测盘 / nsid8 `iso.img` ISO9660 只读，`morion-os.iso` 的副本） |
 | `make run-ide` | IDE PIO 运行（回退验证路径） |
 | `make debug` | QEMU + GDB（`-s -S`） |
 | `make clean` / `check` / `clippy` | 清理 / 检查 / 静态检查 |
