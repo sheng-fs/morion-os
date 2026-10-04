@@ -690,15 +690,135 @@ fn icmp_responder_selftest(our_mac: u64, tx_va: u64) -> bool {
     inet_checksum_valid(icmp, info.payload_len)
 }
 
-/// 发一帧并等到设备消费完（TX used 环前进），保证 TX 缓冲可安全复用。
-fn tx_send(caps: &virtio::Caps, tx: &Vq, buf_pa: u64, len: u64) {
-    let before = tx.used_idx();
-    tx.set_desc(0, buf_pa, len as u32, 0, 0);
-    tx.avail_push(0);
-    tx.kick(caps, 1);
-    let mut spins = 0u32;
-    while tx.used_idx() == before && spins < 1_000_000 {
-        spins += 1;
+/// 收到的一帧: 在 RX DMA 缓冲里的坐标（已剥掉 virtio-net 头）。用完须 `recycle`。
+struct RxFrame {
+    /// 描述符号（补投回 avail 环用）。
+    id: u16,
+    /// RX 缓冲起始（含 virtio-net 头），供按需再解析头部的调用方。
+    buf_va: u64,
+    /// 完整长度（含 virtio-net 头）。
+    raw_len: u64,
+    /// 以太帧起始（去头之后）。
+    eth_va: u64,
+    /// 以太帧长度。
+    len: u64,
+}
+
+/// **帧级网卡抽象**（N5）：只收发以太帧 + 暴露 MAC，不含任何 IP/TCP 语义。
+///
+/// 把驱动细节（virtqueue / virtio-net 头 / RX 补投 / MSI-X 等待）收进这里，协议栈只经
+/// [`Nic::send`] / [`Nic::poll_rx`] / [`Nic::recycle`] / [`Nic::wait`] 交互 —— 为 N6 把协议栈
+/// 抽到独立服务（`netstack_srv`）铺路。**行为与重构前逐字一致**（纯等价重构）。
+struct Nic {
+    caps: virtio::Caps,
+    rx: Vq,
+    tx: Vq,
+    rx_size: u16,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    irq_mask: u64,
+    irq_vectors: u64,
+    /// RX used 环的消费游标（跨 DHCP 与主循环共用）。
+    last_used: u16,
+}
+
+impl Nic {
+    /// 建驱动态：投满 RX 缓冲 → `DRIVER_OK`（设备开始收包）。行为与 N2 一致。
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        caps: virtio::Caps,
+        rx: Vq,
+        tx: Vq,
+        rx_size: u16,
+        dma_vaddr: u64,
+        dma_paddr: u64,
+        irq_mask: u64,
+        irq_vectors: u64,
+    ) -> Nic {
+        let mut nic = Nic {
+            caps,
+            rx,
+            tx,
+            rx_size,
+            dma_vaddr,
+            dma_paddr,
+            irq_mask,
+            irq_vectors,
+            last_used: 0,
+        };
+        nic.post_rx_buffers();
+        nic.caps.driver_ok();
+        nic
+    }
+
+    /// 投满 RX 缓冲（每个描述符一格缓冲；设备收包时写进对应格）。批量投完再敲一次门铃。
+    fn post_rx_buffers(&mut self) {
+        let mut i = 0u16;
+        while i < self.rx_size {
+            let buf_pa = self.dma_paddr + RX_BUF_PAGE * PAGE + (i as u64) * BUF_SZ;
+            self.rx
+                .set_desc(i, buf_pa, BUF_SZ as u32, virtio::DESC_F_WRITE, 0);
+            self.rx.avail_push(i);
+            i += 1;
+        }
+        self.rx.kick(&self.caps, 0);
+    }
+
+    /// 发一帧（帧已构造在 `buf_pa` 起始的 TX 缓冲里）并**等设备消费完**（TX used 环前进），
+    /// 保证 TX 缓冲可安全复用。
+    fn send(&self, buf_pa: u64, len: u64) {
+        let before = self.tx.used_idx();
+        self.tx.set_desc(0, buf_pa, len as u32, 0, 0);
+        self.tx.avail_push(0);
+        self.tx.kick(&self.caps, 1);
+        let mut spins = 0u32;
+        while self.tx.used_idx() == before && spins < 1_000_000 {
+            spins += 1;
+        }
+    }
+
+    /// 排空 RX used 环，返回下一帧（无则 `None`）。含 virtio-net 头剥离与游标推进。
+    fn poll_rx(&mut self) -> Option<RxFrame> {
+        let used = self.rx.used_idx();
+        if self.last_used == used {
+            return None;
+        }
+        let slot = (self.last_used as u64) % (self.rx_size as u64);
+        let (id, rlen) = self.rx.used_elem(slot as u16);
+        self.last_used = self.last_used.wrapping_add(1);
+        let buf_va = self.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
+        Some(RxFrame {
+            id,
+            buf_va,
+            raw_len: rlen as u64,
+            eth_va: buf_va + VNET_HDR_LEN,
+            len: (rlen as u64).saturating_sub(VNET_HDR_LEN),
+        })
+    }
+
+    /// 把刚消费过的 RX 描述符补投回 avail 环（缓冲可复用）。
+    fn recycle(&self, id: u16) {
+        self.rx.avail_push(id);
+    }
+
+    /// 补投后敲一次 RX 门铃。
+    fn kick_rx(&self) {
+        self.rx.kick(&self.caps, 0);
+    }
+
+    /// 等下一次 RX 事件。有中断：快路径 `poll` 命中即返回，否则阻塞至多 `irq_poll_ms`；
+    /// 无中断：睡固定 20ms。返回 `(本次耗时 ms, 是否命中中断)`。
+    fn wait(&self, irq_poll_ms: u64) -> (u64, bool) {
+        if self.irq_vectors != 0 {
+            if sys_irq_poll(self.irq_mask) != 0 || sys_irq_wait(self.irq_mask, irq_poll_ms) != 0 {
+                (0, true)
+            } else {
+                (irq_poll_ms, false)
+            }
+        } else {
+            sys_sleep(20);
+            (20, false)
+        }
     }
 }
 
@@ -1103,20 +1223,8 @@ fn dhcp_build(buf_va: u64, mac: u64, msg_type: u8, req_ip: [u8; 4], server_id: [
     ipv4_finish(buf_va, ulen)
 }
 
-/// N3c：DHCP 客户端。`last_used` 是 RX used 环的消费游标（与随后主循环共用）；
-/// 成功返回租约并推进游标，超时返回 `None`（调用方回落默认地址）。
-#[allow(clippy::too_many_arguments)]
-fn dhcp_acquire(
-    caps: &virtio::Caps,
-    tx: &Vq,
-    rx: &Vq,
-    g: &DeviceGrant,
-    mac: u64,
-    rx_size: u16,
-    irq_mask: u64,
-    irq_vectors: u64,
-    last_used: &mut u16,
-) -> Option<DhcpLease> {
+/// N3c：DHCP 客户端。经帧级 [`Nic`] 收发；成功返回租约并推进 RX 游标，超时返回 `None`。
+fn dhcp_acquire(nic: &mut Nic, g: &DeviceGrant, mac: u64) -> Option<DhcpLease> {
     // DHCP 与随后的 ARP 串行，复用 ARP 的 TX 页（页 6），不额外占用 DMA 页。
     let tx_va = g.dma_vaddr + TX_BUF_PAGE * PAGE;
     let tx_pa = g.dma_paddr + TX_BUF_PAGE * PAGE;
@@ -1131,7 +1239,7 @@ fn dhcp_acquire(
     let mut got_ack = false;
 
     let len = dhcp_build(tx_va, mac, DHCP_DISCOVER, [0; 4], [0; 4]);
-    tx_send(caps, tx, tx_pa, len);
+    nic.send(tx_pa, len);
     println("net: DHCPDISCOVER sent (broadcast)");
 
     let mut ms: u64 = 0;
@@ -1139,23 +1247,16 @@ fn dhcp_acquire(
         // OFFER 到手就立刻发 REQUEST（并把 offered / server id 回填进去）。
         if got_offer && !request_sent {
             let len = dhcp_build(tx_va, mac, DHCP_REQUEST, offered, server_id);
-            tx_send(caps, tx, tx_pa, len);
+            nic.send(tx_pa, len);
             request_sent = true;
             print("net: DHCPREQUEST sent for ");
             print_ip(offered);
             println("");
         }
         // 排干 RX（把每个描述符补投回 avail 环）。
-        let used = rx.used_idx();
         let mut drained = 0u32;
-        while *last_used != used {
-            let slot = (*last_used as u64) % (rx_size as u64);
-            let (id, rlen) = rx.used_elem(slot as u16);
-            let rlen = rlen as u64;
-            let buf_va = g.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
-            let eth_va = buf_va + VNET_HDR_LEN;
-            let eth_len = rlen.saturating_sub(VNET_HDR_LEN);
-            if let Some((p, l, _s, _d)) = udp_payload(eth_va, eth_len, DHCP_CLIENT_PORT) {
+        while let Some(f) = nic.poll_rx() {
+            if let Some((p, l, _s, _d)) = udp_payload(f.eth_va, f.len, DHCP_CLIENT_PORT) {
                 if let Some((msg, yi, m, r, dn, sid)) = dhcp_parse(p, l, DHCP_XID) {
                     if msg == DHCP_ACK {
                         offered = yi;
@@ -1176,24 +1277,17 @@ fn dhcp_acquire(
                     }
                 }
             }
-            rx.avail_push(id);
-            *last_used = (*last_used).wrapping_add(1);
+            nic.recycle(f.id);
             drained += 1;
         }
         if drained > 0 {
-            rx.kick(caps, 0);
+            nic.kick_rx();
         }
         if got_ack {
             break;
         }
         // 有界等待（有中断优先，否则睡一小段）。
-        if irq_vectors != 0 {
-            let _ = sys_irq_poll(irq_mask) != 0 || sys_irq_wait(irq_mask, IRQ_WAIT_MS) != 0;
-            ms += IRQ_WAIT_MS;
-        } else {
-            sys_sleep(20);
-            ms += 20;
-        }
+        ms += nic.wait(IRQ_WAIT_MS).0;
     }
     if !got_ack {
         return None;
@@ -1342,34 +1436,22 @@ pub fn run() {
         println("net: no MSI-X (kernel gave no vectors/table window), polling");
     }
 
-    // 投满 RX 缓冲（每个描述符一格缓冲；设备收包时写进对应格）。批量投完再敲一次门铃。
-    let mut i = 0u16;
-    while i < rx_size {
-        let buf_pa = g.dma_paddr + RX_BUF_PAGE * PAGE + (i as u64) * BUF_SZ;
-        rx.set_desc(i, buf_pa, BUF_SZ as u32, virtio::DESC_F_WRITE, 0);
-        rx.avail_push(i);
-        i += 1;
-    }
-    rx.kick(&caps, 0);
-
-    // DRIVER_OK：驱动就绪，设备开始收包。
-    caps.driver_ok();
+    // 建驱动态：投满 RX 缓冲 → `DRIVER_OK`（设备开始收包）。此后一切收发都经帧级 `Nic`。
+    let mut nic = Nic::new(
+        caps,
+        rx,
+        tx,
+        rx_size,
+        g.dma_vaddr,
+        g.dma_paddr,
+        irq_mask,
+        irq_vectors,
+    );
     println("net: DRIVER_OK, RX buffers posted");
 
     // N3c：先走 DHCP 取租约（失败回落默认地址）。DHCP 与随后的 ARP 串行复用 TX 页 6；
-    // RX used 环消费游标 `last_used` 自这里开始，DHCP 消费后主循环接着往后走。
-    let mut last_used: u16 = 0;
-    match dhcp_acquire(
-        &caps,
-        &tx,
-        &rx,
-        &g,
-        mac,
-        rx_size,
-        irq_mask,
-        irq_vectors,
-        &mut last_used,
-    ) {
+    // RX used 环消费游标现由 `Nic` 内部维护，DHCP 消费后主循环接着往后走。
+    match dhcp_acquire(&mut nic, &g, mac) {
         Some(l) => {
             let gw = if l.gw == [0u8; 4] {
                 DEFAULT_GW_IP
@@ -1404,9 +1486,7 @@ pub fn run() {
     let ip_buf_pa = g.dma_paddr + IP_TX_BUF_PAGE * PAGE;
 
     let flen = arp_build(tx_buf_va, mac);
-    tx.set_desc(0, tx_buf_pa, flen as u32, 0, 0);
-    tx.avail_push(0);
-    tx.kick(&caps, 1);
+    nic.send(tx_buf_pa, flen);
     print("net: ARP request sent for 10.0.2.2 (gateway), frame len=");
     print_u64(flen);
     println("");
@@ -1455,19 +1535,15 @@ pub fn run() {
     let mut tcp_ms: u64 = 0;
     let mut tcp_done = false;
     loop {
-        let used_idx = rx.used_idx();
         let mut drained = 0u32;
-        while last_used != used_idx {
-            let slot = (last_used as u64) % (rx_size as u64);
-            let (id, len) = rx.used_elem(slot as u16);
+        while let Some(f) = nic.poll_rx() {
             rx_frames += 1;
             drained += 1;
-            let len = len as u64;
-            let buf_va = g.dma_vaddr + RX_BUF_PAGE * PAGE + (id as u64) * BUF_SZ;
-            let eth_va = buf_va + VNET_HDR_LEN;
-            let eth_len = len.saturating_sub(VNET_HDR_LEN);
+            let buf_va = f.buf_va;
+            let eth_va = f.eth_va;
+            let eth_len = f.len;
             // NET1：命中网关 ARP 应答即记下其 MAC 并打自测标记；同时写入/刷新 ARP 缓存。
-            if let Some(m) = gw_arp_reply_mac(buf_va, len) {
+            if let Some(m) = gw_arp_reply_mac(buf_va, f.raw_len) {
                 gw_mac = m;
                 arp_cache.insert(m);
                 if !arp_ok {
@@ -1494,7 +1570,7 @@ pub fn run() {
             }
             // 收到发往本机的 echo request → 回 echo reply（真实入站路径）。
             if let Some(rlen) = icmp_echo_reply_build(eth_va, eth_len, mac, ip_buf_va) {
-                tx_send(&caps, &tx, ip_buf_pa, rlen);
+                nic.send(ip_buf_pa, rlen);
                 println("net: icmp echo request answered");
             }
             // NET4：观察对真实对端 SYN 的回应（RST = 被拒；SYN-ACK = 完成握手并发数据）。
@@ -1532,7 +1608,7 @@ pub fn run() {
                                 TCP_WINDOW,
                                 b"",
                             );
-                            tx_send(&caps, &tx, ip_buf_pa, ack);
+                            nic.send(ip_buf_pa, ack);
                             let data = tcp_build(
                                 ip_buf_va,
                                 mac,
@@ -1547,7 +1623,7 @@ pub fn run() {
                                 TCP_WINDOW,
                                 b"MORION-N4",
                             );
-                            tx_send(&caps, &tx, ip_buf_pa, data);
+                            nic.send(ip_buf_pa, data);
                             tcp_peer = 1;
                             println("net: tcp handshake + data sent (SYN-ACK received)");
                         }
@@ -1555,11 +1631,10 @@ pub fn run() {
                 }
             }
             // 把同一个描述符补投回 avail 环，缓冲可被复用。
-            rx.avail_push(id);
-            last_used = last_used.wrapping_add(1);
+            nic.recycle(f.id);
         }
         if drained > 0 {
-            rx.kick(&caps, 0);
+            nic.kick_rx();
             print("net: rx frames=");
             print_u64(rx_frames);
             print(" irq_hits=");
@@ -1579,14 +1654,14 @@ pub fn run() {
                 b"MORION-N3B",
             );
             let ifl = ipv4_finish(ip_buf_va, ilen);
-            tx_send(&caps, &tx, ip_buf_pa, ifl);
+            nic.send(ip_buf_pa, ifl);
             icmp_sent = true;
             println("net: icmp echo request sent to 10.0.2.2");
 
             let upay = ipv4_build(ip_buf_va, mac, dst_mac, IP_PROTO_UDP, gw_ip());
             let ulen = udp_write(upay, TEST_UDP_SPORT, TEST_UDP_DPORT, b"MORION-UDP");
             let ufl = ipv4_finish(ip_buf_va, ulen);
-            tx_send(&caps, &tx, ip_buf_pa, ufl);
+            nic.send(ip_buf_pa, ufl);
             udp_sent = true;
             println("net: udp sent to 10.0.2.2:9999");
 
@@ -1605,7 +1680,7 @@ pub fn run() {
                 TCP_WINDOW,
                 b"",
             );
-            tx_send(&caps, &tx, ip_buf_pa, syn);
+            nic.send(ip_buf_pa, syn);
             tcp_syn_sent = true;
             println("net: tcp SYN sent to 10.0.2.2:12345");
         }
@@ -1640,18 +1715,10 @@ pub fn run() {
             println("");
             tcp_done = true;
         }
-        let mut elapsed_ms: u64 = 0;
-        if irq_vectors != 0 {
-            // 快路径 poll 命中就不睡；否则阻塞等下一次中断，超时回落重扫。
-            let hit = sys_irq_poll(irq_mask) != 0 || sys_irq_wait(irq_mask, IRQ_WAIT_MS) != 0;
-            if hit {
-                irq_hits += 1;
-            } else {
-                elapsed_ms = IRQ_WAIT_MS;
-            }
-        } else {
-            sys_sleep(20);
-            elapsed_ms = 20;
+        // 快路径 poll 命中就不睡；否则阻塞等下一次中断，超时回落重扫（无中断则睡）。
+        let (elapsed_ms, hit) = nic.wait(IRQ_WAIT_MS);
+        if hit {
+            irq_hits += 1;
         }
         if !net2_done {
             probe_ms += elapsed_ms;
@@ -1663,7 +1730,7 @@ pub fn run() {
         arp_cache.advance(elapsed_ms);
         if arp_cache.is_stale() {
             let flen = arp_build(tx_buf_va, mac);
-            tx_send(&caps, &tx, tx_buf_pa, flen);
+            nic.send(tx_buf_pa, flen);
             arp_cache.mark_refreshed();
             print("net: arp cache expired, re-ARP sent (hits=");
             print_u64(arp_cache.hits);
