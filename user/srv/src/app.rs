@@ -3389,6 +3389,9 @@ pub fn run() {
     // NET-5 (N6): 应用经 libnetv 用 UDP socket —— 端口能力门禁 + 回环收发 + 真实收帧。
     net5_udp_socket();
 
+    // NET-11 (N9.2): 经第二台真网卡 (e1000e, NIC1) 用**同一套** socket API —— 多网卡出口。
+    net11_udp_e1000e();
+
     // 34. FS-31 自测 (01 健壮性收口): 最小 fsck 对账口径的稳定性。
     //     客户机内无法制造「已分配但不可达」的 inode 泄漏 (那要在目录项插入与 inode 登记
     //     之间掉电), 故本自测断言**对一份结构一致的卷**: 报泄漏 inode = 0、可回收块 = 0;
@@ -3949,6 +3952,43 @@ fn net5_udp_socket() {
     sys_sleep(300);
     let _ = morion::net::close(sock);
     println("app: NET5 udp socket OK (cap-gate denial + loopback recv + tx probe)");
+}
+
+/// NET-11 (N9.2): 经第二台真网卡 (e1000e, NIC1) 用**同一套** socket API 收发。
+///
+/// 覆盖三件事:
+///   ① `socket_on(1)` 建在 NIC1 上, `bind(12345)` 复用 app 已有的端口能力;
+///   ② 回环发本机地址 → NIC1 路径投递回同一 socket, `recvfrom` 逐字节一致;
+///   ③ `sendto` 到网关 `10.0.2.2:9999` 走 e1000e 真实 TX, 帧经 e1000e_srv 发出后触发
+///      ICMP 端口不可达 —— netstack 打出 `nic1 rx (icmp unreachable)` 取证。
+fn net11_udp_e1000e() {
+    const PORT: u16 = 12345;
+    let sock = morion::net::socket_on(1);
+    if sock == 0 || !morion::net::bind(sock, PORT) {
+        println("app: NET11 e1000e socket/bind FAILED");
+        return;
+    }
+    let msg = b"MORION-N9";
+    if !morion::net::sendto(sock, PORT, morion::net::ip4(10, 0, 2, 15), msg) {
+        println("app: NET11 e1000e sendto(loopback) FAILED");
+        return;
+    }
+    let mut buf = [0u8; 32];
+    let n = morion::net::recvfrom(sock, &mut buf);
+    if n as usize != msg.len() || buf[..n as usize] != msg[..] {
+        println("app: NET11 e1000e loopback recv mismatch FAILED");
+        return;
+    }
+    // 真实 TX via e1000e: 触发链路发帧 (回程 ICMP 不可达由 netstack 的 nic1 路径打印)。
+    let _ = morion::net::sendto(
+        sock,
+        9999,
+        morion::net::ip4(10, 0, 2, 2),
+        b"MORION-N9-PROBE",
+    );
+    sys_sleep(300);
+    let _ = morion::net::close(sock);
+    println("app: NET11 udp via e1000e (nic1) OK (loopback + tx probe)");
 }
 
 /// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。

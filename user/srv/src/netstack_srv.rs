@@ -4,25 +4,33 @@
 //!
 //! ```text
 //! 应用 ── libnetv ──▶ netstack_srv(本服务: ARP/IPv4/UDP + socket + 端口能力门禁)
-//!                          │  帧级 IPC (NetReq, 帧走共享页 IO_VADDR)
-//!                          ▼
-//!                     net_srv(域 16: 纯 NIC 驱动)
+//!                          │  帧级 IPC (NetReq, 帧走共享页)
+//!                          ├──▶ net_srv(域 16: virtio-net)      = NIC 0
+//!                          └──▶ e1000e_srv(域 22: e1000e, N9)   = NIC 1
 //! ```
 //!
 //! **N6.5/N6.6**：实现 IPv4/UDP 与 UDP socket 服务；`bind` 时用 `SYS_NET_OWNER` 核对
 //! 发起域在内核登记的端口归属（不可伪造）；支持**本机自投递**（loopback，用途确定性自测）
 //! 与经真实网卡的收发（先 ARP 学网关 MAC，再发帧；收到的帧解析后投递给 socket）。
+//!
+//! **N9.2**：驱动/栈解耦的直接收益 —— 本服务不认识任何具体网卡，只按**网卡索引**（NIC index）
+//! 通过同一套 `NetReq` 收发裸以太帧。NIC 0 = virtio-net，NIC 1 = e1000e；socket 建时可指定
+//! 出口网卡，**上层 socket API 不变**（`socket_on(nic)` 只是在 `socket()` 上多带一个索引）。
 
 use crate::common::*;
 use morion::syscall::*;
 
-/// net_srv 域号（帧级 NIC 驱动）。
+/// NIC 0：net_srv（virtio-net，域 16）。
 const NET_DOMAIN: u64 = 16;
+/// NIC 1：e1000e_srv（e1000e，域 22，N9）。
+const E1000E_DOMAIN: u64 = 22;
+/// 各网卡收发帧的共享页（同址共享）。
+const IO0_VADDR: u64 = 0x0000_0080_001A_0000;
+const IO1_VADDR: u64 = 0x0000_0080_001A_1000;
+/// 网卡数量。
+const NIC_COUNT: usize = 2;
 
-/// net_srv 收发帧的共享页（同址共享）。
-const IO_VADDR: u64 = 0x0000_0080_001A_0000;
-
-/// 本机静态配置（与 net_srv 的 DHCP 回落值一致）。
+/// 本机静态配置（与网卡驱动的 DHCP 回落值一致）。
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 
@@ -83,30 +91,49 @@ fn put_mac(a: u64, m: [u8; 6]) {
 }
 
 // ---------------------------------------------------------------------------
-// 与 net_srv 的帧级通道
+// 网卡链路（帧级通道）
 // ---------------------------------------------------------------------------
 
-fn link_call(op: u64, len: u64) -> u64 {
-    let req = NetReq {
-        op,
-        len,
-        buf: IO_VADDR,
-    };
+/// 一条发送/接收裸以太帧的链路（对应内核交出的一台网卡驱动服务）。
+#[derive(Clone, Copy)]
+struct Link {
+    domain: u64,
+    io: u64,
+    mac: u64,
+    gw_mac: Option<[u8; 6]>,
+    up: bool,
+}
+
+impl Link {
+    const fn down(domain: u64, io: u64) -> Link {
+        Link {
+            domain,
+            io,
+            mac: 0,
+            gw_mac: None,
+            up: false,
+        }
+    }
+}
+
+/// 调一次链路的帧级 ops（`NET_OP_*`）。
+fn link_call(l: &Link, op: u64, len: u64) -> u64 {
+    let req = NetReq { op, len, buf: l.io };
     let b = unsafe {
         core::slice::from_raw_parts(
             &req as *const NetReq as *const u8,
             core::mem::size_of::<NetReq>(),
         )
     };
-    sys_call_payload(NET_DOMAIN, NET_REQ_TAG, b)
+    sys_call_payload(l.domain, NET_REQ_TAG, b)
 }
-/// 发一帧（帧已构造在 `IO_VADDR` 页里）。
-fn link_tx(len: u64) -> bool {
-    link_call(NET_OP_TX, len) == 1
+/// 发一帧（帧已构造在链路的共享页里）。
+fn link_tx(l: &Link, len: u64) -> bool {
+    link_call(l, NET_OP_TX, len) == 1
 }
-/// 收一帧到 `IO_VADDR`；返回帧长（无帧 `None`）。
-fn link_rx() -> Option<u64> {
-    let r = link_call(NET_OP_RX, 0);
+/// 收一帧到链路共享页；返回帧长（无帧 `None`）。
+fn link_rx(l: &Link) -> Option<u64> {
+    let r = link_call(l, NET_OP_RX, 0);
     if r == 0 || r == u64::MAX {
         None
     } else {
@@ -122,6 +149,8 @@ fn link_rx() -> Option<u64> {
 struct Sock {
     used: bool,
     port: u16,
+    /// 出口网卡索引。
+    nic: usize,
     len: u64,
     data: [u8; PAY_MAX],
 }
@@ -131,6 +160,7 @@ impl Sock {
         Sock {
             used: false,
             port: 0,
+            nic: 0,
             len: 0,
             data: [0; PAY_MAX],
         }
@@ -138,8 +168,7 @@ impl Sock {
 }
 
 struct Stack {
-    mac: u64,
-    gw_mac: Option<[u8; 6]>,
+    links: [Link; NIC_COUNT],
     socks: [Sock; MAX_SOCKS],
 }
 
@@ -153,18 +182,18 @@ fn idle() -> ! {
 // 帧构造 / 解析
 // ---------------------------------------------------------------------------
 
-/// 广播一个 ARP 请求问 `target` 的 MAC；写进 `IO_VADDR`，返回帧长。
-fn build_arp_request(our_mac: u64, target: [u8; 4]) -> u64 {
-    let f = IO_VADDR;
+/// 在某链路的共享页里拼一个广播 ARP 请求问 `target` 的 MAC；返回帧长。
+fn build_arp_request(l: &Link, target: [u8; 4]) -> u64 {
+    let f = l.io;
     put_mac(f, [0xff; 6]);
-    put_mac(f + 6, mac_bytes(our_mac));
+    put_mac(f + 6, mac_bytes(l.mac));
     wr16be(f + 12, ETH_ARP);
     wr16be(f + 14, 0x0001); // htype = Ethernet
     wr16be(f + 16, ETH_IPV4); // ptype = IPv4
     wr8(f + 18, 6);
     wr8(f + 19, 4);
     wr16be(f + 20, 0x0001); // oper = request
-    put_mac(f + 22, mac_bytes(our_mac));
+    put_mac(f + 22, mac_bytes(l.mac));
     for (i, b) in OUR_IP.iter().enumerate() {
         wr8(f + 28 + i as u64, *b);
     }
@@ -175,9 +204,9 @@ fn build_arp_request(our_mac: u64, target: [u8; 4]) -> u64 {
     42
 }
 
-/// 把 UDP 数据报构造进 `IO_VADDR`（负载从 `payload_va` 拷入），返回帧长。
+/// 把 UDP 数据报构造进链路共享页（负载从 `payload_va` 拷入），返回帧长。
 fn build_udp(
-    st: &Stack,
+    l: &Link,
     dst_mac: [u8; 6],
     dst_ip: [u8; 4],
     sport: u16,
@@ -185,9 +214,9 @@ fn build_udp(
     payload_va: u64,
     plen: u64,
 ) -> u64 {
-    let f = IO_VADDR;
+    let f = l.io;
     put_mac(f, dst_mac);
-    put_mac(f + 6, mac_bytes(st.mac));
+    put_mac(f + 6, mac_bytes(l.mac));
     wr16be(f + 12, ETH_IPV4);
     let ip = f + 14;
     wr8(ip, 0x45);
@@ -219,15 +248,15 @@ fn build_udp(
     14 + 20 + 8 + plen
 }
 
-/// 学网关 MAC（发 ARP 请求 + 有界收包）。取不到则保持在 `None`。
-fn arp_learn_gw(st: &mut Stack) {
+/// 学某网卡的网关 MAC（发 ARP 请求 + 有界收包）。取不到则保持 `None`。
+fn arp_learn_gw(st: &mut Stack, nic: usize) {
     let mut tries = 0u64;
-    while st.gw_mac.is_none() && tries < 40 {
-        let len = build_arp_request(st.mac, GW_IP);
-        let _ = link_tx(len);
+    while st.links[nic].gw_mac.is_none() && tries < 40 {
+        let len = build_arp_request(&st.links[nic], GW_IP);
+        let _ = link_tx(&st.links[nic], len);
         for _ in 0..5 {
-            if let Some(n) = link_rx() {
-                handle_frame(st, n);
+            if let Some(n) = link_rx(&st.links[nic]) {
+                handle_frame(st, nic, n);
             }
             sys_sleep(10);
         }
@@ -235,18 +264,18 @@ fn arp_learn_gw(st: &mut Stack) {
     }
 }
 
-/// 处理一帧（帧在 `IO_VADDR`，长 `n`）。
-fn handle_frame(st: &mut Stack, n: u64) {
+/// 处理某网卡收到的一帧（帧在链路共享页，长 `n`）。
+fn handle_frame(st: &mut Stack, nic: usize, n: u64) {
     if n < 14 {
         return;
     }
-    let f = IO_VADDR;
+    let f = st.links[nic].io;
     let et = rd16be(f + 12);
     if et == ETH_ARP {
         if n >= 42 && rd16be(f + 20) == 0x0002 {
             let sip = [rd8(f + 28), rd8(f + 29), rd8(f + 30), rd8(f + 31)];
             if sip == GW_IP {
-                st.gw_mac = Some([
+                st.links[nic].gw_mac = Some([
                     rd8(f + 22),
                     rd8(f + 23),
                     rd8(f + 24),
@@ -274,7 +303,11 @@ fn handle_frame(st: &mut Stack, n: u64) {
     if proto == IP_PROTO_ICMP {
         let ic = ip + ihl;
         if n > 14 + ihl && rd8(ic) == ICMP_UNREACH {
-            println("netstack: nic rx (icmp unreachable) OK");
+            print("netstack: nic");
+            if nic != 0 {
+                print_u64(nic as u64);
+            }
+            println(" rx (icmp unreachable) OK");
         }
         return;
     }
@@ -283,15 +316,15 @@ fn handle_frame(st: &mut Stack, n: u64) {
         let dport = rd16be(udp + 2);
         let ulen = rd16be(udp + 4) as u64;
         if ulen >= 8 && n >= 14 + ihl + ulen {
-            deliver(st, dport, udp + 8, ulen - 8);
+            deliver(st, nic, dport, udp + 8, ulen - 8);
         }
     }
 }
 
-/// 把负载投递给绑定 `dport` 的 socket。
-fn deliver(st: &mut Stack, dport: u16, src_va: u64, len: u64) {
+/// 把负载投递给**绑在该网卡**上、绑定 `dport` 的 socket。
+fn deliver(st: &mut Stack, nic: usize, dport: u16, src_va: u64, len: u64) {
     for s in st.socks.iter_mut() {
-        if s.used && s.port == dport && len <= PAY_MAX as u64 {
+        if s.used && s.nic == nic && s.port == dport && len <= PAY_MAX as u64 {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src_va as *const u8,
@@ -309,11 +342,12 @@ fn deliver(st: &mut Stack, dport: u16, src_va: u64, len: u64) {
 // 套接字服务（应用侧 IPC）
 // ---------------------------------------------------------------------------
 
-fn sock_alloc(st: &mut Stack) -> u64 {
+fn sock_alloc(st: &mut Stack, nic: usize) -> u64 {
     for (i, s) in st.socks.iter_mut().enumerate() {
         if !s.used {
             *s = Sock::new();
             s.used = true;
+            s.nic = nic;
             return (i + 1) as u64;
         }
     }
@@ -346,15 +380,18 @@ fn sock_bind(st: &mut Stack, id: u64, port: u16, from: u64) -> u64 {
     }
 }
 
-/// `NETS_OP_SENDTO`: 本机目标走回环投递；否则经真实网卡发（需已知网关 MAC）。
+/// `NETS_OP_SENDTO`: 本机目标走回环投递；否则经 socket 所属网卡发（需已知网关 MAC）。
 fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
     if req.buf == 0 || req.len == 0 || req.len > PAY_MAX as u64 || sys_virt_to_phys(req.buf) == 0 {
         return 0;
     }
-    let sport = match sock_slot(st, req.sock) {
-        Some(s) => s.port,
+    let (sport, nic) = match sock_slot(st, req.sock) {
+        Some(s) => (s.port, s.nic),
         None => return 0,
     };
+    if nic >= NIC_COUNT || !st.links[nic].up {
+        return 0;
+    }
     let dst = [
         ((req.addr >> 24) & 0xff) as u8,
         ((req.addr >> 16) & 0xff) as u8,
@@ -363,13 +400,13 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
     ];
     let dport = req.port as u16;
     if dst == OUR_IP {
-        deliver(st, dport, req.buf, req.len); // 回环（用途确定性自测）
+        deliver(st, nic, dport, req.buf, req.len); // 回环（用途确定性自测）
         return 1;
     }
-    match st.gw_mac {
+    match st.links[nic].gw_mac {
         Some(gm) => {
-            let len = build_udp(st, gm, dst, sport, dport, req.buf, req.len);
-            if link_tx(len) {
+            let len = build_udp(&st.links[nic], gm, dst, sport, dport, req.buf, req.len);
+            if link_tx(&st.links[nic], len) {
                 1
             } else {
                 0
@@ -423,7 +460,14 @@ fn serve_app(st: &mut Stack) {
         let req: NetSReq =
             unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const NetSReq) };
         let reply = match req.op {
-            NETS_OP_SOCKET => sock_alloc(st),
+            // SOCKET: `sock` 字段 = 请求的网卡索引（0/1）。
+            NETS_OP_SOCKET => {
+                if (req.sock as usize) < NIC_COUNT {
+                    sock_alloc(st, req.sock as usize)
+                } else {
+                    0
+                }
+            }
             NETS_OP_BIND => sock_bind(st, req.sock, req.port as u16, msg.from),
             NETS_OP_SENDTO => sock_sendto(st, &req),
             NETS_OP_RECVFROM => sock_recvfrom(st, &req),
@@ -440,56 +484,88 @@ fn serve_app(st: &mut Stack) {
 
 /// 域 21 — netstack_srv 入口。
 pub fn run() {
-    if sys_alloc_page(IO_VADDR) != 1 || sys_share_page(IO_VADDR, NET_DOMAIN) != 1 {
+    let mut st = Stack {
+        links: [
+            Link::down(NET_DOMAIN, IO0_VADDR),
+            Link::down(E1000E_DOMAIN, IO1_VADDR),
+        ],
+        socks: [Sock::new(); MAX_SOCKS],
+    };
+
+    // NIC 0：virtio-net（必需）。分配帧页并共享给 net_srv。
+    if sys_alloc_page(IO0_VADDR) != 1 || sys_share_page(IO0_VADDR, NET_DOMAIN) != 1 {
         println("netstack: cannot share IO page with net_srv, idle");
         idle();
     }
+    // NIC 1：e1000e（可选）。页面照分配+共享；驱动给的 MAC 为 0 即视为不在。
+    let _ = sys_alloc_page(IO1_VADDR);
+    let _ = sys_share_page(IO1_VADDR, E1000E_DOMAIN);
 
-    // 取网卡 MAC（net_srv 可能还在跑自测，重试）。
-    let mut mac = 0u64;
+    // 取 NIC 0 的 MAC（net_srv 可能还在跑自测，重试）。
+    let mut mac0 = 0u64;
     let mut i = 0u64;
     while i < 200 {
-        mac = link_call(NET_OP_INFO, 0);
-        if mac != 0 {
+        mac0 = link_call(&st.links[0], NET_OP_INFO, 0);
+        if mac0 != 0 {
             break;
         }
         sys_sleep(50);
         i += 1;
     }
-    if mac == 0 {
+    if mac0 == 0 {
         println("netstack: no NIC (net_srv gave no MAC), idle");
         idle();
     }
-
-    let mut st = Stack {
-        mac,
-        gw_mac: None,
-        socks: [Sock::new(); MAX_SOCKS],
-    };
-    // 学网关 MAC（同时验证 netstack 的 TX + RX 路径）。
-    arp_learn_gw(&mut st);
+    st.links[0].mac = mac0;
+    st.links[0].up = true;
+    arp_learn_gw(&mut st, 0);
 
     print("netstack: up (frame link to net_srv OK), nic mac=0x");
-    print_hex(mac);
-    if st.gw_mac.is_some() {
+    print_hex(mac0);
+    if st.links[0].gw_mac.is_some() {
         print(", gw mac learned");
     } else {
         print(", gw mac timeout");
     }
     println("");
 
-    // 主循环: 服务应用请求 + 排空 NIC RX。
+    // NIC 1：e1000e（best-effort）。学网关 MAC 同时验证该网卡的 TX + RX 路径。
+    let mac1 = link_call(&st.links[1], NET_OP_INFO, 0);
+    if mac1 != 0 {
+        st.links[1].mac = mac1;
+        st.links[1].up = true;
+        arp_learn_gw(&mut st, 1);
+        print("netstack: nic1 up (e1000e OK), mac=0x");
+        print_hex(mac1);
+        if st.links[1].gw_mac.is_some() {
+            print(", gw mac learned");
+        } else {
+            print(", gw mac timeout");
+        }
+        println("");
+    } else {
+        println("netstack: nic1 absent (no e1000e)");
+    }
+
+    // 主循环: 服务应用请求 + 排空各网卡 RX。
     loop {
         serve_app(&mut st);
-        let mut n = 0;
-        while n < 8 {
-            match link_rx() {
-                Some(len) => {
-                    handle_frame(&mut st, len);
-                    n += 1;
+        let mut nic = 0;
+        while nic < NIC_COUNT {
+            if st.links[nic].up {
+                let mut n = 0;
+                while n < 8 {
+                    let got = link_rx(&st.links[nic]);
+                    match got {
+                        Some(len) => {
+                            handle_frame(&mut st, nic, len);
+                            n += 1;
+                        }
+                        None => break,
+                    }
                 }
-                None => break,
             }
+            nic += 1;
         }
         sys_sleep(10);
     }

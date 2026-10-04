@@ -219,7 +219,7 @@ grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
 # (端口能力门禁拒绝越权 + 回环收发 + 真实 TX 触发 ICMP 不可达回程)。任一缺即判失败。
 net_bad=0
 echo "== 网络能力自测 (N5/N6: NET1..NET4 + netstack + NET5) =="
-grep -nE 'NET1|NET2|NET3|NET4|NET9|netstack:|app: NET5|e1000e:' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'NET1|NET2|NET3|NET4|NET9|NET11|netstack:|app: NET5|e1000e:' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'NET1 virtio-net up, MAC=.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET3 dhcp OK, ip=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET2 ipv4/icmp OK.*udp TX 10.0.2.2:9999 -> icmp unreachable' "$log" 2>/dev/null || net_bad=1
@@ -229,6 +229,11 @@ grep -qE 'app: NET5 udp socket OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'netstack: nic rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 # N9 (第二台真网卡): e1000e 读 MAC + 广播 ARP 收应答 → `NET9 e1000e OK … ARP reply OK`。
 grep -qE 'NET9 e1000e OK.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
+# N9.2 (多网卡出口): 协议栈把 e1000e 当 NIC1 拉起 (同一套帧级 IPC), 应用经 NIC1 用同一套
+# socket API 收发 (回环 + 真实 TX 触发 ICMP 不可达回程)。上层 socket API 不变。
+grep -qE 'netstack: nic1 up \(e1000e OK\)' "$log" 2>/dev/null || net_bad=1
+grep -qE 'app: NET11 udp via e1000e \(nic1\) OK' "$log" 2>/dev/null || net_bad=1
+grep -qE 'netstack: nic1 rx \(icmp unreachable\) OK' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。

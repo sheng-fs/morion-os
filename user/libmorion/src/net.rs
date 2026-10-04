@@ -69,10 +69,15 @@ fn call(op: u64, sock: u64, port: u64, addr: u64, len: u64) -> u64 {
 
 /// 建一个 UDP socket；失败返回 0。
 pub fn socket() -> u64 {
+    socket_on(0)
+}
+
+/// 建一个绑定到出口网卡 `nic` 的 UDP socket（N9.2 多网卡：0=virtio-net, 1=e1000e）。
+pub fn socket_on(nic: u64) -> u64 {
     if !ensure() {
         return 0;
     }
-    call(NETS_OP_SOCKET, 0, 0, 0, 0)
+    call(NETS_OP_SOCKET, nic, 0, 0, 0)
 }
 
 /// 绑定本地端口 `port`：先经内核登记归属（需 `Net` 能力），再让协议栈生效。

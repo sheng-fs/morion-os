@@ -127,7 +127,7 @@ pub const NETSTACK_DOMAIN: u64 = 21;
 
 /// 套接字服务请求 tag（N6.5）: 应用经 `libnetv` 与 netstack_srv 交互。
 pub const NETS_REQ_TAG: u64 = 0x4E53_544B; // "NSTK"
-/// 建 socket; 回复 socket id（>0）/ 0。
+/// 建 socket; 回复 socket id（>0）/ 0。请求里 `sock` 字段 = 出口网卡索引（N9.2: 0=virtio-net, 1=e1000e）。
 pub const NETS_OP_SOCKET: u64 = 0;
 /// 绑端口（需内核 `Net` 能力）; 回复 1/0。
 pub const NETS_OP_BIND: u64 = 1;
