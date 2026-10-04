@@ -3393,8 +3393,9 @@ pub fn run() {
     net_ok &= net11_udp_e1000e(); // N9.2: 经第二台真网卡 (e1000e) 出口
     net_ok &= net12_tcp_client(); // N7.2: TCP socket 主动连接真实对端
     net_ok &= net8_dns(); // N8: DNS 最小解析
+    net_ok &= net13_http(); // N8.2: 回环 TCP + 客户机内建 HTTP 服务
     if net_ok {
-        println("app: NET7 app socket OK (udp + nic1 + tcp + dns)");
+        println("app: NET7 app socket OK (udp + nic1 + tcp + dns + http)");
     } else {
         println("app: NET7 app socket FAILED");
     }
@@ -4059,6 +4060,73 @@ fn print_ip(ip: [u8; 4]) {
     print_u64(ip[2] as u64);
     print(".");
     print_u64(ip[3] as u64);
+}
+
+/// 子串查找（`naive`）。
+fn contains(h: &[u8], n: &[u8]) -> bool {
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let mut j = 0;
+        while j < n.len() && h[i + j] == n[j] {
+            j += 1;
+        }
+        if j == n.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// NET-13 (N8.2): 经**回环 TCP** 从客户机内建 HTTP 服务 (`10.0.2.15:80`) 取一个页面。
+///
+/// 这是 N8.2 的端到端验收：真实 TCP 三次握手（被动打开）+ 请求/响应 + FIN，全部在客户机内
+/// 完成（netstack 内建 HTTP 服务即"环境"），无需任何外部服务端。
+fn net13_http() -> bool {
+    const CPORT: u16 = 12348;
+    let sock = morion::net::tcp_socket();
+    if sock == 0 || !morion::net::tcp_bind(sock, CPORT) {
+        println("app: NET13 http socket/bind FAILED");
+        return false;
+    }
+    if !morion::net::tcp_connect(sock, morion::net::ip4(10, 0, 2, 15), 80) {
+        println("app: NET13 http connect FAILED");
+        return false;
+    }
+    if !morion::net::tcp_send(sock, b"GET / HTTP/1.0\r\nHost: 10.0.2.15\r\n\r\n") {
+        println("app: NET13 http send FAILED");
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let mut got = 0u64;
+    let mut i = 0;
+    while i < 50 {
+        let n = morion::net::tcp_recv(sock, &mut buf);
+        if n > 0 {
+            got = n;
+            break;
+        }
+        sys_sleep(20);
+        i += 1;
+    }
+    let _ = morion::net::tcp_close(sock);
+    if got == 0 {
+        println("app: NET13 http no response FAILED");
+        return false;
+    }
+    let resp = &buf[..got as usize];
+    if !contains(resp, b"200 OK") || !contains(resp, b"morion-guest-httpd") {
+        println("app: NET13 http response mismatch FAILED");
+        return false;
+    }
+    println("app: NET13 http OK (loopback tcp + guest httpd, 200 + body)");
+    true
 }
 
 /// 轮询等待某域"有/没有存活任务", 最多等 `budget_ms`。

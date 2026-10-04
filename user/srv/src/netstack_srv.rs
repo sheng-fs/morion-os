@@ -35,7 +35,7 @@ const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 
 const MAX_SOCKS: usize = 4;
-const MAX_TCONS: usize = 4;
+const MAX_TCONS: usize = 6;
 const PAY_MAX: usize = NETS_PAYLOAD_MAX as usize;
 
 const ETH_IPV4: u16 = 0x0800;
@@ -323,9 +323,7 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
         if let Some(info) = ipv4_parse(f, n) {
             if let Some(seg) = tcp_parse(&info) {
                 let len = tcp_input(st, nic, info.src, &seg, now);
-                if len > 0 {
-                    let _ = link_tx(&st.links[nic], len);
-                }
+                tcp_emit_deliver(st, nic, len, now);
             }
         }
         return;
@@ -569,11 +567,13 @@ fn tcp_build(
     14 + 20 + seg_len
 }
 
-/// TCP 连接状态（客户端侧子集）。
+/// TCP 连接状态（含主动/被动打开子集）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TcpState {
     Closed,
+    Listen,
     SynSent,
+    SynRcvd,
     Established,
     FinWait1,
     FinWait2,
@@ -581,10 +581,17 @@ enum TcpState {
     TimeWait,
 }
 
-/// 一条 TCP 连接。
+/// 连接在协议栈里的角色。
+const TCP_ROLE_CLIENT: u8 = 0;
+const TCP_ROLE_LISTENER: u8 = 1;
+const TCP_ROLE_SERVER: u8 = 2;
+
+/// 一条 TCP 连接（客户端/监听者/被接受的连接共用）。
 #[derive(Clone, Copy)]
 struct TcpConn {
     used: bool,
+    /// [`TCP_ROLE_CLIENT`] / [`TCP_ROLE_LISTENER`] / [`TCP_ROLE_SERVER`]。
+    role: u8,
     state: TcpState,
     nic: usize,
     mac: u64,
@@ -607,12 +614,15 @@ struct TcpConn {
     /// 收妥的对端数据。
     rx_len: u64,
     rx: [u8; PAY_MAX],
+    /// 服务端连接是否已被 `accept` 取走。
+    accepted: bool,
 }
 
 impl TcpConn {
     const fn new() -> TcpConn {
         TcpConn {
             used: false,
+            role: TCP_ROLE_CLIENT,
             state: TcpState::Closed,
             nic: 0,
             mac: 0,
@@ -630,6 +640,7 @@ impl TcpConn {
             tx: [0; TCP_MSS],
             rx_len: 0,
             rx: [0; PAY_MAX],
+            accepted: false,
         }
     }
 }
@@ -720,6 +731,36 @@ fn tcp_handle(conn: &mut TcpConn, io: u64, seg: &TcpSeg, now: u64) -> u64 {
                 conn.rto_ms = TCP_RTO_MS;
                 conn.last_tx_ms = now;
                 conn.state = TcpState::Established;
+                return tcp_seg(conn, io, conn.snd_nxt, conn.rcv_nxt, TCP_ACK, &[]);
+            }
+            0
+        }
+        TcpState::SynRcvd => {
+            if seg.flags & TCP_RST != 0 {
+                conn.state = TcpState::Closed;
+                return 0;
+            }
+            let mut need_ack = false;
+            if seg.flags & TCP_ACK != 0 && seg.ack == conn.snd_nxt && conn.snd_una != conn.snd_nxt {
+                conn.snd_una = conn.snd_nxt;
+                conn.state = TcpState::Established;
+                conn.retx = 0;
+                conn.rto_ms = TCP_RTO_MS;
+            }
+            if seg.payload_len > 0 && seg.seq == conn.rcv_nxt {
+                let n = seg.payload_len.min(PAY_MAX as u64);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        seg.payload_off as *const u8,
+                        conn.rx.as_mut_ptr(),
+                        n as usize,
+                    );
+                }
+                conn.rx_len = n;
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.payload_len as u32);
+                need_ack = true;
+            }
+            if need_ack {
                 return tcp_seg(conn, io, conn.snd_nxt, conn.rcv_nxt, TCP_ACK, &[]);
             }
             0
@@ -1042,6 +1083,76 @@ fn tcp_open(st: &mut Stack, nic: usize) -> u64 {
     0
 }
 
+/// 建一个监听者（被动打开）。返回连接 id（>0）/ 0。内核端口门禁由调用方负责。
+fn tcp_listen_internal(st: &mut Stack, nic: usize, port: u16) -> u64 {
+    if nic >= NIC_COUNT {
+        return 0;
+    }
+    let mut i = 0;
+    while i < MAX_TCONS {
+        if !st.tcons[i].used {
+            let mut c = TcpConn::new();
+            c.used = true;
+            c.role = TCP_ROLE_LISTENER;
+            c.state = TcpState::Listen;
+            c.nic = nic;
+            c.local_port = port;
+            c.mac = st.links[nic].mac;
+            st.tcons[i] = c;
+            return (i + 1) as u64;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// 接受一个已建立的服务端连接（属于监听端口 `port`），返回其 id（>0）/ 0。
+fn tcp_accept_internal(st: &mut Stack, port: u16) -> u64 {
+    let mut i = 0;
+    while i < MAX_TCONS {
+        let c = &st.tcons[i];
+        if c.used
+            && c.role == TCP_ROLE_SERVER
+            && c.state == TcpState::Established
+            && !c.accepted
+            && c.local_port == port
+        {
+            st.tcons[i].accepted = true;
+            return (i + 1) as u64;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// 内建 HTTP 服务的固定响应（`Content-Length` 与 body 一致：`hello from morion-guest-httpd\n` = 30 字节）。
+const HTTP_PORT: u16 = 80;
+const HTTP_RESP: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 30\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from morion-guest-httpd\n";
+
+/// 内建 HTTP 服务：对被接受、已建立且已收到数据的服务端连接回一个固定响应并关闭。
+///
+/// 这是客户机内的"**环境**" —— 应用/shell 的 `wget` 可对 `10.0.2.15:80` 发起真实 HTTP `GET`，
+/// 数据经上述**回环 TCP** 走完整协议栈（握手/收发/FIN），无需任何外部服务端。
+fn http_serve(st: &mut Stack, now: u64) {
+    let mut i = 0;
+    while i < MAX_TCONS {
+        let ready = st.tcons[i].used
+            && st.tcons[i].role == TCP_ROLE_SERVER
+            && st.tcons[i].state == TcpState::Established
+            && st.tcons[i].rx_len > 0;
+        if ready {
+            let nic = st.tcons[i].nic;
+            let io = st.links[nic].io;
+            st.tcons[i].rx_len = 0; // 消费请求，避免重复响应
+            let fl = tcp_send(&mut st.tcons[i], io, HTTP_RESP, now);
+            tcp_emit_deliver(st, nic, fl, now);
+            let fin = tcp_close(&mut st.tcons[i], io, now);
+            tcp_emit_deliver(st, nic, fin, now);
+        }
+        i += 1;
+    }
+}
+
 fn tcp_slot(st: &mut Stack, id: u64) -> Option<&mut TcpConn> {
     if id == 0 || id as usize > MAX_TCONS {
         return None;
@@ -1095,7 +1206,8 @@ fn tcp_connect_op(st: &mut Stack, id: u64, addr: u64, port: u64, now: u64) -> u6
     c.dst_mac = dst_mac;
     let isn = 0x4d4f_0000u32 ^ (id as u32).wrapping_mul(0x0101_0101);
     let len = tcp_connect(c, io, isn, now);
-    if link_tx(&st.links[nic], len) {
+    tcp_emit_deliver(st, nic, len, now);
+    if len > 0 {
         1
     } else {
         0
@@ -1113,7 +1225,8 @@ fn tcp_send_op(st: &mut Stack, id: u64, buf: u64, len: u64, now: u64) -> u64 {
     let io = st.links[nic].io;
     let payload = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
     let fl = tcp_send(&mut st.tcons[id as usize - 1], io, payload, now);
-    if fl > 0 && link_tx(&st.links[nic], fl) {
+    tcp_emit_deliver(st, nic, fl, now);
+    if fl > 0 {
         1
     } else {
         0
@@ -1144,15 +1257,14 @@ fn tcp_close_op(st: &mut Stack, id: u64, now: u64) -> u64 {
     };
     let io = st.links[nic].io;
     let fl = tcp_close(&mut st.tcons[id as usize - 1], io, now);
-    if fl > 0 && link_tx(&st.links[nic], fl) {
-        1
-    } else {
+    tcp_emit_deliver(st, nic, fl, now);
+    if fl == 0 {
         // 已经关闭 / 处于不可关状态：直接释放槽位。
         if id != 0 && (id as usize) <= MAX_TCONS {
             st.tcons[id as usize - 1] = TcpConn::new();
         }
-        1
     }
+    1
 }
 
 /// 处理某网卡收到的一个 TCP 段；若有回应段，构造在链路共享页并返回帧长。
@@ -1174,7 +1286,68 @@ fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64
         i += 1;
     }
     if idx == usize::MAX {
-        return 0;
+        // 被动打开: 找在该端口上监听的监听者; 仅 SYN 建连。
+        if seg.flags & TCP_SYN == 0 {
+            return 0;
+        }
+        let mut li = usize::MAX;
+        let mut k = 0;
+        while k < MAX_TCONS {
+            let c = &st.tcons[k];
+            if c.used
+                && c.role == TCP_ROLE_LISTENER
+                && c.state == TcpState::Listen
+                && c.nic == nic
+                && c.local_port == seg.dport
+            {
+                li = k;
+                break;
+            }
+            k += 1;
+        }
+        if li == usize::MAX {
+            return 0;
+        }
+        let mut si = usize::MAX;
+        let mut m = 0;
+        while m < MAX_TCONS {
+            if !st.tcons[m].used {
+                si = m;
+                break;
+            }
+            m += 1;
+        }
+        if si == usize::MAX {
+            return 0;
+        }
+        // 新建服务端连接 (SynRcvd), 回 SYN-ACK。
+        let mut c = TcpConn::new();
+        c.used = true;
+        c.role = TCP_ROLE_SERVER;
+        c.state = TcpState::SynRcvd;
+        c.nic = nic;
+        c.mac = st.links[nic].mac;
+        c.dst_mac = st.links[nic].gw_mac.unwrap_or([0; 6]);
+        c.local_port = seg.dport;
+        c.remote_ip = src_ip;
+        c.remote_port = seg.sport;
+        c.rcv_nxt = seg.seq.wrapping_add(1);
+        c.snd_una = 0x4d4f_9000u32 ^ (si as u32).wrapping_mul(0x0101);
+        c.snd_nxt = c.snd_una;
+        c.rto_ms = TCP_RTO_MS;
+        c.last_tx_ms = now;
+        st.tcons[si] = c;
+        let io = st.links[nic].io;
+        let len = tcp_seg(
+            &st.tcons[si],
+            io,
+            st.tcons[si].snd_una,
+            st.tcons[si].rcv_nxt,
+            TCP_SYN | TCP_ACK,
+            &[],
+        );
+        st.tcons[si].snd_nxt = st.tcons[si].snd_una.wrapping_add(1);
+        return len;
     }
     let was = st.tcons[idx].state;
     let len = tcp_handle(&mut st.tcons[idx], io, seg, now);
@@ -1187,6 +1360,43 @@ fn tcp_input(st: &mut Stack, nic: usize, src_ip: [u8; 4], seg: &TcpSeg, now: u64
     len
 }
 
+/// 把 `io` 里已构造好的一个段送出：目的为本机 (`OUR_IP`) 走**回环**投递给栈内对端，
+/// 否则经网卡发到链路上。
+fn tcp_emit_deliver(st: &mut Stack, nic: usize, len: u64, now: u64) {
+    if len == 0 {
+        return;
+    }
+    let io = st.links[nic].io;
+    let local = match ipv4_parse(io, len) {
+        Some(info) => info.dst == OUR_IP,
+        None => false,
+    };
+    if local {
+        lo_pump(st, nic, len, now);
+    } else {
+        let _ = link_tx(&st.links[nic], len);
+    }
+}
+
+/// 本机回环 pump：把 `io` 里的段当作"从 `OUR_IP` 收到"反复投递给栈，直到不再产生回应。
+/// 每次回应覆盖 `io`；`guard` 防死循环。这样客户机内客户端↔服务端可完成完整握手/收发。
+fn lo_pump(st: &mut Stack, nic: usize, mut len: u64, now: u64) {
+    let mut guard = 0u32;
+    while guard < 32 && len > 0 {
+        guard += 1;
+        let f = st.links[nic].io;
+        let info = match ipv4_parse(f, len) {
+            Some(i) => i,
+            None => break,
+        };
+        let seg = match tcp_parse(&info) {
+            Some(s) => s,
+            None => break,
+        };
+        len = tcp_input(st, nic, info.src, &seg, now);
+    }
+}
+
 /// 推进所有 TCP 连接的重传定时器；需重传则发帧。
 fn tcp_tick_all(st: &mut Stack, now: u64) {
     let mut i = 0;
@@ -1195,9 +1405,7 @@ fn tcp_tick_all(st: &mut Stack, now: u64) {
             let nic = st.tcons[i].nic;
             let io = st.links[nic].io;
             let len = tcp_tick(&mut st.tcons[i], io, now);
-            if len > 0 {
-                let _ = link_tx(&st.links[nic], len);
-            }
+            tcp_emit_deliver(st, nic, len, now);
         }
         i += 1;
     }
@@ -1423,6 +1631,11 @@ pub fn run() {
         println("NET6 tcp conn FAILED");
     }
 
+    // 内建 HTTP 服务（客户机"环境"）：在 `OUR_IP:80` 起监听者，配合回环 TCP 供 wget 取用。
+    if tcp_listen_internal(st, 0, HTTP_PORT) == 0 {
+        println("netstack: http listener FAILED");
+    }
+
     // 主循环: 服务应用请求 + 排空各网卡 RX + 推进 TCP 重传定时器。
     let mut now = 0u64;
     loop {
@@ -1446,6 +1659,7 @@ pub fn run() {
             nic += 1;
         }
         tcp_tick_all(st, now);
+        http_serve(st, now);
         sys_sleep(10);
     }
 }

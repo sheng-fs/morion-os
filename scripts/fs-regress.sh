@@ -219,7 +219,7 @@ grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
 # (端口能力门禁拒绝越权 + 回环收发 + 真实 TX 触发 ICMP 不可达回程)。任一缺即判失败。
 net_bad=0
 echo "== 网络能力自测 (N5/N6: NET1..NET4 + netstack + NET5) =="
-grep -nE 'NET1|NET2|NET3|NET4|NET6|NET7|NET8|NET9|NET11|NET12|netstack:|app: NET5|e1000e:' "$log" 2>/dev/null || echo "(无)"
+grep -nE 'NET1|NET2|NET3|NET4|NET6|NET7|NET8|NET9|NET11|NET12|NET13|netstack:|app: NET5|e1000e:' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'NET1 virtio-net up, MAC=.*ARP reply OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET3 dhcp OK, ip=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'NET2 ipv4/icmp OK.*udp TX 10.0.2.2:9999 -> icmp unreachable' "$log" 2>/dev/null || net_bad=1
@@ -243,6 +243,8 @@ grep -qE 'app: NET12 tcp client OK' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET8 dns parser OK, A=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET8 dns OK, A=' "$log" 2>/dev/null || net_bad=1
 grep -qE 'app: NET7 app socket OK' "$log" 2>/dev/null || net_bad=1
+# N8.2 (回环 TCP + 客户机内建 HTTP): 应用对 10.0.2.15:80 发起真实 HTTP GET, 返回 200 + body。
+grep -qE 'app: NET13 http OK' "$log" 2>/dev/null || net_bad=1
 echo "== 可执行文件加载 + 退出即回收 (E1/E2b: FS-27 / FS-28) =="
 # app 自测把一份独立编译的 ELF 写进 /tmp 再读回来, 交给内核载入**新域**运行;
 # 子程序 (user/hello) 自己打印 `exec:` 行 —— 两行都在才说明"加载 + 真的跑起来"。

@@ -240,6 +240,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  ls [-l] [path] list directory (-l: long form)");
             println("  cat <file>     print file content");
             println("  run <file>     load a .mex program from a file and run it (new domain)");
+            println("  wget [path]    fetch a page from the guest's built-in HTTP server (10.0.2.15:80)");
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -283,6 +284,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "ls" => shell_ls(st, if arg.is_empty() { "." } else { arg }),
         "cat" => shell_cat(st, arg),
         "run" => shell_run(st, arg),
+        "wget" => shell_wget(arg),
         "cd" => shell_cd(st, if arg.is_empty() { "/" } else { arg }),
         "mkdir" => shell_mkdir(st, arg),
         "touch" => shell_touch(st, arg),
@@ -329,6 +331,76 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println(cmd);
         }
     }
+}
+
+/// 逐字节打印（仅可打印 ASCII 与换行；其余跳过），避免对非 UTF-8 数据用 `from_utf8_unchecked`。
+fn print_bytes(b: &[u8]) {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\n' || c == b'\r' || (0x20..0x7f).contains(&c) {
+            let one = [c];
+            unsafe {
+                print(core::str::from_utf8_unchecked(&one));
+            }
+        }
+        i += 1;
+    }
+}
+
+/// `wget <path>` — 从客户机**内建 HTTP 服务**（`10.0.2.15:80`，见 netstack_srv）取一个页面并打印。
+///
+/// 走完整的 TCP 客户端路径（socket/bind/connect/send/recv/close），握手与数据经栈内**回环**
+/// 与服务端完成 —— 无需任何外部服务端。
+fn shell_wget(arg: &str) {
+    let path = if arg.is_empty() { "/" } else { arg };
+    let sock = morion::net::tcp_socket();
+    if sock == 0 || !morion::net::tcp_bind(sock, 12349) {
+        println("wget: socket/bind failed");
+        return;
+    }
+    if !morion::net::tcp_connect(sock, morion::net::ip4(10, 0, 2, 15), 80) {
+        println("wget: connect failed");
+        let _ = morion::net::tcp_close(sock);
+        return;
+    }
+    // 组装 "GET <path> HTTP/1.0\r\nHost: 10.0.2.15\r\n\r\n"。
+    let mut req = [0u8; 160];
+    let mut n = 0usize;
+    for &b in b"GET " {
+        req[n] = b;
+        n += 1;
+    }
+    for &b in path.as_bytes() {
+        if n < req.len() - 30 {
+            req[n] = b;
+            n += 1;
+        }
+    }
+    for &b in b" HTTP/1.0\r\nHost: 10.0.2.15\r\n\r\n" {
+        if n < req.len() {
+            req[n] = b;
+            n += 1;
+        }
+    }
+    if !morion::net::tcp_send(sock, &req[..n]) {
+        println("wget: send failed");
+        let _ = morion::net::tcp_close(sock);
+        return;
+    }
+    let mut buf = [0u8; 1024];
+    let mut i = 0;
+    while i < 50 {
+        let r = morion::net::tcp_recv(sock, &mut buf);
+        if r > 0 {
+            print_bytes(&buf[..r as usize]);
+            break;
+        }
+        sys_sleep(20);
+        i += 1;
+    }
+    println("");
+    let _ = morion::net::tcp_close(sock);
 }
 
 /// `uname` — 打印内核报告的整行 `MorionOS <release> <machine>`（V1）。

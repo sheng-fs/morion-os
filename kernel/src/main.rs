@@ -410,6 +410,11 @@ pub extern "C" fn kernel_main() -> ! {
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
     // 服务自己的暂存页, 不需要共享缓冲, 故只给 SendTo。
     cap::grant(shell_domain, cap::Capability::SendTo(block_domain));
+    // 授权 (N8.2): shell 的网络命令 (`wget`) 经 netstack 用 socket; 端口能力覆盖客户端源端口,
+    // 共享页用于收发负载 (SendTo + MapInto)。
+    cap::grant(shell_domain, cap::Capability::SendTo(netstack_domain));
+    cap::grant(shell_domain, cap::Capability::MapInto(netstack_domain));
+    cap::grant(shell_domain, cap::Capability::Net(12345, 12350));
     // 授权: 各文件服务把**自己那类的额外卷**上报给 mount_srv (M1b 多卷挂载:
     // `/usb<卷号>`)。只需 SendTo —— 挂载请求是一条普通 IPC, 不经共享页。
     cap::grant(fat32_domain, cap::Capability::SendTo(mount_domain));
