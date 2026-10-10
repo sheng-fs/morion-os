@@ -278,22 +278,32 @@ const MAX_SHARED_FRAMES: usize = 64;
 static mut SHARED_FRAMES: [(u64, u8); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
 
 /// 增加某物理帧的引用计数 (已存在则递增, 否则插入新槽位)。
-pub fn inc_ref(addr: u64) {
+///
+/// 返回 `false` 表示**无法登记**: 共享表已满 (没有空槽), 或该帧计数已达 `u8::MAX`
+/// (再增会回绕到 0)。调用方**必须**据此回滚刚建立的映射 —— 否则会出现"已映射但未
+/// 登记"的帧: 把它共享给别的域后, 源域销毁时 [`release_user_frame`] 会因
+/// `is_tracked` 为假而直接 [`free_frame`], 而该帧仍被目标域映射着 → 跨域
+/// use-after-free (内存损坏 / 跨域数据泄漏)。
+pub fn inc_ref(addr: u64) -> bool {
     unsafe {
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.0 == addr && slot.1 > 0 {
+                if slot.1 == u8::MAX {
+                    return false; // 再增会回绕到 0, 视作"未登记"
+                }
                 slot.1 += 1;
-                return;
+                return true;
             }
         }
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.1 == 0 {
                 slot.0 = addr;
                 slot.1 = 1;
-                return;
+                return true;
             }
         }
     }
+    false // 表满: 无空槽可登记
 }
 
 /// 减少某物理帧的引用计数; 返回是否降为 0 (即应真正释放)。
@@ -399,8 +409,8 @@ mod tests {
         // (2) 登记过的帧 (alloc_page / share_page): 计数递减, 归零才释放。
         let shared: u64 = 11 * FRAME_SIZE as u64;
         reserve_frame(shared as usize);
-        inc_ref(shared); // 本域 alloc_page
-        inc_ref(shared); // 又共享给了另一个域
+        assert!(inc_ref(shared)); // 本域 alloc_page
+        assert!(inc_ref(shared)); // 又共享给了另一个域
         assert!(is_tracked(shared));
         release_user_frame(shared);
         assert!(bitmap_test(11), "还有别的域映射着它, 不能释放");
@@ -408,5 +418,33 @@ mod tests {
         release_user_frame(shared);
         assert!(!bitmap_test(11), "计数归零后应释放");
         assert!(!is_tracked(shared));
+
+        // (3) 共享表满 / 计数溢出时 inc_ref 必须返回 false —— 调用方据此回滚映射,
+        //     绝不留下"已映射但未登记"的帧 (否则跨域共享后会触发 use-after-free)。
+        unsafe {
+            SHARED_FRAMES.fill((0, 0));
+        } // 确保表为空
+        for i in 0..MAX_SHARED_FRAMES as u64 {
+            assert!(
+                inc_ref((0x100 + i) * FRAME_SIZE as u64),
+                "第 {i} 个槽应成功登记"
+            );
+        }
+        // 第 65 个不同帧: 表满 → 必须返回 false (不能静默"登记")
+        assert!(
+            !inc_ref((0x100 + MAX_SHARED_FRAMES as u64) * FRAME_SIZE as u64),
+            "表满后 inc_ref 必须返回 false"
+        );
+        // 已登记的帧计数到 u8::MAX 后再增 → 必须返回 false (不能回绕到 0)
+        let s0 = 0x100 * FRAME_SIZE as u64;
+        for _ in 0..(u8::MAX - 1) {
+            assert!(inc_ref(s0), "255 以内递增应成功");
+        }
+        assert_eq!(unsafe { SHARED_FRAMES[0].1 }, u8::MAX);
+        assert!(!inc_ref(s0), "计数到 u8::MAX 后再增必须返回 false");
+        // 清理 (避免污染同进程其它测试)。
+        unsafe {
+            SHARED_FRAMES.fill((0, 0));
+        }
     }
 }

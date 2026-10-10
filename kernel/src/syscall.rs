@@ -427,7 +427,13 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 paddr,
                 crate::memory::paging::UserPagePerm::ReadWrite,
             );
-            crate::memory::frame_allocator::inc_ref(paddr);
+            // 表满 / 计数溢出时回滚映射并归还帧, 绝不留下"已映射但未登记"的帧
+            // (否则后续共享该帧后, 域销毁会把它当本域独占释放, 而它仍被别的域映射 → UAF)。
+            if !crate::memory::frame_allocator::inc_ref(paddr) {
+                crate::memory::paging::unmap_user_page(domain, a1);
+                crate::memory::frame_allocator::free_frame(paddr);
+                return 0;
+            }
             1
         }
         SYS_SHARE_PAGE => {
@@ -441,19 +447,24 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             } else {
                 match crate::memory::paging::resolve_user_page(from, a1) {
                     Some(paddr) => {
-                        // 目标域 `a2` 可能已在 `a1` 有映射: 客户端重启后重共享, 或重复
+                        let old = crate::memory::paging::resolve_user_page(a2, a1);
+                        // 目标域 a2 可能已在 a1 有映射: 客户端重启后重共享, 或重复
                         // 共享同一页。若不处理, map_user_page 会撞 PageAlreadyMapped panic。
-                        if let Some(old) = crate::memory::paging::resolve_user_page(a2, a1) {
-                            if old == paddr {
-                                // 已映射同一帧: 幂等成功, 不重复 inc_ref。
-                                return 1;
-                            }
-                            // 异帧: 先摘除旧映射并递减引用计数 (归零才释放), 再映射新帧。
-                            if let Some(u) = crate::memory::paging::unmap_user_page(a2, a1) {
-                                let was_last = crate::memory::frame_allocator::dec_ref(u);
-                                if was_last {
-                                    crate::memory::frame_allocator::free_frame(u);
-                                }
+                        if old == Some(paddr) {
+                            // 已映射同一帧: 幂等成功, 不重复 inc_ref。
+                            return 1;
+                        }
+                        // 先登记新帧引用计数: 表满 / 计数溢出时拒绝共享 (返回 0),
+                        // 且**不动目标域既有映射** —— 绝不留下"已共享但未登记"的帧,
+                        // 否则源域销毁会把它当独占释放, 而目标域仍映射着 → 跨域 UAF。
+                        if !crate::memory::frame_allocator::inc_ref(paddr) {
+                            return 0;
+                        }
+                        // 异帧: 摘除目标域旧映射并递减旧帧引用计数 (归零才释放), 再映射新帧。
+                        if let Some(u) = crate::memory::paging::unmap_user_page(a2, a1) {
+                            let was_last = crate::memory::frame_allocator::dec_ref(u);
+                            if was_last {
+                                crate::memory::frame_allocator::free_frame(u);
                             }
                         }
                         crate::memory::paging::map_user_page(
@@ -462,7 +473,6 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                             paddr,
                             crate::memory::paging::UserPagePerm::ReadWrite,
                         );
-                        crate::memory::frame_allocator::inc_ref(paddr);
                         1
                     }
                     None => 0,
@@ -510,7 +520,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                             p,
                             crate::memory::paging::UserPagePerm::ReadWrite,
                         );
-                        crate::memory::frame_allocator::inc_ref(p);
+                        // 表满 / 计数溢出时回滚映射并归还帧 (理由同 SYS_ALLOC_PAGE)。
+                        if !crate::memory::frame_allocator::inc_ref(p) {
+                            crate::memory::paging::unmap_user_page(a1, a2);
+                            crate::memory::frame_allocator::free_frame(p);
+                            return 0;
+                        }
                         1
                     }
                     None => 0,
@@ -711,8 +726,31 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            // 校验地址范围: 拒绝内核地址 (否则会打印内核内存 = 信息泄漏),
+            // 与 SYS_ALLOC_PAGE 等信任边界一致。
+            if a1 == 0 || a2 == 0 || !crate::memory::paging::is_user_address(a1) {
+                return 0;
+            }
+            let end = match a1.checked_add(a2 - 1) {
+                Some(e) => e,
+                None => return 0,
+            };
+            if !crate::memory::paging::is_user_address(end) {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
+            // 安全的 UTF-8 校验: from_utf8_unchecked 对任意用户字节是未定义行为,
+            // 校验失败时只打印到首个非法字节之前。
+            let s = match core::str::from_utf8(slice) {
+                Ok(s) => s,
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid == 0 {
+                        return 0;
+                    }
+                    core::str::from_utf8(&slice[..valid]).unwrap_or("")
+                }
+            };
             crate::video::print(s);
             0
         }
