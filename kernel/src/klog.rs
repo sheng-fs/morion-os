@@ -83,3 +83,63 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// 回归 (Phase 0 / P0.1): shell 的 `dmesg` 无参打印经 `SYS_PUTS` → `video::print` 把输出
+    /// **回灌进同一个环形缓冲** (`capture_bytes`)。于是「读一段、打印一段」的循环里 `off` 与
+    /// `total` 同速前进、保留窗口长度恒定, `read` 永远返回非 0 —— 以**实时** `total` 为界会死循环。
+    /// 本测 (a) 复现该缺陷行为, (b) 证明以**进入时的 `total` 快照**为界则必在有限步内结束、且只
+    /// 吐快照窗口 (现 shell 实现)。
+    ///
+    /// 全局环形缓冲: 本文件唯一测试, 独占 `LOG_*` 状态且两步串行, 无并行竞争。
+    #[test]
+    fn dmesg_echo_loop_must_be_snapshot_bounded() {
+        let payload: Vec<u8> = (0..(LOG_CAP + 4096)).map(|i| (i % 251) as u8).collect();
+        capture_bytes(&payload);
+
+        let mut buf = [0u8; 512];
+
+        // (a) 缺陷行为: 以实时 `total` 为界 (旧 shell 实现) —— 4096 步仍读不到头。
+        let mut off = 0u64;
+        let mut steps = 0u32;
+        loop {
+            let n = read(off, &mut buf);
+            if n == 0 {
+                break;
+            }
+            capture_bytes(&buf[..n]); // 模拟打印回灌
+            off += n as u64;
+            steps += 1;
+            if steps == 4096 {
+                break;
+            }
+        }
+        assert_eq!(steps, 4096, "无快照界时应永远读不到头 (缺陷行为)");
+
+        // (b) 修复行为: 以进入时的 `total` 作快照为界 (现 shell 实现), 有限步结束, 只吐窗口。
+        let end = total();
+        let mut off = end.saturating_sub(LOG_CAP as u64);
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut steps = 0u32;
+        while off < end {
+            let want = ((end - off) as usize).min(buf.len());
+            let n = read(off, &mut buf[..want]);
+            if n == 0 {
+                break;
+            }
+            capture_bytes(&buf[..n]); // 打印回灌也不影响: 界是快照, 不随 total 增长
+            emitted.extend_from_slice(&buf[..n]);
+            off += n as u64;
+            steps += 1;
+            assert!(
+                steps <= (LOG_CAP / buf.len()) as u32 + 2,
+                "快照界应有限步结束"
+            );
+        }
+        assert_eq!(emitted.len(), LOG_CAP, "只吐 64 KiB 快照窗口");
+    }
+}

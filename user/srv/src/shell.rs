@@ -506,6 +506,11 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// 内核日志环形缓冲容量, 与 `kernel/src/klog.rs` 的 `LOG_CAP` 保持一致
+/// (docs/shell-reference.md 亦作「64 KiB 环形缓冲」)。`dmesg` 据此从**保留窗口起点**
+/// `total - LOG_CAP` 开始读 (内核会把更早的起点夹到 `oldest`)。
+const LOG_CAP: u64 = 64 * 1024;
+
 /// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
@@ -520,10 +525,18 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         return;
     }
     if arg.is_empty() {
-        let mut off = 0u64;
+        // 打印走 `sys_puts` → `video::print` → `klog::capture_bytes`, 会把刚输出的字节
+        // **写回同一个环形缓冲**, 使 `total` 随打印持续增长。因此必须用**进入时的 total
+        // 作快照**作边界: 若以实时 `total` 为界, `off` 与 `total` 同步前进、间隔恒定,
+        // `sys_log_read` 永远返回非 0 → 死循环 (真机上表现为 `dmesg` 卡死刷屏)。
+        let end = total;
+        // 从**保留窗口起点**开始 (更早的会被内核夹到 `oldest`), 只打印这一份 64 KiB 快照。
+        let mut off = end.saturating_sub(LOG_CAP);
         let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
+        while off < end {
+            // 只读到快照末尾, 不越过 `end`, 否则会把打印回灌出来的新字节也算进去。
+            let want = (end - off).min(buf.len() as u64) as usize;
+            let n = sys_log_read(off, &mut buf[..want]);
             if n == 0 {
                 break;
             }
