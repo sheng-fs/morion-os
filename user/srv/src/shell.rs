@@ -522,11 +522,16 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
     if arg.is_empty() {
         let mut off = 0u64;
         let mut got = 0u64;
-        loop {
+        // 终点用**进入本命令时**的 `total` 快照: `sys_puts` 会经 SYS_PUTS 把刚打印的
+        // 内容再追加回同一个环形缓冲, 若以"即时 total"为终点, 打印出的日志又变成新的
+        // 待读日志 —— 自产自读, 永远追不上 (死循环)。故读到快照处即止。
+        while off < total {
             let n = sys_log_read(off, buf);
             if n == 0 {
                 break;
             }
+            // 只处理到快照边界 (晚于 total 的字节是本次打印的回声)。
+            let n = core::cmp::min(n as u64, total - off) as usize;
             // 只在**合法 UTF-8 前缀**上操作: 4 KiB 分块可能把一个多字节字符 (如中文)
             // 切成两半, 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
             // 用 `valid_up_to` 取合法前缀, 剩余字节下一轮再读 (off 只推进这么多)。
@@ -566,11 +571,15 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
     }
     let mut off = 0u64; // 日志绝对偏移
     let mut woff = 0u64; // 文件内偏移
-    loop {
+
+    // 同样以进入时的 total 快照为终点: 导出期间别的服务若也在打印, 环形缓冲会继续增长,
+    // 不设边界本循环就总有字节可读 (文件无界增长 / 不返回)。
+    while off < total {
         let n = sys_log_read(off, buf);
         if n == 0 {
             break;
         }
+        let n = core::cmp::min(n as u64, total - off) as usize;
         let w = vfs::write(fd, woff, &buf[..n]);
         if w != n as u64 {
             println("dmesg: write FAILED (dumped prefix only)");
