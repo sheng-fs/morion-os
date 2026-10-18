@@ -83,3 +83,79 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// 从绝对偏移 `start` 起连续读到 `stop`（模拟 shell 的读回循环，不含回灌）。
+    fn read_all_from(start: u64, stop: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut dst = [0u8; 4096];
+        let mut off = start;
+        while off < stop {
+            let n = read(off, &mut dst);
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&dst[..n]);
+            off += n as u64;
+        }
+        out
+    }
+
+    /// `dmesg` 读回的两项回归（合并为单测，避免多个测试并发改动全局环形缓冲）：
+    ///
+    /// (1) 打印分支的「读回 → 回灌」循环必须以「打印前快照」为界终止；
+    /// (2) 日志超过容量后必须从最老处（`total - LOG_CAP`）起读，否则 `read` 的夹取
+    ///     会让 `off` 与真实位置错位、内容重复。
+    #[test]
+    fn dmesg_readback_regressions() {
+        // ---- (1) 回灌循环的终止性 ----
+        let payload = [b'x'; 40_000];
+        capture_bytes(&payload);
+        let snapshot = total();
+        let cap = LOG_CAP as u64;
+
+        let mut dst = [0u8; 4096];
+        let mut off = snapshot.saturating_sub(cap); // 从最老处起读
+        let mut steps = 0u32;
+        while off < snapshot {
+            let rem = ((snapshot - off) as usize).min(dst.len());
+            let n = read(off, &mut dst[..rem]);
+            if n == 0 {
+                break;
+            }
+            capture_bytes(&dst[..n]); // 模拟 sys_puts → print 的回灌
+            off += n as u64;
+            steps += 1;
+            assert!(
+                steps <= 1_000_000,
+                "feedback loop must terminate (steps={steps})"
+            );
+        }
+        assert!(off >= snapshot, "loop must reach the snapshot boundary");
+        // 回灌让 total 超过快照，故 off < total —— `n == 0` 永不成立，不能作终止条件。
+        assert!(read(off, &mut dst) > 0);
+
+        // ---- (2) 起读位置必须是最老处，而非 0 ----
+        // 造一段长度 > 容量的可辨识内容：回绕后保留的正是其后 LOG_CAP 字节。
+        let mut payload2 = Vec::with_capacity(100_000);
+        for i in 0..100_000u32 {
+            payload2.push((i % 251) as u8);
+        }
+        capture_bytes(&payload2);
+        let total_now = total();
+        let cap2 = (LOG_CAP as u64).min(total_now);
+        let expected = &payload2[payload2.len() - cap2 as usize..];
+
+        // 从 0 起读（修复前的写法）：被夹到最老处后与真实位置错位 → 与期望不符。
+        assert_ne!(read_all_from(0, total_now), expected.to_vec());
+        // 从最老处起读（修复后）：得到正确的最近 `cap2` 字节。
+        assert_eq!(
+            read_all_from(total_now - cap2, total_now),
+            expected.to_vec()
+        );
+    }
+}

@@ -506,6 +506,13 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// 内核控制台日志环形缓冲容量（字节）。
+///
+/// **必须**与 `kernel/src/klog.rs` 的 `LOG_CAP` 一致: 环形缓冲满后挤掉最老字节，
+/// `SYS_LOG_READ` 会把早于 `total - 该值` 的起始偏移夹到最老处。若两者不一致，下方
+/// 起读位置就会错位（读回内容重复 / 错乱）。
+const LOG_RING_CAP: u64 = 64 * 1024;
+
 /// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
@@ -520,10 +527,23 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         return;
     }
     if arg.is_empty() {
-        let mut off = 0u64;
+        // 以「打印前」的总字节数为终止界: 下面的 `sys_puts` 会经内核 `print` → `klog`
+        // 把刚打印的字节**重新写回同一条环形缓冲**, 使 `sys_log_total()` 持续增长。
+        // 若以「读到 0 字节」为终止条件, `off` 永远追不上自增长的 total → 循环永不结束,
+        // 且日志被自身的副本淹没。以快照 `snapshot` 为界, 只读「打印前」这一份日志。
+        let snapshot = total;
+        // 起读位置 = 环形缓冲里最老的绝对偏移。日志满 64 KiB 时最老处才是有效数据；
+        // 若从 0 起读，内核会把偏移夹到最老处，而 `off` 仍按读到的字节数前进，与真实
+        // 位置错位 → 内容重复 / 错乱。直接从最老处起读可规避夹取。
+        let mut off = total.saturating_sub(LOG_RING_CAP);
         let mut got = 0u64;
         loop {
-            let n = sys_log_read(off, buf);
+            if off >= snapshot {
+                break;
+            }
+            // 本次最多读到快照处, 避免把自打印产生的尾部字节也读进来。
+            let rem = ((snapshot - off) as usize).min(buf.len());
+            let n = sys_log_read(off, &mut buf[..rem]);
             if n == 0 {
                 break;
             }
@@ -564,7 +584,10 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
+    // 日志绝对偏移: 从环形缓冲最老处起读（同打印分支，避开内核夹取导致的错位）。
+    // 用进入循环前的最新总量 —— 上面的 unlink/creat 可能已追加日志字节，若沿用较早的
+    // total，起读位置会落到（新的）最老处之前而被内核夹取。
+    let mut off = sys_log_total().saturating_sub(LOG_RING_CAP);
     let mut woff = 0u64; // 文件内偏移
     loop {
         let n = sys_log_read(off, buf);
