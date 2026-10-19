@@ -83,3 +83,63 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// 回归: `shell` 的 `dmesg`(无参) 打印循环 —— 打印路径回灌进同一环形缓冲。
+    ///
+    /// `dmesg` 每打印一段就经 `video::print` → [`capture_bytes`] 把刚打印的字节**又写回**
+    /// 这个环形缓冲, 令 [`total`] 随打印持续增长。历史缺陷: 循环以**实时** `total` 为界、
+    /// 且读起点从 0 起, 于是每轮读回的正是自己刚写出的字节, `read` 永不返回 0 ——
+    /// `dmesg` 卡死整个 shell。
+    ///
+    /// 本测试复现「环形已满 + 回灌增长」的真实条件, 验证修复所用的有界排空算法:
+    /// 以进入前的 `total` 快照为界、读起点对齐到环形现存最老偏移, 能在**有限步**内
+    /// 终止, 且恰好打印出快照内存活的那段日志 (顺序与内容一致)。
+    #[test]
+    fn dmesg_print_loop_terminates_despite_echo_feedback() {
+        // 先灌入 > 容量的日志, 制造环形回绕 (最老字节已被挤掉) 的真实场景。
+        // 字节内容为数字循环, 便于校验顺序。
+        let seeded: usize = LOG_CAP + 1000;
+        for i in 0..seeded {
+            let b = [(b'0' + (i % 10) as u8)];
+            capture_bytes(&b);
+        }
+
+        let end = total(); // 打印前的快照: 循环界钉死在此, 不随回灌增长。
+        assert!(end >= LOG_CAP as u64, "seed must overflow the ring");
+
+        // 与修复后 shell 同构的打印循环 (+ 模拟 sys_puts 的回灌)。
+        let mut off = end.saturating_sub(LOG_CAP as u64);
+        let mut printed: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut iters = 0usize;
+        while off < end {
+            iters += 1;
+            assert!(
+                iters <= LOG_CAP / 4096 + 2,
+                "loop must converge in finite steps"
+            );
+            let want = ((end - off) as usize).min(buf.len());
+            let n = read(off, &mut buf[..want]);
+            if n == 0 {
+                break;
+            }
+            capture_bytes(&buf[..n]); // 回灌: 打印的字节写回同一环形缓冲
+            printed.extend_from_slice(&buf[..n]);
+            off += n as u64;
+        }
+
+        // 恰好排空快照内存活的 LOG_CAP 字节, 顺序与播种一致 (从绝对偏移 1000 起)。
+        assert_eq!(printed.len(), LOG_CAP);
+        for (k, &b) in printed.iter().enumerate() {
+            assert_eq!(b, b'0' + ((1000 + k) % 10) as u8, "byte {k} out of order");
+        }
+
+        // 佐证反馈确实发生: 回灌令 total 在快照之外各增长了 LOG_CAP 字节。
+        assert_eq!(total(), end + LOG_CAP as u64);
+    }
+}

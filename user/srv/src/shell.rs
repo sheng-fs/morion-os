@@ -506,6 +506,13 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// 内核日志环形缓冲容量 (与 `kernel/src/klog.rs` 的 `LOG_CAP` 同口径)。
+///
+/// 打印路径必须按同一容量把读起点对齐到环形里**现存的**最老绝对偏移
+/// (`end - LOG_RING_CAP`)：内核 `read` 会把早于 `total - cap` 的起点夹到最老处，
+/// 若起点偏小就会与自身刚回灌的字节错位, 读回自己刚写出的内容。
+const LOG_RING_CAP: u64 = 64 * 1024;
+
 /// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
@@ -520,10 +527,18 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         return;
     }
     if arg.is_empty() {
-        let mut off = 0u64;
+        // 回灌反馈循环 (致命): `sys_puts` 经内核 `video::print` → `klog::capture_bytes`
+        // 把刚打印的字节**又写回同一个环形缓冲**, 令 `total()` 随打印持续增长。
+        // 若以实时 total 为循环界、且读起点从 0 起, 每轮读回的正是自己刚写出的字节,
+        // 于是 `n` 永不为 0、`off` 永远追不上 total —— `dmesg` 永不返回, shell 卡死。
+        // 修复: ①边界钉死在进入前的快照 `total`; ②起点对齐到环形现存最老偏移
+        // (`end - LOG_RING_CAP`), 与内核 `read` 的裁剪口径一致; ③单轮读长不越界快照。
+        let end = total;
+        let mut off = end.saturating_sub(LOG_RING_CAP);
         let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
+        while off < end {
+            let want = ((end - off) as usize).min(buf.len());
+            let n = sys_log_read(off, &mut buf[..want]);
             if n == 0 {
                 break;
             }
@@ -564,7 +579,11 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
+    // 起点对齐到环形现存最老偏移 (同打印路径): 若从 0 起, 当 total > 容量时内核会把
+    // 起点夹到最老处, 而 `off` 仍按读回长度前进, 于是同一段最老字节被重复写入文件
+    // (boot.log 头部出现重复块) —— 这正是真机取证的主路径。此路径经 `vfs::write`
+    // 落盘、不触发回灌, 故 total 恒定, 循环自然终止。
+    let mut off = total.saturating_sub(LOG_RING_CAP); // 日志绝对偏移
     let mut woff = 0u64; // 文件内偏移
     loop {
         let n = sys_log_read(off, buf);
