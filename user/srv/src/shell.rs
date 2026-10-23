@@ -506,41 +506,90 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// `dmesg` 一次读出的日志快照上限 (字节)。
+///
+/// 必须 **不小于内核 `klog::LOG_CAP` (64 KiB)**: 环形缓冲写满后只保留**最近**的
+/// `LOG_CAP` 字节, 一次读满才能拿到**完整**的现存窗口 —— 被挤掉的字节内核不会再
+/// 补 (只能按绝对偏移取), 少读就没有"剩下的"可取。
+const LOG_SNAPSHOT_MAX: usize = 64 * 1024;
+
+/// 打印日志时单次 `SYS_PUTS` 的上限 (字节)。
+///
+/// 内核 `video::print` 打印期间**关中断**, 串口 115200 下 64 KiB 要好几秒 ——
+/// 分块发, 别让中断关那么久。
+const LOG_PRINT_CHUNK: usize = 4096;
+
+/// 缓冲区首字节若落在多字节 UTF-8 字符中间 (被环形回绕切断), 跳过开头的续字节,
+/// 返回**第一个合法字符起点**的偏移; 本来就在边界上则返回 0。
+fn utf8_first_boundary(buf: &[u8]) -> usize {
+    let mut i = 0usize;
+    // 续字节 (10xxxxxx) 不是字符起点; 一个字符最多 3 个续字节 (UTF-8 最长 4 字节)。
+    while i < buf.len() && (buf[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
+
+/// 返回 `buf[start..]` 中**合法 UTF-8 前缀**的结束偏移 (末尾可能是被切断的半个字符)。
+fn utf8_valid_end(buf: &[u8], start: usize) -> usize {
+    match core::str::from_utf8(&buf[start..]) {
+        Ok(_) => buf.len(),
+        Err(e) => start + e.valid_up_to(),
+    }
+}
+
+/// 字节 `b` 是否落在字符**边界**上 (续字节不是边界)。
+fn utf8_is_boundary(b: u8) -> bool {
+    (b & 0xC0) != 0x80
+}
+
 /// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
 /// 机器的唯一办法）。带 `path`: 把日志写入该文件（如 `dmesg /boot.log`），供真机
 /// 拔盘取走。日志环形缓冲满后挤掉最老字节，故保留的是**最近的** 64 KiB。
+///
+/// **一次读完整个窗口, 不分块读**: 内核 `klog::read` 会把请求起点夹到「最老仍保留
+/// 的字节」(`total - LOG_CAP`)。若分块读并按读到的字节数推进起点, 起点永远落后于
+/// 夹取后的真实位置 —— 打印路径因「打印本身也进日志」(`SYS_PUTS` → `video::print`
+/// → `klog::capture_bytes`) 而**死循环**, 写文件路径则会**反复写同一块**、文件无限
+/// 增长。一次读满 `LOG_CAP` 字节拿到的是**连续**的现存窗口, 没有这个问题。
 fn shell_dmesg(st: &ShellState, arg: &str) {
-    static mut BUF: [u8; 4096] = [0u8; 4096];
-    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    static mut SNAP: [u8; LOG_SNAPSHOT_MAX] = [0u8; LOG_SNAPSHOT_MAX];
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(SNAP) };
     let total = sys_log_total();
     if total == 0 {
         println("dmesg: log is empty");
         return;
     }
+    // 从 0 起读一次即可: 内核把起点夹到最老仍保留的字节, 返回的正是**最近**的那段。
+    let n = sys_log_read(0, buf);
+    if n == 0 {
+        println("dmesg: log read failed");
+        return;
+    }
     if arg.is_empty() {
-        let mut off = 0u64;
+        // 只切**合法 UTF-8**: 窗口首字节可能是被回绕切断的半个字符 (续字节),
+        // 末尾也可能半个字符 —— 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
+        let start = utf8_first_boundary(&buf[..n]);
+        let end = utf8_valid_end(&buf[..n], start);
+        let mut pos = start;
         let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
-            if n == 0 {
+        while pos < end {
+            let mut e = (pos + LOG_PRINT_CHUNK).min(end);
+            if e < end {
+                // 块末尾回退到字符边界 (不能把半个字符切进块里)。
+                while e > pos && !utf8_is_boundary(buf[e]) {
+                    e -= 1;
+                }
+            }
+            if e == pos {
                 break;
             }
-            // 只在**合法 UTF-8 前缀**上操作: 4 KiB 分块可能把一个多字节字符 (如中文)
-            // 切成两半, 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
-            // 用 `valid_up_to` 取合法前缀, 剩余字节下一轮再读 (off 只推进这么多)。
-            let used = match core::str::from_utf8(&buf[..n]) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if used == 0 {
-                break; // 防御: 只读到半个字符时不再前进
-            }
-            let s = unsafe { core::str::from_utf8_unchecked(&buf[..used]) };
+            let s = unsafe { core::str::from_utf8_unchecked(&buf[pos..e]) };
             sys_puts(s);
-            off += used as u64;
-            got += used as u64;
+            got += (e - pos) as u64;
+            pos = e;
         }
         // 日志尾部可能不带换行, 补一个, 免得后续提示符黏在最后一行。
         println("");
@@ -564,20 +613,18 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
     let mut woff = 0u64; // 文件内偏移
-    loop {
-        let n = sys_log_read(off, buf);
-        if n == 0 {
-            break;
-        }
-        let w = vfs::write(fd, woff, &buf[..n]);
-        if w != n as u64 {
+    let mut pos = 0usize; // 快照内偏移
+                          // 落盘: **原样字节** (文件不是终端, 不必按 UTF-8 处理); 一页一块 (vfs::write 上限一页)。
+    while pos < n {
+        let chunk = (n - pos).min(4096);
+        let w = vfs::write(fd, woff, &buf[pos..pos + chunk]);
+        if w != chunk as u64 {
             println("dmesg: write FAILED (dumped prefix only)");
             break;
         }
-        off += n as u64;
         woff += w;
+        pos += chunk;
     }
     vfs::close(fd);
     print("dmesg: wrote ");

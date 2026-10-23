@@ -19,7 +19,7 @@ cd /home/jinjun/文档/morion-os
 
 # 最小自检（约 1 分钟）
 cargo fmt --all -- --check && make check && make clippy
-cargo test --lib -p morion-kernel          # 期望 36 passed
+cargo test --lib -p morion-kernel          # 期望 37 passed
 ```
 
 **都是踩过的坑**：
@@ -47,7 +47,7 @@ cd /home/jinjun/文档/morion-os
 # ① 静态检查（必须 0 warning）
 cargo fmt --all && make fmt && make check && make clippy
 
-# ② 内核单测（当前 36 passed）
+# ② 内核单测（当前 37 passed）
 cargo test --lib -p morion-kernel
 
 # ③ 只构建镜像（不启动 QEMU）

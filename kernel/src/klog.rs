@@ -83,3 +83,58 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重置环形缓冲状态 (klog 状态只有本模块的测试用, 无并发竞争)。
+    fn reset() {
+        unsafe {
+            LOG_BUF = [0; LOG_CAP];
+            LOG_HEAD = 0;
+            LOG_TOTAL = 0;
+        }
+    }
+
+    /// 日志环形缓冲的读语义 —— 用户态 `dmesg` 依赖它:
+    ///
+    /// 1. 一次读满 `LOG_CAP` 字节 = **现存窗口** (最近 `LOG_CAP` 字节), 连续无缺口;
+    /// 2. 起点早于最老保留字节时**夹取**到最老处 —— 请求的偏移**不会**被照办。
+    ///
+    /// 第 2 条正是 `dmesg` 必须**一次读完**的原因: 分块读时起点永远落后于夹取后的
+    /// 真实位置, 读到的还是同一块 (打印路径还会因「打印本身也进日志」而永不结束)。
+    #[test]
+    fn read_returns_retained_window_and_clamps_evicted_start() {
+        // 未写满: 全部读出。
+        reset();
+        capture_bytes(b"hello morion");
+        let mut buf = [0u8; 32];
+        assert_eq!(read(0, &mut buf), 12);
+        assert_eq!(&buf[..12], b"hello morion");
+        // 起点越过末尾 → 0 字节 (已读到头)。
+        assert_eq!(read(12, &mut buf), 0);
+        assert_eq!(read(9999, &mut buf), 0);
+
+        // 写满 LOG_CAP + 100 字节: 只保留最近 LOG_CAP 字节。
+        reset();
+        let total = LOG_CAP as u64 + 100;
+        for i in 0..total {
+            capture_bytes(&[(i % 251) as u8]);
+        }
+        let mut win = [0u8; LOG_CAP];
+        assert_eq!(read(0, &mut win), LOG_CAP);
+        for (i, &b) in win.iter().enumerate() {
+            assert_eq!(b, ((total as usize - LOG_CAP + i) % 251) as u8);
+        }
+        // 已被挤掉的起点 → 夹取到最老处 (拿到窗口首字节, 而**不是**请求处的字节)。
+        let evicted = total - LOG_CAP as u64 - 1;
+        let mut small = [0u8; 16];
+        assert_eq!(read(evicted, &mut small), 16);
+        assert_eq!(small[0], ((total as usize - LOG_CAP) % 251) as u8);
+        // 窗口内的起点: 必须拿到该处**连续**的字节。
+        let mid = total - LOG_CAP as u64 + 10;
+        assert_eq!(read(mid, &mut small), 16);
+        assert_eq!(small[0], ((total as usize - LOG_CAP + 10) % 251) as u8);
+    }
+}
