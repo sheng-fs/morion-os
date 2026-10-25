@@ -267,7 +267,7 @@ lspci: 9 device(s)
 
 ### `dmesg [path]`
 
-打印 / 导出**控制台日志**（Phase 0 / P0.1，plan-net-real.md）。内核把**所有**控制台输出（内核与用户态 —— 用户输出经 `SYS_PUTS` 汇入 `video::print`）额外追加进一个 **64 KiB 环形缓冲**；`dmesg` 经 `SYS_LOG_TOTAL(58)` / `SYS_LOG_READ(59)` 把它读出来。
+打印 / 导出**控制台日志**（Phase 0 / P0.1，plan-net-real.md）。内核把**所有**控制台输出（内核与用户态 —— 用户输出经 `SYS_PUTS` 汇入 `video::print`）额外追加进一个 **64 KiB 环形缓冲**；`dmesg` 经 `SYS_LOG_OLDEST(61)` / `SYS_LOG_TOTAL(58)` / `SYS_LOG_READ(59)` 把它读出来。
 
 - 不带参数：原样打印全部日志（含**内核引导日志**：PCI 枚举、ACPI/VT-d 探测等），末尾报已打印字节数。
 - 带 `path`：把日志**写入该文件**（如 `dmesg /boot.log`），走既有 FAT32 写路径；覆盖写（先删旧文件）。

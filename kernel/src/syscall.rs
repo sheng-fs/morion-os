@@ -167,6 +167,11 @@ pub const SYS_LOG_READ: u64 = 59;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3, shell `lspci`): `a1` = 索引、`a2` = 用户缓冲
 /// (3 个 u64), 返回 1/0 (见 [`crate::arch::pci::syscall_info`])。
 pub const SYS_PCI_INFO: u64 = 60;
+/// 控制台日志**最老**字节的绝对偏移 (Phase 0 / P0.1): 无参, 返回 [`crate::klog::oldest`]。
+///
+/// 与 `SYS_LOG_TOTAL` 一起圈定"当前仍存活的日志窗口": 环形缓冲写满后更早的日志已被
+/// 覆盖, 本值是起点、`SYS_LOG_TOTAL` 是终点。
+pub const SYS_LOG_OLDEST: u64 = 61;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -896,6 +901,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::net::owner(a1 as u16)
         }
         SYS_LOG_TOTAL => crate::klog::total(),
+        SYS_LOG_OLDEST => crate::klog::oldest(),
         SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
         SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
         _ => 0,

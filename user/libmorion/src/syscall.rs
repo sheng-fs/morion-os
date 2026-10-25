@@ -113,6 +113,8 @@ pub const SYS_LOG_TOTAL: u64 = 58;
 pub const SYS_LOG_READ: u64 = 59;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
+/// 控制台日志**最老**字节的绝对偏移 (Phase 0 / P0.1): 无参, 返回仍可读到的起点。
+pub const SYS_LOG_OLDEST: u64 = 61;
 
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
@@ -507,6 +509,16 @@ pub fn sys_cap_audit(domain: u64, slot: u64) -> u64 {
 /// 控制台日志累计字节数 (Phase 0 / P0.1): 环形缓冲的绝对总量。
 pub fn sys_log_total() -> u64 {
     unsafe { syscall(SYS_LOG_TOTAL, 0, 0, 0) }
+}
+
+/// 控制台日志环形缓冲里**最老**字节的绝对偏移 (Phase 0 / P0.1)。
+///
+/// 缓冲写满后更早的日志已被覆盖, 本值是**仍可读到的起点** —— 与 [`sys_log_total`]
+/// 一起圈定当前存活的日志窗口。内核 [`sys_log_read`] 会把过小的起始偏移静默夹到
+/// 此处, 故按自己的偏移推进的读循环会反复读到同一窗口 (shell `dmesg` 的旧实现即
+/// 栽在这里): 要读全窗口, 起点必须用本值。
+pub fn sys_log_oldest() -> u64 {
+    unsafe { syscall(SYS_LOG_OLDEST, 0, 0, 0) }
 }
 
 /// 从绝对偏移 `start` 起把控制台日志读进 `dst`, 返回实际读取字节数 (0 = 读到头)。

@@ -519,11 +519,23 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println("dmesg: log is empty");
         return;
     }
+    // 读取窗口 = `[start, end)`:
+    //
+    // * 起点必须是**最老存活字节**的偏移 (`sys_log_oldest`)。环形缓冲写满后更早的
+    //   日志已被覆盖, 内核 `klog::read` 会把过小的起始偏移**静默夹**到最老处 ——
+    //   从 0 起读的话每轮都被夹回同一窗口: 打印分支会**死循环**, 落盘分支会把同一
+    //   段重复写进文件。
+    // * 终点取**快照** (`total`)。打印本身经 `SYS_PUTS` 回灌进同一个环形缓冲
+    //   (内核 `video::print` → `klog::capture_bytes`), 用实时 total 当终点会一路
+    //   读到越写越新的内容, 永不停歇。
+    let start = sys_log_oldest();
+    let end = total;
     if arg.is_empty() {
-        let mut off = 0u64;
+        let mut off = start;
         let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
+        while off < end {
+            let want = core::cmp::min((end - off) as usize, buf.len());
+            let n = sys_log_read(off, &mut buf[..want]);
             if n == 0 {
                 break;
             }
@@ -535,7 +547,10 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
                 Err(e) => e.valid_up_to(),
             };
             if used == 0 {
-                break; // 防御: 只读到半个字符时不再前进
+                // 窗口起点 (或上一块的尾) 落在多字节字符中间 —— 跳过这一个字节继续
+                // 找字符边界, 否则整段日志都会因 `used == 0` 被丢掉。
+                off += 1;
+                continue;
             }
             let s = unsafe { core::str::from_utf8_unchecked(&buf[..used]) };
             sys_puts(s);
@@ -564,10 +579,11 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
+    let mut off = start; // 日志绝对偏移 (窗口起点 = 最老存活字节)
     let mut woff = 0u64; // 文件内偏移
-    loop {
-        let n = sys_log_read(off, buf);
+    while off < end {
+        let want = core::cmp::min((end - off) as usize, buf.len());
+        let n = sys_log_read(off, &mut buf[..want]);
         if n == 0 {
             break;
         }

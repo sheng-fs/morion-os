@@ -170,6 +170,7 @@ UEFI 固件
 | 58 | `SYS_LOG_TOTAL` | — | **控制台日志累计字节数**（Phase 0 / P0.1）：返回 [`klog`](../../kernel/src/klog.rs) 环形缓冲的绝对写入总量。真机（笔记本）没有串口，日志靠这条路带出机器 |
 | 59 | `SYS_LOG_READ` | `rdi=缓冲指针, rsi=长度, rdx=起始绝对偏移` | **读控制台日志**（Phase 0 / P0.1）：把环形缓冲里从 `起始绝对偏移` 起的字节写入用户缓冲，返回实际字节数（`0` = 读到头 / 越界）。缓冲满时挤掉最老字节，故 `起始偏移` 早于 `total - 64 KiB` 会被夹到最老处。使用方 = shell `dmesg` |
 | 60 | `SYS_PCI_INFO` | `rdi=索引, rsi=用户缓冲(3 个 u64)` | **读一台 PCI 设备记录**（Phase 0 / P0.3）：`[0]=vendor\|device<<16`、`[1]=class\|subclass<<8\|progif<<16\|bus<<24\|dev<<32\|func<<40`、`[2]=BAR0`。启动期枚举快照（[`pci::publish`](../../kernel/src/arch/pci.rs)），返回 `1` / 越界 `0`。使用方 = shell `lspci` |
+| 61 | `SYS_LOG_OLDEST` | — | **控制台日志最老存活字节的绝对偏移**（Phase 0 / P0.1）：返回 `total - 64 KiB`（未满时 `0`）。与 `SYS_LOG_TOTAL` 一起圈定"当前仍存活的日志窗口"：`SYS_LOG_READ` 会把过小的起始偏移**静默夹**到本值，故按自己的偏移推进的读循环会反复读到同一窗口 —— 窗口型读取必须以本值为起点 |
 
 ### MSR 配置（`syscall::init()`）
 
