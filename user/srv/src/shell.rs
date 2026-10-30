@@ -520,10 +520,16 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         return;
     }
     if arg.is_empty() {
-        let mut off = 0u64;
+        // `end` 取**读前快照**: `dmesg` 自己的输出经 SYS_PUTS 也会写回环形缓冲,
+        // 若以「读到 0」为终止条件, 打印出去的字节立刻又出现在日志尾部, 永远追不上
+        // (自喂养死循环)。起点取「当前仍保留的最老偏移」, 回绕后不能从 0 递增 ——
+        // 内核会把早于最老处的 start 静默夹到最老处, 偏移就对不上了。
+        let end = total;
+        let mut off = total.saturating_sub(LOG_CAP);
         let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
+        while off < end {
+            let want = ((end - off) as usize).min(buf.len());
+            let n = sys_log_read(off, &mut buf[..want]);
             if n == 0 {
                 break;
             }
@@ -564,10 +570,15 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
+    // 与打印分支同口径: 快照终点 + 从「当前仍保留的最老偏移」起读。
+    // （写文件不会回显进日志, 但起点若取 0, 回绕后会被内核反复夹回最老处 → 同一段被
+    //   重复追加到文件, 直到写失败。）
+    let end = total;
+    let mut off = total.saturating_sub(LOG_CAP); // 日志绝对偏移
     let mut woff = 0u64; // 文件内偏移
-    loop {
-        let n = sys_log_read(off, buf);
+    while off < end {
+        let want = ((end - off) as usize).min(buf.len());
+        let n = sys_log_read(off, &mut buf[..want]);
         if n == 0 {
             break;
         }

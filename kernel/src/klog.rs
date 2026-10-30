@@ -83,3 +83,40 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_bytes, read, total, LOG_CAP, LOG_HEAD, LOG_TOTAL};
+
+    /// 回绕后从「当前仍保留的最老偏移」起顺序读, 必须恰好拿到整个保留窗口且不重复。
+    ///
+    /// 这正是 shell `dmesg` 的读法 (Phase 0 / P0.1)。客户端若从 0 开始递增, 内核会把
+    /// 早于最老处的 `start` 夹回最老处, 客户端偏移与夹取点对不上 —— 同一段会被反复读出。
+    #[test]
+    fn wrapped_window_reads_back_exactly_once() {
+        unsafe {
+            LOG_HEAD = 0;
+            LOG_TOTAL = 0;
+        }
+        for i in 0..(LOG_CAP as u64 + 100) {
+            capture_bytes(&[(i % 251) as u8]);
+        }
+        let end = total();
+        let mut off = end - LOG_CAP as u64;
+        assert_eq!(off, 100, "只应丢掉最老的 100 字节");
+        let mut dst = [0u8; 4096];
+        let mut got = 0usize;
+        while off < end {
+            let want = ((end - off) as usize).min(dst.len());
+            let n = read(off, &mut dst[..want]);
+            assert!(n > 0, "快照内仍有数据时必须读到字节");
+            // 逐字节核对其绝对偏移对应的写入值, 重复/错位都会在这里暴露。
+            for (j, &b) in dst[..n].iter().enumerate() {
+                assert_eq!(b, ((off + j as u64) % 251) as u8);
+            }
+            off += n as u64;
+            got += n;
+        }
+        assert_eq!(got, LOG_CAP, "必须恰好读回保留窗口的长度");
+    }
+}

@@ -110,7 +110,15 @@ pub const SYS_NET_OWNER: u64 = 57;
 /// 控制台日志累计字节数 (Phase 0 / P0.1): 无参, 返回日志环形缓冲的绝对总量。
 pub const SYS_LOG_TOTAL: u64 = 58;
 /// 读控制台日志 (Phase 0 / P0.1): `a1` = 缓冲、`a2` = 长度、`a3` = 起始绝对偏移。
+///
+/// `start` 早于「当前仍保留的最老偏移」时内核会**静默夹到最老处**（回绕后这是常态）。
+/// 客户端因此必须自己从 `total - LOG_CAP` 起读，不能拿 `start = 0` 一路递增 ——
+/// 否则递增值会一直落在夹取点之前，反复读到同一段（见 [`LOG_CAP`]）。
 pub const SYS_LOG_READ: u64 = 59;
+/// 内核控制台日志环形缓冲容量 (64 KiB)，与 `kernel/src/klog.rs` 的 `LOG_CAP` 保持一致。
+///
+/// 缓冲满后只保留最近这么多字节，故「当前仍保留的最老绝对偏移」= `sys_log_total() - LOG_CAP`。
+pub const LOG_CAP: u64 = 64 * 1024;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
 
