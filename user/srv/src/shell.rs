@@ -506,6 +506,12 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// 内核日志环形缓冲容量（必须与 `kernel/src/klog.rs` 的 `LOG_CAP` 一致）。
+///
+/// `dmesg` 从 `total - LOG_CAP` 起读：若从 0 起读，日志回绕后内核会把起点夹到最老处，
+/// 而调用方仍按"从 0 读了多少"推进偏移 —— 最老的一段会被重复输出。
+const LOG_CAP: u64 = 64 * 1024;
+
 /// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
@@ -519,33 +525,41 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println("dmesg: log is empty");
         return;
     }
+    let start = total.saturating_sub(LOG_CAP);
     if arg.is_empty() {
-        let mut off = 0u64;
-        let mut got = 0u64;
-        loop {
-            let n = sys_log_read(off, buf);
-            if n == 0 {
+        // 先把快照窗口整段读进本地缓冲，**再**输出：dmesg 自己的输出也经 `SYS_PUTS`
+        // 重新进环形缓冲。边读边打时，打印会覆盖尚未读到的最老日志（可读窗口恰好等于
+        // 缓冲容量），且 `total` 与 `off` 同步增长 —— `off` 永远追不上 `total`（死循环）。
+        static mut SNAP: [u8; LOG_CAP as usize] = [0u8; LOG_CAP as usize];
+        let snap = unsafe { &mut *core::ptr::addr_of_mut!(SNAP) };
+        let mut off = start;
+        let mut got = 0usize;
+        while off < total {
+            let want = ((total - off) as usize).min(snap.len() - got);
+            if want == 0 {
                 break;
             }
-            // 只在**合法 UTF-8 前缀**上操作: 4 KiB 分块可能把一个多字节字符 (如中文)
-            // 切成两半, 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
-            // 用 `valid_up_to` 取合法前缀, 剩余字节下一轮再读 (off 只推进这么多)。
-            let used = match core::str::from_utf8(&buf[..n]) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if used == 0 {
-                break; // 防御: 只读到半个字符时不再前进
+            let n = sys_log_read(off, &mut snap[got..got + want]);
+            if n == 0 || n > want {
+                break;
             }
-            let s = unsafe { core::str::from_utf8_unchecked(&buf[..used]) };
+            off += n as u64;
+            got += n;
+        }
+        // 只在**合法 UTF-8 前缀**上操作: 环形缓冲里理论上都是 `&str` 的字节, 但
+        // 防御性地裁到合法前缀, 避免给内核 `chars()` 递非法序列。
+        let used = match core::str::from_utf8(&snap[..got]) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if used > 0 {
+            let s = unsafe { core::str::from_utf8_unchecked(&snap[..used]) };
             sys_puts(s);
-            off += used as u64;
-            got += used as u64;
         }
         // 日志尾部可能不带换行, 补一个, 免得后续提示符黏在最后一行。
         println("");
         print("dmesg: ");
-        print_u64(got);
+        print_u64(got as u64);
         println(" bytes");
         return;
     }
@@ -564,11 +578,12 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
+    let mut off = start; // 日志绝对偏移 (从快照窗口起点开始, 见 `LOG_CAP`)
     let mut woff = 0u64; // 文件内偏移
-    loop {
-        let n = sys_log_read(off, buf);
-        if n == 0 {
+    while off < total {
+        let want = ((total - off) as usize).min(buf.len());
+        let n = sys_log_read(off, &mut buf[..want]);
+        if n == 0 || n > want {
             break;
         }
         let w = vfs::write(fd, woff, &buf[..n]);

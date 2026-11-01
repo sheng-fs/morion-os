@@ -83,3 +83,34 @@ pub fn handle_read(a1: u64, a2: u64, a3: u64) -> u64 {
     let dst = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, len as usize) };
     read(a3, dst) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dmesg` 的取数契约: 日志回绕后, 从 `total - LOG_CAP` 起读必须恰好拿到整个窗口
+    /// (`LOG_CAP` 字节), 每个绝对偏移只出现一次 —— 这是 shell 从 `total - LOG_CAP`
+    /// 起读、而不是从 0 起读的依据 (从 0 起读会被夹到最老处 → 最老一段重复输出)。
+    #[test]
+    fn window_read_starts_at_oldest_without_duplicates() {
+        let cap = LOG_CAP as u64;
+        let extra = 4096u64;
+        let base = total();
+        for i in 0..cap + extra {
+            capture_bytes(&[(base + i) as u8]);
+        }
+        let total = total();
+        let start = total - cap;
+        let mut buf = [0u8; 4096];
+        let mut off = start;
+        let mut got = 0u64;
+        while off < total {
+            let n = read(off, &mut buf);
+            assert!(n > 0, "窗口内绝对偏移 {off} 应可读");
+            assert_eq!(buf[0], off as u8, "绝对偏移 {off} 的字节不对");
+            off += n as u64;
+            got += n as u64;
+        }
+        assert_eq!(got, cap);
+    }
+}
