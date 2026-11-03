@@ -121,23 +121,48 @@ impl<'a> KernelLoader<'a> {
         tpm.measure_kernel(data);
 
         // 遍历程序头加载段
-        let phoff = header.phoff as usize;
-        let phentsize = header.phentsize as usize;
-        let phnum = header.phnum as usize;
+        let phoff = header.phoff;
+        let phentsize = header.phentsize as u64;
+        let phnum = header.phnum as u64;
+
+        // 程序头表整体必须落在镜像内 (checked_mul 防 phoff 或 phentsize 溢出)。
+        let Some(ph_end) = phoff
+            .checked_add(phentsize.checked_mul(phnum)?)
+        else {
+            return Err("ELF 程序头表加法溢出");
+        };
+        if ph_end > data.len() as u64 {
+            return Err("ELF 程序头表越界");
+        }
 
         let mut lowest_addr = u64::MAX;
         let mut highest_addr = 0u64;
 
         for i in 0..phnum {
             let ph_offset = phoff + i * phentsize;
-            if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() {
-                break;
-            }
-            let ph = unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+            let ph = unsafe { &*(data.as_ptr().add(ph_offset as usize) as *const Elf64ProgramHeader) };
 
             if ph.ptype == PT_LOAD && ph.memsz > 0 {
+                // p_offset + p_filesz 必须整段落在镜像里 (checked_add 防溢出, 防止
+                // 恶意/损坏 ELF 在后续切片 [ph_offset..ph_offset+ph_filesz] 处 panic)。
+                let Some(file_end) = ph.offset.checked_add(ph.filesz) else {
+                    return Err("ELF 段 offset+filesz 加法溢出");
+                };
+                if file_end > data.len() as u64 {
+                    return Err("ELF 段文件内容越界");
+                }
+                if ph.filesz > ph.memsz {
+                    return Err("ELF 段 filesz > memsz");
+                }
+
                 let load_addr = ph.paddr;
                 let memsz = ph.memsz as usize;
+
+                // 物理目标地址必须 4 KiB 对齐 (未对齐等于违反段默认对齐, 极可能是
+                // 损坏或恶意 ELF; bootloader 不应在这种地址上盲写)。
+                if load_addr & 0xFFF != 0 {
+                    return Err("ELF 段 paddr 未对齐到 4 KiB");
+                }
 
                 // 分配物理内存
                 let pages = (memsz + 0xFFF) >> 12; // 向上取整到 4KB
@@ -149,12 +174,16 @@ impl<'a> KernelLoader<'a> {
                         load_addr,
                         &data[ph.offset as usize..ph.offset as usize + ph.filesz as usize],
                         memsz,
+                        data.as_ptr() as u64,
+                        data.len() as u64,
                     )?;
 
                     if load_addr < lowest_addr {
                         lowest_addr = load_addr;
                     }
-                    let end = load_addr + memsz as u64;
+                    let Some(end) = load_addr.checked_add(ph.memsz) else {
+                        return Err("ELF 段 load_addr+memsz 加法溢出");
+                    };
                     if end > highest_addr {
                         highest_addr = end;
                     }
@@ -178,12 +207,29 @@ impl<'a> KernelLoader<'a> {
     }
 
     /// 分配物理内存并加载段数据
+    ///
+    /// `data_phys_base` / `data_phys_len`: 源 ELF 映像在物理内存中的基址与长度
+    /// (UEFI 恒等映射下 data.as_ptr() 即物理地址, 由调用方传入)。用于防止
+    /// 目标物理区间覆盖源映像, 导致 memmove-like 行为在后续段加载时读到被破坏数据。
     fn allocate_and_load(
         &self,
         phys_addr: u64,
         data: &[u8],
         memsz: usize,
+        data_phys_base: u64,
+        data_phys_len: u64,
     ) -> Result<(), &'static str> {
+        // 物理区间重叠检测: 目标 `[phys_addr, phys_addr + memsz)` 不得覆盖
+        // 源 ELF 映像本身 —— UEFI 环境下 data 切片本身也落在物理地址空间里,
+        // 段加载目标若与它重叠会在后续段复制时读到被覆盖的数据。
+        let target_end = phys_addr.checked_add(memsz as u64).ok_or("memsz 加法溢出")?;
+        if data_phys_len > 0 {
+            let data_end = data_phys_base.checked_add(data_phys_len).ok_or("data 长度溢出")?;
+            if phys_addr < data_end && target_end > data_phys_base {
+                return Err("段加载目标与源 ELF 映像重叠");
+            }
+        }
+
         // 在 UEFI 环境中，物理内存与虚拟内存一一映射
         // 直接 memcpy 到目标地址
         if !data.is_empty() {
