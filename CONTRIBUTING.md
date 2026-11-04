@@ -1,177 +1,91 @@
 # 贡献指南
 
-感谢你对 Morion OS 的关注！本文档说明如何参与项目开发、提交 Issue 与 Pull Request。
+感谢参与 Morion OS。本文只保留「怎么快速跑起来、怎么提 PR」的必要信息；架构与接口细节见
+[docs/architecture.md](./docs/architecture.md) 和 [docs/dev-reference.md](./docs/dev-reference.md)。
 
-## 贡献工作流（重要）
+## 60 秒上手
 
-所有贡献统一通过「**新建自己的分支 → 推送 → 提交 PR → 检查通过 → 合并**」完成，**不要直接向 `main` 分支推送代码**。
-
-```
-1. 从 main 切出你自己的分支
-       ↓
-2. 在该分支上开发并提交
-       ↓
-3. 推送你的分支到远端
-       ↓
-4. 提交 Pull Request 到 main
-       ↓
-5. 通过 CI 检查 + 维护者 review
-       ↓
-6. 合并到 main
-```
+依赖：Rust nightly（`rust-toolchain.toml` 已固定）、`nasm`、`qemu`、`xorriso`、`mtools`、`edk2-ovmf`。
 
 ```bash
-# 1. 确保基于最新的 main
-git checkout main
-git pull origin main
+make setup        # 检查工具链并提示缺失依赖
+make iso          # 构建可启动 ISO
+make run          # QEMU + KVM；无 KVM 用 make run-nokvm
+```
 
-# 2. 新建自己的功能分支（用简短、描述性的名字）
-git checkout -b feat/your-feature
-# 或修复缺陷: git checkout -b fix/your-bug
-# 3. 开发并提交（遵循下方的提交规范）
-git add <相关文件>
+`make help` 可看全部目标。
+
+## 提交流程
+
+`main` 受保护，**不要直接 push**。所有改动走分支 + PR：
+
+```bash
+git switch main && git pull
+git switch -c feat/your-feature     # 或 fix/、docs/、refactor/
+# 开发……
+git add -p
 git commit -m "feat(boot): 新增亚克力主题渲染"
-
-# 4. 推送自己的分支到远端
 git push -u origin feat/your-feature
-
-# 5. 在 GitHub 上打开 Pull Request，等待检查与 review
 ```
 
-> 合并前需满足：CI 检查全部通过、至少一位维护者 review 通过。合并由维护者执行。
+然后在 GitHub 打开 PR：模板会自动带出变更类型、关联 Issue 和测试清单。合并条件：CI 全绿 +
+至少一位维护者 review；合并由维护者执行。
 
-## 快速开始
+## 提交信息
 
-Morion OS 是基于 Rust 的 UEFI 引导加载器 + 微内核项目，当前处于**重新设计与重写阶段**。旧代码已归档到 `legacy` 分支，主线 `main` 重新开始。
+使用 [Conventional Commits](https://www.conventionalcommits.org/)，格式 `<type>(<scope>): <描述>`：
 
-### 环境准备
+| type | 用途 | type | 用途 |
+|------|------|------|------|
+| `feat` | 新功能 | `test` | 测试 |
+| `fix` | Bug 修复 | `build` | 构建 / 依赖 |
+| `refactor` | 重构（不改行为） | `ci` | CI |
+| `docs` | 文档 | `chore` | 杂项维护 |
+| `perf` | 性能 | `style` | 纯格式 |
 
-- **Rust nightly** 工具链（由根目录 `rust-toolchain.toml` 固定）
-- 目标三元组：`x86_64-unknown-uefi`（引导器）、`x86_64-unknown-none`（内核）
-- 构建依赖：`nasm`、`qemu`、`xorriso`、`mtools`、`edk2-ovmf`
+示例：`feat(xhci): 支持多控制器与 USB HID 键盘`、`fix(init): 连续失败后放弃重启`。
+
+一个 PR 尽量只做一件事；提交信息写清楚「为什么」，不必罗列改了哪几行。
+
+## 合并前自检
 
 ```bash
-# 一键检查并安装 Rust 工具链与依赖提示
-make setup
-
-# 构建完整 ISO 镜像
-make iso
-
-# 在 QEMU 中运行
-make run          # 需要 KVM
-make run-nokvm    # 无硬件虚拟化环境
+make fmt && make check && make clippy   # 与 CI 相同的三项门禁
 ```
 
-其他常用目标见 `make help`。
+- **内核 / 文件系统 / 驱动改动**：再跑一次 `bash scripts/fs-regress.sh`（QEMU 全量自测，本地 KVM
+  约 6 分钟；CI 每周定时跑，也可在 Actions 里手动触发）。
+- **用户可见行为变更**：同步 `README.md` / `README.en.md` / 相关 `docs/` 与 `CHANGELOG.md`。
+- **改了用户态服务**：必须 `make iso` —— 服务 ELF 会被打进 ESP 和 FAT32 根盘。
+- **切换构建变体**（`NOGUI=1` / `SAFE=1`）前先 `cargo clean`，避免复用上一个变体的产物。
+- **真机没有串口**：用 `dmesg /boot.log` 把日志写到 U 盘带出来。
 
-## 目录结构约定
+## 分支与目录
 
-项目为 Rust workspace，当前包含三个 crate：
+- `main`：主线，受保护；`legacy`：旧代码归档，只读。
+- 功能分支：`feat/xxx`、`fix/xxx`、`docs/xxx`、`refactor/xxx`。
+- 主要目录：`boot/`（UEFI 引导器）、`kernel/`（微内核）、`user/`（用户态服务与库）、
+  `docs/`（架构 / 接口 / 路线图）、`scripts/`（构建与回归脚本）。
+- 新增资源按用途放：引导期资源进 `boot/loader/resources/`，系统资源进 `resources/system/`；
+  不要散落在根目录，改路径时同步更新 `Makefile` 与引导配置。
+- 注释用中文；格式直接交给 `cargo fmt`，不要手写对抗 rustfmt 的排版。
 
-| 路径 | 说明 |
-|------|------|
-| `boot/` | UEFI 引导加载器（morion-boot） |
-| `kernel/` | 微内核，最小可信基（morion-kernel） |
-| `kernel_test/` | 引导器联调用测试内核（临时） |
+## Issue
 
-资源归档约定：
+先搜索是否已有同类 Issue，再选模板：
 
-- 引导期资源 → `boot/loader/resources/`（动画、背景、图标、Logo、进度条、闪屏）
-- 系统全局资源 → `resources/system/`（设备/文件/服务图标、系统 Logo、终端背景）
-- 引导配置 → `boot/loader/`（`loader.conf`、`theme.toml`、`entries/`）
+- **Bug**：复现步骤、环境（真机 / QEMU、构建变体）、`dmesg` 日志；
+- **Feature**：使用场景、期望行为、可选方案。
 
-> 新增资源请按用途放入对应目录，不要散落在根目录；修改资源路径时同步更新构建配置（`Makefile`、`boot/` 中的配置）。
-
-## 分支规范
-
-- `main`：主线，全新重写的代码（受保护，不直接推送）
-- `legacy`：旧代码归档分支，只读
-- 功能分支：`feat/xxx`、`fix/xxx`，完成后通过 PR 合并回 `main`
-
-## 提交规范
-
-使用 [Conventional Commits](https://www.conventionalcommits.org/) 风格：
-
-```
-<type>(<scope>): <简要描述>
-```
-
-常用 `type`：
-
-| type | 说明 |
-|------|------|
-| `feat` | 新功能 |
-| `fix` | Bug 修复 |
-| `refactor` | 重构 |
-| `docs` | 文档 |
-| `ci` | 构建 / CI |
-| `chore` | 杂项维护 |
-
-示例：`feat(boot): 新增亚克力主题渲染`、`fix(kernel): 修复缺页处理`。
-
-## 代码风格
-
-- 提交前确保通过检查：
-
-```bash
-make fmt      # 格式检查 (cargo fmt --all -- --check)
-make check    # 编译检查
-make clippy   # Clippy 检查（-D warnings）
-```
-
-- 注释使用中文，与现有代码保持一致。
-
-### 关于 `make fmt`
-
-**三项都是 CI 门禁**。fmt 能成为门禁是因为 2026-09 做过一次**全仓库** `cargo fmt`
-（37 个文件，+2839/−856）：
-
-- 在此之前代码是**手写的紧凑单行风格**（如 `struct Color { b: u8, g: u8, r: u8, a: u8 }`、
-  单行 `const fn`），与默认 rustfmt 相差 **244 处**，没法当门禁。试过用
-  `use_small_heuristics = "Max"` + `fn_single_line` 等选项去贴合，差异反而涨到 351 处 ——
-  「调一份配置对上」这条路走不通，只能反过来让代码去对齐默认配置。
-- 所以现在**请直接跑 `cargo fmt --all`**（或 `make fmt` 检查），不要手写对抗 rustfmt 的紧凑
-  排版；一次性重排已经作为独立的 `style:` 提交做完了，此后不再有「大重排」。
-
-## CI
-
-`.github/workflows/` 下有两个工作流：
-
-| 工作流 | 触发 | 内容 |
-| --- | --- | --- |
-| `ci.yml` | 每次 push / PR 到 `main` / `master` | `make fmt` → `make check` → `make clippy`（只编译，不跑 QEMU，几分钟出结果） |
-| `fs-regress.yml` | **每周定时** + **手动**（Actions → Run workflow） | 构建 ISO 与 6 张测试盘 → `bash scripts/fs-regress.sh`（QEMU 全量自测） |
-
-`fs-regress.yml` 之所以不挂在 push 上：公共 runner 通常没有 `/dev/kvm`，QEMU 只能走 TCG，
-本地 KVM 下约 6 分钟的整套自测会慢好几倍。
-
-## Issue 规范
-
-报告问题或提出建议前，请先搜索是否已有相关 Issue。提交时选择对应模板：
-
-- **Bug 报告**：`[Bug]` 前缀，附带复现步骤、环境信息与日志
-- **功能请求**：`[Feat]` 前缀，说明背景动机与方案
-
-### 标签规划
-
-| 类型 | 标签 |
-|------|------|
-| 缺陷 / 功能 / 文档 / 重构 | `bug` / `feat` / `docs` / `refactor` |
-| 性能 / 杂项 / 测试 | `perf` / `chore` / `test` |
-| 组件归属 | `boot` / `kernel` / `ui-assets` / `security` / `ci` |
-| 优先级 | `priority-high` / `priority-medium` / `priority-low` |
-| 状态 | `good-first-issue` / `help-wanted` / `question` / `wontfix` |
-
-完整标签定义见 [.github/labels.yml](./.github/labels.yml)。
-
-## Pull Request 规范
-
-1. 从 `main` 切出你自己的功能分支进行开发（见上方「贡献工作流」）
-2. 遵循提交规范与代码风格
-3. 使用 PR 模板填写变更说明、关联 Issue 与测试情况
-4. 确保 CI 检查（`check` / `clippy`）全部通过
-5. 由维护者 review 通过后合并到 `main`
+标签由维护者按 [.github/labels.yml](./.github/labels.yml) 添加，提交时不用纠结分类。
 
 ## 许可证
 
-贡献的代码默认遵循项目的 [MIT 许可证](./LICENSE)。
+本项目采用**按模块许可**，提交前请确认你改的目录对应哪个协议：
+
+- 核心（`boot/`、`kernel/`、`user/`）：MIT；
+- 飞地实现（`enclave/`）：Apache-2.0（含专利授权）；`enclave/abi/` 仍为 MIT；
+- 第三方驱动 / 固件：保留原协议，不要把 GPL 代码提交进主仓库。
+
+提交即表示你同意对应目录的 SPDX 协议。新增文件请加 SPDX 头（如 `// SPDX-License-Identifier: MIT`），
+第三方代码注明来源、原协议与 commit。完整映射见 [docs/licensing.md](./docs/licensing.md)。

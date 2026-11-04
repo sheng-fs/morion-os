@@ -1,0 +1,12 @@
+Morion OS
+Copyright (c) 2026 sheng-fs
+
+The Morion OS core (boot/, kernel/, user/) is licensed under the MIT License.
+See LICENSE and LICENSES/MIT.txt.
+
+Modules under enclave/ are licensed under the Apache License, Version 2.0.
+See LICENSES/Apache-2.0.txt. That license includes an express patent grant
+and a patent-litigation termination clause (Section 3).
+
+Third-party drivers and firmware retain their original licenses. See
+docs/licensing.md and the LICENSE / NOTICE file in each directory.

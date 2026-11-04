@@ -6,7 +6,7 @@
 
 ---
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20Apache--2.0-blue.svg)](./docs/licensing.md)
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
 [![Arch](https://img.shields.io/badge/arch-x86__64%20|%20AArch64%20|%20RISC--V-brightgreen.svg)]()
 [![Stage](https://img.shields.io/badge/stage-design%20&%20rewrite-yellow.svg)]()
@@ -411,7 +411,13 @@
 
 ## 许可证
 
-本项目采用 [MIT 许可证](./LICENSE)。
+本项目采用**按模块许可**：
+
+- 核心（`boot/`、`kernel/`、`user/`）：[MIT](./LICENSE)
+- 飞地模块（`enclave/`）：[Apache-2.0](./LICENSES/Apache-2.0.txt)，含明示专利授权与专利诉讼终止
+- 第三方驱动 / 固件：保留原协议，见 [docs/licensing.md](./docs/licensing.md)
+
+对外统一表述：**Morion OS core is MIT-licensed; the enclave module is Apache-2.0; third-party drivers and firmware retain their own licenses.** 不是全仓库单一 MIT。
 
 ---
 

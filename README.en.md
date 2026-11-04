@@ -6,7 +6,7 @@
 
 ---
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20Apache--2.0-blue.svg)](./docs/licensing.md)
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
 [![Arch](https://img.shields.io/badge/arch-x86__64%20|%20AArch64%20|%20RISC--V-brightgreen.svg)]()
 [![Stage](https://img.shields.io/badge/stage-design%20&%20rewrite-yellow.svg)]()
@@ -392,7 +392,13 @@ The project is a Rust workspace (root `Cargo.toml`) currently containing the `bo
 
 ## License
 
-This project is licensed under the [MIT License](./LICENSE).
+This project uses **per-module licensing**:
+
+- Core (`boot/`, `kernel/`, `user/`): [MIT](./LICENSE)
+- Enclave module (`enclave/`): [Apache-2.0](./LICENSES/Apache-2.0.txt), including an express patent grant and patent-litigation termination
+- Third-party drivers / firmware: retain their original licenses; see [docs/licensing.md](./docs/licensing.md)
+
+Canonical wording: **Morion OS core is MIT-licensed; the enclave module is Apache-2.0; third-party drivers and firmware retain their own licenses.** The repository is not single-licensed MIT.
 
 ---
 
