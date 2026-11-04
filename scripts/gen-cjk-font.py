@@ -52,7 +52,16 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 与脚本同址的这些路径用于「仓库里出现过的非 ASCII 字符」这一步。
-SCAN_PATHS = ["kernel/src", "user/src", "boot/src", "docs", "README.md", "README.en.md"]
+SCAN_PATHS = [
+    "kernel/src",
+    "user/src",
+    "boot/src",
+    "docs",
+    "README.md",
+    "README.zh-CN.md",
+    "README.ja.md",
+    "README.ko.md",
+]
 
 RECORD = 37
 UNIFONT_VERSION = "18.0.01"

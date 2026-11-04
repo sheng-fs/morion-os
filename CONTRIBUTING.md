@@ -55,7 +55,7 @@ make fmt && make check && make clippy   # 与 CI 相同的三项门禁
 
 - **内核 / 文件系统 / 驱动改动**：再跑一次 `bash scripts/fs-regress.sh`（QEMU 全量自测，本地 KVM
   约 6 分钟；CI 每周定时跑，也可在 Actions 里手动触发）。
-- **用户可见行为变更**：同步 `README.md` / `README.en.md` / 相关 `docs/` 与 `CHANGELOG.md`。
+- **用户可见行为变更**：同步 `README.md`（英文主）、`README.zh-CN.md` 等各语言版本、相关 `docs/` 与 `CHANGELOG.md`。
 - **改了用户态服务**：必须 `make iso` —— 服务 ELF 会被打进 ESP 和 FAT32 根盘。
 - **切换构建变体**（`NOGUI=1` / `SAFE=1`）前先 `cargo clean`，避免复用上一个变体的产物。
 - **真机没有串口**：用 `dmesg /boot.log` 把日志写到 U 盘带出来。
