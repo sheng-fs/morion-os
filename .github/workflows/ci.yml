@@ -82,7 +82,12 @@ jobs:
           for f in /tmp/fmt.log /tmp/check.log /tmp/clippy.log; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
-            errs=$(sed -e "$strip" "$f" | grep -iE -B2 -A6 'error(\[|:)' | head -n 40 \
-                   | tr '\n' '|' | tr -d '%' | cut -c1-1200)
-            echo "::error title=${name} 报错行::${errs:-（日志里没有 error 行）}"
+            # fmt 失败没有 "error:"，只有 "Diff in ..."；两种都提出来。
+            errs=$(sed -e "$strip" "$f" | grep -iE -B2 -A6 'error(\[|:)|Diff in ' | head -n 40 \
+                   | tr '\n' '|' | tr -d '%' | cut -c1-1200 || true)
+            if [ -n "$errs" ]; then
+              echo "::error title=${name} 报错行::${errs}"
+            else
+              echo "::notice title=${name}::（日志里没有 error / Diff 行）"
+            fi
           done

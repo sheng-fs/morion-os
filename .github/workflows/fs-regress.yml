@@ -50,16 +50,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf mtools dosfstools e2fsprogs exfatprogs util-linux xorriso
 
-      # Makefile 与回归脚本按 Arch 的路径写死了 OVMF (/usr/share/edk2/x64/OVMF.4m.fd),
-      # Ubuntu 装在 /usr/share/OVMF/ 下且文件名带 4M —— 按实际存在的文件补软链。
-      - name: Provide OVMF at the expected path
+      # Ubuntu 的 ovmf 包只提供分开的 CODE/VARS（没有合并版 OVMF.fd），
+      # 用 -bios 加载 CODE 会直接退出（串口 0 字节），必须走两块 pflash。
+      # 把路径交给回归脚本，由脚本复制一份可写的 VARS 副本。
+      - name: Locate OVMF (pflash)
         run: |
-          sudo mkdir -p /usr/share/edk2/x64
           code=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -n1)
           vars=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -n1)
           test -n "$code" && test -n "$vars"
-          sudo ln -sf "$code" /usr/share/edk2/x64/OVMF.4m.fd
-          sudo ln -sf "$vars" /usr/share/edk2/x64/OVMF_VARS.fd
+          echo "OVMF_CODE=$code" >> "$GITHUB_ENV"
+          echo "OVMF_VARS=$vars" >> "$GITHUB_ENV"
+          echo "::notice title=OVMF::CODE=$code VARS=$vars"
 
       # 自测依赖的 6 张盘: nvme/ext2/parts/exfat 由 Makefile 造; mfs.img 与 spare.img
       # 由回归脚本自己 dd 成空白 (首次挂载自动格式化 / 供 mkfs.mfs 自测)。

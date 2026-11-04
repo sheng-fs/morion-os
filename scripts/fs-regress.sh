@@ -82,6 +82,24 @@ t0=$(date +%s)
 
 QEMU=${QEMU:-qemu-system-x86_64}
 BIOS=${BIOS:-/usr/share/edk2/x64/OVMF.4m.fd}
+# CI (Ubuntu) 不再提供合并版 OVMF.fd，而是分开的 CODE/VARS。此时用两块 pflash：
+# CODE 只读，VARS 复制一份可写副本。两者必须同时设置；否则回退到本地常见的合并版 -bios。
+vars_copy=""
+cleanup_vars() { [ -n "$vars_copy" ] && rm -f "$vars_copy"; }
+trap cleanup_vars EXIT
+if [ -n "${OVMF_CODE:-}" ] || [ -n "${OVMF_VARS:-}" ]; then
+  if [ -z "${OVMF_CODE:-}" ] || [ -z "${OVMF_VARS:-}" ]; then
+    echo "!! OVMF_CODE 与 OVMF_VARS 必须同时设置" >&2
+    exit 2
+  fi
+  vars_copy=$(mktemp)
+  cp "$OVMF_VARS" "$vars_copy"
+  fw_args=(-drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$vars_copy")
+  echo "== OVMF: pflash (CODE=$OVMF_CODE)"
+else
+  fw_args=(-bios "$BIOS")
+  echo "== OVMF: -bios (BIOS=$BIOS)"
+fi
 # 默认跑本目录构建的镜像; 变体 (如安装盘) 用 REGRESS_ISO 指过去。
 ISO=${REGRESS_ISO:-$OUT_DIR/morion-os.iso}
 
@@ -108,7 +126,8 @@ fi
 cp -f "$ISO" "$OUT_DIR/iso.img"
 
 $QEMU \
-  -machine q35 ${iommu_arg} -m "${QEMU_MEM:-2G}" -bios "$BIOS" \
+  -machine q35 ${iommu_arg} -m "${QEMU_MEM:-2G}" \
+  "${fw_args[@]}" \
   -cdrom "$ISO" \
   -device nvme,serial=MORION,id=nvme0 \
   -drive file="$OUT_DIR/nvme.img",if=none,id=n1,format=raw -device nvme-ns,drive=n1,bus=nvme0,nsid=1 \

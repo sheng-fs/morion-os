@@ -30,5 +30,9 @@ jobs:
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
+          if [ -z "${GITEE_TOKEN}" ]; then
+            echo "::notice title=Gitee mirror::GITEE_TOKEN 未配置，跳过镜像推送"
+            exit 0
+          fi
           git remote add gitee "https://sheng_jheng:${GITEE_TOKEN}@gitee.com/sheng_jheng/morion-os.git"
           git push --force gitee main:main
