@@ -63,7 +63,7 @@ pub extern "C" fn morion_main(_domain_id: u64) {
 
 | | 载体 | 载入时机 | 现状 |
 |---|---|---|---|
-| **系统服务程序**（`user/srv/`，24 个程序各自一个 `[[bin]]`；含监督者 `init`、图形服务 `gfx_srv`、设备驱动服务 `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` / `e1000e_srv`、网络协议栈 `netstack_srv` 与客户机 HTTP 服务 `httpd_srv`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
+| **系统服务程序**（`user/srv/`，26 个程序各自一个 `[[bin]]`；含监督者 `init`、图形服务 `gfx_srv`、设备驱动服务 `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` / `e1000e_srv` / `e1000_srv` / `wifi_srv`、网络协议栈 `netstack_srv` 与客户机 HTTP 服务 `httpd_srv`） | 各自一份**独立 ELF**（`build/user/srv/<name>.elf`） | 引导期：引导器从 ESP 读入 → `BootInfo` 模块表 → 内核按表载入**各自固定域**；退出后由 `init` 用引导模块内存镜像（失败回退盘）**原地重启** | E2b/E3b/E3c 起 |
 | **运行时程序**（如 `user/hello/`） | `.mex` 文件（ELF64 `ET_EXEC`） | **运行时**：`SYS_SPAWN_ELF` 载入**新域** | E1/E2 起可用 |
 
 两者都是**独立 ELF**，走同一条加载链（`elf::parse` + `exec`）—— 差别只在"什么时候、载入哪个域"：

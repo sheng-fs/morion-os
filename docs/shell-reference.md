@@ -43,7 +43,7 @@ shell: type 'help' for commands
 | `dns` / `nslookup` | `dns <name>` | 解析 `<name>` 的 A 与 AAAA 记录各打印一行（走 slirp 内置 DNS `10.0.2.3`） |
 | `wifi` | `wifi [status\|scan\|connect <ssid> [psk]]` | 无线 station（`wifi_srv`，域 25）。本轮是**抽象层**：无 radio 时 `status` 报 `radio=0`、`scan` 返 0 条、`connect` 恒失败。真机接入前后命令接口不变 |
 | `lspci` | `lspci` | 列出启动期枚举到的 PCI 设备（Phase 0 / P0.3）：`bb:dd.f  vend=… dev=… class=…[:…:…] [bar0=0x…]`，经 `SYS_PCI_INFO(60)` 读内核只读快照。真机取证用：能看到"内核认得、但还没有驱动"的硬件 |
-| `dmesg` | `dmesg [path]` | 打印 / 导出控制台日志（Phase 0 / P0.1）：不带参数原样打印（含**内核引导日志**）；带 `path` 则写入文件（如 `dmesg /boot.log`）。日志在内核 64 KiB 环形缓冲里，满了挤掉最老 —— 真机（无串口）靠它把日志带出机器 |
+| `dmesg` | `dmesg [-d ms] [-a] [-g pat] [path]` | 打印 / 导出控制台日志（Phase 0 / P0.1）：默认逐行慢打（便于 `Ctrl+C` 中止），`-d ms` 调行间延迟、`-a` 全速、`-g pat` 只打含该子串的行并报匹配行数；带 `path` 则把日志写入文件（如 `dmesg /boot.log`）。日志在内核 64 KiB 环形缓冲里，满了挤掉最老 —— 真机（无串口）靠它把日志带出机器 |
 | `cd` | `cd [path]` | 切换工作目录，默认 `/` |
 | `mkdir` | `mkdir <path>` | 创建目录 |
 | `touch` | `touch <file>` | 创建空文件（已存在则等价打开，不报错） |
@@ -71,6 +71,8 @@ shell: type 'help' for commands
 | `part.wipe` | `part.wipe <nsid>` | 清空分区表，盘回到「无分区表」 |
 | `part.reload` | `part.reload` | 重读分区表（重建并打印卷表） |
 | `clear` | `clear` | 清屏并复位历史/光标/回滚状态 |
+| `poweroff` / `halt` / `shutdown` | `poweroff` | ACPI S5 软关机（`SYS_POWEROFF(61)`；需 `Capability::Spawn`）。固件不接受 S5 时打印失败并停机 |
+| `reboot` | `reboot` | 硬重启（`SYS_REBOOT(62)`；i8042 `0xFE` → `0xCF9` → 三重故障兜底） |
 
 命令名**区分大小写**（须全小写）；未知命令打印 `shell: unknown command: <cmd>`。
 空行（去空白后为空）直接忽略。
@@ -94,7 +96,7 @@ commands:
   dns <name>     resolve A and AAAA records (alias: nslookup)
   wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)
   lspci          list PCI devices seen by the kernel (vendor:device:class)
-  dmesg [path]   print console log (kernel + services); with path, write it to a file
+  dmesg [-d ms] [-a] [-g pat] [path]  console log; slow per-line by default (-d ms = delay, -a = full speed, -g pat = only lines containing pat), path = write to file
   cd [path]      change directory (default: /)
   mkdir <path>   create directory
   touch <file>   create empty file
@@ -122,6 +124,9 @@ commands:
   part.wipe <nsid>   clear the partition table (disk becomes blank)
   part.reload      re-read all partition tables
   clear          clear screen
+  poweroff       power off the machine (ACPI S5; alias: halt/shutdown)
+  reboot         reset and restart the machine
+  (Ctrl+C: cancel the current input line, or abort a long dump like dmesg)
   (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)
   (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)
 ```
@@ -265,12 +270,14 @@ lspci: 9 device(s)
 - 真机取证意义：能看到"**内核认得、但还没有驱动**"的硬件（如无线 `8086:2725`、有线 `10ec:8168`），这正是"看得见 vs 能驱动"的分界证据。
 - 无设备：`lspci: no PCI devices recorded`。
 
-### `dmesg [path]`
+### `dmesg [-d ms] [-a] [-g pat] [path]`
 
 打印 / 导出**控制台日志**（Phase 0 / P0.1，plan-net-real.md）。内核把**所有**控制台输出（内核与用户态 —— 用户输出经 `SYS_PUTS` 汇入 `video::print`）额外追加进一个 **64 KiB 环形缓冲**；`dmesg` 经 `SYS_LOG_TOTAL(58)` / `SYS_LOG_READ(59)` 把它读出来。
 
-- 不带参数：原样打印全部日志（含**内核引导日志**：PCI 枚举、ACPI/VT-d 探测等），末尾报已打印字节数。
+- 默认**逐行慢打**（每行约 5 ms 停顿），行边界检查 `SYS_KEY_TRY_READ(63)` —— 按 **`Ctrl+C`** 立即中止；`-d ms` 改行间延迟、`-a` 全速（不延迟）。
+- `-g pat`：只打印含 `pat` 的行，结束时报 `dmesg: <n> lines matched`（如 `dmesg -g xhci`）。
 - 带 `path`：把日志**写入该文件**（如 `dmesg /boot.log`），走既有 FAT32 写路径；覆盖写（先删旧文件）。
+- 不带 `-g` 的终端模式末尾报 `dmesg: <n> bytes`。
 
 真机（笔记本）**没有串口**，这是把日志带出机器的唯一办法：
 
@@ -585,6 +592,18 @@ MorionFS 的**快照与空间回收**四件套（此前只有自测在用，现�
 
 调用 `SYS_CLEAR`：清屏 + 复位历史环形缓冲 / 输入行 / 光标 / 回滚偏移，
 并用背景渐变重铺整屏。
+
+### `poweroff` / `reboot`
+
+- `poweroff`（别名 `halt` / `shutdown`）：打印 `poweroff: ACPI S5 ...`，调 `SYS_POWEROFF(61)`。
+  内核从 FADT 取 `PM1a/PM1b_CNT_BLK`、从 DSDT `_S5` 取 `SLP_TYP`（QEMU 为 0、多数真机为 5），
+  读-改-写 PM1 控制块；没有 FADT 时回退经典口 `0x604`。固件不接受时打印
+  `[poweroff] firmware did not accept ACPI S5; halting` 后停机，shell 侧打印
+  `poweroff: FAILED (firmware has no usable ACPI S5)`。
+- `reboot`：打印 `reboot: resetting ...`，调 `SYS_REBOOT(62)`；内核依次尝试 i8042 `0xFE`、
+  PCI 复位控制 `0xCF9`（`0x02` → `0x06`）、空 IDT + `int3` 三重故障。都不生效时 shell 打印
+  `reboot: FAILED (no usable reset path)`。
+- 两个命令都要求 `Capability::Spawn`（只给可信域；零能力域调用返回 0）。
 
 ---
 

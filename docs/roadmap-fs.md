@@ -1685,12 +1685,14 @@ E2b 让服务成了「独立程序 + 域可回收」，但服务的**生命周�
    全量回归：`SELFTEST DONE`×1、`FAILED`/`PANIC` 0、`irq_cmds == cmds = 28672` 且 `poll_cmds = 0`、
    宿主 `sgdisk -v` "No problems found"、`[OK] 14 service ELFs loaded (boot modules)` + `[up]` × 14。
 3. ✅ **已完成（E3c init / 监督重启）**：新增域 14 `init`（`user/srv/src/init.rs` + `svc-init`
-   门控 + 第 15 个引导模块）+ 两个 syscall：`SYS_DOMAIN_ALIVE(42)`（该域是否还有存活任务）
+   门控 + 26 个引导模块之一）+ 两个 syscall：`SYS_DOMAIN_ALIVE(42)`（该域是否还有存活任务）
    与 `SYS_SPAWN_ELF_AT(41)`（在**指定域**里加载并启动 —— 先验镜像, 目标域须存在且**无存活
    任务**, 然后 `domain::reset` 清用户地址空间 + `scheduler::reap_terminated` 摘已终止任务
    (否则每轮重启漏一份 32 KiB 内核栈、迟早占满 `MAX_TASKS`), 再映射新镜像 ⇒ **域号不变**）。
-   监督者每 40 ms 巡检 `echo/kbd/mount_srv/tmpfs_srv/ext2_srv/exfat_srv`，实例没了就从 FAT32
-   根盘 `/system/services/<name>.elf` 读回镜像原地拉起（`BOOT_DOMAINS` 14 → 15）。
+   监督者每 40 ms 巡检 16 个长期服务域（`pager / echo / kbd / fat32_srv / mount_srv / tmpfs_srv /
+   mfs_srv / ext2_srv / exfat_srv / gfx_srv / net_srv / netstack_srv / e1000e_srv / httpd_srv /
+   e1000_srv / wifi_srv`），实例没了就从 FAT32 根盘 `/system/services/<name>.elf` 读回镜像原地拉起
+   （`BOOT_DOMAINS` 随服务扩张同步增至 26）。
    自测 **FS-29**：app 用 `sys_send(3, ECHO_QUIT_TAG)` 让 echo 自己 `SYS_EXIT` → 断言它一度
    "没有存活任务" → 等 init 拉起 → 断言**域号仍是 3**、新实例能正常回显、存活域数不变。
    回归实录：`init: restarted echo (domain 3, total 1)` + `app: FS29 supervisor restart OK`；
@@ -1701,8 +1703,9 @@ E2b 让服务成了「独立程序 + 域可回收」，但服务的**生命周�
    目标域无存活任务 → `domain::reset` → `reap_terminated` → 起任务」流程，区别只在**镜像来源**：
    内核按域号去 `bootinfo::get().service_modules()`（E3b 交来的 `LOADER_DATA` 镜像）里取，
    过 `is_identity_mapped` 后直接映射，**不依赖磁盘**。init 重启时**先试内存镜像、失败再回退盘**
-   (`/system/services/<name>.elf`)，并打印来源。监督集 6 → 9：新增 **pager(2) / fat32_srv(6) /
-   mfs_srv(11)**，于是「读盘要靠文件服务、文件服务死了没法自救」的鸡生蛋问题不复存在。
+   (`/system/services/<name>.elf`)，并打印来源。监督集 6 → 16：新增 **pager(2) / fat32_srv(6) /
+   mfs_srv(11) / gfx_srv(15) / net_srv(16) / netstack_srv(21) / e1000e_srv(22) / httpd_srv(23) /
+   e1000_srv(24) / wifi_srv(25)**，于是「读盘要靠文件服务、文件服务死了没法自救」的鸡生蛋问题不复存在。
    **刻意排除 block_srv(5)**：内核为它映射了 NVMe 配置页与 DMA 帧，`domain::reset` 会把这些
    **物理帧**还给帧分配器、甚至把 BAR0 的 MMIO 地址当成 RAM 交出去 —— 纳入监督前必须先让 reset
    跳过内核保留映射。回归实录：`init: restarted echo (domain 3, total 1, from memory)`。

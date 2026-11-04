@@ -11,10 +11,11 @@
 | --- | --- | --- |
 | `make` | 默认目标，等价 `make iso` | `build/morion-os.iso` |
 | `make kernel` | 仅构建微内核 | `build/kernel/morion-kernel` |
-| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（24 份独立 ELF） |
+| `make user` | 仅构建用户态服务 | `build/user/srv/*.elf`（26 份独立 ELF） |
 | `make hello` | 仅构建可执行文件加载演示程序 | `build/user/hello.elf` |
 | `make boot` | 仅构建 UEFI 引导器 | `build/boot/morion-boot.efi` |
 | `make iso` | 构建完整可启动 ISO | `build/morion-os.iso` |
+| `make usbimg` | 构建可引导 U 盘镜像（BOOTX64.EFI + 服务 ELF） | `build/morion-usb.img` |
 | `make clean` | 清理 `target/` 与 `build/` | — |
 | `make check` | 逐个 crate 用**各自 target** 做 `cargo check` | — |
 | `make clippy` | 同上跑 clippy，**门禁**（`-D warnings`，有告警即失败） | — |
@@ -24,11 +25,22 @@
 
 依赖关系（E3b 起）：`iso → kernel, boot, user`。`boot` 需要先 `make kernel` 产出
 `boot/loader/morion-kernel.elf`（引导器把它 `include_bytes!` 嵌进 `morion-boot.efi`）；
-24 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
+26 份服务 ELF 由 Makefile 放进 **ESP（`efiboot.img`）的 `EFI/morion/services/`**，引导器在
 `exit_boot_services` 之前用 UEFI 文件系统读它们 —— 故**内核不再依赖服务 ELF**；
 同时也放进 **FAT32 根盘的 `/system/services/`**（E3c：监督者 `init` 的**盘上**重启源 —— 重启
 优先用引导模块内存镜像，失败才回退它）。
 **只改了用户态代码也必须走 `make iso`**（ESP 与根盘上的服务镜像都是从这里取的）。
+
+构建变体（产物落在对应子目录，互不覆盖）：
+
+```bash
+NOGUI=1 make iso      # build/nogui/     无图形，串口控制台（QEMU/真机取证）
+SAFE=1 make iso       # build/safe/      真机安全：启动盘限制生效、自测跳过
+NOGUI=1 SAFE=1 make iso   # build/nogui-safe/
+```
+
+> 变体之间共用 `target/`，`NOGUI/SAFE` 是编译期环境变量。**切换变体前先 `cargo clean`**，
+> 否则可能复用上一个变体编译出的内核/服务（曾导致 `-nogui` 构建里混进 SAFE 行为）。
 
 `check` / `clippy` 不能写成 `cargo check --workspace`：三个 crate 的 target 各不相同
 （kernel `x86_64-unknown-none`、user 自定义 `user/x86_64-morion-user.json`、boot
@@ -405,5 +417,5 @@ s.sendall(b'screendump build/screen.ppm\n')
 2. **同一条命令里清理与启动要分开**：残留的 QEMU 会持有 `build/nvme.img` / `build/mfs.img`
    的写锁，导致新 QEMU 报 `Failed to get "write" lock`。先确认无残留再启动。
 3. **后台启动 QEMU 必须显式给 monitor**：不加 `-monitor` 时 QEMU 会尝试占用 stdio 而退出。
-4. **改用户态代码后必须 `make iso`**（内核逐个嵌入 `build/user/srv/*.elf`）。
+4. **改用户态代码后必须 `make iso`**（服务 ELF 会被打进 ESP 与根盘）。
 5. 验证只能用**自动可判定**的方式（`grep` 关键字 / 截图），不要依赖人工肉眼看屏。

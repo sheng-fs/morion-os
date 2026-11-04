@@ -325,6 +325,26 @@
 - **未做（P11b 安装器）**：从 `/cdrom` 读 `efiboot.img` → 分区（GPT ESP）→ 整块裸拷到目标盘
   → 使其可引导；见设计稿 §5。真机 ATAPI 光驱亦未做。
 
+### 真机收尾 — 多 xHCI + USB HID + 启动盘限制 + 关机（2026-11-04）✅
+
+第一轮真机（笔记本 + USB 启动盘）暴露的最后一组驱动问题，已全部在 QEMU 复现并验证：
+
+- **多 xHCI 控制器**：内核按 class `0C:03:30` 遍历，对每台调 `device::grant_slot()`（最多
+  `DEVICE_MULTI_SLOTS = 4`）；描述页 / BAR / DMA 分别映射到 `DEVICE_MULTI_CFG/BAR/DMA_VADDR`
+  + 槽位步长（1 页 / 4 页 / 16 页）。`xhci_srv` 用 `DeviceGrant::load_at(slot)` 逐台探测，
+  不再只认第一台。真机日志：`[OK] xHCI controller #0/#1/#2 …`。
+- **USB HID boot keyboard**：设备是 HID class 3 / subclass 1 / protocol 1 时，解析配置描述符里的
+  Interrupt IN 端点（EP Type 7），`SET_CONFIGURATION` + `SET_PROTOCOL(0)` 后用 `bulkin` 环收
+  8 字节 boot report；按「本帧新按下」的 usage 映射成 ASCII/回车/退格，经 `SYS_KEY_PUSH` 注入
+  内核键队列。日志 `xhci: USB HID keyboard ready (port=…, slot=…, dci=…)`。
+- **启动盘限制**：引导器从启动卷 Device Path 取 PCI `device/function`（`BootInfo` v5）；
+  `SAFE` 变体内核只暴露启动盘链上的块控制器（class `0x01`），USB 控制器永不裁剪。
+  `[OK] boot-disk restriction: only PCI 3:0 storage controllers exposed (6 devices; USB controllers always kept)`。
+- **PS/2 探测 / 关机**：`keyboard::init()` 读 `0x64` 状态，`0xFF` 明确告警；`poweroff` 走
+  FADT + DSDT `_S5` 的 ACPI S5，`reboot` 走 i8042 → `0xCF9` → 三重故障。
+- **回归**：双 `qemu-xhci` 下 USB 存储 `USB1 … sig=ok`、USB 键盘可驱动 shell；SAFE USB 启动
+  生效启动盘限制；`scripts/fs-regress.sh` 0 失败、`make clippy` 全绿。
+
 ### E1 — IOMMU (Intel VT-d)
 - 解析 ACPI **DMAR** 表 → 找到 DRHD（各 IOMMU 单元与管辖范围）→ 建**根表/上下表** → 为设备建 **DMA 重映射域**。
 - 与 D1 结合：`SYS_DEVICE_GRANT` 在飞地场景下把设备的 DMA 权限绑到一个 **IOVA 窗口**（只映射飞地自己的缓冲），其余一律**拒绝**。

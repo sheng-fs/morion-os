@@ -6,6 +6,32 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 2026-11-04
+
+**真机收尾：启动盘限制 / 多 xHCI + USB HID / ACPI 关机 / 诊断。**
+
+### 新增
+
+- **启动盘限制**：引导器从启动卷的 Device Path 取 PCI `device/function`，`BootInfo` 升到 **v5**；
+  `SAFE` 变体内核只暴露「启动盘这条链上的块控制器」（class `0x01`），USB 控制器永不裁剪 ——
+  真机上不会误碰内建 NVMe/SATA 上的其它磁盘。
+- **多 xHCI 控制器 + USB HID 键盘**：内核按 class `0C:03:30` 最多授权 4 台控制器
+  （`device::grant_slot` + 多实例窗口），`xhci_srv` 逐台探测；新增 USB HID boot keyboard
+  支持（配置 Interrupt IN 端点、解析 8 字节报告、把新按键注入内核键队列）。
+- **关机 / 重启**：shell 新增 `poweroff`（含 `halt` / `shutdown` 别名）与 `reboot`，对应
+  `SYS_POWEROFF(61)` / `SYS_REBOOT(62)`。ACPI S5 从 FADT 取 `PM1a/PM1b_CNT_BLK`、从 DSDT
+  `_S5` 取 `SLP_TYP`；`reboot` 走 i8042 → `0xCF9` → 三重故障三级兜底。
+- **稳定性 / 诊断**：`init` 对每个被监督域做连续失败预算（4 次后 `giving up`）；`kbd` 打印
+  `waiting for scancodes` / `first scancode received`；`dmesg` 支持 `-d ms` / `-a` / `-g pat`
+  与行边界 `Ctrl+C` 中止（`SYS_KEY_TRY_READ(63)`）；PS/2（i8042）缺失时明确告警。
+
+### 验证
+
+- QEMU 双 `qemu-xhci`：USB 存储 `USB1 … sig=ok`、USB 键盘 `USB HID keyboard ready` 并可驱动 shell；
+- SAFE + USB 镜像启动：`boot disk pci = 3:0` → `boot-disk restriction … (6 devices; USB controllers always kept)`；
+- `poweroff`：`ACPI S5 via PM1a=0x604` 后 QEMU 立即退出（exit 0）；
+- `scripts/fs-regress.sh`：`FAILED/PANIC = 0`；`make clippy` 全绿。
+
 ## [Unreleased] — 2026-10-02
 
 **文件系统四条并行流 + 驱动 D4 / 安装盘变体 V3 的收口**（承接 `0.4.0-nogui`；版本串仍是 `0.4.0`）。

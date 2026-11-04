@@ -26,7 +26,7 @@
 
 ### 核心理念
 
-- **微内核可信基**：内核只对外暴露「系统调用」这一条边界，文件系统、网络、设备驱动、图形、Shell 等所有传统内核功能一律由用户态服务实现；留在内核里的只有 IPC、地址空间映射、保护域、能力等少数核心原语 —— 即便放进编号 0–53 的整张系统调用表，它们也只占其中一小部分（完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节）。
+- **微内核可信基**：内核只对外暴露「系统调用」这一条边界，文件系统、网络、设备驱动、图形、Shell 等所有传统内核功能一律由用户态服务实现；留在内核里的只有 IPC、地址空间映射、保护域、能力等少数核心原语 —— 即便放进编号 0–63 的整张系统调用表，它们也只占其中一小部分（完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节）。
 - **外核高性能路径**：通过"性能飞地"机制，利用 IOMMU / CHERI 等硬件能力，让游戏、AI 等高性能应用直接操作硬件，实现零内核陷落、零数据拷贝。
 - **能力安全模型**：抛弃传统 UID/GID 权限体系，以能力（Capability）作为唯一访问凭证，从根本上消除"root 可做任何事"的隐患。
 - **Anykernel 双形态驱动**：同一套驱动源码可编译为用户态服务进程（共享场景）或直通库（高性能场景），共享超过 90% 的代码。
@@ -43,14 +43,15 @@
 | 方向 | 状态 | 说明 |
 |------|------|------|
 | 微内核核心 | ✅ 已跑通 | 保护域、同步 / 异步 IPC、抢占式调度（含**带超时阻塞**）、地址空间与按需分页、中断路由（PIC + **LAPIC/MSI-X**，含**阻塞等中断**与**多向量 `wait_any`**）、能力系统（含**能力随 IPC 传递**） |
-| 系统调用接口 | ✅ 46 个（编号 0–53） | 内核完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节；面向应用的子集见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
+| 真机启动 / 电源 | ✅ 已跑通 | UEFI 引导器从启动卷 Device Path 定位启动盘（`BootInfo` v5）；**`SAFE` 变体只暴露启动盘链上的块控制器**（USB 控制器永不裁剪）；shell `poweroff` 走 ACPI S5（FADT + DSDT `_S5`）、`reboot` 走 i8042 → `0xCF9` → 三重故障；PS/2 缺失时明确告警 |
+| 系统调用接口 | ✅ 56 个（编号 0–63） | 内核完整编号表见 [docs/dev-reference.md](./docs/dev-reference.md) 第 5 节；面向应用的子集见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 3 节 |
 | 能力安全模型 | ✅ 已跑通 | 能力槽 + **能力句柄**（打开时签发、每次 I/O 前校验、关闭时撤销），默认零能力；运行时可经 IPC **移交句柄**（移动）与**委派能力**（复制、无放大）——不必全靠启动期静态授权 |
-| 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2/N3 驱动已跑通（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK` / **MSI-X 中断驱动收帧**，并自发 ARP 请求收到网关应答 `NET1 … ARP reply OK`）。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力，MSI-X 表在别的 BAR 上时内核按 `BIR` 另映射给驱动 |
+| 用户态驱动 | ✅ 部分 | 键盘驱动（IRQ1 / PS/2 存在性探测 + USB HID boot keyboard）；块设备服务（NVMe 驱动，含 IDE PIO 回退）；**多控制器 xHCI**（最多 4 台，USB 存储 + USB HID 键盘）；网络驱动 **`net_srv`（virtio-net，域 16）**—— N2/N3 驱动已跑通（modern：解析 virtio 能力 / 取 MAC / 建 RX·TX virtqueue / `DRIVER_OK` / **MSI-X 中断驱动收帧**，并自发 ARP 请求收到网关应答 `NET1 … ARP reply OK`）。**通用设备授权（D1）**：内核 [`device.rs`](./kernel/src/device.rs) 交出 `DeviceGrant`（BAR + 连续 DMA 块 + MSI-X 参数，不含设备语义），内核**不再有 NVMe 专属代码**，队列布局与设备协议都回到驱动域 —— 驱动还可用 `SYS_DEVICE_CONFIG_READ` 自行解析自己那台设备的 PCI 能力，MSI-X 表在别的 BAR 上时内核按 `BIR` 另映射给驱动 |
 | 用户态文件系统 | ✅ 部分 | FAT32（含 VFAT 长名）、tmpfs、原创 MorionFS v2（COW + 快照 + 空闲位图/空间回收 + 大文件间接块 + 变长目录项/长名 + 节点元数据 + inode 号间接层/硬链接/软链接 + **按卷几何格式化** + **显式格式化 `mkfs.mfs`、多卷与主卷切换**）、ext2（读 + 有限写）、exFAT（读 + 写，支持大容量/大簇卷） |
 | 分区 / 卷层 | ✅ 已跑通 | block_srv 解析各盘 **MBR/GPT** 分区表 → 卷表，按卷首签名探测 FS 类型；**也能写分区表**（`part.create/del/wipe/reload`：建/删分区、清空、重读，GPT 与 MBR 都支持）；`dev` 已升级为「卷号」，块层支持多页 DMA（单命令 ≤ 128 KiB）；**块层只读扇区缓存 + 顺序预读**（4 KiB/行 × 240 行 = 960 KiB，键含卷号、写穿透 + 按区间失效，对上层透明；实测回归命中率 ≈80%）；**多卷挂载**：同类的额外卷自动挂到 `/usb<卷号>`，一份代码可同时服务多块盘，为读真实 U 盘分区铺路；**02b-2**：驱动侧批量提交 + 等完成（`nvme_batch_rw` 一次敲铃发 K 条 SQE 再统一等 K 个 CQE + `BLOCK_OP_BATCH_READ/WRITE` 协议 + MFS 写回 16 页暂存窗）→ 全量回归 258 s → 133 s；**02b-2 续**：完成路径默认轮询（`NVME_POLL_FIRST`）+ 时钟 tick 100→500 Hz → 再降到 **33 s（3.6×）**；**1000 Hz**：修掉启动期 sender/receiver 握手竞态后 tick 500→1000 Hz → **23 s**（较 02b-2 前 258 s 共约 11×） |
-| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/df/part.create/part.del/part.wipe/part.reload/clear`（`ls -l` 长格式，软链接显示为 `l`；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
+| Shell 与统一目录树 | ✅ 已跑通 | `help/echo/uname/version/pwd/ls/cat/run/wget/net/ping/ping6/dns/wifi/lspci/dmesg/cd/mkdir/touch/rm/mv/ln/ln -s/chmod/chown/truncate/stat/lstat/readlink/mkfs.mfs/mfs.primary/mfs.snap/mfs.snaps/mfs.rollback/mfs.gc/mfs.fsck/mfs.sync/df/part.create/part.del/part.wipe/part.reload/clear/poweroff/reboot`（`ls -l` 长格式，软链接显示为 `l`；`dmesg` 支持 `-d/-a/-g/path` 与 `Ctrl+C` 中止；`uname`/`version` 经 `SYS_UNAME` 报告版本串）；多文件系统经挂载层拼成单根 `/`，支持运行时挂载 |
 | 图形 / GUI | 🚧 进行中 | **G1** 帧缓冲交用户态 `gfx_srv`（域 15）独占：新增 `Capability::Fb` + `SYS_FB_INFO/MAP/TAKEOVER`，接管后内核终端不再写屏（输出只留 COM1）。**G2** 绘制原语 `fill/rect/blit` + 共享表面 + 客户端库 [`libmorion::gfx`](./user/libmorion/src/gfx.rs)；`blit` 拷完**回读帧缓冲**校验通过才回成功（自测 GS-1，已肉眼确认画面）。**G3a** 文本渲染外移：字库（ASCII 8×16 + 汉字 16×16 `cjk.bin` ≈276 KB）与终端状态（光标/换行/滚动/清屏，按**显示列**排版）从内核搬到 [`gfx/`](./user/srv/src/gfx/)，新协议 `GFX_OP_TEXT/CLEAR/MOVE/QUERY`，落笔**逐像素写后回读**校验（自测 GT-1 断言 ASCII 5 列 / 汉字 10 列）。**G3b** shell 输出上屏：新增 `SYS_CONSOLE_READY(47)`，`libmorion` 的打印出口 `sink()` 支持按进程**镜像**一份到屏幕控制台（只有 shell 开），shell 的横幅/中文欢迎语/命令输出同时进串口与屏幕。**G3c** 内核卸掉汉字字库（−276 KB，内核 ELF 347 KB → 69 KB），终端降为 ASCII + 豆腐块，汉字渲染只在用户态。**G4** 输入搬出内核：新增 `SYS_KEY_PUSH(48)/SYS_KEY_READ(49)` 键字节队列（内核只做搬运），行编辑/回显落客户端库 `morion::console::readline`，内核侧输入机件全部删除、终端降为只输出。**G6** 服务自愈：`ipc::call` 不再永久挂起（超时 + 目标无存活任务即失败）+ 帧缓冲登记内核保留区间 + 重启丢弃目标邮箱旧请求 + 客户端重建共享会话 + `gfx_srv` 纳入 init 监督（自测 GS-2）。内核文本控制台仅剩引导期与 panic 输出 |
-| 网络 / 虚拟化 / 飞地 / 包管理 | 🚧 进行中 | **网络**：`net_srv` virtio-net 驱动已跑通，做过 ARP + 最小 IPv4 栈（IPv4/ICMP echo/UDP）+ DHCP + 最小 TCP（三次握手 + 单段数据）与 ARP 缓存老化 端到端自测；**飞地**：IOMMU/VT-d 硬件隔离已做（E1c 起目标设备窗口受限、越界 DMA 被拒并留证），飞地管理器 E2/E3 未做；**虚拟化与包管理**：设计已定，尚无实现 |
+| 网络 / 虚拟化 / 飞地 / 包管理 | 🚧 进行中 | **网络**：`net_srv` virtio-net 驱动已跑通；协议栈已拆成独立 `netstack_srv`（域 21，TCP/IP + socket 服务 + 端口能力门禁），并接入第二/第三台真网卡 `e1000e_srv`(22) / `e1000_srv`(24)、无线 `wifi_srv`(25) 与客户机内建 `httpd_srv`(23)；**飞地**：IOMMU/VT-d 硬件隔离已做（E1c 起目标设备窗口受限、越界 DMA 被拒并留证），飞地管理器 E2/E3 未做；**虚拟化与包管理**：设计已定，尚无实现 |
 | 面向系统 AI 的能力接口 | 📐 已定规范 | 应用如何把功能暴露给系统 AI 见 [docs/app-dev-guide.md](./docs/app-dev-guide.md) 第 9 节 |
 
 > 快速上手：构建与运行命令见 [docs/commands.md](./docs/commands.md)；
