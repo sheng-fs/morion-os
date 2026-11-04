@@ -972,15 +972,17 @@ struct BootDiskPci {
 /// 启动卷的设备路径形如 `PciRoot(0)/Pci(dev,func)/USB(...)`; PCI 节点足以把
 /// "启动盘挂在哪台控制器上"与内核的枚举结果对上 (日志 `boot disk pci = <dev>:<func>`)。
 fn boot_disk_pci(bt: &BootServices, handle: uefi::Handle) -> Option<BootDiskPci> {
-    use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams};
     use uefi::proto::device_path::{DevicePath, DeviceSubType, DeviceType};
+    use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams};
 
     let params = OpenProtocolParams {
         handle,
         agent: bt.image_handle(),
         controller: None,
     };
-    let path = match unsafe { bt.open_protocol::<DevicePath>(params, OpenProtocolAttributes::GetProtocol) } {
+    let path = match unsafe {
+        bt.open_protocol::<DevicePath>(params, OpenProtocolAttributes::GetProtocol)
+    } {
         Ok(p) => p,
         Err(_) => {
             serial_write("[boot] boot disk: no DevicePath on volume handle\n");
@@ -1207,15 +1209,15 @@ fn boot_fail(fb: &mut Fb, msg: &str, hint: &str) -> ! {
 /// - **必须在 `exit_boot_services` 之前读**：文件系统与页分配都是引导服务。
 fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64, Option<BootDiskPci>) {
     serial_write("[boot] reading service ELFs from the ESP...\n");
-    let (modules, boot_disk) = match with_service_volume(bt, |volume| load_all_modules(bt, volume, fb))
-    {
-        Some(m) => m,
-        None => boot_fail(
-            fb,
-            "Cannot open a volume containing service ELFs",
-            "(the ESP must contain EFI/morion/services/*.elf)",
-        ),
-    };
+    let (modules, boot_disk) =
+        match with_service_volume(bt, |volume| load_all_modules(bt, volume, fb)) {
+            Some(m) => m,
+            None => boot_fail(
+                fb,
+                "Cannot open a volume containing service ELFs",
+                "(the ESP must contain EFI/morion/services/*.elf)",
+            ),
+        };
 
     // 启动盘定位: 供内核对块控制器做"只暴露启动盘"的限制 (真机安全)。
     match boot_disk {

@@ -296,14 +296,16 @@ fn dsdt_s5(rsdp: u64) -> Option<u8> {
                         j += 1; // 跳过 NumElements
                     }
                     if j < len {
-                        return Some(match bytes[j] {
-                            0x0A if j + 1 < len => bytes[j + 1],
-                            0x0B if j + 2 < len => bytes[j + 1],
-                            0x0C if j + 4 < len => bytes[j + 1],
-                            0x00 => 0,
-                            0x01 => 1,
-                            _ => return None,
-                        } & 0x7);
+                        return Some(
+                            match bytes[j] {
+                                0x0A if j + 1 < len => bytes[j + 1],
+                                0x0B if j + 2 < len => bytes[j + 1],
+                                0x0C if j + 4 < len => bytes[j + 1],
+                                0x00 => 0,
+                                0x01 => 1,
+                                _ => return None,
+                            } & 0x7,
+                        );
                     }
                 }
             }

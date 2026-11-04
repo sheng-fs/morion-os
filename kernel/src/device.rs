@@ -256,12 +256,7 @@ fn map_zero_cfg(domain: u64, vaddr: u64) {
     unsafe {
         core::ptr::write_bytes(cfg_paddr as *mut u8, 0, PAGE as usize);
     }
-    paging::map_user_page(
-        domain,
-        vaddr,
-        cfg_paddr,
-        paging::UserPagePerm::ReadWrite,
-    );
+    paging::map_user_page(domain, vaddr, cfg_paddr, paging::UserPagePerm::ReadWrite);
 }
 
 /// 域 → 已授权设备的登记表 (供 [`config_read`] 与运行期 `SYS_DEVICE_*` 使用)。
