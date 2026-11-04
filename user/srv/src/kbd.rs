@@ -81,11 +81,18 @@ pub fn run() {
         println("kbd: register irq1 FAILED");
         return;
     }
+    println("kbd: irq1 registered, waiting for scancodes (press a key)");
 
+    let mut first = true;
     let mut ext = false;
     let mut shift = false;
+    let mut ctrl = false;
     loop {
         let sc = sys_recv() as u8;
+        if first {
+            first = false;
+            println("kbd: first scancode received (input path alive)");
+        }
 
         // E0 扩展前缀: 标记后续字节为扩展键码。
         if sc == 0xE0 {
@@ -97,6 +104,9 @@ pub fn run() {
             let base = sc & 0x7F;
             if base == 0x2A || base == 0x36 {
                 shift = false;
+            }
+            if base == 0x1D {
+                ctrl = false;
             }
             ext = false;
             continue;
@@ -113,12 +123,17 @@ pub fn run() {
 
         // 普通按下码。
         match sc {
+            0x1D => ctrl = true,         // 左 Ctrl 按下
             0x2A | 0x36 => shift = true, // 左右 shift 按下
             0x0E => {
                 sys_key_push(0x08); // 退格
             }
             0x1C => {
                 sys_key_push(b'\n'); // 回车
+            }
+            // Ctrl+C: 行编辑与长输出 (dmesg) 据此中止。
+            0x2E if ctrl => {
+                sys_key_push(0x03);
             }
             _ => {
                 if let Some(c) = key_char(sc, shift) {

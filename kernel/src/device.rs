@@ -36,6 +36,19 @@ pub const DEVICE_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x83_0000;
 /// MSI-X 表所在 BAR 的映射窗口（仅当表**不在**设备 BAR 上时才用，如 virtio-net 的表在 BAR1）。
 pub const DEVICE_MSIX_VADDR: u64 = paging::USER_SPACE_BASE + 0x84_0000;
 
+/// **多实例设备**（一台域接多台同类型设备）的窗口：xHCI 真机常见 2–3 个控制器。
+///
+/// 与单实例窗口分开（0x90_0000 起），避免和既有映射重叠；每个实例的步长足以覆盖
+/// 4 页 BAR + 16 页 DMA。
+pub const DEVICE_MULTI_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x90_0000;
+pub const DEVICE_MULTI_BAR_VADDR: u64 = paging::USER_SPACE_BASE + 0x91_0000;
+pub const DEVICE_MULTI_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x93_0000;
+/// 单实例 BAR / DMA 步长（4 页 / 16 页）。
+pub const DEVICE_MULTI_BAR_STRIDE: u64 = 0x4000;
+pub const DEVICE_MULTI_DMA_STRIDE: u64 = 0x1_0000;
+/// 最多同时授权的设备实例数（xHCI 控制器上限）。
+pub const DEVICE_MULTI_SLOTS: u64 = 4;
+
 /// 描述结构 magic (校验内核与用户态布局一致)。
 pub const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131; // "DEVOS!1"
 
@@ -97,6 +110,36 @@ pub struct GrantRequest<'a> {
 
 /// 配置一台设备并授权给 `req.domain`。成功返回 `true`。
 pub fn grant(req: GrantRequest) -> bool {
+    grant_at(
+        &req,
+        DEVICE_CFG_VADDR,
+        DEVICE_BAR_VADDR,
+        DEVICE_DMA_VADDR,
+        false,
+    )
+}
+
+/// 把第 `slot` 台同类型设备授权给 `req.domain`（多控制器场景，如 xHCI）。
+///
+/// 描述页 / BAR / DMA 各自按实例步长偏移；驱动在固定窗口 + `slot * 步长` 处读取。
+pub fn grant_slot(req: GrantRequest, slot: u32) -> bool {
+    let i = slot as u64;
+    grant_at(
+        &req,
+        DEVICE_MULTI_CFG_VADDR + i * PAGE,
+        DEVICE_MULTI_BAR_VADDR + i * DEVICE_MULTI_BAR_STRIDE,
+        DEVICE_MULTI_DMA_VADDR + i * DEVICE_MULTI_DMA_STRIDE,
+        true,
+    )
+}
+
+fn grant_at(
+    req: &GrantRequest,
+    cfg_vaddr: u64,
+    bar_vaddr: u64,
+    dma_vaddr: u64,
+    multi: bool,
+) -> bool {
     let bar_paddr = req.bar_paddr & !(PAGE - 1);
     let dma_pages = req.dma_pages.max(1);
 
@@ -130,10 +173,10 @@ pub fn grant(req: GrantRequest) -> bool {
     let desc = DeviceGrant {
         magic: DEVICE_GRANT_MAGIC,
         bar_paddr,
-        bar_vaddr: DEVICE_BAR_VADDR,
+        bar_vaddr,
         bar_bytes: req.bar_pages * PAGE,
         dma_paddr,
-        dma_vaddr: DEVICE_DMA_VADDR,
+        dma_vaddr,
         dma_bytes: dma_pages * PAGE,
         msix_vector_base: msix.vector,
         msix_vector_count: msix.count,
@@ -150,26 +193,26 @@ pub fn grant(req: GrantRequest) -> bool {
     // 记下"域 ↔ 已授权设备": 既是 `SYS_DEVICE_CONFIG_READ` 的放行依据 (只放行"读自己
     // 那台设备"), 也是 D1b 运行期 `SYS_DEVICE_INFO` / `SYS_DEVICE_GRANT` 的登记来源
     // (查询本域设备 / 能力门禁 / 幂等确认)。
-    bind(req.domain, req.bus, req.dev, req.func, bar_paddr, cfg_paddr);
+    if multi {
+        bind_push(req.domain, req.bus, req.dev, req.func, bar_paddr, cfg_paddr);
+    } else {
+        bind(req.domain, req.bus, req.dev, req.func, bar_paddr, cfg_paddr);
+    }
 
     // 4. 映射描述页、BAR 窗口 (非缓存 MMIO) 与 DMA 各页 (数据: RW + NX)。
     paging::map_user_page(
         req.domain,
-        DEVICE_CFG_VADDR,
+        cfg_vaddr,
         cfg_paddr,
         paging::UserPagePerm::ReadWrite,
     );
     for i in 0..req.bar_pages {
-        paging::map_mmio(
-            req.domain,
-            DEVICE_BAR_VADDR + i * PAGE,
-            bar_paddr + i * PAGE,
-        );
+        paging::map_mmio(req.domain, bar_vaddr + i * PAGE, bar_paddr + i * PAGE);
     }
     for i in 0..dma_pages {
         paging::map_user_page(
             req.domain,
-            DEVICE_DMA_VADDR + i * PAGE,
+            dma_vaddr + i * PAGE,
             dma_paddr + i * PAGE,
             paging::UserPagePerm::ReadWrite,
         );
@@ -185,6 +228,26 @@ pub fn grant(req: GrantRequest) -> bool {
 /// `magic == 0` (不等于 [`DEVICE_GRANT_MAGIC`]) 后自行优雅退出, 而不是读未映射地址
 /// 触发缺页死循环。
 pub fn grant_empty(domain: u64) {
+    map_zero_cfg(domain, DEVICE_CFG_VADDR);
+}
+
+/// 多实例降级: 从 `first` 起为剩余实例各映射一页零描述。
+///
+/// 驱动会无条件探测 `DEVICE_MULTI_SLOTS` 个槽位，故未授权的槽位也必须是**已映射**的
+/// 零页 —— 否则驱动读到未映射地址会陷入缺页循环。
+pub fn grant_empty_multi_from(domain: u64, first: u64) {
+    let mut i = first;
+    while i < DEVICE_MULTI_SLOTS {
+        map_zero_cfg(domain, DEVICE_MULTI_CFG_VADDR + i * PAGE);
+        i += 1;
+    }
+}
+
+pub fn grant_empty_multi(domain: u64) {
+    grant_empty_multi_from(domain, 0);
+}
+
+fn map_zero_cfg(domain: u64, vaddr: u64) {
     let cfg_paddr = match frame_allocator::allocate_frame() {
         Some(p) => p,
         None => return,
@@ -195,7 +258,7 @@ pub fn grant_empty(domain: u64) {
     }
     paging::map_user_page(
         domain,
-        DEVICE_CFG_VADDR,
+        vaddr,
         cfg_paddr,
         paging::UserPagePerm::ReadWrite,
     );
@@ -236,6 +299,18 @@ fn bind(domain: u64, bus: u8, dev: u8, func: u8, bar_paddr: u64, cfg_paddr: u64)
             cfg_paddr,
         });
     }
+}
+
+/// 记下某域被授权的设备 (同一域多台设备时追加; 供多实例驱动使用)。
+fn bind_push(domain: u64, bus: u8, dev: u8, func: u8, bar_paddr: u64, cfg_paddr: u64) {
+    BINDINGS.lock().push(DeviceBinding {
+        domain,
+        bus,
+        dev,
+        func,
+        bar_paddr,
+        cfg_paddr,
+    });
 }
 
 /// 读**调用域**被授权设备的 PCI 配置空间 dword (`offset` 内部对齐到 4)。

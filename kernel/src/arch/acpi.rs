@@ -197,8 +197,8 @@ fn xsdt_or_rsdt(rsdp: u64) -> Option<(u64, bool)> {
     }
 }
 
-/// 遍历 XSDT/RSDT，找签名 `DMAR` 的表。
-fn find_dmar(rsdp: u64) -> Option<&'static [u8]> {
+/// 遍历 XSDT/RSDT，找签名 `sig` 的表。
+fn find_table(rsdp: u64, sig: &[u8; 4]) -> Option<&'static [u8]> {
     let (root, is_xsdt) = xsdt_or_rsdt(rsdp)?;
     let root_sig: &[u8; 4] = if is_xsdt { b"XSDT" } else { b"RSDT" };
     let table = table_at(root, root_sig)?;
@@ -215,11 +215,16 @@ fn find_dmar(rsdp: u64) -> Option<&'static [u8]> {
         if paddr == 0 {
             continue;
         }
-        if let Some(t) = table_at(paddr, b"DMAR") {
+        if let Some(t) = table_at(paddr, sig) {
             return Some(t);
         }
     }
     None
+}
+
+/// 遍历 XSDT/RSDT，找签名 `DMAR` 的表。
+fn find_dmar(rsdp: u64) -> Option<&'static [u8]> {
+    find_table(rsdp, b"DMAR")
 }
 
 /// 探测 DMAR（E1a）。引导器没给 RSDP / 固件没给 DMAR 时返回 `found = false` 的空摘要。
@@ -228,6 +233,155 @@ pub fn probe_dmar() -> DmarSummary {
     match find_dmar(rsdp) {
         Some(bytes) => parse_dmar(bytes),
         None => DmarSummary::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 关机 / 重启（真机 P0：笔记本调试完要能关掉）
+// ---------------------------------------------------------------------------
+
+/// FADT（`FACP`）里的 `PM1a_CNT_BLK` / `PM1b_CNT_BLK` 端口（0 = 该块不存在）。
+///
+/// FADT 偏移是 ACPI 规范固定的：0x40 = PM1a 控制块、0x44 = PM1b 控制块。
+fn fadt_pm1(rsdp: u64) -> (u16, u16) {
+    let Some(t) = find_table(rsdp, b"FACP") else {
+        return (0, 0);
+    };
+    if t.len() < 0x48 {
+        return (0, 0);
+    }
+    (rd32(t, 0x40) as u16, rd32(t, 0x44) as u16)
+}
+
+/// 从 DSDT 的 `_S5` 包里取 SLP_TYP（不同固件取值不同：多数真机 5，QEMU 为 0）。
+///
+/// AML 形态: `_S5_` `12 <PkgLength> <NumElements> <第一个整数>`；整数可能是
+/// `0A xx`（byte）/ `0B xx xx`（word）/ `0C xx..`（dword）/ `00`（Zero）/ `01`（One）。
+fn dsdt_s5(rsdp: u64) -> Option<u8> {
+    let fadt = find_table(rsdp, b"FACP")?;
+    let dsdt_addr = if fadt.len() >= 0x90 {
+        let x = rd64(fadt, 0x8C);
+        if x != 0 {
+            x
+        } else {
+            rd32(fadt, 0x28) as u64
+        }
+    } else {
+        rd32(fadt, 0x28) as u64
+    };
+    if dsdt_addr == 0 {
+        return None;
+    }
+    let base = dsdt_addr as *const u8;
+    let sig = unsafe { core::slice::from_raw_parts(base, 4) };
+    if sig != b"DSDT" {
+        return None;
+    }
+    let len = (rd32(unsafe { core::slice::from_raw_parts(base, 8) }, 4) as usize).min(0x4_0000);
+    if len < 8 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(base, len) };
+    let mut i = 0usize;
+    while i + 4 <= len {
+        if &bytes[i..i + 4] == b"_S5_" {
+            let mut j = i + 4;
+            if j < len && bytes[j] == 0x12 {
+                j += 1;
+                if j < len {
+                    let lead = bytes[j];
+                    let extra = (lead >> 6) as usize;
+                    j += 1 + extra; // 跳过 PkgLength
+                    if j < len {
+                        j += 1; // 跳过 NumElements
+                    }
+                    if j < len {
+                        return Some(match bytes[j] {
+                            0x0A if j + 1 < len => bytes[j + 1],
+                            0x0B if j + 2 < len => bytes[j + 1],
+                            0x0C if j + 4 < len => bytes[j + 1],
+                            0x00 => 0,
+                            0x01 => 1,
+                            _ => return None,
+                        } & 0x7);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// ACPI S5 软关机。返回 `!` —— 固件接受后机器直接断电；不接受则进入停机循环。
+pub fn poweroff() -> ! {
+    let rsdp = crate::bootinfo::get().rsdp_addr();
+    let (pm1a, pm1b) = fadt_pm1(rsdp);
+    let s5 = dsdt_s5(rsdp).unwrap_or(5);
+    let slp_s5: u16 = ((s5 as u16) << 10) | (1 << 13);
+
+    if pm1a != 0 {
+        crate::video::print("[poweroff] ACPI S5 via PM1a=0x");
+        crate::video::print_hex(pm1a as u64);
+        crate::video::println("");
+        unsafe {
+            use x86_64::instructions::port::Port;
+            // 读-改-写: 保留 SCI_EN 等既有位, 只替换 SLP_TYP 并置 SLP_EN。
+            let mut p: Port<u16> = Port::new(pm1a);
+            let cur = p.read();
+            p.write((cur & !(7 << 10)) | slp_s5);
+            if pm1b != 0 {
+                let mut pb: Port<u16> = Port::new(pm1b);
+                let curb = pb.read();
+                pb.write((curb & !(7 << 10)) | slp_s5);
+            }
+        }
+        // 给固件一点时间真正断电；若还活着就走停机兜底。
+        for _ in 0..1_000_000u64 {
+            core::hint::spin_loop();
+        }
+    } else {
+        crate::video::println("[poweroff] no FADT PM1a; trying classic port 0x604");
+        unsafe {
+            use x86_64::instructions::port::Port;
+            // QEMU/Bochs 的 ACPI 关机口（PM base 0x600 + 4）：同样读-改-写。
+            let mut p: Port<u16> = Port::new(0x604);
+            let cur = p.read();
+            p.write((cur & !(7 << 10)) | slp_s5);
+        }
+        for _ in 0..1_000_000u64 {
+            core::hint::spin_loop();
+        }
+    }
+
+    crate::video::println("[poweroff] firmware did not accept ACPI S5; halting");
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// 硬重启：先试 i8042 复位线，再试 PCI 复位控制寄存器 (`0xCF9`)，最后三重故障兜底。
+pub fn reboot() -> ! {
+    unsafe {
+        use x86_64::instructions::port::PortWriteOnly;
+        // 1. 键盘控制器 0xFE: 拉低 RESET#（大多数 x86 固件都认）。
+        PortWriteOnly::<u8>::new(0x64).write(0xFE);
+        // 2. PCI 复位控制: 先置 SYS_RST，再置 FULL_RST | SYS_RST。
+        PortWriteOnly::<u8>::new(0xCF9).write(0x02);
+        PortWriteOnly::<u8>::new(0xCF9).write(0x06);
+    }
+    // 3. 三重故障（空 IDT + int3）—— 任何 x86 CPU 都会复位。
+    let idtr = [0u8; 10];
+    unsafe {
+        core::arch::asm!("lidt [{}]", in(reg) idtr.as_ptr(), options(readonly, nostack));
+        core::arch::asm!("int3", options(nomem, nostack));
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
     }
 }
 

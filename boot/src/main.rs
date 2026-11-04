@@ -938,7 +938,7 @@ static KERNEL_ELF: &[u8] = include_bytes!("../loader/morion-kernel.elf");
 #[repr(C)]
 struct BootInfo {
     magic: u32,   // 0x4D4F5249 = "MORI"
-    version: u32, // 4
+    version: u32, // 5
     fb_addr: u64, // 帧缓冲物理地址
     fb_width: u32,
     fb_height: u32,
@@ -953,6 +953,55 @@ struct BootInfo {
     svc_entry_size: u64, // 单个模块条目字节数
     // --- ACPI (E1a): RSDP 物理地址, 内核据此走 XSDT/RSDT → DMAR (IOMMU) ---
     rsdp_addr: u64, // 0 = 固件没提供
+    // --- 启动盘 (真机安全): 引导卷所在 PCI 控制器的 device/function ---
+    // 内核据此只暴露"启动盘这条链上的块控制器", 避免在真机上误碰其它磁盘。
+    boot_disk_valid: u32, // 0 = 没识别出来 (不限制)
+    boot_disk_dev: u32,
+    boot_disk_func: u32,
+}
+
+/// 启动卷所在 PCI 控制器的位置 (Device Path 只带 device/function; bus 由根桥决定)。
+#[derive(Clone, Copy)]
+struct BootDiskPci {
+    dev: u8,
+    func: u8,
+}
+
+/// 从句柄的 Device Path 里取 PCI 节点 (`Hardware/Pci`) 的 device/function。
+///
+/// 启动卷的设备路径形如 `PciRoot(0)/Pci(dev,func)/USB(...)`; PCI 节点足以把
+/// "启动盘挂在哪台控制器上"与内核的枚举结果对上 (日志 `boot disk pci = <dev>:<func>`)。
+fn boot_disk_pci(bt: &BootServices, handle: uefi::Handle) -> Option<BootDiskPci> {
+    use uefi::table::boot::{OpenProtocolAttributes, OpenProtocolParams};
+    use uefi::proto::device_path::{DevicePath, DeviceSubType, DeviceType};
+
+    let params = OpenProtocolParams {
+        handle,
+        agent: bt.image_handle(),
+        controller: None,
+    };
+    let path = match unsafe { bt.open_protocol::<DevicePath>(params, OpenProtocolAttributes::GetProtocol) } {
+        Ok(p) => p,
+        Err(_) => {
+            serial_write("[boot] boot disk: no DevicePath on volume handle\n");
+            return None;
+        }
+    };
+    for node in path.node_iter() {
+        if node.device_type() == DeviceType::HARDWARE
+            && node.sub_type() == DeviceSubType::HARDWARE_PCI
+        {
+            // Pci 节点负载: function(u8), device(u8)。
+            let data = node.data();
+            if data.len() >= 2 {
+                return Some(BootDiskPci {
+                    dev: data[1],
+                    func: data[0],
+                });
+            }
+        }
+    }
+    None
 }
 
 // ============================================================
@@ -1040,22 +1089,18 @@ fn read_from_volume(volume: &mut SimpleFileSystem, path: &str) -> Option<alloc::
 
 /// 找到"含服务 ELF 的卷"并对其执行 `f`。
 ///
-/// 先试「本映像所在的卷」(`get_image_file_system`) —— 它走 LoadedImage → DevicePath →
-/// `locate_device_path::<SimpleFileSystem>`；在 **El Torito 光盘引导**下这条链解析不出来
-/// （实测返回失败），于是退化为**枚举所有 SimpleFileSystem 卷**，用"能不能读出第一个
-/// 服务 ELF"判定（反正紧接着就要读它们，这一探测不是额外成本）。
+/// 优先**枚举所有 SimpleFileSystem 卷**，用"能不能读出第一个服务 ELF"判定（反正紧接着
+/// 就要读它们，这一探测不是额外成本）。这样拿到的是**真实卷句柄**，可以继续取它的
+/// Device Path 定位启动盘 PCI 位置；而 `image_handle()` 在部分固件（真机 USB 启动）上
+/// 取不到 DevicePath。
+///
+/// 最后兜底试「本映像所在的卷」(`get_image_file_system`)，覆盖 ESP 被固件隐藏的少数情况。
 fn with_service_volume<R>(
     bt: &BootServices,
     f: impl FnOnce(&mut SimpleFileSystem) -> R,
-) -> Option<R> {
-    match bt.get_image_file_system(bt.image_handle()) {
-        Ok(mut volume) => return Some(f(&mut volume)),
-        Err(e) => {
-            serial_write("[boot] get_image_file_system failed, status=0x");
-            serial_write_u64(e.status().0 as u64);
-            serial_write("\n");
-        }
-    }
+) -> Option<(R, Option<BootDiskPci>)> {
+    // 总是扫卷: 先确认**哪个卷**真的带服务, 再从这个卷的句柄取 Device Path ——
+    // 直接用 `image_handle()` 在部分固件上拿不到 DevicePath (真机 USB 启动时踩到过)。
     serial_write("[boot] scanning volumes for services...\n");
 
     let handles = bt.find_handles::<SimpleFileSystem>().ok()?;
@@ -1072,12 +1117,21 @@ fn with_service_volume<R>(
                 serial_write("has services (");
                 serial_write_u64(d.len() as u64);
                 serial_write(" bytes)\n");
-                return Some(f(&mut volume));
+                let boot_disk = boot_disk_pci(bt, handle);
+                return Some((f(&mut volume), boot_disk));
             }
             None => serial_write("no services\n"),
         }
     }
-    None
+
+    // 兜底: 某些固件把 ESP 藏在镜像设备的文件系统里, 扫卷看不到。
+    match bt.get_image_file_system(bt.image_handle()) {
+        Ok(mut volume) => {
+            let boot_disk = boot_disk_pci(bt, bt.image_handle());
+            Some((f(&mut volume), boot_disk))
+        }
+        Err(_) => None,
+    }
 }
 
 /// 把这 14 份服务 ELF 从 `volume` 读进 `LOADER_DATA` 页，返回模块表项。
@@ -1151,9 +1205,10 @@ fn boot_fail(fb: &mut Fb, msg: &str, hint: &str) -> ! {
 ///   （见 `kernel/src/memory/frame_allocator.rs`），`LOADER_DATA` 天然被保留 ——
 ///   否则这些镜像会被当成空闲内存分出去，跑着跑着被覆盖（症状是随机崩溃）。
 /// - **必须在 `exit_boot_services` 之前读**：文件系统与页分配都是引导服务。
-fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64) {
+fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64, Option<BootDiskPci>) {
     serial_write("[boot] reading service ELFs from the ESP...\n");
-    let modules = match with_service_volume(bt, |volume| load_all_modules(bt, volume, fb)) {
+    let (modules, boot_disk) = match with_service_volume(bt, |volume| load_all_modules(bt, volume, fb))
+    {
         Some(m) => m,
         None => boot_fail(
             fb,
@@ -1161,6 +1216,18 @@ fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64) {
             "(the ESP must contain EFI/morion/services/*.elf)",
         ),
     };
+
+    // 启动盘定位: 供内核对块控制器做"只暴露启动盘"的限制 (真机安全)。
+    match boot_disk {
+        Some(d) => {
+            serial_write("[boot] boot disk pci = ");
+            serial_write_u64(d.dev as u64);
+            serial_write(":");
+            serial_write_u64(d.func as u64);
+            serial_write(" (only this disk's block controllers are exposed)\n");
+        }
+        None => serial_write("[boot] boot disk not identified (unrestricted)\n"),
+    }
 
     // 表本身也放进 `LOADER_DATA` 页 —— 不放引导器镜像里的静态变量：内核只保证不碰
     // 自己的镜像与低内存，引导器镜像所在区域不在那个保证范围内。
@@ -1179,7 +1246,7 @@ fn load_service_modules(bt: &BootServices, fb: &mut Fb) -> (u64, u64) {
     serial_write("[boot] service modules loaded: ");
     serial_write_u64(modules.len() as u64);
     serial_write("\n");
-    (table, modules.len() as u64)
+    (table, modules.len() as u64, boot_disk)
 }
 
 /// 从 UEFI 配置表里取 **ACPI RSDP** 的物理地址（E1a）。
@@ -1232,7 +1299,7 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
         40,
         Color::rgb(0xCC, 0xCC, 0xCC),
     );
-    let (svc_addr, svc_count) = load_service_modules(st.boot_services(), fb);
+    let (svc_addr, svc_count, boot_disk) = load_service_modules(st.boot_services(), fb);
 
     // ACPI RSDP (E1a): 必须在 `exit_boot_services` 之前读 UEFI 配置表。
     let rsdp_addr = find_rsdp(&st);
@@ -1243,7 +1310,7 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
     // 设置 Boot Info 到 0x7000
     let boot_info = BootInfo {
         magic: 0x4D4F5249, // "MORI"
-        version: 4,
+        version: 5,
         fb_addr: fb.base as u64,
         fb_width: fb.w,
         fb_height: fb.h,
@@ -1256,6 +1323,9 @@ fn boot_kernel(st: SystemTable<Boot>, fb: &mut Fb) -> ! {
         svc_count,
         svc_entry_size: core::mem::size_of::<ServiceModule>() as u64,
         rsdp_addr,
+        boot_disk_valid: boot_disk.is_some() as u32,
+        boot_disk_dev: boot_disk.map_or(0, |d| d.dev as u32),
+        boot_disk_func: boot_disk.map_or(0, |d| d.func as u32),
     };
     unsafe {
         let ptr = 0x7000 as *mut BootInfo;

@@ -30,11 +30,20 @@ unsafe fn wait_output_full(status: &mut PortReadOnly<u8>) {
 }
 
 /// 初始化 i8042 控制器, 确保键盘中断使能、键盘启用、scancode 翻译为 set 1。
-pub fn init() {
+///
+/// 返回**初始化前**读到的状态寄存器值: `0xFF` 表示总线上没有 i8042 (真机常见 ——
+/// 只有 USB 键盘且固件关了 USB legacy 支持), 此时不做任何写操作, 由调用方打告警。
+pub fn init() -> u8 {
     unsafe {
         let mut status: PortReadOnly<u8> = PortReadOnly::new(STATUS);
         let mut command: PortWriteOnly<u8> = PortWriteOnly::new(COMMAND);
         let mut data: Port<u8> = Port::new(DATA);
+
+        // 0. 先探在不在: 没有控制器时状态端口读回 0xFF, 后面的等待循环会死等。
+        let first = status.read();
+        if first == 0xFF {
+            return first;
+        }
 
         // 1. 禁用键盘, 避免初始化期间产生 IRQ。
         wait_input_empty(&mut status);
@@ -65,6 +74,7 @@ pub fn init() {
         // 6. 重新使能键盘 (0xAE)。
         wait_input_empty(&mut status);
         command.write(0xAE);
+        first
     }
 }
 

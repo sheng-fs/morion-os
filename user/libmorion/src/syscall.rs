@@ -113,6 +113,12 @@ pub const SYS_LOG_TOTAL: u64 = 58;
 pub const SYS_LOG_READ: u64 = 59;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
+/// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn`。
+pub const SYS_POWEROFF: u64 = 61;
+/// 硬重启 (真机 P0): 无参; 需 `Capability::Spawn`。
+pub const SYS_REBOOT: u64 = 62;
+/// 非阻塞取按键: 有键返回字节, 队列空返回 `u64::MAX`。
+pub const SYS_KEY_TRY_READ: u64 = 63;
 
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
@@ -529,6 +535,30 @@ pub fn sys_pci_info(i: u64) -> Option<[u64; 3]> {
         None
     } else {
         Some(rec)
+    }
+}
+
+/// 非阻塞取一个按键字节; 队列空返回 `None`。
+pub fn sys_key_try_read() -> Option<u8> {
+    let v = unsafe { syscall(SYS_KEY_TRY_READ, 0, 0, 0) };
+    if v == u64::MAX {
+        None
+    } else {
+        Some(v as u8)
+    }
+}
+
+/// ACPI S5 软关机; 仅在持有 `Capability::Spawn` 的域里有效。固件不接受时返回 (由调用方报错)。
+pub fn sys_poweroff() {
+    unsafe {
+        syscall(SYS_POWEROFF, 0, 0, 0);
+    }
+}
+
+/// 硬重启; 仅在持有 `Capability::Spawn` 的域里有效。
+pub fn sys_reboot() {
+    unsafe {
+        syscall(SYS_REBOOT, 0, 0, 0);
     }
 }
 

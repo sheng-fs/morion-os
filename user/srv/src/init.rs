@@ -100,6 +100,12 @@ const REQUIRED: [(u64, u64); 3] = [
 
 /// 每个被监督域「上一轮已发现它没有存活任务」的标记（两连击去抖，见 [`run`]）。
 static mut PENDING: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
+/// 每个被监督域**连续快速失败**的次数（真机无卷可挂时防止重启风暴）。
+static mut RAPID_FAILS: [u32; SUPERVISED.len()] = [0; SUPERVISED.len()];
+/// 已放弃的域（达到失败上限后不再重启）。
+static mut GAVE_UP: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
+/// 连续快速失败上限：到顶后停止重启并打 `init: giving up on ...`。
+const MAX_RAPID_FAILS: u32 = 4;
 
 /// 监督循环: 每轮检查一遍被监督域，缺谁补谁。
 ///
@@ -119,9 +125,13 @@ pub fn run() {
     let mut restarts = 0u64;
     loop {
         for (i, &(domain, name)) in SUPERVISED.iter().enumerate() {
+            if unsafe { GAVE_UP[i] } {
+                continue;
+            }
             if sys_domain_alive(domain) != 0 {
                 unsafe {
                     PENDING[i] = false;
+                    RAPID_FAILS[i] = 0;
                 }
                 continue;
             }
@@ -135,6 +145,19 @@ pub fn run() {
             unsafe {
                 PENDING[i] = false;
             }
+            // 连续失败预算用尽: 真机上"盘上没有可挂的卷"会让文件服务秒退, 无限重启只会
+            // 把日志刷爆并饿死 shell —— 到达上限后彻底放弃本域。
+            if unsafe { RAPID_FAILS[i] } >= MAX_RAPID_FAILS {
+                unsafe {
+                    GAVE_UP[i] = true;
+                }
+                print("init: giving up on ");
+                print(name);
+                print(" (domain ");
+                print_u64(domain);
+                println(") - repeated rapid failures, not restarting again");
+                continue;
+            }
             // 域号必须原样回来 (内核只允许"原地重启") —— 不相等说明约定被破坏，宁可报错。
             let (revived, from_disk) = restart(domain, name);
             if revived != domain {
@@ -142,6 +165,9 @@ pub fn run() {
                 print(name);
                 println(" FAILED");
                 continue;
+            }
+            unsafe {
+                RAPID_FAILS[i] += 1;
             }
             restarts += 1;
             print("init: restarted ");

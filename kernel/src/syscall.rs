@@ -167,6 +167,12 @@ pub const SYS_LOG_READ: u64 = 59;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3, shell `lspci`): `a1` = 索引、`a2` = 用户缓冲
 /// (3 个 u64), 返回 1/0 (见 [`crate::arch::pci::syscall_info`])。
 pub const SYS_PCI_INFO: u64 = 60;
+/// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn` (可信域)。见 [`crate::arch::acpi::poweroff`]。
+pub const SYS_POWEROFF: u64 = 61;
+/// 硬重启 (真机 P0): 无参; 需 `Capability::Spawn`。见 [`crate::arch::acpi::reboot`]。
+pub const SYS_REBOOT: u64 = 62;
+/// 非阻塞取按键 (P0 诊断命令可被 Ctrl+C 中止): 有键返回值, 队列空返回 `u64::MAX`。
+pub const SYS_KEY_TRY_READ: u64 = 63;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -831,6 +837,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 crate::scheduler::block_current(crate::scheduler::KEY_WAIT);
             }
         }
+        SYS_KEY_TRY_READ => crate::key::pop().map_or(u64::MAX, |c| c as u64),
         SYS_DOMAIN_ALIVE => {
             // 该域是否**还有存活任务** (监督者巡检原语)。
             (crate::domain::is_alive(a1) && crate::scheduler::live_tasks(a1) > 0) as u64
@@ -898,6 +905,27 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_LOG_TOTAL => crate::klog::total(),
         SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
         SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
+        SYS_POWEROFF => {
+            // 关机是不可逆的全局操作: 只给"能造进程"的可信域 (app/shell/init)。
+            if !crate::cap::has(
+                crate::scheduler::current_domain(),
+                crate::cap::Capability::Spawn,
+            ) {
+                0
+            } else {
+                crate::arch::acpi::poweroff()
+            }
+        }
+        SYS_REBOOT => {
+            if !crate::cap::has(
+                crate::scheduler::current_domain(),
+                crate::cap::Capability::Spawn,
+            ) {
+                0
+            } else {
+                crate::arch::acpi::reboot()
+            }
+        }
         _ => 0,
     }
 }

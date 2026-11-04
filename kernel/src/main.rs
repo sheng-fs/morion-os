@@ -158,7 +158,15 @@ pub extern "C" fn kernel_main() -> ! {
     video::println("Stage 4: Hardware interrupts");
     arch::pic::init();
     arch::pit::init();
-    arch::keyboard::init();
+    // 真机常见: 没有 i8042 (只有 USB 键盘) —— 先探在不在, 不在就明确告警, 不再死等。
+    let ps2_status = arch::keyboard::init();
+    if ps2_status == 0xFF {
+        video::print("[!!] PS/2 (i8042) not present: status=0x");
+        video::print_hex(ps2_status as u64);
+        video::println(" (USB keyboard? USB legacy off?)");
+    } else {
+        video::println("[OK] PS/2 (i8042) controller present");
+    }
     video::print("[OK] PIC remapped + PIT timer started (");
     video::print_u64(arch::pit::TARGET_FREQ as u64);
     video::println(" Hz)");
@@ -168,9 +176,7 @@ pub extern "C" fn kernel_main() -> ! {
     // ============================================================
     video::println("");
     video::println("Stage 4.5: PCI enumeration");
-    let pci_devices = arch::pci::enumerate();
-    // Phase 0 / P0.3: 留一份只读快照, 供 shell `lspci` 随时重列 (真机取证用)。
-    arch::pci::publish(&pci_devices);
+    let mut pci_devices = arch::pci::enumerate();
     video::print("[OK] PCI devices found: ");
     video::print_u64(pci_devices.len() as u64);
     video::println("");
@@ -185,6 +191,32 @@ pub extern "C" fn kernel_main() -> ! {
         video::print_hex(((d.class as u64) << 16) | ((d.subclass as u64) << 8) | d.progif as u64);
         video::println("");
     }
+    // 启动盘限制（真机安全）: 引导器把启动卷所在 PCI 控制器 (device:function) 交过来后，
+    // 只保留"这台控制器上的块设备"—— 真机上因此不会去碰内建 NVMe / SATA 上的其它磁盘
+    // (USB 控制器 class 0C 永不裁剪, 否则 USB 键盘/启动盘自己也消失了)。
+    //
+    // **只在 SAFE 变体启用**: QEMU 回归用 `-cdrom` 启动, 同时挂 NVMe / virtio-blk / AHCI
+    // 多块盘做驱动自测 —— 真机安全策略在测试环境会把它们全裁掉, 所以普通构建保持原样。
+    if morion_kernel::version::IS_SAFE {
+        match crate::bootinfo::get().boot_disk() {
+            Some((dev, func)) => {
+                pci_devices.retain(|d| d.class != 0x01 || (d.dev == dev && d.func == func));
+                video::print("[OK] boot-disk restriction: only PCI ");
+                video::print_u64(dev as u64);
+                video::print(":");
+                video::print_u64(func as u64);
+                video::print(" storage controllers exposed (");
+                video::print_u64(pci_devices.len() as u64);
+                video::println(" devices; USB controllers always kept)");
+            }
+            None => {
+                video::println("[OK] boot-disk not identified: no restriction on block controllers")
+            }
+        }
+    }
+    // Phase 0 / P0.3: 留一份只读快照, 供 shell `lspci` 随时重列 (真机取证用)。
+    // 注意放在限制之后: `lspci` 看到的应当就是驱动层实际能用的设备集。
+    arch::pci::publish(&pci_devices);
 
     // ============================================================
     //  阶段 4.6: ACPI / IOMMU (DMAR) 探测 —— E1a
@@ -654,31 +686,52 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(block_domain, cap::Capability::MapInto(ahci_domain));
     cap::grant(ahci_domain, cap::Capability::SendTo(block_domain));
 
-    // 探测 xHCI (USB 3.x) 控制器并通用地授权给域 19（驱动路线 03c: USB 存储, 第一版只读
-    // bring-up）。BAR0 是 64 位 MMIO 寄存器窗口 (约 4 页, 含端口寄存器区); DMA 16 页:
-    // DCBAA / 命令环 / 事件环 / ERST / 输入·设备上下文 / EP0+两条 Bulk 传输环 / 数据页 /
-    // 命令表。**第一版全轮询** —— 轮询事件环, 不申请向量 (msix_vectors=0), 判据不变。
-    match arch::pci::find_xhci(&pci_devices) {
-        Some((bus, dev, func, bar0)) => {
-            device::grant(device::GrantRequest {
+    // 探测 xHCI (USB 3.x) 控制器并通用地授权给域 19。真机常见 2–3 个控制器
+    // (不同 USB 口挂在不同控制器上), 所以这里**逐个授权**，驱动按实例偏移读取。
+    let mut xhci_count = 0u32;
+    for d in &pci_devices {
+        if d.class != 0x0C || d.subclass != 0x03 || d.progif != 0x30 {
+            continue;
+        }
+        let Some(bar0) = arch::pci::read_bar0(d.bus, d.dev, d.func) else {
+            continue;
+        };
+        if xhci_count >= device::DEVICE_MULTI_SLOTS as u32 {
+            break;
+        }
+        device::grant_slot(
+            device::GrantRequest {
                 domain: xhci_domain,
-                bus,
-                dev,
-                func,
+                bus: d.bus,
+                dev: d.dev,
+                func: d.func,
                 bar_paddr: bar0,
                 bar_pages: 4,
                 dma_pages: 16,
                 msix_vectors: 0,
                 label: "xhci",
-            });
-            video::print("[OK] xHCI controller BAR0=0x");
-            video::print_hex(bar0);
-            video::println("");
-        }
-        None => {
-            device::grant_empty(xhci_domain);
-            video::println("[OK] no xHCI controller, xhci_srv idle");
-        }
+            },
+            xhci_count,
+        );
+        video::print("[OK] xHCI controller #");
+        video::print_u64(xhci_count as u64);
+        video::print(" at ");
+        video::print_u64(d.bus as u64);
+        video::print(":");
+        video::print_u64(d.dev as u64);
+        video::print(".");
+        video::print_u64(d.func as u64);
+        video::print(" BAR0=0x");
+        video::print_hex(bar0);
+        video::println("");
+        xhci_count += 1;
+    }
+    // 驱动会探测全部 4 个槽位: 未授权的槽位补零描述页, 避免读到未映射地址。
+    if (xhci_count as u64) < device::DEVICE_MULTI_SLOTS {
+        device::grant_empty_multi_from(xhci_domain, xhci_count as u64);
+    }
+    if xhci_count == 0 {
+        video::println("[OK] no xHCI controller, xhci_srv idle");
     }
 
     // 授权 (03c): USB 盘经 block_srv 的**卷层**对外提供 —— 同 03b 的 AHCI 模式：

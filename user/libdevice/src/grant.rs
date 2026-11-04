@@ -8,6 +8,11 @@
 /// = `USER_SPACE_BASE + 0x81_0000`）。
 pub const DEVICE_CFG_VADDR: u64 = 0x0000_0080_0081_0000;
 
+/// **多实例**描述页窗口（= 内核 `device::DEVICE_MULTI_CFG_VADDR`），每个实例一页。
+pub const DEVICE_MULTI_CFG_VADDR: u64 = 0x0000_0080_0090_0000;
+/// 多实例上限（与内核 `DEVICE_MULTI_SLOTS` 一致）。
+pub const DEVICE_MULTI_SLOTS: u32 = 4;
+
 /// 运行期设备授权 syscall 号（= 内核 `syscall::SYS_DEVICE_GRANT`，D1b）。
 ///
 /// libdevice 保持**零依赖**（不引 `morion`），故这里本地定义编号 + 裸 `syscall` 指令，
@@ -93,6 +98,18 @@ impl DeviceGrant {
     /// 是否是有效授权（magic 匹配）；不匹配表示内核没授权设备（`grant_empty`）。
     pub fn is_valid(&self) -> bool {
         self.magic == DEVICE_GRANT_MAGIC
+    }
+
+    /// 读**第 `slot` 个实例**的授权描述（多控制器场景，如 xHCI）。
+    ///
+    /// 内核在 boot 期把每个实例的描述页映射到 `MULTI_CFG + slot * 4096`；
+    /// 越界或未授权时返回全零描述（`is_valid() == false`）。
+    pub fn load_at(slot: u32) -> Self {
+        if slot >= DEVICE_MULTI_SLOTS {
+            return unsafe { core::mem::zeroed() };
+        }
+        let p = DEVICE_MULTI_CFG_VADDR + slot as u64 * 4096;
+        unsafe { core::ptr::read_volatile(p as *const DeviceGrant) }
     }
 
     /// 页大小（内核填；缺省 4096）。

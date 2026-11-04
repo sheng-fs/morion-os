@@ -44,6 +44,12 @@ pub fn readline(buf: &mut [u8]) -> u64 {
                     flush();
                 }
             }
+            // Ctrl+C: 取消当前输入行 (丢弃已输入的字符), 回到空提示符。
+            0x03 => {
+                print("^C\n");
+                flush();
+                return 0;
+            }
             b if (0x20..=0x7E).contains(&b) && len < buf.len() => {
                 buf[len] = b;
                 len += 1;

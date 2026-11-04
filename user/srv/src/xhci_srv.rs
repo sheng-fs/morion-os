@@ -751,25 +751,230 @@ fn parse_bulk_endpoints(buf_va: u64, total: u32) -> Option<(BulkEp, BulkEp)> {
 }
 
 // ---------------------------------------------------------------------------
-// 主入口
+// 主入口（多控制器 + USB 存储 / USB HID 键盘）
 // ---------------------------------------------------------------------------
 
-/// 域 19 — xhci_srv：xHCI 驱动 + 只读自测（03c）。
-pub fn run() {
-    let g = DeviceGrant::load();
-    if !g.is_valid() {
-        println("xhci: no device grant (no xHCI), idle");
-        idle();
+/// 单台控制器的探测结果。
+enum ProbeOutcome {
+    /// 这台控制器没有可用设备（或初始化失败）：继续看下一台。
+    None,
+    /// 挂上了 USB 存储，已异步通知 block_srv。
+    Storage(StorageDev),
+    /// 配好了 USB HID 键盘。
+    Keyboard(KeyboardDev),
+}
+
+/// 已挂进 block_srv 卷层的 USB 存储控制器。
+struct StorageDev {
+    hc: Xhci,
+    cap_sectors: u64,
+}
+
+/// 一台已配置好的 USB HID 键盘控制器。
+struct KeyboardDev {
+    hc: Xhci,
+    dci: u32,
+    /// 上一次的 6 个按键码（boot report 的 byte2..7），用于只上报"新按下"。
+    prev: [u8; 6],
+    /// 是否已压入一笔等待数据的 Interrupt IN 传输。
+    armed: bool,
+}
+
+impl KeyboardDev {
+    /// 在 HID 中断端点上压一笔 8 字节输入传输（无数据时控制器会一直 NAK，不产生完成事件）。
+    fn arm(&mut self) {
+        let trb = Trb {
+            param: self.hc.data_pa,
+            status: 8,
+            control: (TRB_NORMAL << 10) | (1 << 5) | (1 << 16),
+        };
+        self.hc.bulkin.push(trb);
+        fence();
+        wr32(self.hc.db + (self.hc.slot as u64) * 4, self.dci);
+        self.armed = true;
     }
+
+    /// 非阻塞收 HID 报告；收到就把新按下的键推进内核键队列，并重新压一笔传输。
+    fn poll(&mut self) {
+        let erdp = self.hc.rt + RT_IR0 + IR_ERDP;
+        let mut got = false;
+        while let Some(e) = self.hc.evt.poll(erdp) {
+            if trb_type(&e) != TRB_TRANSFER_EVENT {
+                continue; // 端口状态变化等无关事件
+            }
+            let slot = (e.control >> 24) & 0xFF;
+            let dci = (e.control >> 16) & 0x1F;
+            if slot != self.hc.slot || dci != self.dci {
+                continue;
+            }
+            let mut rep = [0u8; 8];
+            let mut i = 0usize;
+            while i < 8 {
+                rep[i] = rd8(self.hc.data_va + i as u64);
+                i += 1;
+            }
+            self.emit(&rep);
+            got = true;
+        }
+        if got && self.armed {
+            self.armed = false;
+            self.arm();
+        }
+    }
+
+    /// boot report → 字符：只上报"这一帧新按下"的键（按住不放不会重复）。
+    fn emit(&mut self, rep: &[u8; 8]) {
+        let shift = rep[0] & 0x22 != 0; // bit1 左 shift / bit5 右 shift
+        let mut i = 0usize;
+        while i < 6 {
+            let code = rep[2 + i];
+            if code != 0 && !self.prev.contains(&code) {
+                if let Some(c) = hid_char(code, shift) {
+                    sys_key_push(c);
+                }
+            }
+            i += 1;
+        }
+        self.prev.copy_from_slice(&rep[2..8]);
+    }
+}
+
+/// HID usage ID（boot keyboard）→ ASCII；不可打印键返回 `None`。
+fn hid_char(code: u8, shift: bool) -> Option<u8> {
+    let c = match code {
+        0x04..=0x1D => b'a' + (code - 0x04),
+        0x1E..=0x27 => b'1' + (code - 0x1E),
+        0x28 => return Some(b'\n'),
+        0x2A => return Some(0x08),
+        0x2C => b' ',
+        0x2D => return Some(if shift { b'_' } else { b'-' }),
+        0x2E => return Some(if shift { b'+' } else { b'=' }),
+        0x2F => return Some(if shift { b'{' } else { b'[' }),
+        0x30 => return Some(if shift { b'}' } else { b']' }),
+        0x31 => return Some(if shift { b'|' } else { b'\\' }),
+        0x32 => return Some(if shift { b':' } else { b';' }),
+        0x33 => return Some(if shift { b'"' } else { b'\'' }),
+        0x34 => return Some(if shift { b'~' } else { b'`' }),
+        0x35 => return Some(if shift { b'<' } else { b',' }),
+        0x36 => return Some(if shift { b'>' } else { b'.' }),
+        0x37 => return Some(if shift { b'?' } else { b'/' }),
+        _ => return None,
+    };
+    if shift {
+        if c.is_ascii_lowercase() {
+            return Some(c - 32);
+        }
+        // 数字行：shift 后是符号。
+        return Some(match code {
+            0x1E => b'!',
+            0x1F => b'@',
+            0x20 => b'#',
+            0x21 => b'$',
+            0x22 => b'%',
+            0x23 => b'^',
+            0x24 => b'&',
+            0x25 => b'*',
+            0x26 => b'(',
+            0x27 => b')',
+            _ => c,
+        });
+    }
+    Some(c)
+}
+
+/// 配置描述符里与本驱动有关的接口信息（只保留最后一个接口的类别与端点）。
+#[derive(Clone, Copy, Default)]
+struct IfaceInfo {
+    class: u8,
+    subclass: u8,
+    proto: u8,
+    bulk_in: Option<BulkEp>,
+    bulk_out: Option<BulkEp>,
+    /// (DCI, MaxPacketSize, Interval)
+    hid: Option<(u32, u16, u8)>,
+}
+
+/// 遍历配置描述符，收集接口类别与端点。
+fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
+    let mut info = IfaceInfo::default();
+    let mut off = 0u32;
+    while off + 2 <= total {
+        let len = rd8(buf_va + off as u64) as u32;
+        let dtype = rd8(buf_va + off as u64 + 1);
+        if len < 2 {
+            break;
+        }
+        let base = buf_va + off as u64;
+        if dtype == 4 && len >= 9 {
+            // Interface descriptor
+            info.class = rd8(base + 5);
+            info.subclass = rd8(base + 6);
+            info.proto = rd8(base + 7);
+        } else if dtype == 5 && len >= 7 {
+            // Endpoint descriptor
+            let addr = rd8(base + 2);
+            let attr = rd8(base + 3);
+            let mps = (rd8(base + 4) as u16) | ((rd8(base + 5) as u16) << 8);
+            let interval = rd8(base + 6);
+            let num = (addr & 0x0F) as u32;
+            match attr & 0x3 {
+                2 if addr & 0x80 != 0 => {
+                    info.bulk_in = Some(BulkEp {
+                        dci: 2 * num + 1,
+                        mps: mps & 0x7FF,
+                    })
+                }
+                2 => {
+                    info.bulk_out = Some(BulkEp {
+                        dci: 2 * num,
+                        mps: mps & 0x7FF,
+                    })
+                }
+                3 if addr & 0x80 != 0 => info.hid = Some((2 * num + 1, mps & 0x7FF, interval)),
+                _ => {}
+            }
+        }
+        off += len;
+    }
+    info
+}
+
+/// 配置 HID 的 Interrupt IN 端点（EP Type = 7）。
+fn configure_hid(
+    hc: &mut Xhci,
+    slot: u32,
+    speed: u32,
+    port: u32,
+    dci: u32,
+    mps: u16,
+    interval: u8,
+) -> bool {
+    let (slot_ctx, ep_base) = clear_input(hc);
+    wr32(hc.input_va + 4, 1 | (1 << dci));
+    wr32(slot_ctx, (dci << 27) | (speed << 20));
+    wr32(slot_ctx + 4, port << 16);
+    let ep = input_ep_ctx(hc, ep_base, dci);
+    // EP 上下文 DWORD0：Interval 在 bits 23:16。
+    wr32(ep, (interval as u32) << 16);
+    // DWORD1：MPS | EP Type=7(Interrupt IN) | CErr=3。
+    wr32(ep + 4, ((mps as u32) << 16) | (7 << 3) | (3 << 1));
+    wr64(ep + 8, hc.bulkin.pa | 1);
+    match hc.context_cmd(TRB_CONFIGURE_ENDPOINT, slot) {
+        Some(e) => trb_cc(&e) == CC_SUCCESS,
+        None => false,
+    }
+}
+
+/// 探测一台控制器：初始化 → 找端口 → 地址设备 → 识别存储 / HID 键盘。
+fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     if g.dma_bytes < DMA_PAGES * PAGE {
         println("xhci: device grant DMA too small, aborting");
-        idle();
+        return ProbeOutcome::None;
     }
     let mmio = g.bar_vaddr;
     let dma_va = g.dma_vaddr;
     let dma_pa = g.dma_paddr;
 
-    // 读取能力寄存器并算出各寄存器块基址。
     let caplength = rd8(mmio + CAP_CAPLENGTH) as u64;
     let op = mmio + caplength;
     let hcs1 = rd32(mmio + CAP_HCSPARAMS1);
@@ -779,12 +984,14 @@ pub fn run() {
     let db = mmio + (rd32(mmio + CAP_DBOFF) & !0x3) as u64;
     let max_slots = hcs1 & 0xFF;
     let num_ports = (hcs1 >> 24) & 0xFF;
-    // CSZ (HCCPARAMS1 bit2): 上下文大小 = 64 B (1) 或 32 B (0)。
     let ctx_size: u64 = if hcc1 & (1 << 2) != 0 { 64 } else { 32 };
-    // Scratchpad 数 = HCSPARAMS2 的 [31:27] 为低 5 位、[25:21] 为高 5 位。
     let scratchpad = ((hcs2 >> 27) & 0x1F) | (((hcs2 >> 21) & 0x1F) << 5);
 
-    print("xhci: caplen=");
+    print("xhci: ctrl#");
+    print_u64(idx as u64);
+    print(" bar=0x");
+    print_hex(mmio);
+    print(" caplen=");
     print_u64(caplength);
     print(" max_slots=");
     print_u64(max_slots as u64);
@@ -830,32 +1037,49 @@ pub fn run() {
         tag: 0,
     };
 
-    // 清零所有 DMA 结构页（ERST / 事件环 / 命令环 / DCBAA / 上下文 / 环 / 数据）。
     zero_bytes(dma_va as *mut u8, (DMA_PAGES * PAGE) as usize);
 
     if !hc.reset() {
         println("xhci: controller reset FAILED (CNR still set)");
-        idle();
+        return ProbeOutcome::None;
     }
 
-    // 复位后事件环 / 环的 Link TRB 内容被清零，重新写一次。
     hc.cmd.write_link();
     hc.ep0.write_link();
     hc.bulkin.write_link();
     hc.bulkout.write_link();
 
-    // 清掉复位后可能残留的 RW1C 状态位（HSE/EINT/PCD/SRE/HCE）——
-    // ⚠️ 端口在复位时已连接，而事件环尚未建立，QEMU 会因「事件投递时 ERST 无效」置 HCE。
     wr32(op + OP_USBSTS, 0x105C);
 
-    // 清掉复位后端口变化位（CSC/PLC 等 RW1C）—— 免得刚起步就被复位时产生的
-    // Port Status Change 事件占满事件环（后续端口复位仍会正常产生事件）。
+    // 端口上电并汇总"有没有设备"。
+    let mut present = false;
+    print("xhci: ctrl#");
+    print_u64(idx as u64);
+    print(" ports=");
+    print_u64(num_ports as u64);
     let mut p = 1u32;
     while p <= num_ports {
         let reg = op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
-        let sc = rd32(reg);
-        wr32(reg, sc); // 写 1 清 RW1C 变化位
+        let mut sc = rd32(reg);
+        if sc & PORT_PP == 0 {
+            wr32(reg, (sc & !PORT_CHANGE) | PORT_PP);
+            sys_sleep(10);
+            sc = rd32(reg);
+        }
+        print(" 0x");
+        print_hex(sc as u64);
+        if sc & PORT_CCS != 0 {
+            present = true;
+        }
         p += 1;
+    }
+    println(if present {
+        " (device present)"
+    } else {
+        " (no device)"
+    });
+    if !present {
+        return ProbeOutcome::None;
     }
 
     // ERST：1 段，段表项 = {环基址, 环 TRB 数}。
@@ -865,13 +1089,12 @@ pub fn run() {
     wr64(rt + RT_IR0 + IR_ERSTBA, pbase(ERST_PAGE));
     wr64(rt + RT_IR0 + IR_ERDP, pbase(EVT_PAGE));
 
-    // DCBAA：数组首项留给 scratchpad 数组（没有则 0），其余槽位在启用时填。
     if scratchpad > 0 {
         if scratchpad > 4 {
             print("xhci: scratchpad too many (");
             print_u64(scratchpad as u64);
             println("), aborting");
-            idle();
+            return ProbeOutcome::None;
         }
         wr64(hc.dcbaa_va, base(SCRATCH_ARR_PAGE));
         let mut i = 0u64;
@@ -882,21 +1105,23 @@ pub fn run() {
     }
     wr64(op + OP_DCBAAP, hc.dcbaa_pa);
 
-    // CONFIG.MaxSlotsEn。
     let cfg = rd32(op + OP_CONFIG);
     wr32(op + OP_CONFIG, (cfg & !0xFF) | max_slots);
-
-    // CRCR：命令环基址 + RCS=1。
     wr64(op + OP_CRCR, hc.cmd.pa | 1);
 
     hc.start();
+    print("xhci: ctrl#");
+    print_u64(idx as u64);
+    println(" started (controller running)");
 
     // ---- 端口复位 ----
     let (port, speed) = match hc.find_port() {
         Some(v) => v,
         None => {
-            println("xhci: no connected USB device on any port, idle");
-            idle();
+            print("xhci: ctrl#");
+            print_u64(idx as u64);
+            println(": no connected USB device");
+            return ProbeOutcome::None;
         }
     };
     print("xhci: port ");
@@ -912,25 +1137,23 @@ pub fn run() {
         Some(e) => e,
         None => {
             println("xhci: Enable Slot: no command completion event");
-            idle();
+            return ProbeOutcome::None;
         }
     };
     if trb_cc(&ev) != CC_SUCCESS {
         print("xhci: Enable Slot FAILED cc=");
         print_u64(trb_cc(&ev) as u64);
         println("");
-        idle();
+        return ProbeOutcome::None;
     }
     let slot = (ev.control >> 24) & 0xFF;
     hc.slot = slot;
-    // DCBAA[slot] = 本设备的上下文。
     wr64(hc.dcbaa_va + (slot as u64) * 8, hc.devctx_pa);
     print("xhci: slot ");
     print_u64(slot as u64);
     println(" enabled");
 
     // ---- Address Device ----
-    // 速度默认最大包：1=Full(8) 2=Low(8) 3=High(64) 4=Super(512)。
     let default_mps: u16 = match speed {
         1 | 2 => 8,
         4 | 5 => 512,
@@ -938,14 +1161,13 @@ pub fn run() {
     };
     if !address_device(&mut hc, slot, speed, port, default_mps) {
         println("xhci: Address Device FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     hc.log("device addressed");
 
-    // ---- 读设备描述符（18 字节）----
     if !hc.get_device_descriptor(18) {
         println("xhci: GET_DESCRIPTOR(device) FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     let bmax0 = rd8(hc.data_va + 7) as u16;
     print("xhci: device descriptor vid=0x");
@@ -956,22 +1178,59 @@ pub fn run() {
     print_u64(bmax0 as u64);
     println("");
 
-    // ---- 读配置描述符（先 9 字节拿 wTotalLength，再读全量）----
     if !hc.control(0x80, 6, 2 << 8, 0, 9, true, hc.data_pa) {
         println("xhci: GET_DESCRIPTOR(config,9) FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     let total = (rd8(hc.data_va + 2) as u32) | ((rd8(hc.data_va + 3) as u32) << 8);
     let want = if total > 512 { 512 } else { total };
     if want < 9 || !hc.control(0x80, 6, 2 << 8, 0, want as u16, true, hc.data_pa) {
         println("xhci: GET_DESCRIPTOR(config,full) FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
-    let (bin, bout) = match parse_bulk_endpoints(hc.data_va, want) {
-        Some(v) => v,
-        None => {
-            println("xhci: no bulk endpoints in config descriptor");
-            idle();
+    let iface = parse_config(hc.data_va, want);
+
+    // ---- USB HID boot keyboard ----
+    if iface.class == 0x03 && iface.subclass == 0x01 && iface.proto == 0x01 {
+        let Some((dci, mps, interval)) = iface.hid else {
+            println("xhci: device ignored (unsupported interface class)");
+            return ProbeOutcome::None;
+        };
+        if !hc.control(0x00, 9, 1, 0, 0, false, 0) {
+            println("xhci: kbd SET_CONFIGURATION FAILED");
+            return ProbeOutcome::None;
+        }
+        if !configure_hid(&mut hc, slot, speed, port, dci, mps, interval) {
+            println("xhci: kbd Configure Endpoint FAILED");
+            return ProbeOutcome::None;
+        }
+        // SET_PROTOCOL(boot)；个别键盘不认，仍按 boot report 尝试。
+        if !hc.control(0x21, 0x0B, 0, 0, 0, false, 0) {
+            println("xhci: kbd SET_PROTOCOL FAILED (still trying report format)");
+        }
+        print("xhci: USB HID keyboard ready (port=");
+        print_u64(port as u64);
+        print(", slot=");
+        print_u64(slot as u64);
+        print(", dci=");
+        print_u64(dci as u64);
+        print(") interval=");
+        print_u64(interval as u64);
+        println("");
+        return ProbeOutcome::Keyboard(KeyboardDev {
+            hc,
+            dci,
+            prev: [0u8; 6],
+            armed: false,
+        });
+    }
+
+    // ---- USB 大容量存储（BOT + SCSI）----
+    let (bin, bout) = match (iface.bulk_in, iface.bulk_out) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            println("xhci: device ignored (unsupported interface class)");
+            return ProbeOutcome::None;
         }
     };
     hc.bulkin_dci = bin.dci;
@@ -988,23 +1247,20 @@ pub fn run() {
     print_u64(bout.mps as u64);
     println("");
 
-    // ---- SET_CONFIGURATION(1) ----
     if !hc.control(0x00, 9, 1, 0, 0, false, 0) {
         println("xhci: SET_CONFIGURATION FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
 
-    // ---- Configure Endpoint（两条 Bulk）----
     if !configure_endpoints(&mut hc, slot, speed, port) {
         println("xhci: Configure Endpoint FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     hc.log("bulk endpoints configured");
 
-    // ---- SCSI 自测：INQUIRY → READ CAPACITY → READ(10) 扇区 0 ----
     if !hc.scsi_inquiry() {
         println("xhci: INQUIRY FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     print("xhci: inquiry vendor=");
     print_sig(&{
@@ -1022,7 +1278,7 @@ pub fn run() {
         Some(v) => v,
         None => {
             println("xhci: READ CAPACITY FAILED");
-            idle();
+            return ProbeOutcome::None;
         }
     };
     let cap_sectors = (last_lba as u64) + 1;
@@ -1034,7 +1290,7 @@ pub fn run() {
 
     if !hc.scsi_read10(0, 1) {
         println("xhci: READ(10) sector 0 FAILED");
-        idle();
+        return ProbeOutcome::None;
     }
     let mut sig = [0u8; 16];
     let mut sig_ok = true;
@@ -1047,7 +1303,6 @@ pub fn run() {
         i += 1;
     }
 
-    // marker：只读链路的端到端取证（枚举 + BOT + SCSI READ(10)）。
     print("USB1 xhci OK, cap=");
     print_u64(cap_sectors);
     print(", sector0 sig=");
@@ -1056,22 +1311,79 @@ pub fn run() {
     print(if sig_ok { "ok" } else { "BAD" });
     println("");
 
-    // 03c：把 U 盘挂进 block_srv 的卷层（异步通知，随后 block_srv 回调做读写校验）。
     if !attach_to_block(cap_sectors) {
         println("xhci: attach to block_srv FAILED (send refused), idle");
+        return ProbeOutcome::None;
+    }
+
+    ProbeOutcome::Storage(StorageDev { hc, cap_sectors })
+}
+
+/// 域 19 — xhci_srv：多控制器 xHCI 驱动（USB 存储 + HID 键盘）。
+pub fn run() {
+    let mut storage: Option<StorageDev> = None;
+    let mut keyboard: Option<KeyboardDev> = None;
+
+    let mut slot = 0u32;
+    while slot < libdevice::grant::DEVICE_MULTI_SLOTS {
+        let g = DeviceGrant::load_at(slot);
+        if !g.is_valid() {
+            slot += 1;
+            continue;
+        }
+        match probe_controller(&g, slot) {
+            ProbeOutcome::Storage(s) => {
+                if storage.is_none() {
+                    storage = Some(s);
+                }
+            }
+            ProbeOutcome::Keyboard(k) => {
+                if keyboard.is_none() {
+                    keyboard = Some(k);
+                }
+            }
+            ProbeOutcome::None => {}
+        }
+        slot += 1;
+    }
+
+    if storage.is_none() && keyboard.is_none() {
+        println("xhci: no supported USB device (storage/keyboard), idle");
         idle();
     }
 
-    // 服务循环：接收 block_srv 转来的 `BlockReq`（读/写），每笔经 BOT+SCSI 完成后回复。
+    // 键盘：压入第一笔等待数据的传输。
+    if let Some(k) = keyboard.as_mut() {
+        k.arm();
+    }
+
+    // 只有键盘（无存储）：纯轮询 HID。
+    let Some(st) = storage.as_mut() else {
+        loop {
+            if let Some(k) = keyboard.as_mut() {
+                k.poll();
+            }
+            sys_sleep(5);
+        }
+    };
+    let _ = st.cap_sectors;
+
+    // 服务循环：每轮先收 HID 报告，再非阻塞收 block_srv 的读/写请求。
     loop {
+        if let Some(k) = keyboard.as_mut() {
+            k.poll();
+        }
         let mut msg = Message {
             from: 0,
             to: 0,
             tag: 0,
             payload: [0; PAYLOAD_LEN],
         };
-        sys_recv_msg(&mut msg as *mut Message as *mut u8);
-
+        let tag = sys_try_recv(&mut msg as *mut Message as *mut u8);
+        if tag == u64::MAX {
+            sys_sleep(1);
+            continue;
+        }
         if msg.tag != BLOCK_REQ_TAG {
             sys_reply(0);
             continue;
@@ -1079,8 +1391,8 @@ pub fn run() {
         let req: BlockReq =
             unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
         let ok = match (req.op & 0xFF) as u8 {
-            BLOCK_OP_READ => serve_rw(&mut hc, true, req.lba, req.count),
-            BLOCK_OP_WRITE => serve_rw(&mut hc, false, req.lba, req.count),
+            BLOCK_OP_READ => serve_rw(&mut st.hc, true, req.lba, req.count),
+            BLOCK_OP_WRITE => serve_rw(&mut st.hc, false, req.lba, req.count),
             _ => false,
         };
         sys_reply(if ok { 1 } else { 0 });

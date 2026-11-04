@@ -249,7 +249,9 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
                 "  wifi [status|scan|connect <ssid> [psk]]  wireless station (abstraction layer)",
             );
             println("  lspci          list PCI devices seen by the kernel (vendor:device:class)");
-            println("  dmesg [path]   print console log (kernel + services); with path, write it to a file");
+            println(
+                "  dmesg [-d ms] [-a] [-g pat] [path]  console log; slow per-line by default (-d ms = delay, -a = full speed, -g pat = only lines containing pat), path = write to file",
+            );
             println("  cd [path]      change directory (default: /)");
             println("  mkdir <path>   create directory");
             println("  touch <file>   create empty file");
@@ -281,6 +283,9 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  part.wipe <nsid>   clear the partition table (disk becomes blank)");
             println("  part.reload      re-read all partition tables");
             println("  clear          clear screen");
+            println("  poweroff       power off the machine (ACPI S5; alias: halt/shutdown)");
+            println("  reboot         reset and restart the machine");
+            println("  (Ctrl+C: cancel the current input line, or abort a long dump like dmesg)");
             println("  (mounts: / = fat32, /tmp = tmpfs, /mfs = MorionFS, /ext2 = ext2 ro, /usb = exFAT)");
             println(
                 "  (extra volumes auto-mounted as /usb<N>, N = volume id in the boot volume list)",
@@ -341,6 +346,16 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             } else {
                 sys_clear();
             }
+        }
+        "poweroff" | "halt" | "shutdown" => {
+            println("poweroff: ACPI S5 ...");
+            sys_poweroff();
+            println("poweroff: FAILED (firmware has no usable ACPI S5)");
+        }
+        "reboot" => {
+            println("reboot: resetting ...");
+            sys_reboot();
+            println("reboot: FAILED (no usable reset path)");
         }
         _ => {
             print("shell: unknown command: ");
@@ -506,84 +521,156 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
-/// `dmesg [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
+/// `dmesg [-d ms] [-a] [-g pat] [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
-/// 不带参数: 原样打印全部日志（含**内核引导日志** —— 真机没有串口，这是把日志带出
-/// 机器的唯一办法）。带 `path`: 把日志写入该文件（如 `dmesg /boot.log`），供真机
-/// 拔盘取走。日志环形缓冲满后挤掉最老字节，故保留的是**最近的** 64 KiB。
+/// 逐行打印（默认每行停顿 `-d` 毫秒，便于按 Ctrl+C 中止长日志）；`-a` 全速、
+/// `-g pat` 只打含该子串的行并报告匹配行数。带 `path`: 把日志原样写入该文件
+/// （如 `dmesg /boot.log`），供真机拔盘取走。日志环形缓冲满后挤掉最老字节，
+/// 故保留的是**最近的** 64 KiB。
 fn shell_dmesg(st: &ShellState, arg: &str) {
     static mut BUF: [u8; 4096] = [0u8; 4096];
+    static mut LINE: [u8; 512] = [0u8; 512];
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
     let total = sys_log_total();
     if total == 0 {
         println("dmesg: log is empty");
         return;
     }
-    if arg.is_empty() {
-        let mut off = 0u64;
-        let mut got = 0u64;
+
+    // 选项解析: `-a` 全速、`-d <ms>` 行间延迟、`-g <pat>` 过滤; 其余位置参数是导出路径。
+    let mut fast = false;
+    let mut delay_ms = 5u64;
+    let mut pattern: Option<&str> = None;
+    let mut path_arg: Option<&str> = None;
+    let mut it = arg.split_whitespace();
+    while let Some(tok) = it.next() {
+        match tok {
+            "-a" | "--all" => fast = true,
+            "-d" => match it.next().and_then(parse_dec) {
+                Some(ms) => delay_ms = ms,
+                None => {
+                    println("dmesg: -d needs a millisecond count (e.g. dmesg -d 200)");
+                    return;
+                }
+            },
+            "-g" => match it.next() {
+                Some(p) => pattern = Some(p),
+                None => {
+                    println("dmesg: -g needs a substring (e.g. dmesg -g xhci)");
+                    return;
+                }
+            },
+            _ => path_arg = Some(tok),
+        }
+    }
+
+    // 导出模式: 原样写整段日志（真机把日志带出机器的唯一通路）。
+    if let Some(p) = path_arg {
+        let path = match resolve_in_cwd(st.cwd_str(), p) {
+            Some(p) => p,
+            None => {
+                println("dmesg: path too long");
+                return;
+            }
+        };
+        // 覆盖写: `creat` 对已存在的文件是"打开且不截断", 会留下旧尾巴, 故先删。
+        vfs::unlink(path);
+        let fd = vfs::creat(path);
+        if fd == u64::MAX {
+            print("dmesg: cannot create ");
+            println(path);
+            return;
+        }
+        let mut off = 0u64; // 日志绝对偏移
+        let mut woff = 0u64; // 文件内偏移
         loop {
             let n = sys_log_read(off, buf);
             if n == 0 {
                 break;
             }
-            // 只在**合法 UTF-8 前缀**上操作: 4 KiB 分块可能把一个多字节字符 (如中文)
-            // 切成两半, 直接 `from_utf8_unchecked` 会给内核 `chars()` 递非法序列。
-            // 用 `valid_up_to` 取合法前缀, 剩余字节下一轮再读 (off 只推进这么多)。
-            let used = match core::str::from_utf8(&buf[..n]) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            if used == 0 {
-                break; // 防御: 只读到半个字符时不再前进
+            let w = vfs::write(fd, woff, &buf[..n]);
+            if w != n as u64 {
+                println("dmesg: write FAILED (dumped prefix only)");
+                break;
             }
-            let s = unsafe { core::str::from_utf8_unchecked(&buf[..used]) };
-            sys_puts(s);
-            off += used as u64;
-            got += used as u64;
+            off += n as u64;
+            woff += w;
         }
-        // 日志尾部可能不带换行, 补一个, 免得后续提示符黏在最后一行。
-        println("");
-        print("dmesg: ");
-        print_u64(got);
-        println(" bytes");
-        return;
-    }
-    let path = match resolve_in_cwd(st.cwd_str(), arg) {
-        Some(p) => p,
-        None => {
-            println("dmesg: path too long");
-            return;
-        }
-    };
-    // 覆盖写: `creat` 对已存在的文件是"打开且不截断", 会留下旧尾巴, 故先删。
-    vfs::unlink(path);
-    let fd = vfs::creat(path);
-    if fd == u64::MAX {
-        print("dmesg: cannot create ");
+        vfs::close(fd);
+        print("dmesg: wrote ");
+        print_u64(woff);
+        print(" bytes to ");
         println(path);
         return;
     }
-    let mut off = 0u64; // 日志绝对偏移
-    let mut woff = 0u64; // 文件内偏移
+
+    // 行模式: 逐行输出, 支持 -g 过滤、-d 节流与 Ctrl+C 中止。
+    let mut off = 0u64;
+    let mut got = 0u64;
+    let mut matched = 0u64;
+    let mut ll = 0usize;
     loop {
         let n = sys_log_read(off, buf);
         if n == 0 {
             break;
         }
-        let w = vfs::write(fd, woff, &buf[..n]);
-        if w != n as u64 {
-            println("dmesg: write FAILED (dumped prefix only)");
-            break;
+        got += n as u64;
+        for &b in &buf[..n] {
+            if b == b'\n' {
+                let show = match pattern {
+                    None => true,
+                    Some(p) => bytes_contains(&line[..ll], p.as_bytes()),
+                };
+                if show {
+                    print_bytes(&line[..ll]);
+                    println("");
+                    matched += 1;
+                    if !fast {
+                        sys_sleep(delay_ms);
+                    }
+                }
+                ll = 0;
+                // 只在行边界检查按键: dmesg 是诊断命令, Ctrl+C 必须能中止长输出。
+                if let Some(0x03) = sys_key_try_read() {
+                    println("^C");
+                    return;
+                }
+            } else if ll < line.len() {
+                line[ll] = b;
+                ll += 1;
+            }
         }
         off += n as u64;
-        woff += w;
     }
-    vfs::close(fd);
-    print("dmesg: wrote ");
-    print_u64(woff);
-    print(" bytes to ");
-    println(path);
+    if ll > 0 {
+        let show = match pattern {
+            None => true,
+            Some(p) => bytes_contains(&line[..ll], p.as_bytes()),
+        };
+        if show {
+            print_bytes(&line[..ll]);
+            println("");
+            matched += 1;
+        }
+    }
+    if pattern.is_some() {
+        print("dmesg: ");
+        print_u64(matched);
+        println(" lines matched");
+    } else {
+        print("dmesg: ");
+        print_u64(got);
+        println(" bytes");
+    }
+}
+
+/// 判断 `needle` 是否出现在 `haystack` 里（空 pattern 恒匹配）。
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// `lspci` — 列出启动期枚举到的 PCI 设备（Phase 0 / P0.3）。

@@ -34,6 +34,13 @@ pub struct BootInfo {
     pub svc_entry_size: u64,   // 单个模块条目字节数
     /// **ACPI RSDP** 的物理地址（E1a）。0 = 固件未提供 / 引导器版本过旧。
     pub rsdp_addr: u64,
+    /// 启动盘所在 PCI 控制器的 device/function（0 = 没识别出来）。
+    ///
+    /// 引导器从启动卷的 Device Path 里取；内核据此只暴露"启动盘这条链上的块控制器"，
+    /// 避免在真机上误碰其它磁盘（见 `main.rs` Stage 4.5）。
+    pub boot_disk_valid: u32,
+    pub boot_disk_dev: u32,
+    pub boot_disk_func: u32,
 }
 
 impl BootInfo {
@@ -46,6 +53,17 @@ impl BootInfo {
             self.rsdp_addr
         } else {
             0
+        }
+    }
+
+    /// 启动盘所在 PCI 控制器的 `(device, function)`；`None` = 引导器没识别出来（不限制）。
+    ///
+    /// 旧引导器（`version < 5`）没有这三个字段，一律按"未识别"处理。
+    pub fn boot_disk(&self) -> Option<(u8, u8)> {
+        if self.version >= BOOT_VERSION && self.boot_disk_valid != 0 {
+            Some((self.boot_disk_dev as u8, self.boot_disk_func as u8))
+        } else {
+            None
         }
     }
 
@@ -85,8 +103,8 @@ pub const BOOT_MAGIC: u32 = 0x4D4F5249;
 ///
 /// 布局一变就 +1：内核与引导器是**两个独立编译**的产物，版本不一致时对新增字段按"不可用"
 /// 处理（见 [`BootInfo::rsdp_addr`]），而不是按新布局去读旧内存。历史：3 = 加服务模块表，
-/// 4 = 加 RSDP。
-pub const BOOT_VERSION: u32 = 4;
+/// 4 = 加 RSDP，5 = 加启动盘 PCI 位置。
+pub const BOOT_VERSION: u32 = 5;
 
 /// UEFI 内存描述符 (EFI_MEMORY_DESCRIPTOR, 40 字节)
 ///
