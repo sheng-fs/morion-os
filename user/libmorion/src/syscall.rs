@@ -568,6 +568,15 @@ pub fn sys_puts(s: &str) {
     }
 }
 
+/// 直接以 (指针, 长度) 形式调用 `SYS_PUTS` —— 仅供 syscall 信任边界自测从用户态
+/// 构造"坏指针"用例 (正常打印走 [`sys_puts`], 不必用这个封装)。
+///
+/// # Safety
+/// `(ptr, len)` 指向的内存须可读; 内核对内核地址/未映射页一律拒绝并返回 0。
+pub unsafe fn sys_puts_raw(ptr: u64, len: u64) -> u64 {
+    syscall(SYS_PUTS, ptr, len, 0)
+}
+
 /// 终止当前用户任务 (永不返回)。
 pub fn sys_exit() -> ! {
     unsafe {

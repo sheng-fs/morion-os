@@ -234,6 +234,14 @@ cap_bad=0
 echo "== 能力审计 (② cap-audit) =="
 grep -nE 'cap-audit:' "$log" 2>/dev/null || echo "(无)"
 grep -qE 'cap-audit: OK' "$log" 2>/dev/null || cap_bad=1
+# syscall 信任边界: 低权域 (morion-hello, 与攻击者同能力面) 直接对内核发"坏指针"系统调用
+# (SYS_PUTS 传内核地址/未映射用户页 + SYS_TRY_RECV 传内核输出缓冲)。内核校验通过打印
+# `sec: syscall boundary OK`; 修复前的内核会在 Ring0 缺页红屏停机 (日志戛然而止) 或把
+# 内核内存打进终端。缺 OK 行即判失败 (FAILED 行本身也会被上面的收工判据抓住)。
+sec_bad=0
+echo "== syscall 信任边界自测 (低权域坏指针) =="
+grep -nE 'sec: syscall' "$log" 2>/dev/null || echo "(无)"
+grep -qE 'sec: syscall boundary OK' "$log" 2>/dev/null || sec_bad=1
 # 网络能力 (N5–N6): net_srv 帧级 NIC 驱动自测 (NET1 ARP / NET2 ipv4+icmp / NET3 DHCP / NET4 TCP)
 # + netstack_srv 协议栈起来 (frame link) + N6.6 应用经 libnetv 的 UDP socket 端到端
 # (端口能力门禁拒绝越权 + 回环收发 + 真实 TX 触发 ICMP 不可达回程)。任一缺即判失败。
@@ -306,4 +314,4 @@ grep -nE 'FS27|FS28|FS29|GS1|GT1|exec: |init: restarted|gfx: |screen console' "$
 echo "== 失败明细 =="
 grep -nE 'FAILED|PANIC' "$log" 2>/dev/null | grep -v "$harmless" || echo "(无)"
 
-[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${iso_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ] && [ "${net_bad:-0}" -eq 0 ]
+[ "${done_n:-0}" -ge 1 ] && [ "${fail_n:-0}" -eq 0 ] && [ "${host_bad:-0}" -eq 0 ] && [ "${vblk_bad:-0}" -eq 0 ] && [ "${ahci_bad:-0}" -eq 0 ] && [ "${usb_bad:-0}" -eq 0 ] && [ "${iso_bad:-0}" -eq 0 ] && [ "${cap_bad:-0}" -eq 0 ] && [ "${sec_bad:-0}" -eq 0 ] && [ "${net_bad:-0}" -eq 0 ]

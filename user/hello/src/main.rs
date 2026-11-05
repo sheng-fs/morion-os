@@ -14,7 +14,8 @@
 #![no_main]
 
 use morion::syscall::{
-    domain_id, print, print_hex, print_u64, println, sys_alloc_page, sys_share_page,
+    domain_id, print, print_hex, print_u64, println, sys_alloc_page, sys_puts_raw, sys_share_page,
+    sys_try_recv,
 };
 use morion::vfs;
 
@@ -54,7 +55,44 @@ pub extern "C" fn morion_main(_domain_id: u64) {
     print(", 入口 = 0x");
     print_hex(morion::_start as *const () as usize as u64);
     println("");
+    boundary_selftest();
     perm_selftest();
+}
+
+/// syscall 信任边界自测 (低权域视角 —— 与潜在攻击者同一个能力面, 且不受 `perm.go`
+/// 夹具开关影响, 每个实例都跑): 直接对内核发起"坏指针"系统调用。
+///
+/// 1) `SYS_PUTS` 传**内核空间**地址 (PML4 槽 0 恒等映射区): 内核必须拒绝 ——
+///    修复前要么把内核内存打进终端 (信息泄露), 要么在未映射处 Ring0 缺页
+///    (`idt` 对非 USER_MODE 错误直接红屏停机);
+/// 2) `SYS_PUTS` 传**用户空间但未映射**的页: 同样必须拒绝而不是内核态缺页停机;
+/// 3) `SYS_TRY_RECV` 输出缓冲指向内核空间: 邮箱为空 → `u64::MAX`, 不许有别的副作用
+///    (消息拷贝路径与 SYS_PUTS 共用内核侧同一套 `user_out_buf_ok` 校验)。
+///
+/// 正常打印在本行之后仍可用 (能打印 `sec:` 本身即 `SYS_PUTS` 正路未被破坏)。
+fn boundary_selftest() {
+    // PML4 槽 0 (内核恒等映射区) 且远超 QEMU RAM 的地址。
+    const KERNEL_ADDR: u64 = 0x0000_0000_7000_0000;
+    // PML4 槽 1 (用户空间) 但远离镜像/共享缓冲/用户栈的头几 MiB —— 必未映射。
+    const USER_UNMAPPED: u64 = 0x0000_0080_0100_0000;
+
+    let mut bad: u64 = 0;
+    if unsafe { sys_puts_raw(KERNEL_ADDR, 8) } != 0 {
+        bad |= 1;
+    }
+    if unsafe { sys_puts_raw(USER_UNMAPPED, 8) } != 0 {
+        bad |= 2;
+    }
+    if unsafe { sys_try_recv(KERNEL_ADDR as *mut u8) } != u64::MAX {
+        bad |= 4;
+    }
+    if bad == 0 {
+        println("sec: syscall boundary OK");
+    } else {
+        print("sec: syscall boundary FAILED bits=");
+        print_u64(bad);
+        println("");
+    }
 }
 
 /// FS-34..37 (04b): 以**低权身份**(运行期新建域 => uid 1000)跑权限端到端用例。

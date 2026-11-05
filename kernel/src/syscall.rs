@@ -315,6 +315,36 @@ fn user_elf_image(ptr: u64, len: u64) -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
 }
 
+/// 校验用户态交给内核的**输出**缓冲区 (`ptr..ptr+len`, 内核往里写)。
+///
+/// 信任边界与 `user_elf_image` / `read_user_payload` 一致: 两端都必须是用户空间地址,
+/// 且逐页确认**已映射** —— 内核以调用方的 CR3 直接写它, 不校验的话低权域既可以把
+/// 消息写到内核内存 (恒等映射区Ring0 可写), 也可以用未映射地址把内核态缺页变成
+/// 整机红屏停机。不通过返回 false, 调用方应拒绝拷贝。
+fn user_out_buf_ok(ptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = match ptr.checked_add(len as u64) {
+        Some(end) => end,
+        None => return false,
+    };
+    if !crate::memory::paging::is_user_address(ptr)
+        || !crate::memory::paging::is_user_address(end - 1)
+    {
+        return false;
+    }
+    let from = crate::scheduler::current_domain();
+    let mut page = ptr & !0xFFF;
+    while page < end {
+        if crate::memory::paging::resolve_user_page(from, page).is_none() {
+            return false;
+        }
+        page += 4096;
+    }
+    true
+}
+
 /// 按域号取**引导模块内存镜像** (`SYS_SPAWN_ELF_MODULE` 用): 引导器读进 `LOADER_DATA`
 /// 页、经 `BootInfo` 模块表交过来的那一份, 与内核同生命周期、不依赖磁盘。
 ///
@@ -393,8 +423,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_RECV => {
             // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
+            // 缓冲区须过 user_out_buf_ok: 非用户地址时跳过拷贝 —— 否则低权域
+            // 可把 120 字节消息写到内核内存, 或用未映射地址造成内核态缺页停机
+            // (消息本身已被消费, 调用方拿 tag 即可感知没有有效 payload)。
             let msg = crate::ipc::receive();
-            if a1 != 0 {
+            if a1 != 0 && user_out_buf_ok(a1, core::mem::size_of::<crate::ipc::Message>()) {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         &msg as *const crate::ipc::Message as *const u8,
@@ -717,6 +750,14 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            // 信任边界: 缓冲须全在用户空间且逐页已映射 —— 否则既是内核内存泄露
+            // (恒等映射在 Ring0 可直接读), 也会把内核态缺页变成整机停机。长度
+            // 上限挡住超长 a2 让关中断的内核做无界逐页校验/打印 (合法调用是
+            // 单行文本, 最长的 cat 单块也只有 4 KiB)。
+            const PUTS_MAX: usize = 64 * 1024;
+            if a2 == 0 || a2 as usize > PUTS_MAX || !user_out_buf_ok(a1, a2 as usize) {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
             let s = unsafe { core::str::from_utf8_unchecked(slice) };
             crate::video::print(s);
@@ -877,9 +918,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_TRY_RECV => {
             // 非阻塞收: 有消息就把完整消息写回 `a1` 并返回 tag; 邮箱空返回 u64::MAX。
+            // 写回前同 SYS_RECV 一样过 user_out_buf_ok (信任边界: 用户缓冲)。
             match crate::ipc::try_receive() {
                 Some(msg) => {
-                    if a1 != 0 {
+                    if a1 != 0 && user_out_buf_ok(a1, core::mem::size_of::<crate::ipc::Message>()) {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 &msg as *const crate::ipc::Message as *const u8,
