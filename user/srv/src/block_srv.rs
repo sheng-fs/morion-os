@@ -303,6 +303,11 @@ static mut LAST_W_END: u64 = 0;
 static mut LAST_W_VOL: u64 = u64::MAX;
 const BLK_REQ_STATS_EVERY: u64 = 4096;
 
+/// 上一次因「卷号不存在」告警的卷号 (`u64::MAX` = 还没告警过)。
+///
+/// 重启循环里同一个卷号会被反复请求, 只打第一条即可 —— 真机上日志刷屏比缺这一行更糟。
+static mut WARNED_MISSING_VOL: u64 = u64::MAX;
+
 /// 记一条块请求并在整点打印 (证据行)。`vol` = 卷号, `lba` = 卷内起始扇区。
 fn blk_req_tick(is_read: bool, vol: usize, lba: u64, sectors: u64) {
     unsafe {
@@ -956,12 +961,16 @@ fn backend_rw(domain: u64, scratch_va: u64, is_read: bool, lba: u64, count: u64,
             return false;
         }
         if is_read {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    scratch_va as *const u8,
-                    (buf as *mut u8).add(off),
-                    n,
-                );
+            // `buf == scratch_va` 时数据已经在目标页里 (分区扫描就地把暂存页当解析缓冲) ——
+            // 同址 `copy_nonoverlapping` 是 UB, 跳过。
+            if buf != scratch_va {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        scratch_va as *const u8,
+                        (buf as *mut u8).add(off),
+                        n,
+                    );
+                }
             }
         }
         done += chunk;
@@ -1484,17 +1493,29 @@ fn nvme_main() {
                 let vol = match vol_get(dev) {
                     Some(v) => v,
                     None => {
+                        // 去重告警: 让屏幕日志能看出"请求的卷根本不在卷表里"。
+                        unsafe {
+                            if WARNED_MISSING_VOL != dev as u64 {
+                                WARNED_MISSING_VOL = dev as u64;
+                                print("block: no such volume dev=");
+                                print_u64(dev as u64);
+                                println(" (request rejected)");
+                            }
+                        }
                         sys_reply(0);
                         continue;
                     }
                 };
                 let is_read = opcode_low == BLOCK_OP_READ;
                 // AHCI / USB 后端卷: I/O 一律经 IPC 转发给对应驱动 (不走本域 NVMe 通路, 也不走缓存)。
+                // 卷偏移 (`start_lba`) 同样要合并 —— U 盘的 FAT 在分区里 (ESP 从 LBA 2048 起),
+                // 漏加就会读到分区之前的扇区, BPB 直接解析失败。
                 if vol.backend == BACKEND_AHCI || vol.backend == BACKEND_USB {
+                    let base = vol.start_lba as u64 + req.lba;
                     let ok = if vol.backend == BACKEND_AHCI {
-                        ahci_rw(is_read, req.lba, req.count, req.buf)
+                        ahci_rw(is_read, base, req.count, req.buf)
                     } else {
-                        xhci_rw(is_read, req.lba, req.count, req.buf)
+                        xhci_rw(is_read, base, req.count, req.buf)
                     };
                     sys_reply(if ok { 1 } else { 0 });
                     continue;
@@ -1620,56 +1641,12 @@ fn nvme_main() {
                 sys_reply(if ok { 1 } else { 0 });
             }
             // 驱动把它的盘挂进卷层 (03b AHCI / 03c USB): **异步**通知, 故不回覆。
-            // 按发送方分流: 分配各自传输暂存页并同址共享给该驱动, 随后回调它做读写校验。
             BLOCK_OP_ATTACH => {
-                match msg.from {
-                    AHCI_DOMAIN if !vol_has_backend(BACKEND_AHCI) => {
-                        if sys_alloc_page(AHCI_SCRATCH_VADDR) != 1
-                            || sys_share_page(AHCI_SCRATCH_VADDR, AHCI_DOMAIN) != 1
-                        {
-                            println("block: ahci transfer page alloc/share FAILED");
-                            continue;
-                        }
-                        vol_push(0, 0, req.count as u32, VOL_KIND_UNKNOWN, BACKEND_AHCI);
-                        ahci_attach_selftest(req.count as u32, unsafe { VOL_COUNT as u64 - 1 });
-                    }
-                    XHCI_DOMAIN if !vol_has_backend(BACKEND_USB) => {
-                        if sys_alloc_page(XHCI_SCRATCH_VADDR) != 1
-                            || sys_share_page(XHCI_SCRATCH_VADDR, XHCI_DOMAIN) != 1
-                        {
-                            println("block: usb transfer page alloc/share FAILED");
-                            continue;
-                        }
-                        vol_push(0, 0, req.count as u32, VOL_KIND_UNKNOWN, BACKEND_USB);
-                        xhci_attach_selftest(req.count as u32, unsafe { VOL_COUNT as u64 - 1 });
-                    }
-                    _ => {}
-                }
+                vol_attach(msg.from, req.count);
                 continue;
             }
             BLOCK_OP_LIST_VOLUMES => {
-                // 把卷描述符数组写进调用方共享页, 回复卷数。
-                let dst = req.buf as *mut u8;
-                let max = req.count as usize;
-                let n = core::cmp::min(max, unsafe { VOL_COUNT });
-                let dsize = core::mem::size_of::<VolumeDesc>();
-                let mut i = 0usize;
-                while i < n {
-                    let v = unsafe { VOLUMES[i] };
-                    let d = VolumeDesc {
-                        id: i as u32,
-                        nsid: v.nsid,
-                        start_lba: v.start_lba,
-                        sectors: v.sectors,
-                        kind: v.kind,
-                        _pad: 0,
-                    };
-                    unsafe {
-                        core::ptr::write_unaligned(dst.add(i * dsize) as *mut VolumeDesc, d);
-                    }
-                    i += 1;
-                }
-                sys_reply(n as u64);
+                vol_reply_list(&req);
             }
             // 分区表写入 (S2 卷管理收口): 一律按 nsid 寻址, 见 `PartReq`。
             BLOCK_OP_PART_CREATE | BLOCK_OP_PART_DELETE | BLOCK_OP_PART_WIPE
@@ -2076,6 +2053,86 @@ fn vol_reset() {
     }
 }
 
+/// 处理驱动发来的挂盘通知 (`BLOCK_OP_ATTACH`): 分配传输暂存页 → 扫分区 → 登记卷 → 取证。
+///
+/// 两个服务循环 (NVMe / IDE 回退) 共用 —— 真机没有 NVMe 时 block_srv 走 IDE 回退,
+/// 若只有 NVMe 循环认 ATTACH, U 盘/AHCI 盘永远进不了卷表 (真机日志里 `backend=ide`
+/// 就是这条路)。
+fn vol_attach(domain: u64, sectors: u64) {
+    match domain {
+        AHCI_DOMAIN if !vol_has_backend(BACKEND_AHCI) => {
+            if sys_alloc_page(AHCI_SCRATCH_VADDR) != 1
+                || sys_share_page(AHCI_SCRATCH_VADDR, AHCI_DOMAIN) != 1
+            {
+                println("block: ahci transfer page alloc/share FAILED");
+                return;
+            }
+            let n = vol_scan_attached(
+                ahci_rw,
+                VOL_SCRATCH_VADDR as *mut u8,
+                sectors as u32,
+                BACKEND_AHCI,
+            );
+            print("block: ahci disk attached (vols=");
+            print_u64(n as u64);
+            print(", sectors=");
+            print_u64(sectors);
+            println(")");
+            if unsafe { VOL_COUNT } > 0 {
+                ahci_attach_selftest(sectors as u32, unsafe { VOL_COUNT } as u64 - 1);
+            }
+        }
+        XHCI_DOMAIN if !vol_has_backend(BACKEND_USB) => {
+            if sys_alloc_page(XHCI_SCRATCH_VADDR) != 1
+                || sys_share_page(XHCI_SCRATCH_VADDR, XHCI_DOMAIN) != 1
+            {
+                println("block: usb transfer page alloc/share FAILED");
+                return;
+            }
+            let n = vol_scan_attached(
+                xhci_rw,
+                VOL_SCRATCH_VADDR as *mut u8,
+                sectors as u32,
+                BACKEND_USB,
+            );
+            print("block: usb disk attached (vols=");
+            print_u64(n as u64);
+            print(", sectors=");
+            print_u64(sectors);
+            println(")");
+            if unsafe { VOL_COUNT } > 0 {
+                xhci_attach_selftest(sectors as u32, unsafe { VOL_COUNT } as u64 - 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 把卷描述符数组写进调用方共享页并回复卷数 (`BLOCK_OP_LIST_VOLUMES`)。
+fn vol_reply_list(req: &BlockReq) {
+    let dst = req.buf as *mut u8;
+    let max = req.count as usize;
+    let n = core::cmp::min(max, unsafe { VOL_COUNT });
+    let dsize = core::mem::size_of::<VolumeDesc>();
+    let mut i = 0usize;
+    while i < n {
+        let v = unsafe { VOLUMES[i] };
+        let d = VolumeDesc {
+            id: i as u32,
+            nsid: v.nsid,
+            start_lba: v.start_lba,
+            sectors: v.sectors,
+            kind: v.kind,
+            _pad: 0,
+        };
+        unsafe {
+            core::ptr::write_unaligned(dst.add(i * dsize) as *mut VolumeDesc, d);
+        }
+        i += 1;
+    }
+    sys_reply(n as u64);
+}
+
 /// 卷表重建 (NVMe 分区重扫) 后, 把此前挂上的 AHCI / USB 后端卷重新追加到表尾。
 fn vol_attached_reattach() {
     let n = unsafe { ATTACH_VOL_COUNT };
@@ -2172,6 +2229,160 @@ fn vol_detect_kind(buf: *const u8) -> u32 {
         return VOL_KIND_FAT;
     }
     VOL_KIND_UNKNOWN
+}
+
+/// 外接盘 (AHCI / USB 后端) 上某个分区起点的文件系统类型。
+///
+/// 读 8 扇区 = 4 KiB, 够 exFAT/FAT/MFS 首扇区与 ext2 的偏移 1080 签名。
+fn vol_detect_attached(
+    read: fn(bool, u64, u64, u64) -> bool,
+    scratch: *mut u8,
+    start_lba: u32,
+) -> u32 {
+    if !read(
+        true,
+        start_lba as u64,
+        BACKEND_MAX_SECTORS,
+        VOL_SCRATCH_VADDR,
+    ) {
+        return VOL_KIND_UNKNOWN;
+    }
+    vol_detect_kind(scratch)
+}
+
+/// 扫描一块刚挂上来的外接盘: 按分区表登记分区卷, 无分区表则整盘一个卷。
+///
+/// 为什么必须扫: 真机启动 U 盘是 `GPT + ESP` (FAT 在 LBA 2048), 整盘卷从 LBA 0 读到
+/// 的只是保护性 MBR —— 按「整盘 = FAT」去挂永远失败。NVMe 的 `vol_scan_namespace`
+/// 直接调 `nvme_rw_sectors` 且能一次读 16 KiB 项数组; 这里只能走驱动后端 + 4 KiB
+/// 暂存页, 所以 GPT 项数组按扇区逐个解析。
+///
+/// `read` 就是 `xhci_rw` / `ahci_rw` (数据直接落在 `VOL_SCRATCH_VADDR` 暂存页)。
+fn vol_scan_attached(
+    read: fn(bool, u64, u64, u64) -> bool,
+    scratch: *mut u8,
+    total_sectors: u32,
+    backend: u8,
+) -> usize {
+    // 驱动刚收到 ATTACH 就要进服务循环, 首笔读可能赶在它开始收消息之前 → 小幅重试。
+    let mut tries = 0u32;
+    while !read(true, 0, 1, VOL_SCRATCH_VADDR) {
+        if tries >= 50 {
+            // 读不到盘: 退回「整盘一个未知卷」的旧行为, 不臆造分区。
+            vol_push(0, 0, total_sectors, VOL_KIND_UNKNOWN, backend);
+            return 1;
+        }
+        sys_sleep(10);
+        tries += 1;
+    }
+    let mut pushed = 0usize;
+    let boot_sig = unsafe { *scratch.add(510) } == 0x55 && unsafe { *scratch.add(511) } == 0xAA;
+    let entries = unsafe { scratch.add(446) };
+    let protective = boot_sig && unsafe { *entries.add(4) } == PART_MBR_TYPE_PROTECTIVE;
+    if protective {
+        pushed = vol_scan_attached_gpt(read, scratch, backend);
+    } else if boot_sig {
+        // 普通 MBR: 先把 4 项摘出来 —— 类型探测会覆写暂存页 (分区表就在里面)。
+        let mut parts = [(0u32, 0u32); 4];
+        let mut npart = 0usize;
+        let mut i = 0usize;
+        while i < 4 {
+            let e = unsafe { entries.add(i * 16) };
+            let bootflag = unsafe { *e.add(0) };
+            let ptype = unsafe { *e.add(4) };
+            let start = read_u32(unsafe { e.add(8) });
+            let count = read_u32(unsafe { e.add(12) });
+            // 与 NVMe 同一套合法性判据: 启动标志只有 0x00/0x80, 起点不可能为 0。
+            if ptype != 0 && count != 0 && (bootflag == 0x00 || bootflag == 0x80) && start != 0 {
+                parts[npart] = (start, count);
+                npart += 1;
+            }
+            i += 1;
+        }
+        let mut k = 0usize;
+        while k < npart {
+            let (start, count) = parts[k];
+            let kind = vol_detect_attached(read, scratch, start);
+            vol_push(0, start, count, kind, backend);
+            pushed += 1;
+            k += 1;
+        }
+    }
+    if pushed == 0 {
+        // 无分区表 (超级软盘) 或分区表解析不出合法项: 整盘一个卷。
+        let kind = vol_detect_attached(read, scratch, 0);
+        vol_push(0, 0, total_sectors, kind, backend);
+        pushed = 1;
+    }
+    pushed
+}
+
+/// `vol_scan_attached` 的 GPT 分支: 主头 → 项数组 (按扇区读, 每扇区最多 4 项)。
+fn vol_scan_attached_gpt(
+    read: fn(bool, u64, u64, u64) -> bool,
+    scratch: *mut u8,
+    backend: u8,
+) -> usize {
+    // LBA 1 = GPT 主头: 项数组 LBA @0x48, 项数 @0x50, 项大小 @0x54。
+    if !read(true, 1, 1, VOL_SCRATCH_VADDR) {
+        return 0;
+    }
+    let entries_lba = read_u64(unsafe { scratch.add(0x48) });
+    let count = read_u32(unsafe { scratch.add(0x50) });
+    let esize = read_u32(unsafe { scratch.add(0x54) });
+    if entries_lba == 0
+        || count == 0
+        || count > 128
+        || !(128..=512).contains(&esize)
+        || 512 % esize != 0
+    {
+        return 0;
+    }
+    let per_sector = 512 / esize;
+    let mut pushed = 0usize;
+    let mut idx = 0u32;
+    while idx < count {
+        let sec = entries_lba + (idx as u64 * esize as u64) / 512;
+        if sec > u32::MAX as u64 || !read(true, sec, 1, VOL_SCRATCH_VADDR) {
+            break;
+        }
+        // 先摘本扇区的项, 再逐个探测 —— 探测读盘会覆写暂存页。
+        let mut pend = [(0u32, 0u32); 4];
+        let mut pn = 0usize;
+        let base = idx;
+        while idx < count && idx < base + per_sector {
+            let off = (idx as u64 * esize as u64 % 512) as usize;
+            let e = unsafe { scratch.add(off) };
+            let mut used = false;
+            let mut k = 0usize;
+            while k < 16 {
+                if unsafe { *e.add(k) } != 0 {
+                    used = true;
+                    break;
+                }
+                k += 1;
+            }
+            if used {
+                let first = read_u64(unsafe { e.add(0x20) });
+                let last = read_u64(unsafe { e.add(0x28) });
+                if last >= first && first <= u32::MAX as u64 {
+                    let sectors = (last - first + 1).min(u32::MAX as u64) as u32;
+                    pend[pn] = (first as u32, sectors);
+                    pn += 1;
+                }
+            }
+            idx += 1;
+        }
+        let mut k = 0usize;
+        while k < pn {
+            let (start, sectors) = pend[k];
+            let kind = vol_detect_attached(read, scratch, start);
+            vol_push(0, start, sectors, kind, backend);
+            pushed += 1;
+            k += 1;
+        }
+    }
+    pushed
 }
 
 /// 读卷首 8 扇区 (4096 字节) 到 `scratch` 以探测类型。
@@ -3435,6 +3646,11 @@ pub fn run() {
 /// 引入卷层之前完全一致, `dev > 0` 一律失败。IDE 盘的分区扫描留待后续。
 fn ide_block_main() {
     vol_reset();
+    // 卷扫描缓冲页: `vol_scan_attached` 用它做分区表/BPB 解析。
+    if sys_alloc_page(VOL_SCRATCH_VADDR) != 1 {
+        println("block: alloc vol scratch FAILED");
+        return;
+    }
     // 容量向盘要 (ATA IDENTIFY DEVICE), 不再恒为「未知」—— 从前 `sectors = 0` 会让
     // MFS 首次格式化退回 16 MiB 默认尺寸, 整块 IDE 盘也只用得上一点点。
     let sectors = ide_capacity_sectors();
@@ -3459,7 +3675,7 @@ fn ide_block_main() {
         let req: BlockReq =
             unsafe { core::ptr::read_unaligned(msg.payload.as_ptr() as *const BlockReq) };
 
-        // `dev` 是卷号 (IDE 只有一个整盘卷, 即 dev 0)。
+        // `dev` 是卷号 (IDE 回退路径默认只有一块整盘卷, 即 dev 0)。
         let dev = (req.op >> 8) as usize;
         let opcode = (req.op & 0xFF) as u8;
         match opcode {
@@ -3471,36 +3687,31 @@ fn ide_block_main() {
                         continue;
                     }
                 };
-                let lba = vol.start_lba.saturating_add(req.lba as u32);
-                let ok = if opcode == BLOCK_OP_READ {
-                    read_sectors(lba, req.count as u16, req.buf as *mut u8)
-                } else {
-                    write_sectors(lba, req.count as u16, req.buf as *mut u8)
+                let is_read = opcode == BLOCK_OP_READ;
+                let base = vol.start_lba as u64 + req.lba;
+                // 外接盘 (AHCI / USB) 的读写在**别的域**里, 这条回退路径同样要转发,
+                // 否则卷表里登记了卷、读却打到 IDE 口上。
+                let ok = match vol.backend {
+                    BACKEND_AHCI => ahci_rw(is_read, base, req.count, req.buf),
+                    BACKEND_USB => xhci_rw(is_read, base, req.count, req.buf),
+                    _ => {
+                        let lba = base as u32;
+                        if is_read {
+                            read_sectors(lba, req.count as u16, req.buf as *mut u8)
+                        } else {
+                            write_sectors(lba, req.count as u16, req.buf as *mut u8)
+                        }
+                    }
                 };
                 sys_reply(if ok { 1 } else { 0 });
             }
+            BLOCK_OP_ATTACH => {
+                // 无 NVMe 时也要能挂 U 盘 / AHCI 盘 (真机就是这条路)。
+                vol_attach(msg.from, req.count);
+                continue;
+            }
             BLOCK_OP_LIST_VOLUMES => {
-                let dst = req.buf as *mut u8;
-                let n = if req.count as usize >= 1 {
-                    1usize
-                } else {
-                    0usize
-                };
-                if n == 1 {
-                    let v = vol_get(0).unwrap_or(VOL_EMPTY);
-                    let d = VolumeDesc {
-                        id: 0,
-                        nsid: v.nsid,
-                        start_lba: v.start_lba,
-                        sectors: v.sectors,
-                        kind: v.kind,
-                        _pad: 0,
-                    };
-                    unsafe {
-                        core::ptr::write_unaligned(dst as *mut VolumeDesc, d);
-                    }
-                }
-                sys_reply(n as u64);
+                vol_reply_list(&req);
             }
             _ => {
                 // 分区表写入 (`BLOCK_OP_PART_*`) 与裸盘读目前**只实现了 NVMe 路径**:

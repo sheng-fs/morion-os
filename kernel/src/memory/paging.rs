@@ -1,11 +1,16 @@
 //! 虚拟内存管理 (阶段三) — 4 级页表 + offset 映射 + 内核堆
 //!
 //! 建立方式:
-//!   1. 手动构造初始页表 (2 MiB 大页), 将物理内存前 4 GiB 同时映射到:
-//!        - 恒等映射 (P4[0])  : 虚拟地址 == 物理地址, 供现有代码 / 帧缓冲使用
-//!        - offset 映射 (P4[256]): 虚拟地址 = PHYS_OFFSET + 物理地址, 供页表自身访问
-//!   2. 加载 CR3
-//!   3. 用 OffsetPageTable 把内核堆映射到高位虚拟地址, 并初始化全局分配器
+//!   1. 手动构造初始页表 (2 MiB 大页), 将物理内存前 32 GiB 同时映射到恒等映射
+//!      (P4[0], 虚拟地址 == 物理地址, 供固件交来的物理地址直接读) 与 offset 映射
+//!      (P4[256], 虚拟地址 = PHYS_OFFSET + 物理地址, 供页表自身访问)。
+//!      覆盖范围必须 ≥ 帧分配器可管理的上限: 否则一旦帧分配器把页表帧/用户帧分到
+//!      4 GiB 以上, offset 映射访问页表本身就会缺页 —— 真机上 (QEMU 2 GiB 不会复现)
+//!      表现为启动到 paging::init 后立刻三重故障复位。
+//!   2. 帧缓冲另经 `FB_VIRT_BASE` 的 ioremap 窗口映射 (与 Linux efifb/simplefb 同理):
+//!      固件给的帧缓冲物理地址可能落到 32 GiB 之外, 不能依赖恒等映射。
+//!   3. 加载 CR3
+//!   4. 用 OffsetPageTable 把内核堆映射到高位虚拟地址, 并初始化全局分配器
 
 #[cfg(target_os = "none")]
 use linked_list_allocator::LockedHeap;
@@ -41,8 +46,20 @@ const HEAP_START: u64 = 0x4444_4444_0000;
 ///   域/任务后每任务仍要 32 KiB 内核栈 (任务表上限 32 → 约 1 MiB 仅栈), 故留 4 MiB。
 const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
-/// 可管理的物理内存上限 (前 4 GiB, 覆盖 QEMU 2 GiB 内存)
-const MANAGED_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
+/// 直接映射 (恒等 + offset) 覆盖的物理内存上限。
+///
+/// 与 `frame_allocator::MAX_MANAGED_FRAMES` 保持一致 (32 GiB): 帧分配器能交出的
+/// 任何物理帧, 都必须能经 offset 映射被页表代码访问。原先固定 4 GiB 时, 大内存
+/// 真机上页表帧一旦落在 4 GiB 以上, `map_to` 访问页表就会 #PF → #DF → 三重故障。
+const MANAGED_MEMORY: u64 = 32 * 1024 * 1024 * 1024;
+
+/// 直接映射所需的 PD 数量 (每个 PD 覆盖 1 GiB)。
+const MANAGED_PDS: usize = (MANAGED_MEMORY / (512 * 0x20_0000)) as usize;
+
+/// 帧缓冲 ioremap 窗口的虚拟基址 (P4[384], 与恒等 / offset / 内核堆 / 用户空间均不冲突)。
+pub const FB_VIRT_BASE: u64 = 0xFFFF_C000_0000_0000;
+/// ioremap 窗口大小上限 (1 GiB, 足够 8K×4K×32bpp 的帧缓冲)。
+const FB_WINDOW_SIZE: u64 = 512 * 0x20_0000;
 
 /// 帧分配器适配 — 桥接位图分配器与 x86_64 crate 的 FrameAllocator trait
 struct KernelFrameAllocator;
@@ -59,13 +76,25 @@ unsafe impl FrameAllocator<Size4KiB> for KernelFrameAllocator {
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// 初始化分页 (建立页表 + 加载 CR3 + 初始化内核堆)
-pub fn init() {
+/// 初始化分页 (建立页表 + 加载 CR3 + 初始化内核堆)。
+///
+/// 返回帧缓冲 ioremap 窗口的虚拟基址 (帧缓冲可用时); 调用方据此把显示指针
+/// 从"固件物理地址"改到窗口地址 —— 与 Linux 在 `efifb/simplefb` 里 `ioremap`
+/// 帧缓冲后重设 `screen_base` 是同一件事。
+pub fn init(info: &crate::bootinfo::BootInfo) -> Option<u64> {
     enable_nx();
     let pml4_phys = setup_page_tables();
+    let fb_bytes = info.fb_height as u64 * info.fb_stride as u64 * (info.fb_bpp as u64 / 8);
+    let fb_virt = map_framebuffer(pml4_phys, info.fb_addr, fb_bytes);
     load_cr3(pml4_phys);
+    // 先切换显示指针再做后续映射: 堆的页表映射一旦 panic, 现场打印必须已经走
+    // 新页表里确定存在的 ioremap 窗口, 而不是固件物理地址。
+    if let Some(virt) = fb_virt {
+        crate::video::rebind(virt);
+    }
     #[cfg(target_os = "none")]
     init_heap(pml4_phys);
+    fb_virt
 }
 
 /// 开启 `EFER.NXE` —— 页表项 NX (不可执行) 位生效的前提, W^X 依赖它。
@@ -92,16 +121,16 @@ fn enable_nx() {
 /// 与内核栈顶或仍在使用的引导器页表重合, 就会在 `paging::init` 处 triple fault,
 /// 且时有时无。改为静态存储后该类问题不再可能发生。
 #[repr(C, align(4096))]
+#[derive(Clone, Copy)]
 struct BootPageTable([u64; 512]);
 
 static mut BOOT_PML4: BootPageTable = BootPageTable([0; 512]);
 static mut BOOT_PDPT: BootPageTable = BootPageTable([0; 512]);
-static mut BOOT_PDS: [BootPageTable; 4] = [
-    BootPageTable([0; 512]),
-    BootPageTable([0; 512]),
-    BootPageTable([0; 512]),
-    BootPageTable([0; 512]),
-];
+static mut BOOT_PDS: [BootPageTable; MANAGED_PDS] = [BootPageTable([0; 512]); MANAGED_PDS];
+
+/// 帧缓冲 ioremap 窗口的 PDPT / PD (最多 1 GiB, 2 MiB 大页)。
+static mut FB_PDPT: BootPageTable = BootPageTable([0; 512]);
+static mut FB_PD: BootPageTable = BootPageTable([0; 512]);
 
 /// 手动构造初始页表, 返回 PML4 的物理地址。
 ///
@@ -110,9 +139,9 @@ fn setup_page_tables() -> PhysAddr {
     // 启动页表位于 .bss (镜像内, 已被帧分配器保留), 不再向分配器申请。
     let pml4_phys = core::ptr::addr_of!(BOOT_PML4) as u64;
     let pdpt_phys = core::ptr::addr_of!(BOOT_PDPT) as u64;
-    let pd_count = (MANAGED_MEMORY / (512 * 0x20_0000)) as usize; // 4 GiB → 4 个 PD
+    let pd_count = MANAGED_PDS;
     let pds_base = core::ptr::addr_of!(BOOT_PDS) as *const BootPageTable;
-    let mut pd_phys = [0u64; 4];
+    let mut pd_phys = [0u64; MANAGED_PDS];
     for (i, slot) in pd_phys.iter_mut().enumerate().take(pd_count) {
         *slot = pds_base.wrapping_add(i) as u64;
     }
@@ -156,6 +185,51 @@ fn setup_page_tables() -> PhysAddr {
     }
 
     PhysAddr::new(pml4_phys)
+}
+
+/// 把固件帧缓冲映射到 [`FB_VIRT_BASE`] 窗口 (2 MiB 大页, 首尾按 2 MiB 对齐覆盖)。
+///
+/// 返回帧缓冲**首字节**在窗口中的虚拟地址 (含未对齐偏移); 参数异常或区间超出窗口
+/// 时返回 `None` —— 调用方保留原物理地址指针 (仅当它落在恒等映射范围内才安全)。
+///
+/// 与 Linux `efifb`/`simplefb` 的 `screen_base = ioremap(fb_phys, size)` 同理:
+/// 帧缓冲的物理地址由固件决定, 可能远高于内核直接映射的上限, 不能拿它当虚拟地址用。
+fn map_framebuffer(pml4_phys: PhysAddr, fb_addr: u64, fb_len: u64) -> Option<u64> {
+    const PAGE: u64 = 0x20_0000;
+    if fb_addr == 0 || fb_len == 0 {
+        return None;
+    }
+    let aligned = fb_addr & !(PAGE - 1);
+    let offset = fb_addr - aligned;
+    let span = offset.checked_add(fb_len)?;
+    let pages = span.div_ceil(PAGE);
+    if pages * PAGE > FB_WINDOW_SIZE {
+        return None;
+    }
+
+    let pdpt_phys = core::ptr::addr_of!(FB_PDPT) as u64;
+    let pd_phys = core::ptr::addr_of!(FB_PD) as u64;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    unsafe {
+        core::ptr::write_bytes(pdpt_phys as *mut u8, 0, 4096);
+        core::ptr::write_bytes(pd_phys as *mut u8, 0, 4096);
+    }
+
+    let p4_index = ((FB_VIRT_BASE >> 39) & 0x1FF) as usize;
+    let pml4 = unsafe { &mut *(pml4_phys.as_u64() as *mut PageTable) };
+    pml4[p4_index].set_frame(frame(pdpt_phys), flags);
+
+    let pdpt = unsafe { &mut *(pdpt_phys as *mut PageTable) };
+    pdpt[0].set_frame(frame(pd_phys), flags);
+
+    let pd = unsafe { &mut *(pd_phys as *mut PageTable) };
+    for i in 0..pages as usize {
+        let phys = aligned + i as u64 * PAGE;
+        pd[i].set_addr(PhysAddr::new(phys), flags | PageTableFlags::HUGE_PAGE);
+    }
+
+    Some(FB_VIRT_BASE + offset)
 }
 
 /// 加载新页表到 CR3。
@@ -211,7 +285,7 @@ pub fn heap_size() -> usize {
     HEAP_SIZE
 }
 
-/// 该物理区间是否被内核的**恒等映射**覆盖（前 `MANAGED_MEMORY` 字节）。
+/// 该物理区间是否被内核的**恒等映射**覆盖（前 `MANAGED_MEMORY` 字节, 32 GiB）。
 ///
 /// 引导器交来的服务 ELF 镜像（E3b）以物理地址给出，内核靠恒等映射按物理地址读它；
 /// 落在覆盖范围之外的区间内核够不着，只能判失败而不是拿着地址去读。
@@ -428,12 +502,15 @@ mod tests {
     use super::{flags_for, is_identity_mapped, is_user_address, UserPagePerm, USER_SPACE_BASE};
     use x86_64::structures::paging::PageTableFlags;
 
-    /// 引导模块可达性判定 (E3b): 恒等映射只覆盖前 4 GiB, 且地址加法回绕要判否。
+    /// 引导模块可达性判定 (E3b): 恒等映射覆盖帧分配器可管理的全部物理内存 (32 GiB),
+    /// 且地址加法回绕要判否。
     #[test]
-    fn identity_map_covers_first_4gib_only() {
+    fn identity_map_covers_managed_memory() {
         assert!(is_identity_mapped(0x1000, 0x1000));
-        assert!(is_identity_mapped(0xFFFF_F000, 0x1000)); // 恰好到 4 GiB 边界
-        assert!(!is_identity_mapped(0x1_0000_0000, 0x1000)); // 起于 4 GiB 之上
+        assert!(is_identity_mapped(0xFFFF_F000, 0x1000));
+        assert!(is_identity_mapped(0x1_0000_0000, 0x1000)); // 4 GiB 之上也在覆盖内
+        assert!(is_identity_mapped(0x7_FFFF_F000, 0x1000)); // 恰好到 32 GiB 边界
+        assert!(!is_identity_mapped(0x8_0000_0000, 0x1000)); // 起于 32 GiB 之上
         assert!(!is_identity_mapped(u64::MAX - 8, 0x1000)); // 加法回绕
     }
 

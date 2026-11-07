@@ -173,6 +173,16 @@ pub const SYS_POWEROFF: u64 = 61;
 pub const SYS_REBOOT: u64 = 62;
 /// 非阻塞取按键 (P0 诊断命令可被 Ctrl+C 中止): 有键返回值, 队列空返回 `u64::MAX`。
 pub const SYS_KEY_TRY_READ: u64 = 63;
+/// 内核终端日志回滚: `a1` = 带符号行数 (正 = 向上回看, 负 = 向下)。
+///
+/// 真机没有串口时, 内核终端是唯一日志窗口; USB HID 键盘的方向键不经过 PS/2,
+/// 由 `xhci_srv` 经此入口翻页。屏幕已交由 `gfx_srv` 接管时是空操作。
+pub const SYS_CONSOLE_SCROLL: u64 = 64;
+/// 日志环形缓冲里还能读到的**最老绝对偏移** (无参, 见 [`crate::klog::oldest`])。
+///
+/// `shell` 的 `dmesg` 必须从这里起步: 更早的偏移会被内核夹到最老处, 调用方若仍按
+/// 「偏移 += 读到的字节数」前进, 就会原地反复读同一段 (日志被无限重复打印)。
+pub const SYS_LOG_OLDEST: u64 = 65;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -825,6 +835,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_CONSOLE_READY => crate::video::is_taken_over() as u64,
         SYS_KEY_PUSH => {
             // 键盘域推一个按键字节进来; 内核只做搬运, 不解释语义。
+            // 有键按下意味着"用户正在操作", 日志视口回到最新输出 (USB HID 键盘
+            // 的方向键走 SYS_CONSOLE_SCROLL, 普通字符则走到这里)。
+            crate::video::scroll_to_bottom();
             crate::key::push(a1 as u8);
             1
         }
@@ -838,6 +851,15 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_KEY_TRY_READ => crate::key::pop().map_or(u64::MAX, |c| c as u64),
+        SYS_CONSOLE_SCROLL => {
+            let delta = a1 as i64;
+            if delta > 0 {
+                crate::video::scroll_up(delta as usize);
+            } else if delta < 0 {
+                crate::video::scroll_down(delta.unsigned_abs() as usize);
+            }
+            1
+        }
         SYS_DOMAIN_ALIVE => {
             // 该域是否**还有存活任务** (监督者巡检原语)。
             (crate::domain::is_alive(a1) && crate::scheduler::live_tasks(a1) > 0) as u64
@@ -904,6 +926,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_LOG_TOTAL => crate::klog::total(),
         SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
+        SYS_LOG_OLDEST => crate::klog::oldest(),
         SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
         SYS_POWEROFF => {
             // 关机是不可逆的全局操作: 只给"能造进程"的可信域 (app/shell/init)。

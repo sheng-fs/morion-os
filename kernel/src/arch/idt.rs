@@ -8,12 +8,20 @@
 //!   - keyboard (IRQ1, 向量 33)     : 键盘中断, 转发 scancode 给用户态驱动
 //!   - msi (向量 0x50..0x5F)        : MSI/MSI-X 向量段, 置待处理位 (阶段 4)
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use super::gdt::DOUBLE_FAULT_IST_INDEX;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+/// 已经进入过内核缺页的崩溃打印路径。
+///
+/// 若打印现场本身又缺页 (例如帧缓冲所在的物理地址根本没被映射), 第二次进入时
+/// 必须停止一切视频输出: 否则 #PF → #PF → #DF → 三重故障, CPU 直接复位,
+/// 真机上看到的就是"日志闪一下 → 黑屏 → 自动重启", 现场全丢。
+static KERNEL_FAULT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
     crate::video::println("[IDT] Breakpoint exception (#BP) caught");
@@ -104,6 +112,12 @@ extern "x86-interrupt" fn page_fault_handler(
     // 转发, 会把内核态地址当作用户缺页处理, 导致调度状态混乱 → 三重故障。
     // 因此这里直接红屏打印现场并停机, 便于定位。
     if !error_code.contains(PageFaultErrorCode::USER_MODE) {
+        // 第二次内核缺页: 上一次的现场打印又缺页了。此时连"写屏"都不能做,
+        // 只能串口留证后停机 —— 宁可静止, 也不要三重故障把机器重启掉。
+        if KERNEL_FAULT_ACTIVE.swap(true, Ordering::SeqCst) {
+            crate::video::serial_print("KERNEL PAGE FAULT (recursive) -> halted\n");
+            crate::halt();
+        }
         crate::video::clear(0x003300);
         crate::video::println("=== KERNEL PAGE FAULT (bug) ===");
         crate::video::print("cr2:        0x");
@@ -169,10 +183,27 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// 键盘中断 (IRQ1, 向量 33) — 读取 scancode 后转发给用户态键盘驱动域。
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let scancode = super::keyboard::read_scancode();
+    // SAFE 变体下屏幕由内核终端负责: ↑/↓/PageUp/PageDown 用于回看更早的日志。
+    // 其它键照旧转发给键盘驱动域 (kbd_srv 本来就会丢弃方向键, 两者不冲突)。
+    crate::video::handle_scancode(scancode);
     // 中断即 IPC: 把 scancode 作为消息 tag 转发给注册了 IRQ1 的驱动域。
     crate::irq::dispatch(1, scancode as u64);
     super::pic::send_eoi();
 }
+
+/// PIC 其余 IRQ (向量 34..=47) 的兜底处理: 回 EOI 后直接返回。
+///
+/// 真机上 8259 可能投递**伪中断**, 典型是 IRQ7 (向量 39)。若该向量的 IDT 门
+/// 根本没有安装, CPU 会在投递阶段抛 #NP (error code 形如 `向量*8+3`), 而
+/// `report_crash` 把它当致命错误停机 —— 一次伪中断就能打死整机。
+/// Linux 的做法是给所有向量都装处理器 (`spurious_interrupt` 等), 这里同理。
+extern "x86-interrupt" fn unhandled_pic_irq(_stack_frame: InterruptStackFrame) {
+    super::pic::send_eoi();
+}
+
+/// IRQ7 (向量 39) 伪中断: 8259 并未真正进入服务, **不能**回 EOI
+/// (回 EOI 会误清掉一个真实待处理的中断), 直接返回即可。
+extern "x86-interrupt" fn spurious_irq7(_stack_frame: InterruptStackFrame) {}
 
 // ---------------------------------------------------------------------------
 // MSI/MSI-X 向量段 (阶段 4)
@@ -380,6 +411,14 @@ pub fn init() {
         // 硬件中断 (PIC 重映射后: 时钟 → 32, 键盘 → 33)
         idt[32].set_handler_fn(timer_handler);
         idt[33].set_handler_fn(keyboard_handler);
+        // PIC 的其余 IRQ 也必须有门 (真机伪中断 IRQ7 → #NP → 整机停机)。
+        for vector in 34u8..=47u8 {
+            if vector == 39 {
+                idt[vector].set_handler_fn(spurious_irq7);
+            } else {
+                idt[vector].set_handler_fn(unhandled_pic_irq);
+            }
+        }
 
         // MSI/MSI-X 向量段 (0x50..=0x5F): 设备经 LAPIC 直接投递向量 (见 arch/apic.rs)。
         install_msi_vectors!(idt);

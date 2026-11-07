@@ -40,6 +40,15 @@ pub fn total() -> u64 {
     unsafe { LOG_TOTAL }
 }
 
+/// 环形里还能读到的**最老绝对偏移** (`SYS_LOG_OLDEST`)。
+///
+/// 调用方必须从这里起步：[`read`] 会把更早的 `start` 悄悄夹到最老处，若调用方
+/// 仍按「起始偏移 += 读到的字节数」前进，就会反复读到同一段（表现为 `dmesg`
+/// 把同一段日志无限重复打印）。
+pub fn oldest() -> u64 {
+    unsafe { LOG_TOTAL.saturating_sub(LOG_CAP as u64) }
+}
+
 /// 从**绝对偏移** `start` 起读最多 `dst.len()` 字节, 返回实际字节数。
 ///
 /// 环形里现存的最老绝对偏移 = `total - LOG_CAP`（`total > LOG_CAP` 时）；`start`

@@ -34,6 +34,11 @@ impl Framebuffer {
         }
     }
 
+    /// 更换基址 (切到内核页表后指向帧缓冲的 ioremap 虚拟窗口)。
+    pub fn set_base(&mut self, base: u64) {
+        self.base = base as *mut u8;
+    }
+
     /// 写入单个像素 (0x00RRGGBB)。
     ///
     /// 按 32 位写入: 行跨度以像素为单位且帧缓冲基址 4 字节对齐, 故 `(y*stride+x)*4`

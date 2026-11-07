@@ -102,10 +102,17 @@ const REQUIRED: [(u64, u64); 3] = [
 static mut PENDING: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
 /// 每个被监督域**连续快速失败**的次数（真机无卷可挂时防止重启风暴）。
 static mut RAPID_FAILS: [u32; SUPERVISED.len()] = [0; SUPERVISED.len()];
+/// 每个被监督域**连续被采样到存活**的轮数。
+///
+/// 只有它达到 [`HEALTHY_POLLS`] 才清零 [`RAPID_FAILS`] —— 秒退的服务在重启后总会
+/// "活一下子", 单次采样到 alive 就清零会让失败预算永远用不完, 重启风暴无限循环。
+static mut ALIVE_POLLS: [u32; SUPERVISED.len()] = [0; SUPERVISED.len()];
 /// 已放弃的域（达到失败上限后不再重启）。
 static mut GAVE_UP: [bool; SUPERVISED.len()] = [false; SUPERVISED.len()];
 /// 连续快速失败上限：到顶后停止重启并打 `init: giving up on ...`。
 const MAX_RAPID_FAILS: u32 = 4;
+/// 连续存活多少轮才算"真的稳住了"（约 2 s，按 [`POLL_MS`] 折算）。
+const HEALTHY_POLLS: u32 = 50;
 
 /// 监督循环: 每轮检查一遍被监督域，缺谁补谁。
 ///
@@ -131,9 +138,16 @@ pub fn run() {
             if sys_domain_alive(domain) != 0 {
                 unsafe {
                     PENDING[i] = false;
-                    RAPID_FAILS[i] = 0;
+                    // 连续存活足够久才算"稳住", 才允许清零失败预算 (见 ALIVE_POLLS 注释)。
+                    ALIVE_POLLS[i] = ALIVE_POLLS[i].saturating_add(1);
+                    if ALIVE_POLLS[i] >= HEALTHY_POLLS {
+                        RAPID_FAILS[i] = 0;
+                    }
                 }
                 continue;
+            }
+            unsafe {
+                ALIVE_POLLS[i] = 0;
             }
             // 两连击: 第一次发现"没有存活任务"只记一笔, 下一轮仍然如此才重启。
             if !unsafe { PENDING[i] } {

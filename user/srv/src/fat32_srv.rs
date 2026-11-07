@@ -1345,15 +1345,40 @@ pub fn run() {
     block_wb_enable(FAT32_WB_VADDR, FAT32_WB_PAGES, FAT32_WB_DESC_VADDR);
 
     // 认领卷: 第一个 FAT 签名的卷; 无分区表的整盘镜像即卷 0 (回退值)。
+    // 真机上 AHCI / xHCI 的枚举可能晚于本服务启动, 故先等最多 10 s; 等不到就**留在本域里
+    // 慢轮询**, 不退出让 `init` 反复重启 —— 真机日志里的那种重启循环正是"秒退 + 重启"造成的。
+    // 于是只有"确实找到了 FAT 卷"之后才会去读 LBA 0, 读失败那行日志的含义也随之明确。
+    let mut tries = 0u32;
+    let fat_vol = loop {
+        if let Some(v) = vol_claim_wait(bpb_buf as *mut u8, 16, VOL_KIND_FAT, 10_000) {
+            break v;
+        }
+        // 只喊前几次: 真机上挂不上盘时日志会一直滚屏, 把"上面到底发生了什么"顶出屏幕。
+        // 之后改为静默慢轮询 (盘晚插/晚枚举仍能接上), 屏幕交给命令行。
+        if tries < 3 {
+            println("fat32: no FAT volume yet, retrying in 30s");
+        } else if tries == 3 {
+            println("fat32: still no FAT volume - quiet retry every 30s (shell is available)");
+        }
+        tries += 1;
+        sys_sleep(30_000);
+    };
     unsafe {
-        FAT_VOL = vol_claim(bpb_buf as *mut u8, 16, VOL_KIND_FAT, 0);
+        FAT_VOL = fat_vol;
         // 启动期 (读 BPB / FS-1 自测) 的读写都落在默认卷上。
         FAT_CUR_VOL = FAT_VOL;
     }
 
     // 经 block_srv 读 LBA 0 并解析 BPB。
     if !block_read(0, 1, bpb_buf as *mut u8) {
-        println("fat32: read LBA 0 FAILED");
+        // 把"卷表里有没有卷"一并打出来: 无卷 (vols=0) 与有卷但读失败是两种完全不同的
+        // 病因, 真机没有串口, 这行日志是唯一能区分它们的证据。
+        let vols = block_list_volumes(bpb_buf as *mut u8, 16);
+        print("fat32: read LBA 0 FAILED (vol=");
+        print_u64(unsafe { FAT_VOL });
+        print(", vols=");
+        print_u64(vols);
+        println(")");
         return;
     }
     // 引导签名校验 (offset 510 = 0x55, 511 = 0xAA)。
@@ -1377,10 +1402,23 @@ pub fn run() {
         println("");
         return;
     }
+    // 挂上卷的成功证据: 真机没有串口/调试器, 这行是"U 盘认到了、BPB 解析成功"的唯一凭据。
+    print("fat32: volume vol=");
+    print_u64(unsafe { FAT_VOL });
+    print(" cluster=");
+    print_u64(cbytes as u64);
+    print(" fatsz=");
+    print_u64(bpb.fat_size as u64);
+    print(" root=");
+    print_u64(bpb.root_cluster as u64);
+    println("");
 
     // FS-1 自测: 验证元数据原语 (find_dir_slot / write_dir_entry / find_entry /
     // unlink_entry / free_cluster_chain) 的建项 → 命中 → 删项 → 释放簇全链路。
-    {
+    //
+    // SAFE 构建跑在真机上, 这个卷就是**启动 U 盘** —— 拿用户的启动盘做写入自测不安全
+    // (自测中途掉电会留下半截目录项), 与 app 的 "SAFE mode: no disk writes" 保持一致。
+    if !SAFE_MODE {
         let sn = match short_name_from_query(b"FS1TEST") {
             Some(s) => s,
             None => {

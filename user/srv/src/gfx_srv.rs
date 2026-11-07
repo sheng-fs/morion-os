@@ -77,6 +77,18 @@ const TEXT_FG: u32 = 0xD0_D8_E0;
 pub fn run() {
     println("gfx: starting (framebuffer takeover)");
 
+    // SAFE 变体 = 真机 bring-up: **不接管帧缓冲**。
+    // 接管意味着整屏重绘 + 内核终端退场; 真机上万一后面出问题, 屏幕就只剩一块深色合成器,
+    // 启动日志全被擦掉 (看起来就是"黑屏死机")。SAFE 里让内核终端一直当显示器:
+    // 启动日志、shell 输出 (经 `SYS_PUTS`) 全程留在屏幕上, 便于拍照定位。
+    // 本服务保持存活 (init 会监督重启), 只是不碰屏幕。
+    if SAFE_MODE {
+        println("gfx: SAFE build: framebuffer takeover skipped (kernel console stays)");
+        loop {
+            sys_sleep(1000);
+        }
+    }
+
     let mut info = FbInfo::default();
     if sys_fb_info(&mut info) != 1 {
         println("gfx: SYS_FB_INFO FAILED (missing Capability::Fb?)");

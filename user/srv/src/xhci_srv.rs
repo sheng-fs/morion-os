@@ -49,14 +49,27 @@ const CMD_HCRST: u32 = 1 << 1;
 const STS_HCH: u32 = 1 << 0;
 const STS_CNR: u32 = 1 << 11;
 
+// xHCI 扩展能力: "USB Legacy Support" (xECP id = 1)
+/// xECP id = 1 即 "USB Legacy Support"。
+const LEGACY_SUP_ID: u32 = 1;
+/// USBLEGSUP bit16 = BIOS owned, bit24 = OS owned。
+const LEGACY_BIOS_OWNED: u32 = 1 << 16;
+const LEGACY_OS_OWNED: u32 = 1 << 24;
+
 // PORTSC 位
 const PORT_CCS: u32 = 1 << 0;
 const PORT_PED: u32 = 1 << 1;
 const PORT_PR: u32 = 1 << 4;
+/// 端口链路状态 PLS (bits 8:5): 0 = U0 (正常), 7 = Polling (USB2 复位中), 8 = Recovery。
+const PORT_PLS_MASK: u32 = 0xF << 5;
 const PORT_PP: u32 = 1 << 9;
-/// 所有 RW1C 变化位（写回时须屏蔽，否则会把未处理的变化位清掉）。
-const PORT_CHANGE: u32 =
-    (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
+/// LWS (bit16): 只有置 1 时写 PLS 才生效。**本驱动永远不置这个位** ——
+/// 顺手带上它等于「请求把链路切到读回的那个 PLS」, 真机会把正在做复位/训练的
+/// 端口硬拽进 Recovery(8), 之后 SET_ADDRESS 收不到应答 (Address Device cc=4)。
+const PORT_LWS: u32 = 1 << 16;
+/// CSC = bit17、PRC = bit21（⚠️ 不是 16 / 20 —— 差一位就会写成 LWS / OCC）。
+const PORT_CSC: u32 = 1 << 17;
+const PORT_PRC: u32 = 1 << 21;
 
 // ---------------------------------------------------------------------------
 // 运行时寄存器（MMIO + RTSOFF；interrupter 0 = +0x20）
@@ -80,6 +93,7 @@ const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_TRANSFER_EVENT: u32 = 32;
@@ -264,6 +278,11 @@ struct Xhci {
     num_ports: u32,
 
     slot: u32,
+    /// Address Device 时写进输入上下文的 slot 上下文（8 个 DWORD）。
+    /// Configure Endpoint 必须原样回填 —— xHC 会整份替换自己的 slot 上下文，
+    /// 其中 **Device Address (DWORD3 bits 7:0)** 被清 0 后，后续所有传输都会发往
+    /// 地址 0（真机全部 cc=4；QEMU 不校验所以看不出来）。
+    slot_ctx: [u32; 8],
     bulkin_dci: u32,
     bulkout_dci: u32,
     bulkin_mps: u16,
@@ -301,6 +320,46 @@ fn err_once(msg: &str) {
     }
     print("xhci: ");
     println(msg);
+}
+
+// ---------------------------------------------------------------------------
+// PORTSC 读写辅助
+// ---------------------------------------------------------------------------
+
+/// 端口是否已可用：Enabled (PED=1) 且链路在 U0 (PLS=0)。
+fn port_ready(sc: u32) -> bool {
+    sc & PORT_PED != 0 && sc & PORT_PLS_MASK == 0
+}
+
+/// 安全写 PORTSC：只把 `bits` 里给的位写 1，其余位按读回值写。
+///
+/// 必须回避的三个「写 1 有副作用」的位：
+/// - **PED (bit1) 写 1 = 禁用端口**，绝不能把读到的 1 原样写回；
+/// - **LWS (bit16) 写 1 = 允许改 PLS**，配合读回的 PLS 相当于「请求切到当前链路状态」，
+///   会打断正在进行的端口复位/训练（真机 pls=7 → 8 就是它干的）；
+/// - **PR (bit4) 写 1 = 发起复位**，只在明确要复位时由调用方放进 `bits`。
+fn port_write(reg: u64, sc: u32, bits: u32) {
+    wr32(
+        reg,
+        (sc & !(PORT_PED | PORT_PR | PORT_LWS | PORT_PLS_MASK)) | bits,
+    );
+}
+
+/// 等端口建立链路：PED=1 且 PLS=U0。超时 / 设备被拔掉返回 `None`。
+fn wait_ready(reg: u64, ticks: u32) -> Option<u32> {
+    let mut t = 0u32;
+    while t < ticks {
+        let sc = rd32(reg);
+        if sc & PORT_CCS == 0 {
+            return None;
+        }
+        if port_ready(sc) {
+            return Some(sc);
+        }
+        sys_sleep(1);
+        t += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -390,47 +449,157 @@ impl Xhci {
         }
     }
 
-    /// 复位并找到第一个在位的端口，返回 (端口号, 速度)。
+    /// 接管 "USB Legacy Support" 扩展能力 (xECP id = 1)。
+    ///
+    /// 固件只要开着 Legacy USB (能从这个 U 盘启动就是证据), BIOS 的 SMI 处理器就仍认为
+    /// 端口归它管, 会不断打断/重训链路 —— 现象正是端口一直停在 Polling(7) / Recovery(8),
+    /// 随后的 Address Device 报 cc=4 (USB 事务错误)。QEMU 没有 SMI 层, 所以这个坑只有
+    /// 真机会踩。规范做法: 置 OS-owned, 等 BIOS-owned 清零, 再关掉 SMI 使能位。
+    fn take_legacy(&self) {
+        let hcc = rd32(self.mmio + CAP_HCCPARAMS1);
+        let mut off = ((hcc >> 16) & 0xFFFF) as u64 * 4;
+        let mut guard = 0u32;
+        while off != 0 && guard < 16 {
+            let val = rd32(self.mmio + off);
+            let id = val & 0xFF;
+            let next = ((val >> 8) & 0xFF) as u64 * 4;
+            if id == LEGACY_SUP_ID {
+                print("xhci: legacy usblegsup=0x");
+                print_hex(val as u64);
+                if val & LEGACY_OS_OWNED == 0 {
+                    wr32(self.mmio + off, val | LEGACY_OS_OWNED);
+                    let mut t = 0u32;
+                    while t < 1000 {
+                        if rd32(self.mmio + off) & LEGACY_BIOS_OWNED == 0 {
+                            break;
+                        }
+                        sys_sleep(1);
+                        t += 1;
+                    }
+                    if rd32(self.mmio + off) & LEGACY_BIOS_OWNED == 0 {
+                        println(" -> OS owned");
+                    } else {
+                        println(" -> BIOS still owned (SMI may fight us)");
+                    }
+                } else {
+                    println(" -> already OS owned");
+                }
+                // 关 SMI 使能: USBLEGCTLSTS 紧跟在 USBLEGSUP 后一个 dword。
+                wr32(self.mmio + off + 4, 0);
+                return;
+            }
+            if next == 0 {
+                break;
+            }
+            off += next;
+            guard += 1;
+        }
+        println("xhci: no legacy support cap");
+    }
+
+    /// 打印一个端口的 PORTSC 关键字段 (十进制)。
+    ///
+    /// 真机上没有串口, 用户只能拍照 —— 十进制字段比一串十六进制好认得多,
+    /// 也避免"到底哪一位是 PLS"这种歧义。
+    fn log_port(&self, p: u32, tag: &str, sc: u32) {
+        print("xhci: port ");
+        print_u64(p as u64);
+        print(" ");
+        print(tag);
+        print(": ccs=");
+        print_u64((sc & PORT_CCS) as u64);
+        print(" ped=");
+        print_u64(((sc & PORT_PED) >> 1) as u64);
+        print(" pp=");
+        print_u64(((sc & PORT_PP) >> 9) as u64);
+        print(" pls=");
+        print_u64(((sc & PORT_PLS_MASK) >> 5) as u64);
+        print(" spd=");
+        print_u64(((sc >> 10) & 0xF) as u64);
+        print(" oca=");
+        print_u64(((sc >> 3) & 1) as u64);
+        println("");
+    }
+
+    /// 手动复位一个端口（`Address Device` 失败后的兜底），返回终态 PORTSC。
+    ///
+    /// 规范 (xHCI 4.19.1.2.4)：只有 PED=0 时才能写 PR=1，所以先禁用再复位。
+    fn reset_port(&self, port: u32) -> u32 {
+        let reg = self.op + OP_PORT_BASE + ((port as u64 - 1) * OP_PORT_STRIDE);
+        let mut sc = rd32(reg);
+        if sc & PORT_PED != 0 {
+            port_write(reg, sc, PORT_PED); // 写 PED=1 = 禁用
+            let mut t = 0u32;
+            while t < 100 && rd32(reg) & PORT_PED != 0 {
+                sys_sleep(1);
+                t += 1;
+            }
+        }
+        sc = rd32(reg);
+        port_write(reg, sc, PORT_CSC | PORT_PRC); // 先清挂起的变化位
+        sc = rd32(reg);
+        port_write(reg, sc, PORT_PP | PORT_PR);
+        let mut t = 0u32;
+        while t < 500 {
+            if rd32(reg) & PORT_PR == 0 {
+                break;
+            }
+            sys_sleep(1);
+            t += 1;
+        }
+        if let Some(sc) = wait_ready(reg, 500) {
+            port_write(reg, sc, PORT_CSC | PORT_PRC);
+        }
+        rd32(reg)
+    }
+
+    /// 找到第一个可用端口，返回 (端口号, 速度)。
+    ///
+    /// **默认不复位端口**：HCRST 之后控制器会自己重新检测设备，USB2 端口自己走一遍
+    /// Polling(7) → Enabled(U0)，完成后 PRC=1，设备已回到默认地址 0 —— 此时
+    /// `Address Device` 能直接成功。旧实现在端口还在 Polling 时抢着写 PR / 断 VBUS
+    /// (而且 PORT_CSC 写错成了 LWS)，真机上会把链路打成 Recovery(8)，于是每次
+    /// `Address Device` 都是 cc=4。复位只作为兜底。
     fn find_port(&self) -> Option<(u32, u32)> {
         let mut p = 1u32;
         while p <= self.num_ports {
             let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
             let mut sc = rd32(reg);
-            // 上电（PP）。
             if sc & PORT_PP == 0 {
-                wr32(reg, (sc & !PORT_CHANGE) | PORT_PP);
-                let mut t = 0u32;
-                while t < 100 {
-                    sys_sleep(1);
-                    t += 1;
-                }
+                port_write(reg, sc, PORT_PP);
+                sys_sleep(20);
                 sc = rd32(reg);
             }
             if sc & PORT_CCS == 0 {
                 p += 1;
                 continue;
             }
-            // 触发端口复位，等 PR 自清。
-            wr32(reg, (sc & !PORT_CHANGE) | PORT_PR);
-            let mut t = 0u32;
-            while t < POLL_MAX {
-                sys_sleep(1);
-                sc = rd32(reg);
-                if sc & PORT_PR == 0 {
-                    break;
+            // 诊断: 固件/控制器留下的端口状态 (十进制字段, 见 `log_port`)。
+            self.log_port(p, "pre", sc);
+
+            // ① 先让控制器自己把端口带起来 (USB2 端口的 Polling(7) 就是它自己的复位过程)。
+            if let Some(sc) = wait_ready(reg, 1000) {
+                port_write(reg, sc, PORT_CSC | PORT_PRC);
+                let sc = rd32(reg);
+                if sc & PORT_PED != 0 {
+                    self.log_port(p, "auto", sc);
+                    return Some((p, (sc >> 10) & 0xF));
                 }
-                t += 1;
             }
-            // 清 PRC（端口复位变化），再读终态。
-            sc = rd32(reg);
-            wr32(reg, (sc & !PORT_CHANGE) | (1 << 20));
-            let sc = rd32(reg);
-            if sc & PORT_PED == 0 {
-                p += 1;
-                continue;
+
+            // ② 兜底: 手动端口复位, 最多 3 次。
+            let mut tries = 0u32;
+            while tries < 3 {
+                self.log_port(p, "retry", self.reset_port(p));
+                if rd32(reg) & PORT_PED != 0 && rd32(reg) & PORT_PLS_MASK == 0 {
+                    self.log_port(p, "post", rd32(reg));
+                    return Some((p, (rd32(reg) >> 10) & 0xF));
+                }
+                sys_sleep(50);
+                tries += 1;
             }
-            let speed = (sc >> 10) & 0xF;
-            return Some((p, speed));
+            self.log_port(p, "fail", rd32(reg));
+            p += 1;
         }
         None
     }
@@ -829,8 +998,26 @@ impl KeyboardDev {
         while i < 6 {
             let code = rep[2 + i];
             if code != 0 && !self.prev.contains(&code) {
-                if let Some(c) = hid_char(code, shift) {
-                    sys_key_push(c);
+                // 方向键 / 翻页键: 翻内核终端的日志 (真机 SAFE 变体没有串口;
+                // 屏幕由内核终端负责时这两组键不属于任何用户程序)。
+                match code {
+                    0x4B => {
+                        sys_console_scroll(20);
+                    } // PageUp
+                    0x4E => {
+                        sys_console_scroll(-20);
+                    } // PageDown
+                    0x52 => {
+                        sys_console_scroll(1);
+                    } // ↑
+                    0x51 => {
+                        sys_console_scroll(-1);
+                    } // ↓
+                    _ => {
+                        if let Some(c) = hid_char(code, shift) {
+                            sys_key_push(c);
+                        }
+                    }
                 }
             }
             i += 1;
@@ -940,19 +1127,11 @@ fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
 }
 
 /// 配置 HID 的 Interrupt IN 端点（EP Type = 7）。
-fn configure_hid(
-    hc: &mut Xhci,
-    slot: u32,
-    speed: u32,
-    port: u32,
-    dci: u32,
-    mps: u16,
-    interval: u8,
-) -> bool {
-    let (slot_ctx, ep_base) = clear_input(hc);
+fn configure_hid(hc: &mut Xhci, slot: u32, dci: u32, mps: u16, interval: u8) -> bool {
+    let (_, ep_base) = clear_input(hc);
     wr32(hc.input_va + 4, 1 | (1 << dci));
-    wr32(slot_ctx, (dci << 27) | (speed << 20));
-    wr32(slot_ctx + 4, port << 16);
+    // Slot 上下文原样回填（Device Address 不能丢），只改 Context Entries。
+    restore_slot_ctx(hc, dci);
     let ep = input_ep_ctx(hc, ep_base, dci);
     // EP 上下文 DWORD0：Interval 在 bits 23:16。
     wr32(ep, (interval as u32) << 16);
@@ -1030,6 +1209,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         max_slots,
         num_ports,
         slot: 0,
+        slot_ctx: [0; 8],
         bulkin_dci: 0,
         bulkout_dci: 0,
         bulkin_mps: 512,
@@ -1038,6 +1218,9 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     };
 
     zero_bytes(dma_va as *mut u8, (DMA_PAGES * PAGE) as usize);
+
+    // 先夺回 "USB Legacy Support" 所有权, 再复位控制器 —— 顺序不能反。
+    hc.take_legacy();
 
     if !hc.reset() {
         println("xhci: controller reset FAILED (CNR still set)");
@@ -1062,7 +1245,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         let reg = op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
         let mut sc = rd32(reg);
         if sc & PORT_PP == 0 {
-            wr32(reg, (sc & !PORT_CHANGE) | PORT_PP);
+            port_write(reg, sc, PORT_PP);
             sys_sleep(10);
             sc = rd32(reg);
         }
@@ -1096,7 +1279,10 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
             println("), aborting");
             return ProbeOutcome::None;
         }
-        wr64(hc.dcbaa_va, base(SCRATCH_ARR_PAGE));
+        // DCBAA[0] 是「scratchpad 数组的**物理**地址」(xHCI 规范 6.1) —— 控制器自己会
+        // 按物理地址去读这张表。写虚拟地址时 QEMU (scratchpad=0) 永远走不到这里, 而真机
+        // (scratchpad=2) 会拿到一个非法指针: Enable Slot 能成功, Address Device 直接失败。
+        wr64(hc.dcbaa_va, pbase(SCRATCH_ARR_PAGE));
         let mut i = 0u64;
         while i < scratchpad as u64 {
             wr64(base(SCRATCH_ARR_PAGE) + i * 8, pbase(SCRATCH_PAGE0 + i));
@@ -1153,13 +1339,53 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     print_u64(slot as u64);
     println(" enabled");
 
-    // ---- Address Device ----
+    // ---- Address Device（失败则复位端口 + 换新 slot 重试）----
     let default_mps: u16 = match speed {
         1 | 2 => 8,
         4 | 5 => 512,
         _ => 64,
     };
-    if !address_device(&mut hc, slot, speed, port, default_mps) {
+    // 诊断: 真正送进 slot 上下文的三要素 (真机 cc=4 时, 这行能直接排除"速度/MPS 认错")。
+    print("xhci: address slot=");
+    print_u64(slot as u64);
+    print(" port=");
+    print_u64(port as u64);
+    print(" spd=");
+    print_u64(speed as u64);
+    print(" mps=");
+    print_u64(default_mps as u64);
+    println("");
+    let mut slot = slot;
+    let mut addressed = false;
+    let mut attempt = 0u32;
+    while attempt < 3 {
+        attempt += 1;
+        if address_device(&mut hc, slot, speed, port, default_mps) {
+            addressed = true;
+            break;
+        }
+        if attempt == 3 {
+            break;
+        }
+        // 真机上 HID/复合设备第一次 SET_ADDRESS 偶发不应答 (cc=4):
+        // 复位端口让设备回默认地址, 并用一个新 slot 再试 (失败的 slot 可能已进 Error)。
+        print("xhci: address retry ");
+        print_u64(attempt as u64);
+        println("");
+        let sc = hc.reset_port(port);
+        hc.log_port(port, "retry", sc);
+        let _ = hc.simple_cmd(TRB_DISABLE_SLOT, slot, 0);
+        match hc.simple_cmd(TRB_ENABLE_SLOT, 0, 0) {
+            Some(ev) if trb_cc(&ev) == CC_SUCCESS => {
+                slot = (ev.control >> 24) & 0xFF;
+                hc.slot = slot;
+                wr64(hc.dcbaa_va + (slot as u64) * 8, hc.devctx_pa);
+            }
+            _ => break,
+        }
+        sys_sleep(20);
+    }
+    if !addressed {
         println("xhci: Address Device FAILED");
         return ProbeOutcome::None;
     }
@@ -1200,7 +1426,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
             println("xhci: kbd SET_CONFIGURATION FAILED");
             return ProbeOutcome::None;
         }
-        if !configure_hid(&mut hc, slot, speed, port, dci, mps, interval) {
+        if !configure_hid(&mut hc, slot, dci, mps, interval) {
             println("xhci: kbd Configure Endpoint FAILED");
             return ProbeOutcome::None;
         }
@@ -1252,7 +1478,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         return ProbeOutcome::None;
     }
 
-    if !configure_endpoints(&mut hc, slot, speed, port) {
+    if !configure_endpoints(&mut hc, slot) {
         println("xhci: Configure Endpoint FAILED");
         return ProbeOutcome::None;
     }
@@ -1467,16 +1693,34 @@ fn input_ep_ctx(hc: &Xhci, ep_base: u64, dci: u32) -> u64 {
     ep_base + ((dci as u64) - 1) * hc.ctx_size
 }
 
+/// 把 Address Device 时保存的 slot 上下文原样回填到输入上下文，只改 Context Entries。
+fn restore_slot_ctx(hc: &Xhci, entries: u32) {
+    let slot_ctx = hc.input_va + hc.ctx_size;
+    let mut i = 0usize;
+    while i < 8 {
+        wr32(slot_ctx + (i as u64) * 4, hc.slot_ctx[i]);
+        i += 1;
+    }
+    let d0 = (hc.slot_ctx[0] & !(0x1F << 27)) | ((entries & 0x1F) << 27);
+    wr32(slot_ctx, d0);
+}
+
 /// Address Device：装配 slot + EP0 上下文并发命令。
 fn address_device(hc: &mut Xhci, slot: u32, speed: u32, port: u32, mps: u16) -> bool {
     let (slot_ctx, ep_base) = clear_input(hc);
     // 输入控制上下文：Add flags = A0(slot) | A1(EP0)。
     wr32(hc.input_va + 4, 0b11);
     // Slot 上下文 DWORD0：Context Entries=1（只配 EP0）+ Speed（bits 23:20）。
-    wr32(slot_ctx, (1 << 27) | (speed << 20));
     // Slot 上下文 DWORD1：Root Hub Port Number 在 bits 23:16（**不是** bits 15:8，
     // 15:8 是 TT Port Number）。写错则 QEMU 读到端口 0 → Address Device 回 TRB Error。
-    wr32(slot_ctx + 4, port << 16);
+    let mut ctx = [0u32; 8];
+    ctx[0] = (1 << 27) | (speed << 20);
+    ctx[1] = port << 16;
+    let mut i = 0usize;
+    while i < 8 {
+        wr32(slot_ctx + (i as u64) * 4, ctx[i]);
+        i += 1;
+    }
     // EP0 上下文：DWORD0（EP State / Interval）留 0；字段全在 DWORD1：
     //   MPS bits 31:16 | MaxBurst bits 15:8 | EP Type bits 5:3 | CErr bits 2:1。
     // （与 Linux `xhci.h`：MAX_PACKET(p)=((p&0xffff)<<16)、EP_TYPE(p)=(p<<3)、
@@ -1486,14 +1730,29 @@ fn address_device(hc: &mut Xhci, slot: u32, speed: u32, port: u32, mps: u16) -> 
     wr64(ep0 + 8, hc.ep0.pa | 1);
 
     match hc.context_cmd(TRB_ADDRESS_DEVICE, slot) {
-        Some(e) => trb_cc(&e) == CC_SUCCESS,
-        None => false,
+        Some(e) => {
+            let cc = trb_cc(&e);
+            if cc == CC_SUCCESS {
+                hc.slot_ctx = ctx;
+            } else {
+                // 完成码是唯一能区分「上下文写错(5 TRB Error / 17 Parameter Error)」与
+                // 「真的没收到事件」的证据, 真机没串口只能靠它定位。
+                print("xhci: Address Device cc=");
+                print_u64(cc as u64);
+                println("");
+            }
+            cc == CC_SUCCESS
+        }
+        None => {
+            println("xhci: Address Device: no completion event");
+            false
+        }
     }
 }
 
 /// Configure Endpoint：把两条 Bulk 端点加进设备上下文。
-fn configure_endpoints(hc: &mut Xhci, slot: u32, speed: u32, port: u32) -> bool {
-    let (slot_ctx, ep_base) = clear_input(hc);
+fn configure_endpoints(hc: &mut Xhci, slot: u32) -> bool {
+    let (_, ep_base) = clear_input(hc);
     let highest = if hc.bulkin_dci > hc.bulkout_dci {
         hc.bulkin_dci
     } else {
@@ -1502,9 +1761,8 @@ fn configure_endpoints(hc: &mut Xhci, slot: u32, speed: u32, port: u32) -> bool 
     // Add flags：slot + 两条 Bulk 的 DCI 位（EP0 已配，不再 add）。
     let add = (1u32 << 0) | (1u32 << hc.bulkin_dci) | (1u32 << hc.bulkout_dci);
     wr32(hc.input_va + 4, add);
-    // Slot 上下文：Context Entries = 最高 DCI（Configure 时也要带，保持速度/端口一致）。
-    wr32(slot_ctx, (highest << 27) | (speed << 20));
-    wr32(slot_ctx + 4, port << 16);
+    // Slot 上下文：原样回填（含 Device Address / Speed / Port），只改 Context Entries。
+    restore_slot_ctx(hc, highest);
 
     // Bulk-In：DWORD1 = MPS(bits 31:16) | EP Type(bits 5:3)=6 | CErr(bits 2:1)=3。
     let epin = input_ep_ctx(hc, ep_base, hc.bulkin_dci);

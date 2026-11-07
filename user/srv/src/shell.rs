@@ -193,11 +193,13 @@ pub fn run() {
 
     // G4: **输入完全在用户态** —— 内核只把按键字节搬进队列, 行编辑/回显由
     // `morion::console::readline` 做 (它经 `SYS_KEY_READ` 阻塞, 有键才醒)。
-    // 但**没有屏幕控制台就没有回显通道**, 故控制台不可用时如实报错退出。
-    // 没有屏幕控制台就没有回显通道 —— 但无图形变体走串口, 故它不在此退出。
+    // 回显走 `SYS_PUTS`, 内核终端与串口都能看到 —— 不依赖 `gfx_srv` 是否接管帧缓冲。
+    //
+    // SAFE 变体 (真机) 下 `gfx_srv` 不接管帧缓冲, 屏幕归**内核终端**: 输出经
+    // `SYS_PUTS` 照样上屏, 输入照旧来自 `kbd_srv` 的按键队列 —— 所以这里绝不能退出。
+    // 从前直接 `return` 的后果就是真机永远没有命令行 (屏幕上只剩内核日志)。
     if !mirrored && !NOGUI {
-        println("shell: screen console unavailable (gfx_srv) - no input channel");
-        return;
+        println("shell: gfx console not taken over - using kernel terminal");
     }
 
     let mut line = [0u8; SHELL_LINE_MAX];
@@ -521,19 +523,47 @@ fn print_hex_pad(mut v: u64, digits: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// 读一段日志，但**绝不越过 `end`**（命令开始时的快照）。
+///
+/// 两个坑：
+/// - 打印本身会继续写进同一个环形缓冲，若"一直读到没数据"就会把自己的输出再读一遍
+///   → 自我循环（`dmesg` 越跑越长）；
+/// - 缓冲满后最老字节被挤掉，内核会把过早的起始偏移夹到最老处；调用方若仍按
+///   "偏移 += 读到的字节数"前进，就会原地反复读同一段 → 同一块日志被重复打印。
+///   故每轮先把 `off` 抬到内核给出的最老偏移。
+fn log_read_upto(off: &mut u64, end: u64, buf: &mut [u8]) -> usize {
+    let oldest = sys_log_oldest();
+    if *off < oldest {
+        *off = oldest;
+    }
+    if *off >= end {
+        return 0;
+    }
+    let left = (end - *off) as usize;
+    let want = if left < buf.len() { left } else { buf.len() };
+    let n = sys_log_read(*off, &mut buf[..want]);
+    *off += n as u64;
+    n
+}
+
 /// `dmesg [-d ms] [-a] [-g pat] [path]` — 打印 / 导出控制台日志环形缓冲（Phase 0 / P0.1）。
 ///
 /// 逐行打印（默认每行停顿 `-d` 毫秒，便于按 Ctrl+C 中止长日志）；`-a` 全速、
 /// `-g pat` 只打含该子串的行并报告匹配行数。带 `path`: 把日志原样写入该文件
 /// （如 `dmesg /boot.log`），供真机拔盘取走。日志环形缓冲满后挤掉最老字节，
 /// 故保留的是**最近的** 64 KiB。
+///
+/// **只输出「命令开始执行之前」的日志**：本命令自己的输出也会写进同一个环形缓冲，
+/// 若按「一直读到没数据为止」，就会把自己的输出再读出来（自我循环，越跑越长）。
+/// 故开头先做一次 `total` 快照，读到快照为止。
 fn shell_dmesg(st: &ShellState, arg: &str) {
     static mut BUF: [u8; 4096] = [0u8; 4096];
     static mut LINE: [u8; 512] = [0u8; 512];
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
     let line = unsafe { &mut *core::ptr::addr_of_mut!(LINE) };
-    let total = sys_log_total();
-    if total == 0 {
+    // 快照: 只读到这里为止（之后的字节都是本命令自己的输出）。
+    let end = sys_log_total();
+    if end == 0 {
         println("dmesg: log is empty");
         return;
     }
@@ -585,7 +615,7 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
         let mut off = 0u64; // 日志绝对偏移
         let mut woff = 0u64; // 文件内偏移
         loop {
-            let n = sys_log_read(off, buf);
+            let n = log_read_upto(&mut off, end, buf);
             if n == 0 {
                 break;
             }
@@ -594,7 +624,6 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
                 println("dmesg: write FAILED (dumped prefix only)");
                 break;
             }
-            off += n as u64;
             woff += w;
         }
         vfs::close(fd);
@@ -611,7 +640,7 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
     let mut matched = 0u64;
     let mut ll = 0usize;
     loop {
-        let n = sys_log_read(off, buf);
+        let n = log_read_upto(&mut off, end, buf);
         if n == 0 {
             break;
         }
@@ -641,7 +670,6 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
                 ll += 1;
             }
         }
-        off += n as u64;
     }
     if ll > 0 {
         let show = match pattern {

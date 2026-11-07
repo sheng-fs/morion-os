@@ -273,7 +273,11 @@ pub fn free_frame(addr: u64) {
 // 何时真正释放。仅覆盖 SYS_ALLOC_PAGE / SYS_SHARE_PAGE / SYS_UNMAP 这条路径;
 // 镜像页与栈帧 (加载器直接分配) 不登记 —— 域销毁时按 `release_user_frame`
 // 的规则处理: 登记过的按计数递减, 未登记的视为该域独占直接释放。
-const MAX_SHARED_FRAMES: usize = 64;
+// 各文件服务 (fat32 / mfs / ext2 / exfat) 单次启动就会 alloc + share 二三十页给
+// `block_srv`, 合计早已超过旧上限 64; 槽满时 `inc_ref` 会静默不登记, 域重启时该帧被
+// 当成独占页释放 —— 而 `block_srv` 侧映射仍指向它, 于是泄漏/踩内存 (真机上表现为
+// 重启循环后期 `malloc FAILED`)。`dec_ref` 归零即回收槽位, 正常路径不会常驻。
+const MAX_SHARED_FRAMES: usize = 1024;
 
 static mut SHARED_FRAMES: [(u64, u8); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
 

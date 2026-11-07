@@ -89,6 +89,8 @@ pub const SYS_CONSOLE_READY: u64 = 47;
 pub const SYS_KEY_PUSH: u64 = 48;
 /// **阻塞取**一个按键字节: `()` → 字节值。队列空则睡到有键为止。
 pub const SYS_KEY_READ: u64 = 49;
+/// 内核终端日志回滚: `(带符号行数)` → 1。正 = 向上回看, 负 = 向下。见 [`sys_console_scroll`]。
+pub const SYS_CONSOLE_SCROLL: u64 = 64;
 /// 读本域被授权设备的 PCI 配置空间 dword (N2): `rdi = offset` → dword; 无设备返回 `u64::MAX`。
 pub const SYS_DEVICE_CONFIG_READ: u64 = 50;
 /// `SYS_UNAME` (V1 版本串): `(缓冲指针, 缓冲长度, 选择)` → 写入字节数 (不含结尾 NUL), 失败 0。
@@ -111,6 +113,8 @@ pub const SYS_NET_OWNER: u64 = 57;
 pub const SYS_LOG_TOTAL: u64 = 58;
 /// 读控制台日志 (Phase 0 / P0.1): `a1` = 缓冲、`a2` = 长度、`a3` = 起始绝对偏移。
 pub const SYS_LOG_READ: u64 = 59;
+/// 日志环形缓冲里仍可读到的最老绝对偏移 (无参)。
+pub const SYS_LOG_OLDEST: u64 = 65;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
 /// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn`。
@@ -123,7 +127,11 @@ pub const SYS_KEY_TRY_READ: u64 = 63;
 /// 本程序是否属于**无图形**构建 (V2): 由 `Makefile` 注入的 `MORION_NOGUI` 决定。
 ///
 /// 与内核 `version.rs` 的 `IS_NOGUI` 同一约定 —— `shell` 据此决定要不要开屏幕镜像。
-pub const NOGUI: bool = option_env!("MORION_NOGUI").is_some();
+///
+/// **SAFE 变体同样按无图形走**: 真机 bring-up 阶段不让 `gfx_srv` 接管帧缓冲
+/// (见 `gfx_srv::run`), 由内核终端直接显示 —— 于是启动日志和 shell 输出**全程留在屏幕上**,
+/// 一旦出错还能拍照定位; 图形控制台等真机稳定后再开。
+pub const NOGUI: bool = option_env!("MORION_NOGUI").is_some() || SAFE_MODE;
 
 /// 本程序是否属于**安装盘**构建: 由 `Makefile` 注入的 `MORION_INSTALL` 决定 (`make INSTALL=1 iso`)。
 ///
@@ -379,6 +387,11 @@ pub fn sys_key_read() -> u64 {
     unsafe { syscall(SYS_KEY_READ, 0, 0, 0) }
 }
 
+/// 滚内核终端的日志 (USB HID 键盘的方向键用): 正数向上回看, 负数向下。
+pub fn sys_console_scroll(delta: i64) -> u64 {
+    unsafe { syscall(SYS_CONSOLE_SCROLL, delta as u64, 0, 0) }
+}
+
 pub fn sys_alloc_page(vaddr: u64) -> u64 {
     unsafe { syscall(SYS_ALLOC_PAGE, vaddr, 0, 0) }
 }
@@ -513,6 +526,11 @@ pub fn sys_cap_audit(domain: u64, slot: u64) -> u64 {
 /// 控制台日志累计字节数 (Phase 0 / P0.1): 环形缓冲的绝对总量。
 pub fn sys_log_total() -> u64 {
     unsafe { syscall(SYS_LOG_TOTAL, 0, 0, 0) }
+}
+
+/// 环形缓冲里仍可读到的最老绝对偏移 —— 读日志的起点必须取它。
+pub fn sys_log_oldest() -> u64 {
+    unsafe { syscall(SYS_LOG_OLDEST, 0, 0, 0) }
 }
 
 /// 从绝对偏移 `start` 起把控制台日志读进 `dst`, 返回实际读取字节数 (0 = 读到头)。

@@ -73,10 +73,28 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 2. 初始化视频输出
     video::init(info);
+    // 最先落一条纯色带: 只要它出现, 就说明内核已经跑到显示初始化 (与文字/日志路径无关)。
+    video::boot_beacon();
     video::println("Morion OS Kernel");
     video::println("Stage 1: CPU initialization");
     video::println("");
     video::println("Boot Info verified (MORI)");
+    // 真机取证: 帧缓冲的几何与物理地址 —— 分辨率/stride/bpp 不对会让画面整块错位,
+    // 物理地址越过 4 GiB 则内核恒等映射够不着 (真机上表现为花屏/黑屏)。一行带出全部。
+    {
+        let (w, h, stride, bpp) = video::fb_geometry();
+        video::print("[OK] framebuffer ");
+        video::print_u64(w as u64);
+        video::print("x");
+        video::print_u64(h as u64);
+        video::print("x");
+        video::print_u64(bpp as u64);
+        video::print(" stride=");
+        video::print_u64(stride as u64);
+        video::print(" phys=0x");
+        video::print_hex(video::fb_base());
+        video::println("");
+    }
 
     // 3. GDT + TSS
     arch::gdt::init();
@@ -129,7 +147,16 @@ pub extern "C" fn kernel_main() -> ! {
     // ============================================================
     video::println("");
     video::println("Stage 3: Virtual memory & kernel heap");
-    memory::paging::init();
+    // 建立内核页表: 直接映射覆盖 32 GiB, 帧缓冲另经 ioremap 窗口映射。
+    if let Some(fb_virt) = memory::paging::init(info) {
+        // paging::init 已在切 CR3 后把显示指针改到 ioremap 窗口 (与 Linux
+        // efifb/simplefb 的 `screen_base = ioremap(...)` 同理); 这里只打印结果。
+        video::print("[OK] framebuffer ioremap at 0x");
+        video::print_hex(fb_virt);
+        video::println("");
+    } else {
+        video::println("[WARN] framebuffer not remapped (window unavailable)");
+    }
     video::println("[OK] Paging initialized (identity + offset mapping)");
 
     // 测试内核堆 (Box / Vec)
@@ -450,6 +477,9 @@ pub extern "C" fn kernel_main() -> ! {
     //   - block_srv: IDE PIO 数据/命令寄存器 0x1F0..0x1F8 (NVMe 不可用时的回退路径);
     //   - mfs_srv / exfat_srv: CMOS RTC 索引/数据口 0x70/0x71 (写节点时间戳)。
     cap::grant(block_domain, cap::Capability::IoPort(0x1F0, 8));
+    // kbd_srv 直接轮询 i8042 (0x60 数据口 / 0x64 状态口): 真机上 IRQ1 可能被固件交给
+    // IOAPIC 而内核只用 8259A, 中断到不了 CPU —— 轮询是这条路的兜底。
+    cap::grant(kbd_domain, cap::Capability::IoPort(0x60, 5));
     cap::grant(mfs_domain, cap::Capability::IoPort(0x70, 2));
     cap::grant(exfat_domain, cap::Capability::IoPort(0x70, 2));
     // 授权: shell 可直接让 block_srv 改分区表 (shell 的 `part.*` 命令)。分区表写入只用块
@@ -794,7 +824,7 @@ pub extern "C" fn kernel_main() -> ! {
             for m in modules {
                 // 镜像以物理地址给出, 内核靠恒等映射读它; 超出覆盖范围只能判失败。
                 if !memory::paging::is_identity_mapped(m.addr, m.len) {
-                    video::println("[FAILED] service ELF outside identity map (4 GiB)");
+                    video::println("[FAILED] service ELF outside kernel direct map");
                     continue;
                 }
                 let image =
@@ -846,8 +876,10 @@ impl core::fmt::Write for VidWriter {
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // 关键: panic 不能"清屏 + 抢打印锁" —— 真机上那会表现为"直接黑屏", 什么线索都不留。
+    // `panic_begin` 改为红底白字就地打印, 并旁路打印锁 (panic 可能就发生在持锁的打印路径里)。
+    video::panic_begin();
     if video::ready() {
-        video::clear(0x000033);
         video::println("KERNEL PANIC");
         // 打印 panic 位置与消息, 便于定位崩溃点 (黑匣子)。
         // 注意: 这里不用 format! (依赖堆), 否则堆一旦异常会造成 panic 递归。

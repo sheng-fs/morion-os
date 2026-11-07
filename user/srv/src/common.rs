@@ -921,6 +921,29 @@ pub fn vol_claim(scratch: *mut u8, max: u32, kind: u32, fallback: u64) -> u64 {
     }
 }
 
+/// 等卷表里出现第一个 `kind` 匹配的卷 (最多等 `timeout_ms` 毫秒)。
+///
+/// 与 [`vol_claim`] 的区别是"只认真命中" —— 没等到就返回 `None` 由调用方回退。
+/// 真机上 AHCI / xHCI 的枚举可能晚于文件服务启动; 立刻按约定卷号回退会读到不存在的
+/// 卷并秒退, 进而在 `init` 那里形成重启循环。这里按 `VOL_MAX` 量级反复查表,
+/// 每轮睡 100 ms。
+pub fn vol_claim_wait(scratch: *mut u8, max: u32, kind: u32, timeout_ms: u64) -> Option<u64> {
+    let mut waited = 0u64;
+    loop {
+        let n = block_list_volumes(scratch, max);
+        if n != 0 && n != u64::MAX {
+            if let Some(v) = vol_find_kind(scratch, n, kind) {
+                return Some(v as u64);
+            }
+        }
+        if waited >= timeout_ms {
+            return None;
+        }
+        sys_sleep(100);
+        waited += 100;
+    }
+}
+
 /// 卷表里卷号 `vol` 的描述符; 查不到返回 `None`。
 ///
 /// `scratch` 必须是本域**已共享给 block_srv** 的缓冲页 (卷描述符经它回传)。

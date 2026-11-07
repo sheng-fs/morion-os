@@ -69,6 +69,18 @@ BOOT_TARGET    := x86_64-unknown-uefi
 # 同时置 `INSTALL=1 NOGUI=1` 时优先落 build/install (安装盘大概率还要图形, 该组合很少用)。
 # `SAFE=1` (真机安全模式) 优先级最高, 单独落 `build/safe/`。
 OUT_DIR       ?= $(if $(SAFE),build/safe,$(if $(INSTALL),build/install,$(if $(NOGUI),build/nogui,build)))
+# 变体标志文件: NOGUI / INSTALL / SAFE 改变的是**编译期环境变量**, 不是源文件 ——
+# make 看不出差异, 换变体时会直接复用上次变体的 ELF (实测: SAFE 镜像里带着 NOGUI 的
+# shell, 屏幕镜像被关掉, 启动后屏幕只剩一片深色, 看起来就是"黑屏死机")。
+# 把标志写进文件并作为 kernel / boot / 服务的依赖: 只有标志真的变了才触发重建。
+VARIANT_FLAGS := $(OUT_DIR)/.variant
+.PHONY: FORCE
+FORCE:
+$(VARIANT_FLAGS): FORCE
+	@$(MKDIR) $(dir $@)
+	@echo "$(NOGUI)|$(INSTALL)|$(SAFE)" > $@.tmp
+	@cmp -s $@.tmp $@ || mv -f $@.tmp $@
+	@rm -f $@.tmp
 ISO_DIR       := $(OUT_DIR)/iso
 KERNEL_ELF    := $(OUT_DIR)/kernel/morion-kernel
 # 嵌入引导器的内核 ELF 路径 (boot/src/main.rs 用 include_bytes! 读取)
@@ -172,7 +184,7 @@ USER_SRC   := $(shell find user -type f 2>/dev/null)
 kernel: $(KERNEL_ELF)
 
 # 内核不再 include_bytes! 服务 ELF (E3b: 由引导器从 ESP 读入), 故不依赖 $(SRV_STAMP)。
-$(KERNEL_ELF): $(KERNEL_SRC)
+$(KERNEL_ELF): $(KERNEL_SRC) $(VARIANT_FLAGS)
 	@echo "==> 构建微内核..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \
@@ -220,7 +232,7 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/lib
 # 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
 # (内核 `SERVICE_ELFS` 按名 include_bytes!)。用 stamp 让"多产物一次构建"只跑一遍。
 SRV_SRC := $(shell find user/srv user/libmorion user/libdevice -type f 2>/dev/null) user/linker.ld
-$(SRV_STAMP): $(SRV_SRC)
+$(SRV_STAMP): $(SRV_SRC) $(VARIANT_FLAGS)
 	@echo "==> 构建用户态服务 (E2b: 14 个独立 ELF)..."
 	$(MKDIR) $(SRV_DIR)
 	$(CARGO) build \
@@ -242,7 +254,7 @@ $(SRV_STAMP): $(SRV_SRC)
 .PHONY: boot
 boot: $(BOOT_EFI)
 
-$(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED)
+$(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED) $(VARIANT_FLAGS)
 	@echo "==> 构建 Morion 引导器..."
 	$(MKDIR) $(dir $@)
 	$(CARGO) build \

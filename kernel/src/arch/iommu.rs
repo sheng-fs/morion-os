@@ -266,6 +266,17 @@ fn devfn(dev: u8, func: u8) -> u64 {
 ///
 /// 返回是否真的把翻译打开（无 IOMMU / 表建不起来 / `GSTS` 未生效 → `false`）。
 pub fn init(devices: &[PciDevice]) -> bool {
+    // SAFE 变体 = 真机首次 bring-up: **不打开** DMA 重映射。
+    //
+    // 这里只建了 `[0, DEFAULT_WINDOW_LIMIT)` 的恒等窗口, 而真实固件的 DMAR 与 QEMU 差别很大
+    // (多 DRHD / RMRR / 显示引擎扫描输出也走 IOMMU)。一旦打开翻译, 任何一次落在窗口外的
+    // 固件设备 DMA 都会失败 —— 典型表现就是**画面瞬间全黑** (CPU 还活着)。
+    // 显示与存储路线都确认稳定后, 再用普通构建验证 E1b/E1c。
+    if crate::version::IS_SAFE {
+        crate::video::println("[OK] VT-d: skipped in SAFE build (DMA remapping stays off)");
+        return false;
+    }
+
     let dmar = crate::arch::acpi::probe_dmar();
     if !dmar.found || dmar.drhd_count == 0 {
         crate::video::println("[OK] VT-d: no IOMMU in firmware, DMA remapping not enabled");
