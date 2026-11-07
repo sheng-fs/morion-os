@@ -9,9 +9,9 @@
 pub const DEVICE_CFG_VADDR: u64 = 0x0000_0080_0081_0000;
 
 /// **多实例**描述页窗口（= 内核 `device::DEVICE_MULTI_CFG_VADDR`），每个实例一页。
-pub const DEVICE_MULTI_CFG_VADDR: u64 = 0x0000_0080_0090_0000;
+pub const DEVICE_MULTI_CFG_VADDR: u64 = 0x0000_0080_0060_0000;
 /// 多实例上限（与内核 `DEVICE_MULTI_SLOTS` 一致）。
-pub const DEVICE_MULTI_SLOTS: u32 = 4;
+pub const DEVICE_MULTI_SLOTS: u32 = 16;
 
 /// 运行期设备授权 syscall 号（= 内核 `syscall::SYS_DEVICE_GRANT`，D1b）。
 ///

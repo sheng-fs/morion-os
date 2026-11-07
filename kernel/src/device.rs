@@ -36,18 +36,24 @@ pub const DEVICE_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x83_0000;
 /// MSI-X 表所在 BAR 的映射窗口（仅当表**不在**设备 BAR 上时才用，如 virtio-net 的表在 BAR1）。
 pub const DEVICE_MSIX_VADDR: u64 = paging::USER_SPACE_BASE + 0x84_0000;
 
-/// **多实例设备**（一台域接多台同类型设备）的窗口：xHCI 真机常见 2–3 个控制器。
+/// **多实例设备**（一台域接多台同类型设备）的窗口。
 ///
-/// 与单实例窗口分开（0x90_0000 起），避免和既有映射重叠；每个实例的步长足以覆盖
-/// 4 页 BAR + 16 页 DMA。
-pub const DEVICE_MULTI_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x90_0000;
-pub const DEVICE_MULTI_BAR_VADDR: u64 = paging::USER_SPACE_BASE + 0x91_0000;
-pub const DEVICE_MULTI_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x93_0000;
+/// ⚠️ 真机实测：AMD 笔记本的 xHCI 控制器远不止 "2–3 个" —— `lspci` 里
+/// `class=0c:03:30` 有 13 个（00:00.2 + 00:18.0-7 + 06:00.x + 07:00.0），每个通常只带
+/// 1–4 个端口。之前只授权前 4 台，启动盘所在的控制器很可能**根本没被探测**，
+/// 表现就是"所有端口都试过，但没有一个是 U 盘"。
+///
+/// 窗口放在 `0x60_0000` 起的空闲带：用户栈是 `[0x3F_9000, 0x40_1000)`（自栈顶向下 8 页），
+/// `0x80_0000` 起是单实例设备窗口，`0xA0_0000` 是 wifi 共享页 —— 中间这一段没人用。
+/// 16 个实例共占 `[0x60_0000, 0x75_0000)`：CFG 16 页 + BAR 16×16 KiB + DMA 16×64 KiB。
+pub const DEVICE_MULTI_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x60_0000;
+pub const DEVICE_MULTI_BAR_VADDR: u64 = paging::USER_SPACE_BASE + 0x61_0000;
+pub const DEVICE_MULTI_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x65_0000;
 /// 单实例 BAR / DMA 步长（4 页 / 16 页）。
 pub const DEVICE_MULTI_BAR_STRIDE: u64 = 0x4000;
 pub const DEVICE_MULTI_DMA_STRIDE: u64 = 0x1_0000;
-/// 最多同时授权的设备实例数（xHCI 控制器上限）。
-pub const DEVICE_MULTI_SLOTS: u64 = 4;
+/// 最多同时授权的设备实例数（xHCI 控制器上限；真机见过 13 个）。
+pub const DEVICE_MULTI_SLOTS: u64 = 16;
 
 /// 描述结构 magic (校验内核与用户态布局一致)。
 pub const DEVICE_GRANT_MAGIC: u64 = 0x0044_4556_4F53_2131; // "DEVOS!1"

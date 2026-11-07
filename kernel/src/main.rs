@@ -716,8 +716,9 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(block_domain, cap::Capability::MapInto(ahci_domain));
     cap::grant(ahci_domain, cap::Capability::SendTo(block_domain));
 
-    // 探测 xHCI (USB 3.x) 控制器并通用地授权给域 19。真机常见 2–3 个控制器
-    // (不同 USB 口挂在不同控制器上), 所以这里**逐个授权**，驱动按实例偏移读取。
+    // 探测 xHCI (USB 3.x) 控制器并通用地授权给域 19。真机上控制器数量可能很多
+    // (AMD 笔记本实测 13 个 `class=0c:03:30`，不同 USB 口挂在不同控制器上)，所以
+    // **逐个授权**，驱动按实例偏移读取；实例上限见 `device::DEVICE_MULTI_SLOTS`。
     let mut xhci_count = 0u32;
     for d in &pci_devices {
         if d.class != 0x0C || d.subclass != 0x03 || d.progif != 0x30 {

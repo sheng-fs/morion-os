@@ -1069,21 +1069,30 @@ fn hid_char(code: u8, shift: bool) -> Option<u8> {
     Some(c)
 }
 
-/// 配置描述符里与本驱动有关的接口信息（只保留最后一个接口的类别与端点）。
+/// 配置描述符里与本驱动有关的接口信息。
 #[derive(Clone, Copy, Default)]
 struct IfaceInfo {
+    /// 第一个接口的类别三元组（只用于诊断打印）。
     class: u8,
     subclass: u8,
     proto: u8,
+    /// 接口总数。
+    n_ifaces: u32,
     bulk_in: Option<BulkEp>,
     bulk_out: Option<BulkEp>,
-    /// (DCI, MaxPacketSize, Interval)
+    /// HID 接口（class=03 且带中断 IN）：(DCI, MaxPacketSize, Interval)。
     hid: Option<(u32, u16, u8)>,
+    /// 这个 HID 是否声称 boot 子类/协议（1/1）。
+    hid_boot: bool,
 }
 
 /// 遍历配置描述符，收集接口类别与端点。
+///
+/// ⚠️ 复合设备很常见（键盘带多媒体键、摄像头带麦克风）：端点必须按**所属接口**归类，
+/// 不能拿"最后一个接口的类别"去判断整台设备 —— 旧实现会把 HID 键盘判成不支持。
 fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
     let mut info = IfaceInfo::default();
+    let mut cur = (0u8, 0u8, 0u8); // 当前接口的 (class, subclass, proto)
     let mut off = 0u32;
     while off + 2 <= total {
         let len = rd8(buf_va + off as u64) as u32;
@@ -1094,9 +1103,13 @@ fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
         let base = buf_va + off as u64;
         if dtype == 4 && len >= 9 {
             // Interface descriptor
-            info.class = rd8(base + 5);
-            info.subclass = rd8(base + 6);
-            info.proto = rd8(base + 7);
+            cur = (rd8(base + 5), rd8(base + 6), rd8(base + 7));
+            if info.n_ifaces == 0 {
+                info.class = cur.0;
+                info.subclass = cur.1;
+                info.proto = cur.2;
+            }
+            info.n_ifaces += 1;
         } else if dtype == 5 && len >= 7 {
             // Endpoint descriptor
             let addr = rd8(base + 2);
@@ -1117,13 +1130,56 @@ fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
                         mps: mps & 0x7FF,
                     })
                 }
-                3 if addr & 0x80 != 0 => info.hid = Some((2 * num + 1, mps & 0x7FF, interval)),
+                3 if addr & 0x80 != 0 && cur.0 == 0x03 => {
+                    // HID 中断 IN：优先挑 boot 子类/协议的那一个接口。
+                    let boot = cur.1 == 0x01 && cur.2 == 0x01;
+                    if info.hid.is_none() || (boot && !info.hid_boot) {
+                        info.hid = Some((2 * num + 1, mps & 0x7FF, interval));
+                        info.hid_boot = boot;
+                    }
+                }
                 _ => {}
             }
         }
         off += len;
     }
     info
+}
+
+/// 读 iProduct 字符串描述符并打印其中的 ASCII（"这到底是什么设备"最直接的证据）。
+///
+/// `idx` 必须由调用方在**读配置描述符之前**从设备描述符里取好 —— 两者共用同一块
+/// DMA 缓冲。失败静默跳过（有的设备不实现 0x0409 或没有字符串描述符）。
+fn log_product_string(hc: &mut Xhci, idx: u8) {
+    if idx == 0 {
+        return;
+    }
+    if !hc.control(
+        0x80,
+        6,
+        (3u16 << 8) | idx as u16,
+        0x0409,
+        128,
+        true,
+        hc.data_pa,
+    ) {
+        return;
+    }
+    let len = rd8(hc.data_va) as u64;
+    if len < 4 {
+        return;
+    }
+    print("xhci: product=\"");
+    let mut i = 2u64;
+    while i + 1 < len && i < 128 {
+        let c = rd8(hc.data_va + i); // UTF-16LE 的低字节；ASCII 足够识别型号
+        if (0x20..0x7f).contains(&c) {
+            let one = [c];
+            print(unsafe { core::str::from_utf8_unchecked(&one) });
+        }
+        i += 2;
+    }
+    println("\"");
 }
 
 /// 配置 HID 的 Interrupt IN 端点（EP Type = 7）。
@@ -1396,6 +1452,9 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         return ProbeOutcome::None;
     }
     let bmax0 = rd8(hc.data_va + 7) as u16;
+    // ⚠️ 必须在读配置描述符**之前**取：两次读都用 hc.data_va，后者会覆盖前者。
+    let dev_class = rd8(hc.data_va + 4);
+    let prod_idx = rd8(hc.data_va + 15);
     print("xhci: device descriptor vid=0x");
     print_hex(((rd8(hc.data_va + 9) as u64) << 8) | rd8(hc.data_va + 8) as u64);
     print(" pid=0x");
@@ -1415,13 +1474,34 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         return ProbeOutcome::None;
     }
     let iface = parse_config(hc.data_va, want);
+    // 诊断: 这台设备到底是什么 (真机没有 lspci -v, 只能把这几个字段打出来)。
+    print("xhci: config ifaces=");
+    print_u64(iface.n_ifaces as u64);
+    print(" class=0x");
+    print_hex(iface.class as u64);
+    print(" sub=0x");
+    print_hex(iface.subclass as u64);
+    print(" proto=0x");
+    print_hex(iface.proto as u64);
+    print(" devclass=0x");
+    print_hex(dev_class as u64);
+    print(" bulk_in=");
+    print_u64(iface.bulk_in.is_some() as u64);
+    print(" bulk_out=");
+    print_u64(iface.bulk_out.is_some() as u64);
+    print(" hid=");
+    print_u64(iface.hid.is_some() as u64);
+    println("");
+    log_product_string(&mut hc, prod_idx);
+    if iface.class == 0x09 {
+        println("xhci: this is a USB hub - devices behind it are not scanned");
+    }
 
-    // ---- USB HID boot keyboard ----
-    if iface.class == 0x03 && iface.subclass == 0x01 && iface.proto == 0x01 {
-        let Some((dci, mps, interval)) = iface.hid else {
-            println("xhci: device ignored (unsupported interface class)");
-            return ProbeOutcome::None;
-        };
+    // ---- USB HID 键盘（class=03 且带中断 IN；不要求 boot 子类/协议）----
+    if let Some((dci, mps, interval)) = iface.hid {
+        if !iface.hid_boot {
+            println("xhci: HID is not boot subtype - trying anyway");
+        }
         if !hc.control(0x00, 9, 1, 0, 0, false, 0) {
             println("xhci: kbd SET_CONFIGURATION FAILED");
             return ProbeOutcome::None;
