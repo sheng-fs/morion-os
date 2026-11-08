@@ -21,7 +21,7 @@ pub mod logo;
 pub mod unicode;
 
 use crate::bootinfo::BootInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use framebuffer::Framebuffer;
 use spin::Mutex;
 
@@ -46,6 +46,21 @@ static FB_TAKEN_OVER: AtomicBool = AtomicBool::new(false);
 /// panic 可能正发生在**持锁的打印路径里** (`print` 内部 panic → 处理函数再 `print`);
 /// 那时再取锁会自旋到死, 屏幕上只剩 panic 前那次清屏的颜色 —— 真机上看起来就是"直接黑屏"。
 static PRINT_BYPASS: AtomicBool = AtomicBool::new(false);
+
+/// **行编辑期的输出隔离**：谁正在编辑输入行（`u64::MAX` = 没人）。
+///
+/// 真机 SAFE 变体下屏幕就是内核终端：shell 的每个回显字节都经 `SYS_PUTS` 落到同一个
+/// 「当前输出行」缓冲里。驱动要是在这时候打印（fat32 每 30s 的重试、xhci 探测日志），
+/// 就会把用户**半打完的命令**冲成 `dmesg -g profat32: ...` —— 回车后整行作废，
+/// 现象就是「还没写完就冒出一堆日志，再敲就乱了，回车也没反应」。
+///
+/// 故编辑期间：编辑者（shell）自己的回显照常显示，其它域的日志先进 [`DEFER`] 暂存，
+/// 回车结束编辑时再一次性补到屏幕上。串口与 klog 不受影响，日志一条不丢。
+static LINE_EDIT_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
+/// 编辑期间被暂存的输出上限（超出时丢最老的 1/4）。
+const DEFER_CAP: usize = 4096;
+static mut DEFER: [u8; DEFER_CAP] = [0; DEFER_CAP];
+static mut DEFER_LEN: usize = 0;
 
 const MARGIN: u32 = 16;
 /// 行高 (字符高 + 行间距)
@@ -665,6 +680,75 @@ fn line_backspace() {
     }
 }
 
+/// 当前是否有**别的域**正在编辑输入行（编辑者自己的回显不拦）。
+fn editing_by_other() -> bool {
+    let owner = LINE_EDIT_OWNER.load(Ordering::Relaxed);
+    owner != u64::MAX && owner != crate::scheduler::current_domain()
+}
+
+/// 把一段输出暂存到编辑期的延迟缓冲（超容量时丢最老 1/4，且切在 UTF-8 字符边界上）。
+fn defer_bytes(bytes: &[u8]) {
+    let base = core::ptr::addr_of_mut!(DEFER) as *mut u8;
+    unsafe {
+        for &b in bytes {
+            if DEFER_LEN == DEFER_CAP {
+                let mut drop = DEFER_CAP / 4;
+                // 续字节形如 10xxxxxx: 往前挪到字符首字节，别把汉字劈成半个。
+                while drop < DEFER_CAP && (*base.add(drop) & 0xC0) == 0x80 {
+                    drop += 1;
+                }
+                let keep = DEFER_CAP - drop;
+                core::ptr::copy(base.add(drop), base, keep);
+                DEFER_LEN = keep;
+            }
+            *base.add(DEFER_LEN) = b;
+            DEFER_LEN += 1;
+        }
+    }
+}
+
+/// `SYS_CONSOLE_LINE_EDIT`：行编辑开始 / 结束（见 [`LINE_EDIT_OWNER`]）。
+///
+/// 结束时把编辑期间暂存下来的日志一次性补到屏幕上（先补一个换行，免得接在命令后面）。
+pub fn set_line_edit(active: u64) {
+    if active != 0 {
+        LINE_EDIT_OWNER.store(crate::scheduler::current_domain(), Ordering::Relaxed);
+        return;
+    }
+    LINE_EDIT_OWNER.store(u64::MAX, Ordering::Relaxed);
+    if is_taken_over() || !ready() {
+        unsafe { DEFER_LEN = 0 };
+        return;
+    }
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+    let guard = PRINT_LOCK.lock();
+    unsafe {
+        if DEFER_LEN > 0 {
+            let before = HISTORY_COUNT;
+            let before_len = LINE_LEN;
+            if LINE_LEN > 0 {
+                append_text("\n"); // 当前行还有残留内容时先断行
+            }
+            let len = DEFER_LEN;
+            DEFER_LEN = 0;
+            let bytes = core::slice::from_raw_parts(core::ptr::addr_of!(DEFER) as *const u8, len);
+            if let Ok(s) = core::str::from_utf8(bytes) {
+                append_text(s);
+                // 暂存内容没以换行结尾时补一个，免得接上后面命令的输出。
+                if !s.ends_with('\n') {
+                    append_text("\n");
+                }
+            }
+            render_update(before, before_len);
+        }
+    }
+    drop(guard);
+    if was_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+}
+
 /// 打印字符串 (支持 '\n' 换行)。
 ///
 /// 先镜像到 COM1; 显示已被用户态接管时不再碰帧缓冲, 输出到此为止。
@@ -697,6 +781,16 @@ pub fn print(s: &str) {
 
     // 显示已被用户态接管: 不再碰帧缓冲, 输出到此为止 (串口已写)。
     if is_taken_over() {
+        drop(guard);
+        if was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        return;
+    }
+
+    // 有人正在敲命令: 别的域的输出先攒着, 别把用户那条半截命令冲掉 (串口/klog 已写好)。
+    if editing_by_other() {
+        defer_bytes(s.as_bytes());
         drop(guard);
         if was_enabled {
             x86_64::instructions::interrupts::enable();

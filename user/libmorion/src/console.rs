@@ -14,7 +14,7 @@
 //! 键盘目前只产 **ASCII** (`kbd_srv` 的 scancode 映射表里没有非 ASCII), 故退格恒为 1 列。
 //! 将来若接入非 ASCII 输入, 这里要按字形的**显示列数**重复发 `\b` (列数只有服务端字库知道)。
 
-use crate::syscall::{flush, print, sys_key_read};
+use crate::syscall::{flush, print, sys_console_line_edit, sys_key_read};
 
 /// 退格键 (BS)。
 const BS: u8 = 0x08;
@@ -23,17 +23,23 @@ const BS: u8 = 0x08;
 ///
 /// 超过 `buf.len()` 的按键被丢弃 (行不会溢出)。回显即时提交 (`flush`), 否则要等下一次
 /// 换行才看得见自己敲的字。
+///
+/// 编辑期间置「行编辑」标志：真机 SAFE 变体下屏幕就是内核终端，各驱动的异步日志
+/// 与这里的回显共用同一行，不隔离就会把用户半打完的命令冲成乱码。
 pub fn readline(buf: &mut [u8]) -> u64 {
     let mut len = 0usize;
+    sys_console_line_edit(true);
     loop {
         let c = sys_key_read();
         if c > 0xFF {
+            sys_console_line_edit(false);
             return u64::MAX; // 非字节值 (只可能是内核侧异常)
         }
         match c as u8 {
             b'\n' | b'\r' => {
                 print("\n");
                 flush();
+                sys_console_line_edit(false); // 先把新行提交, 再补显编辑期间的日志
                 return len as u64;
             }
             BS | 0x7F => {
@@ -48,6 +54,7 @@ pub fn readline(buf: &mut [u8]) -> u64 {
             0x03 => {
                 print("^C\n");
                 flush();
+                sys_console_line_edit(false);
                 return 0;
             }
             b if (0x20..=0x7E).contains(&b) && len < buf.len() => {

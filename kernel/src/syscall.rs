@@ -183,6 +183,11 @@ pub const SYS_CONSOLE_SCROLL: u64 = 64;
 /// `shell` 的 `dmesg` 必须从这里起步: 更早的偏移会被内核夹到最老处, 调用方若仍按
 /// 「偏移 += 读到的字节数」前进, 就会原地反复读同一段 (日志被无限重复打印)。
 pub const SYS_LOG_OLDEST: u64 = 65;
+/// 控制台行编辑开关: `a1 != 0` 开始（调用者成为编辑者）, `0` 结束并补显编辑期间暂存的日志。
+///
+/// 真机 SAFE 变体下屏幕就是内核终端, shell 回显与各驱动的异步日志共用同一个「当前行」；
+/// 不做隔离的话驱动日志会把用户半打完的命令冲掉。见 [`crate::video::set_line_edit`]。
+pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -927,6 +932,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_LOG_TOTAL => crate::klog::total(),
         SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
         SYS_LOG_OLDEST => crate::klog::oldest(),
+        SYS_CONSOLE_LINE_EDIT => {
+            crate::video::set_line_edit(a1);
+            0
+        }
         SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
         SYS_POWEROFF => {
             // 关机是不可逆的全局操作: 只给"能造进程"的可信域 (app/shell/init)。

@@ -115,6 +115,8 @@ pub const SYS_LOG_TOTAL: u64 = 58;
 pub const SYS_LOG_READ: u64 = 59;
 /// 日志环形缓冲里仍可读到的最老绝对偏移 (无参)。
 pub const SYS_LOG_OLDEST: u64 = 65;
+/// 控制台行编辑开关: `a1 != 0` 开始, `0` 结束。编辑期间别的域的输出会被内核暂存。
+pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
 /// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn`。
@@ -531,6 +533,14 @@ pub fn sys_log_total() -> u64 {
 /// 环形缓冲里仍可读到的最老绝对偏移 —— 读日志的起点必须取它。
 pub fn sys_log_oldest() -> u64 {
     unsafe { syscall(SYS_LOG_OLDEST, 0, 0, 0) }
+}
+
+/// 行编辑开始 / 结束：编辑期间内核会暂存**其它域**的控制台输出，退出时再补显示。
+///
+/// 真机 SAFE 变体下 shell 的回显和各驱动日志共用内核终端的一行，不隔离就会把用户
+/// 半打完的命令冲掉。
+pub fn sys_console_line_edit(active: bool) -> u64 {
+    unsafe { syscall(SYS_CONSOLE_LINE_EDIT, active as u64, 0, 0) }
 }
 
 /// 从绝对偏移 `start` 起把控制台日志读进 `dst`, 返回实际读取字节数 (0 = 读到头)。
