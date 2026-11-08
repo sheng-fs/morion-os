@@ -151,6 +151,21 @@ impl Decoder {
                 0x51 => {
                     sys_console_scroll(-20); // PageDown
                 }
+                0x4B => {
+                    sys_key_push(0x02); // ← / Ctrl+B: 行编辑光标左移
+                }
+                0x4D => {
+                    sys_key_push(0x06); // → / Ctrl+F: 行编辑光标右移
+                }
+                0x47 => {
+                    sys_key_push(0x01); // Home / Ctrl+A
+                }
+                0x4F => {
+                    sys_key_push(0x05); // End / Ctrl+E
+                }
+                0x53 => {
+                    sys_key_push(0x04); // Delete / Ctrl+D
+                }
                 _ => {}
             }
             return;
@@ -162,6 +177,9 @@ impl Decoder {
             0x2A | 0x36 => self.shift = true, // 左右 shift 按下
             0x0E => {
                 sys_key_push(0x08); // 退格
+            }
+            0x0F => {
+                sys_key_push(0x09); // Tab: shell 命令补全
             }
             0x1C => {
                 sys_key_push(b'\n'); // 回车

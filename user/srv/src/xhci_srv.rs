@@ -1197,6 +1197,24 @@ impl KeyboardDev {
                     0x51 => {
                         sys_console_scroll(-1);
                     } // ↓
+                    0x50 => {
+                        sys_key_push(0x02); // ← / Ctrl+B
+                    }
+                    0x4F => {
+                        sys_key_push(0x06); // → / Ctrl+F
+                    }
+                    0x4A => {
+                        sys_key_push(0x01); // Home / Ctrl+A
+                    }
+                    0x4D => {
+                        sys_key_push(0x05); // End / Ctrl+E
+                    }
+                    0x4C => {
+                        sys_key_push(0x04); // Delete / Ctrl+D
+                    }
+                    0x2B => {
+                        sys_key_push(0x09); // Tab
+                    }
                     _ => {
                         if let Some(c) = hid_char(code, shift) {
                             sys_key_push(c);

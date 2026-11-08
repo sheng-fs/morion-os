@@ -86,6 +86,11 @@ static mut HISTORY_START: usize = 0;
 static mut LINE: [u8; LINE_BYTES] = [0; LINE_BYTES];
 /// 当前行长度 (字节)
 static mut LINE_LEN: usize = 0;
+/// 当前行的**编辑光标**（字节下标，落在 UTF-8 字符边界上）。
+///
+/// 正常输出时光标恒在行尾；shell 行编辑按 ←/→ 时由 [`append_text`] 里的控制字节移动。
+/// 插入/退格/删除都作用于这个位置，而不是行尾。
+static mut LINE_CURSOR: usize = 0;
 
 /// 屏幕回滚偏移: 0 = 跟随最新输出 (看屏幕尾部), >0 = 向上回看的历史行数。
 ///
@@ -278,6 +283,7 @@ pub fn clear_screen() {
         HISTORY_START = 0;
         LINE = [0; LINE_BYTES];
         LINE_LEN = 0;
+        LINE_CURSOR = 0;
         SCROLL_OFFSET = 0;
         SCANCODE_EXT = false;
     }
@@ -334,6 +340,7 @@ fn commit_line() {
     unsafe {
         history_push(&LINE[..LINE_LEN]);
         LINE_LEN = 0;
+        LINE_CURSOR = 0;
     }
 }
 
@@ -453,7 +460,7 @@ fn redraw() {
             // 当前行紧跟历史 (历史满时正好落在给最后一行留出的位置上)。
             bg_fill_rect(0, y, FB.width(), LINE_HEIGHT);
             draw_line(&LINE[..LINE_LEN], y);
-            cursor_draw(y, unicode::str_width(&LINE[..LINE_LEN]));
+            cursor_draw(y, unicode::str_width(&LINE[..LINE_CURSOR]));
         } else {
             // 回看历史时不显示光标 (视口不是"最新输出")。
             cursor_erase();
@@ -587,25 +594,34 @@ fn render_update(before_count: usize, before_len: usize) {
             return;
         }
 
+        if LINE_CURSOR != LINE_LEN {
+            // 光标在行中间 (←/→/中间插入/删除): 后缀已经搬移, 不能只补画新增部分,
+            // 整行擦掉重画。
+            bg_fill_rect(0, y, FB.width(), LINE_HEIGHT);
+            draw_line(&LINE[..LINE_LEN], y);
+            cursor_draw(y, unicode::str_width(&LINE[..LINE_CURSOR]));
+            return;
+        }
+
         if committed == 0 {
             // 同一行继续追加: 只画新增字符 (前缀已在屏幕上, 无需擦除)。
             if before_len <= LINE_LEN {
                 draw_line_from(&LINE[..LINE_LEN], before_len, y);
-                cursor_draw(y, unicode::str_width(&LINE[..LINE_LEN]));
+                cursor_draw(y, unicode::str_width(&LINE[..LINE_CURSOR]));
                 return;
             }
         } else {
             // 新起一行: 只擦这一条带并画当前行。
             bg_fill_rect(0, y, FB.width(), LINE_HEIGHT);
             draw_line(&LINE[..LINE_LEN], y);
-            cursor_draw(y, unicode::str_width(&LINE[..LINE_LEN]));
+            cursor_draw(y, unicode::str_width(&LINE[..LINE_CURSOR]));
             return;
         }
 
         // 兜底 (例如行缓冲被重置): 擦掉当前行重画。
         bg_fill_rect(0, y, FB.width(), LINE_HEIGHT);
         draw_line(&LINE[..LINE_LEN], y);
-        cursor_draw(y, unicode::str_width(&LINE[..LINE_LEN]));
+        cursor_draw(y, unicode::str_width(&LINE[..LINE_CURSOR]));
     }
 }
 
@@ -633,11 +649,21 @@ fn append_cp(cp: u32) {
     unsafe {
         let cols = unicode::str_width(&LINE[..LINE_LEN]) as usize;
         if LINE_LEN + n > LINE_BYTES || cols + w as usize > max_cols() {
+            // 行满了：只有在行尾追加时才提交另起一行；编辑到行中间时丢弃该字符，
+            // 不能把后半行一起提交掉。
+            if LINE_CURSOR != LINE_LEN {
+                return;
+            }
             commit_line();
         }
         if LINE_LEN + n <= LINE_BYTES {
-            LINE[LINE_LEN..LINE_LEN + n].copy_from_slice(&buf[..n]);
+            // 光标在中间时把后缀右移，再写入新字符 —— 正常输出时光标在行尾，不搬移。
+            if LINE_CURSOR < LINE_LEN {
+                LINE.copy_within(LINE_CURSOR..LINE_LEN, LINE_CURSOR + n);
+            }
+            LINE[LINE_CURSOR..LINE_CURSOR + n].copy_from_slice(&buf[..n]);
             LINE_LEN += n;
+            LINE_CURSOR += n;
         }
     }
 }
@@ -656,27 +682,90 @@ fn append_text(s: &str) {
         if ch == '\n' {
             commit_line();
         } else if ch == '\u{8}' {
-            // 退格: 删掉当前行最后一个**字符** (SAFE 变体没有 gfx 控制台, shell 行编辑的
-            // 回显完全靠这个内核终端; 不认 \b 的话用户按退格就是"看不见地删字")。
+            // 退格: 删掉**光标前**的一个字符（SAFE 变体没有 gfx 控制台, shell 行编辑的
+            // 回显完全靠这个内核终端; 不认 \b 的话用户按退格就是"看不见地删字"）。
             line_backspace();
+        } else if ch == '\u{2}' {
+            // Ctrl+B / ←：光标左移一个字符。
+            line_left();
+        } else if ch == '\u{6}' {
+            // Ctrl+F / →：光标右移一个字符。
+            line_right();
+        } else if ch == '\u{4}' {
+            // Ctrl+D / Delete：删除光标处字符。
+            line_delete();
+        } else if ch == '\u{5}' {
+            // Ctrl+E / End：光标移到行尾。
+            unsafe { LINE_CURSOR = LINE_LEN };
         } else {
             append_cp(ch as u32);
         }
     }
 }
 
-/// 删掉当前行最后一个 UTF-8 字符 (至少 1 字节, 汉字 3 字节)。
+/// 删掉**光标前**一个 UTF-8 字符 (至少 1 字节, 汉字 3 字节)，并左移后缀。
 fn line_backspace() {
     unsafe {
-        if LINE_LEN == 0 {
+        if LINE_CURSOR == 0 {
             return;
         }
-        let mut start = LINE_LEN - 1;
+        let mut start = LINE_CURSOR - 1;
         // 回退到该字符的首字节 (UTF-8 续字节形如 10xxxxxx)。
         while start > 0 && (LINE[start] & 0xC0) == 0x80 {
             start -= 1;
         }
-        LINE_LEN = start;
+        let n = LINE_CURSOR - start;
+        if LINE_CURSOR < LINE_LEN {
+            LINE.copy_within(LINE_CURSOR..LINE_LEN, start);
+        }
+        LINE_LEN -= n;
+        LINE_CURSOR = start;
+    }
+}
+
+/// 光标左移一个 UTF-8 字符。
+fn line_left() {
+    unsafe {
+        if LINE_CURSOR == 0 {
+            return;
+        }
+        let mut p = LINE_CURSOR - 1;
+        while p > 0 && (LINE[p] & 0xC0) == 0x80 {
+            p -= 1;
+        }
+        LINE_CURSOR = p;
+    }
+}
+
+/// 光标右移一个 UTF-8 字符（不越过行尾）。
+fn line_right() {
+    unsafe {
+        if LINE_CURSOR >= LINE_LEN {
+            return;
+        }
+        let mut p = LINE_CURSOR + 1;
+        while p < LINE_LEN && (LINE[p] & 0xC0) == 0x80 {
+            p += 1;
+        }
+        LINE_CURSOR = p;
+    }
+}
+
+/// 删除光标处的一个 UTF-8 字符（Delete 键），并左移后缀。
+fn line_delete() {
+    unsafe {
+        if LINE_CURSOR >= LINE_LEN {
+            return;
+        }
+        let mut end = LINE_CURSOR + 1;
+        while end < LINE_LEN && (LINE[end] & 0xC0) == 0x80 {
+            end += 1;
+        }
+        let n = end - LINE_CURSOR;
+        if end < LINE_LEN {
+            LINE.copy_within(end..LINE_LEN, LINE_CURSOR);
+        }
+        LINE_LEN -= n;
     }
 }
 
@@ -825,6 +914,7 @@ pub fn panic_begin() {
         HISTORY_COUNT = 0;
         HISTORY_START = 0;
         LINE_LEN = 0;
+        LINE_CURSOR = 0;
         SCROLL_OFFSET = 0;
         CURSOR_AT = None;
         FB.clear(0x40_00_00);

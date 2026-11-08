@@ -125,7 +125,60 @@ fn resolve_in_cwd(cwd: &str, arg: &str) -> Option<&'static str> {
 /// 「最坏情况别把 shell 卡住」的保险 —— 到点就退回"只写串口/内核终端"的老路。
 const CONSOLE_WAIT_MS: u64 = 1000;
 
+/// shell 命令名（Tab 补全用；与 [`shell_exec`] 的 match 保持一致）。
+const COMMANDS: &[&str] = &[
+    "help",
+    "echo",
+    "uname",
+    "version",
+    "pwd",
+    "ls",
+    "cat",
+    "run",
+    "wget",
+    "net",
+    "ifconfig",
+    "ping",
+    "ping6",
+    "dns",
+    "nslookup",
+    "wifi",
+    "lspci",
+    "dmesg",
+    "cd",
+    "mkdir",
+    "touch",
+    "rm",
+    "mv",
+    "ln",
+    "chmod",
+    "chown",
+    "truncate",
+    "stat",
+    "lstat",
+    "readlink",
+    "mkfs.mfs",
+    "mfs.primary",
+    "mfs.snap",
+    "mfs.snaps",
+    "mfs.rollback",
+    "mfs.gc",
+    "mfs.fsck",
+    "mfs.sync",
+    "df",
+    "part.create",
+    "part.del",
+    "part.wipe",
+    "part.reload",
+    "clear",
+    "poweroff",
+    "halt",
+    "shutdown",
+    "reboot",
+];
+
 /// 域 8 — Shell: 分配结果页 → 循环「提示符 → 读行 → 执行命令」。
+/// shell 主入口（G4：输入完全在用户态，内核只搬按键字节）。
 pub fn run() {
     // 分配 shell 专用结果页并共享给各文件服务 (同地址映射); ls/cat 的结果写在此页。
     if sys_alloc_page(vfs::SHELL_RESULT_BUF) != 1 {
@@ -203,14 +256,31 @@ pub fn run() {
     }
 
     let mut line = [0u8; SHELL_LINE_MAX];
+    // 提示符先拼成一个字符串：Tab 补全需要换行重画时由 readline 原样再打一遍。
+    let mut prompt = [0u8; 128];
     loop {
-        // 行内提示符: 与用户输入同处一行, 形如正常终端 `[user@host cwd]$ `。
-        print("[morion@morion ");
-        print(st.cwd_str());
-        print("]$ ");
+        let mut plen = 0usize;
+        for &b in b"[morion@morion " {
+            prompt[plen] = b;
+            plen += 1;
+        }
+        for &b in st.cwd_str().as_bytes() {
+            if plen < prompt.len() {
+                prompt[plen] = b;
+                plen += 1;
+            }
+        }
+        for &b in b"]$ " {
+            if plen < prompt.len() {
+                prompt[plen] = b;
+                plen += 1;
+            }
+        }
+        let prompt = unsafe { core::str::from_utf8_unchecked(&prompt[..plen]) };
+        print(prompt);
         syscall::flush();
 
-        let n = morion::console::readline(&mut line);
+        let n = morion::console::readline(&mut line, prompt, COMMANDS);
         if n == u64::MAX {
             println("shell: readline FAILED");
             return;
