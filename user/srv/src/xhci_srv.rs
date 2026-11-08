@@ -561,14 +561,19 @@ impl Xhci {
         rd32(reg)
     }
 
-    /// 找到第一个可用端口，返回 (端口号, 速度)。
+    /// 找到一个可用端口，返回 (端口号, 速度)。
     ///
-    /// **默认不复位端口**：HCRST 之后控制器会自己重新检测设备，USB2 端口自己走一遍
-    /// Polling(7) → Enabled(U0)，完成后 PRC=1，设备已回到默认地址 0 —— 此时
-    /// `Address Device` 能直接成功。旧实现在端口还在 Polling 时抢着写 PR / 断 VBUS
-    /// (而且 PORT_CSC 写错成了 LWS)，真机上会把链路打成 Recovery(8)，于是每次
-    /// `Address Device` 都是 cc=4。复位只作为兜底。
+    /// **USB3 连接器在控制器上占两个端口**（一个 SuperSpeed，一个 USB2 伴随口）。
+    /// 设备以 SS 工作时，伴随口报告 `CCS=1 / PED=0 / PLS=4(Disabled)` —— 这是正常的，
+    /// 它归 SS 口所有；此时去复位它会把设备踢回 High Speed（真机实测 spd 从 4 掉到 3，
+    /// 随后首笔 GET_DESCRIPTOR 报 cc=3 Babble）。
+    ///
+    /// 故顺序是：① 先只读普查，**优先挑已经是 SuperSpeed 且已使能**的端口；
+    /// ② 没有就等控制器自己把链路训练完（USB3 比 USB2 慢，给 1.5 s）；
+    /// ③ 仍不行才手动复位，且跳过伴随口。
     fn find_port(&self) -> Option<(u32, u32)> {
+        // ① 只读普查：找已经 Enable(U0) 的端口，SS 优先。
+        let mut ready: Option<(u32, u32)> = None;
         let mut p = 1u32;
         while p <= self.num_ports {
             let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
@@ -578,15 +583,43 @@ impl Xhci {
                 sys_sleep(20);
                 sc = rd32(reg);
             }
+            if sc & PORT_CCS != 0 && sc & PORT_PED != 0 && sc & PORT_PLS_MASK == 0 {
+                let speed = (sc >> 10) & 0xF;
+                let ss = speed == 4 || speed == 5;
+                if ss || ready.is_none() {
+                    ready = Some((p, speed));
+                    if ss {
+                        break;
+                    }
+                }
+            }
+            p += 1;
+        }
+        if let Some((port, speed)) = ready {
+            let reg = self.op + OP_PORT_BASE + ((port as u64 - 1) * OP_PORT_STRIDE);
+            let sc = rd32(reg);
+            port_write(reg, sc, PORT_CSC | PORT_PRC);
+            self.log_port(port, "auto", rd32(reg));
+            return Some((port, speed));
+        }
+
+        // ② 没有现成的：等控制器自己训练链路，然后才考虑复位。
+        let mut p = 1u32;
+        while p <= self.num_ports {
+            let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
+            let sc = rd32(reg);
             if sc & PORT_CCS == 0 {
                 p += 1;
                 continue;
             }
-            // 诊断: 固件/控制器留下的端口状态 (十进制字段, 见 `log_port`)。
+            // USB2 伴随口（CCS=1 但 Disabled）跟着 SS 口走，别碰。
+            if sc & PORT_PED == 0 && (sc & PORT_PLS_MASK) >> 5 == 4 {
+                self.log_port(p, "companion", sc);
+                p += 1;
+                continue;
+            }
             self.log_port(p, "pre", sc);
-
-            // ① 先让控制器自己把端口带起来 (USB2 端口的 Polling(7) 就是它自己的复位过程)。
-            if let Some(sc) = wait_ready(reg, 1000) {
+            if let Some(sc) = wait_ready(reg, 1500) {
                 port_write(reg, sc, PORT_CSC | PORT_PRC);
                 let sc = rd32(reg);
                 if sc & PORT_PED != 0 {
@@ -595,7 +628,7 @@ impl Xhci {
                 }
             }
 
-            // ② 兜底: 手动端口复位, 最多 3 次。
+            // ③ 兜底: 手动端口复位, 最多 3 次。
             let mut tries = 0u32;
             while tries < 3 {
                 self.log_port(p, "retry", self.reset_port(p));
