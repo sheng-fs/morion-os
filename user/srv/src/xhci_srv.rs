@@ -1904,7 +1904,7 @@ fn address_device(hc: &mut Xhci, slot: u32, speed: u32, port: u32, mps: u16) -> 
     // 每次（重新）寻址都把 EP0 传输环清零重来：上一次失败的控制传输 TD 可能还挂在
     // 环里，新 slot 的 EP0 从环首执行时读到的是**旧的** SETUP/DATA/STATUS —— 表现就是
     // 首笔 GET_DESCRIPTOR 永远等不到完成事件（真机实测 `EP0 req=6 no completion event`）。
-    unsafe { zero_bytes(hc.ep0.va as *mut u8, PAGE as usize) };
+    zero_bytes(hc.ep0.va as *mut u8, PAGE as usize);
     hc.ep0.enq = 0;
     hc.ep0.pcs = true;
     hc.ep0.write_link();
