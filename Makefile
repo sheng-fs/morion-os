@@ -100,6 +100,11 @@ EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 # 可引导 U 盘镜像 (Phase 0 / P0.4): 与 ISO 同源, 但额外叠了 GPT/ESP 混合布局。
 USB_IMAGE     := $(OUT_DIR)/morion-usb.img
+# 带“持久化数据分区”的 U 盘镜像: ESP 之后追加一个 exFAT 分区（默认 512 MiB）。
+# ⚠️ 这不是 Linux live 的 overlay 持久化 —— MorionOS 的根 `/` 本身就是可写 FAT32；
+# 这个分区只是给日志/测试文件一个独立、容量更大的落点，启动后由 exFAT 服务挂到 `/usb`。
+PERSIST_MIB   ?= 512
+USB_PERSIST_IMAGE := $(OUT_DIR)/morion-usb-persist.img
 
 # QEMU 配置
 QEMU_MEM      ?= 2G
@@ -357,6 +362,34 @@ usbimg: iso
 	@echo ""
 	@echo "  写入 U 盘 (⚠ 会清空目标盘, 先用 lsblk 确认设备名, 别写错盘!):"
 	@echo "    sudo dd if=$(USB_IMAGE) of=/dev/sdX bs=4M status=progress conv=fsync"
+	@echo "  真机启动前请进 BIOS **关闭 Secure Boot** (MorionOS 的引导器未签名)。"
+
+# 带持久化数据分区（用户界面里常叫“持久化分区”）的 U 盘镜像。
+#
+# 分区布局: [2048, ESP] + [PERSIST, exFAT]。ESP 仍是可写根 `/`；exFAT 分区启动后
+# 自动挂到 `/usb`（MorionOS 的 exFAT 服务支持读写），用来保存 dmesg 日志和测试文件。
+# 注意: 它不参与启动，也不会改变“设备能否被 xHCI 枚举/BOT 是否成功”。
+.PHONY: usbimg-persist
+usbimg-persist: iso
+	@echo "==> 生成带持久化数据分区的 U 盘镜像 (ESP + exFAT $(PERSIST_MIB) MiB)..."
+	@esp_secs=$$(stat -c %s $(EFIBOOT_IMG) | awk '{print int($$1/512)}'); \
+	total_mib=$$((80 + $(PERSIST_MIB))); \
+	rm -f $(USB_PERSIST_IMAGE) $(OUT_DIR)/persist.img; \
+	dd if=/dev/zero of=$(USB_PERSIST_IMAGE) bs=1M count=$$total_mib status=none; \
+	LC_ALL=C sgdisk -n 1:2048:+$$esp_secs -t 1:ef00 -c 1:MORIONOS $(USB_PERSIST_IMAGE) >/dev/null; \
+	dd if=$(EFIBOOT_IMG) of=$(USB_PERSIST_IMAGE) bs=1M seek=1 conv=notrunc status=none; \
+	LC_ALL=C sgdisk -n 2:0:+$(PERSIST_MIB)M -t 2:0700 -c 2:PERSIST $(USB_PERSIST_IMAGE) >/dev/null; \
+	part_start=$$(LC_ALL=C sgdisk -i 2 $(USB_PERSIST_IMAGE) | awk '/First sector/ {print $$3}'); \
+	dd if=/dev/zero of=$(OUT_DIR)/persist.img bs=1M count=$(PERSIST_MIB) status=none; \
+	mkfs.exfat -n PERSIST $(OUT_DIR)/persist.img >/dev/null; \
+	dd if=$(OUT_DIR)/persist.img of=$(USB_PERSIST_IMAGE) bs=512 seek=$$part_start conv=notrunc status=none; \
+	sync
+	@ls -lh $(USB_PERSIST_IMAGE)
+	@LC_ALL=C sgdisk -p $(USB_PERSIST_IMAGE) 2>/dev/null | sed -n '4,20p' || true
+	@echo ""
+	@echo "  写入 U 盘 (⚠ 会清空目标盘, 先用 lsblk 确认设备名, 别写错盘!):"
+	@echo "    sudo dd if=$(USB_PERSIST_IMAGE) of=/dev/sdX bs=4M status=progress conv=fsync"
+	@echo "    sudo sgdisk -e /dev/sdX   # 把备份 GPT 从 592MiB 处挪到盘尾"
 	@echo "  真机启动前请进 BIOS **关闭 Secure Boot** (MorionOS 的引导器未签名)。"
 
 # ============================================================
