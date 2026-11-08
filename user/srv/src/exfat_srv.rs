@@ -1862,9 +1862,17 @@ pub fn run() {
     }
     block_wb_enable(EXFAT_WB_VADDR, EXFAT_WB_PAGES, EXFAT_WB_DESC_VADDR);
     // 认领卷: 第一个 exFAT 签名的卷; 无分区表的整盘镜像即卷 5 (回退值)。
+    //
+    // ⚠️ 必须用 `vol_claim_wait`: 真机上 U 盘/AHCI 的枚举可能晚于本服务启动。
+    // 之前用 `vol_claim` 立刻查表，查不到就回退卷 5 → 挂载失败 → init 重启几次后
+    // 放弃；表现就是根 FAT32 挂上了、`/usb` 的 exFAT 分区却永远不出现。
+    let vol = match vol_claim_wait(exfat_pg(), 16, VOL_KIND_EXFAT, 10_000) {
+        Some(v) => v,
+        None => EXFAT_VOL_FALLBACK,
+    };
     unsafe {
-        EXFAT_VOL = vol_claim(exfat_pg(), 16, VOL_KIND_EXFAT, EXFAT_VOL_FALLBACK);
-        EXFAT_CUR_VOL = EXFAT_VOL;
+        EXFAT_VOL = vol;
+        EXFAT_CUR_VOL = vol;
     }
     let stage = exfat_mount();
     if stage != 0 {
