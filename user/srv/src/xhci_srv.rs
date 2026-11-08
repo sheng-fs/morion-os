@@ -1233,6 +1233,20 @@ fn configure_hid(hc: &mut Xhci, slot: u32, dci: u32, mps: u16, interval: u8) -> 
     }
 }
 
+/// 每个控制器打印一行**探测结论**（真机跑一次 `dmesg -g probe` 就能看全整机 USB 拓扑）。
+///
+/// 真机没有串口、也没有 `lsusb`，驱动日志又长又散；这行是给人拍照用的摘要。
+fn probe_line(idx: u32, vid: u16, pid: u16, result: &str) {
+    print("xhci: probe ctrl#");
+    print_u64(idx as u64);
+    print(" vid=0x");
+    print_hex(vid as u64);
+    print(" pid=0x");
+    print_hex(pid as u64);
+    print(" result=");
+    println(result);
+}
+
 /// 探测一台控制器：初始化 → 找端口 → 地址设备 → 识别存储 / HID 键盘。
 fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     if g.dma_bytes < DMA_PAGES * PAGE {
@@ -1396,6 +1410,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
             print("xhci: ctrl#");
             print_u64(idx as u64);
             println(": no connected USB device");
+            probe_line(idx, 0, 0, "no-device");
             return ProbeOutcome::None;
         }
     };
@@ -1482,28 +1497,33 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     }
     if !ready {
         println("xhci: device unusable on this controller");
+        probe_line(idx, 0, 0, "desc-fail");
         return ProbeOutcome::None;
     }
     let bmax0 = rd8(hc.data_va + 7) as u16;
     // ⚠️ 必须在读配置描述符**之前**取：两次读都用 hc.data_va，后者会覆盖前者。
     let dev_class = rd8(hc.data_va + 4);
     let prod_idx = rd8(hc.data_va + 15);
+    let vid = ((rd8(hc.data_va + 9) as u16) << 8) | rd8(hc.data_va + 8) as u16;
+    let pid = ((rd8(hc.data_va + 11) as u16) << 8) | rd8(hc.data_va + 10) as u16;
     print("xhci: device descriptor vid=0x");
-    print_hex(((rd8(hc.data_va + 9) as u64) << 8) | rd8(hc.data_va + 8) as u64);
+    print_hex(vid as u64);
     print(" pid=0x");
-    print_hex(((rd8(hc.data_va + 11) as u64) << 8) | rd8(hc.data_va + 10) as u64);
+    print_hex(pid as u64);
     print(" bMaxPacket0=");
     print_u64(bmax0 as u64);
     println("");
 
     if !hc.control(0x80, 6, 2 << 8, 0, 9, true, hc.data_pa) {
         println("xhci: GET_DESCRIPTOR(config,9) FAILED");
+        probe_line(idx, vid, pid, "cfg-fail");
         return ProbeOutcome::None;
     }
     let total = (rd8(hc.data_va + 2) as u32) | ((rd8(hc.data_va + 3) as u32) << 8);
     let want = if total > 512 { 512 } else { total };
     if want < 9 || !hc.control(0x80, 6, 2 << 8, 0, want as u16, true, hc.data_pa) {
         println("xhci: GET_DESCRIPTOR(config,full) FAILED");
+        probe_line(idx, vid, pid, "cfg-fail");
         return ProbeOutcome::None;
     }
     let iface = parse_config(hc.data_va, want);
@@ -1528,6 +1548,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     log_product_string(&mut hc, prod_idx);
     if iface.class == 0x09 {
         println("xhci: this is a USB hub - devices behind it are not scanned");
+        probe_line(idx, vid, pid, "hub");
     }
 
     // ---- USB HID 键盘（class=03 且带中断 IN；不要求 boot 子类/协议）----
@@ -1537,10 +1558,12 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         }
         if !hc.control(0x00, 9, 1, 0, 0, false, 0) {
             println("xhci: kbd SET_CONFIGURATION FAILED");
+            probe_line(idx, vid, pid, "hid-setcfg-fail");
             return ProbeOutcome::None;
         }
         if !configure_hid(&mut hc, slot, dci, mps, interval) {
             println("xhci: kbd Configure Endpoint FAILED");
+            probe_line(idx, vid, pid, "hid-cfgep-fail");
             return ProbeOutcome::None;
         }
         // SET_PROTOCOL(boot)；个别键盘不认，仍按 boot report 尝试。
@@ -1556,6 +1579,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         print(") interval=");
         print_u64(interval as u64);
         println("");
+        probe_line(idx, vid, pid, "hid-keyboard");
         return ProbeOutcome::Keyboard(KeyboardDev {
             hc,
             dci,
@@ -1569,6 +1593,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         (Some(a), Some(b)) => (a, b),
         _ => {
             println("xhci: device ignored (unsupported interface class)");
+            probe_line(idx, vid, pid, "other");
             return ProbeOutcome::None;
         }
     };
@@ -1588,17 +1613,20 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
 
     if !hc.control(0x00, 9, 1, 0, 0, false, 0) {
         println("xhci: SET_CONFIGURATION FAILED");
+        probe_line(idx, vid, pid, "storage-setcfg-fail");
         return ProbeOutcome::None;
     }
 
     if !configure_endpoints(&mut hc, slot) {
         println("xhci: Configure Endpoint FAILED");
+        probe_line(idx, vid, pid, "storage-cfgep-fail");
         return ProbeOutcome::None;
     }
     hc.log("bulk endpoints configured");
 
     if !hc.scsi_inquiry() {
         println("xhci: INQUIRY FAILED");
+        probe_line(idx, vid, pid, "storage-inquiry-fail");
         return ProbeOutcome::None;
     }
     print("xhci: inquiry vendor=");
@@ -1617,6 +1645,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         Some(v) => v,
         None => {
             println("xhci: READ CAPACITY FAILED");
+            probe_line(idx, vid, pid, "storage-capacity-fail");
             return ProbeOutcome::None;
         }
     };
@@ -1652,9 +1681,11 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
 
     if !attach_to_block(cap_sectors) {
         println("xhci: attach to block_srv FAILED (send refused), idle");
+        probe_line(idx, vid, pid, "attach-fail");
         return ProbeOutcome::None;
     }
 
+    probe_line(idx, vid, pid, "storage");
     ProbeOutcome::Storage(StorageDev { hc, cap_sectors })
 }
 
