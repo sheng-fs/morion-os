@@ -1247,6 +1247,18 @@ fn probe_line(idx: u32, vid: u16, pid: u16, result: &str) {
     println(result);
 }
 
+/// 失败分支的探测结论：多带端口/速度，用来看"是哪一类端口上的设备"。
+fn probe_line_port(idx: u32, port: u32, speed: u32, result: &str) {
+    print("xhci: probe ctrl#");
+    print_u64(idx as u64);
+    print(" port=");
+    print_u64(port as u64);
+    print(" spd=");
+    print_u64(speed as u64);
+    print(" result=");
+    println(result);
+}
+
 /// 探测一台控制器：初始化 → 找端口 → 地址设备 → 识别存储 / HID 键盘。
 fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     if g.dma_bytes < DMA_PAGES * PAGE {
@@ -1497,7 +1509,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     }
     if !ready {
         println("xhci: device unusable on this controller");
-        probe_line(idx, 0, 0, "desc-fail");
+        probe_line_port(idx, port, speed, "desc-fail");
         return ProbeOutcome::None;
     }
     let bmax0 = rd8(hc.data_va + 7) as u16;
@@ -1852,6 +1864,13 @@ fn restore_slot_ctx(hc: &Xhci, entries: u32) {
 /// Address Device：装配 slot + EP0 上下文并发命令。
 fn address_device(hc: &mut Xhci, slot: u32, speed: u32, port: u32, mps: u16) -> bool {
     let (slot_ctx, ep_base) = clear_input(hc);
+    // 每次（重新）寻址都把 EP0 传输环清零重来：上一次失败的控制传输 TD 可能还挂在
+    // 环里，新 slot 的 EP0 从环首执行时读到的是**旧的** SETUP/DATA/STATUS —— 表现就是
+    // 首笔 GET_DESCRIPTOR 永远等不到完成事件（真机实测 `EP0 req=6 no completion event`）。
+    unsafe { zero_bytes(hc.ep0.va as *mut u8, PAGE as usize) };
+    hc.ep0.enq = 0;
+    hc.ep0.pcs = true;
+    hc.ep0.write_link();
     // 输入控制上下文：Add flags = A0(slot) | A1(EP0)。
     wr32(hc.input_va + 4, 0b11);
     // Slot 上下文 DWORD0：Context Entries=1（只配 EP0）+ Speed（bits 23:20）。
