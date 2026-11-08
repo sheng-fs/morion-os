@@ -70,6 +70,9 @@ const PORT_LWS: u32 = 1 << 16;
 /// CSC = bit17、PRC = bit21（⚠️ 不是 16 / 20 —— 差一位就会写成 LWS / OCC）。
 const PORT_CSC: u32 = 1 << 17;
 const PORT_PRC: u32 = 1 << 21;
+/// Warm Port Reset (bit31)：**只有它能把已退回 USB2 的 USB3 设备重新拉回 SuperSpeed**。
+/// 普通 Port Reset 只会在当前速率上复位。USB2 端口上写这一位无效，故可以无脑先试。
+const PORT_WPR: u32 = 1 << 31;
 
 // ---------------------------------------------------------------------------
 // 运行时寄存器（MMIO + RTSOFF；interrupter 0 = +0x20）
@@ -624,6 +627,28 @@ impl Xhci {
                 let sc = rd32(reg);
                 if sc & PORT_PED != 0 {
                     self.log_port(p, "auto", sc);
+                    return Some((p, (sc >> 10) & 0xF));
+                }
+            }
+
+            // ②' Warm Reset：USB3 设备被固件/上次枚举留在 USB2 模式时，普通 PR 只会在
+            // 当前速率上原地复位；Warm Reset 才能让链路重新训练回 SuperSpeed。
+            // USB2 端口上这一位无效（写了被忽略），所以可以无脑先试。
+            let sc = rd32(reg);
+            port_write(reg, sc, PORT_PP | PORT_WPR);
+            let mut t = 0u32;
+            while t < 500 {
+                if rd32(reg) & PORT_WPR == 0 {
+                    break;
+                }
+                sys_sleep(1);
+                t += 1;
+            }
+            if let Some(sc) = wait_ready(reg, 1000) {
+                port_write(reg, sc, PORT_CSC | PORT_PRC);
+                let sc = rd32(reg);
+                if sc & PORT_PED != 0 {
+                    self.log_port(p, "warm", sc);
                     return Some((p, (sc >> 10) & 0xF));
                 }
             }
@@ -1455,6 +1480,15 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     print("xhci: ctrl#");
     print_u64(idx as u64);
     println(" started (controller running)");
+
+    // 全端口普查：真机只能靠这几行看清 SuperSpeed / USB2 两条 lane 的分布
+    // （USB3 连接器 = 1 个 SS 口 + 1 个 USB2 伴随口，两者会同时报 CCS）。
+    let mut cp = 1u32;
+    while cp <= num_ports {
+        let reg = op + OP_PORT_BASE + ((cp as u64 - 1) * OP_PORT_STRIDE);
+        hc.log_port(cp, "census", rd32(reg));
+        cp += 1;
+    }
 
     // ---- 端口复位 ----
     let (port, speed) = match hc.find_port() {
