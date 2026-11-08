@@ -6,6 +6,37 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 2026-11-08
+
+**真机 USB 3.2 10Gbps 存储 + 持久化分区打通。**
+
+### 新增 / 修复
+
+- **xHCI SuperSpeed 链路**：控制器启动后等待 RxDetect → Polling → U0；已连接未使能的
+  USB3 端口用 `WPR`（Warm Reset）重新训练，USB2 端口退回 `PR`。
+- **UAS 盘 BOT 兼容**：只解析 `bAlternateSetting = 0` 的端点，修复 UAS 盘把
+  alt1 的 EP3/EP4 误当 Bulk 对、导致 `INQUIRY` 超时。
+- **exFAT 迟挂载**：`exfat_srv` 改用 `vol_claim_wait`，等 USB/AHCI 卷出现再认领；
+  修复真机根 FAT32 挂上、`/usb` 永不出现。
+- **持久化数据分区**：新增 `make SAFE=1 usbimg-persist`，在 ESP 后追加 512MiB exFAT
+  `PERSIST`，启动后挂到 `/usb`。
+
+### 验证
+
+- 真机 thinkplus 256GB：`port 4 spd=5`、BOT alt0（EP1 OUT / EP2 IN）、INQUIRY
+  `SMI USB DISK`、`READ CAPACITY = 500118192` 扇区。
+- `USB1 xhci OK` → `block: usb volume attached` → `fat32: volume vol=2` →
+  `exfat-dbg: clusters=16320`；`ls /` 可见 `EFI`，`ls /usb` 可打开，
+  `touch /usb/ok.txt` 与 `dmesg /usb/usb.log` 均报告成功。
+
+### 已知问题
+
+- PERSIST 写入跨关机/拔盘不持久（guest 报成功，宿主看到空分区）；下一步补
+  exFAT flush、BOT `SYNCHRONIZE CACHE(10)` 与关机 sync。
+- 单设备/控制器、Hub 下游未扫描、仅 BOT、无 MSI-X。
+
+详见 [docs/milestone-usb-storage.md](docs/milestone-usb-storage.md)。
+
 ## [Unreleased] — 2026-11-04
 
 **真机收尾：启动盘限制 / 多 xHCI + USB HID / ACPI 关机 / 诊断。**
