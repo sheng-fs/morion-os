@@ -210,6 +210,8 @@ pub struct FbInfo {
 /// 镜像要先整段放进调用方的地址空间, 这个上限既挡恶意的"巨大长度", 也避免内核
 /// 为一个请求遍历过多页; 真正的页数上限在 `exec::MAX_IMAGE_PAGES`。
 const MAX_ELF_LEN: u64 = 1024 * 1024;
+/// `SYS_PUTS` 单次打印的字节上限 (与 `klog::LOG_READ_MAX` 同量级)。
+const MAX_PRINT_LEN: u64 = 1 << 20;
 
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
@@ -306,6 +308,43 @@ fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
         buf.copy_from_slice(src);
         buf
     }
+}
+
+/// 纯地址范围校验: `[ptr, ptr+len)` 须整体落在用户空间 (P4[1]) 且不回绕。
+///
+/// 只做算术/范围判定, 不碰页表 —— 便于宿主单测 (见文末 tests);
+/// 逐页"已映射"检查由 [`valid_user_buffer`] 在其上补齐。
+fn user_range_ok(ptr: u64, len: u64) -> bool {
+    if ptr == 0 || len == 0 || !crate::memory::paging::is_user_address(ptr) {
+        return false;
+    }
+    match ptr.checked_add(len) {
+        Some(end) => crate::memory::paging::is_user_address(end - 1),
+        None => false,
+    }
+}
+
+/// 校验用户缓冲 `[ptr, ptr+len)` 可被内核以调用方 CR3 直接访问: 整段在用户空间
+/// 且逐页已映射。
+///
+/// 为什么必须校验: `Domain::new` 把内核 PML4 条目 (恒等 / offset / 高半区) 复制进了
+/// 每个域的页表, 而 syscall 全程运行在调用方 CR3 上 —— 不校验地址范围, 用户态传进
+/// 来的内核虚拟地址在 Ring 0 下照样可解引用, 等于开放内核任意读/写; 不校验映射,
+/// 走到未映射页会在内核态缺页 (红屏停机, 见 `idt::page_fault_handler`)。
+fn valid_user_buffer(ptr: u64, len: u64) -> bool {
+    if !user_range_ok(ptr, len) {
+        return false;
+    }
+    let from = crate::scheduler::current_domain();
+    let end = ptr + len;
+    let mut page = ptr & !0xFFF;
+    while page < end {
+        if crate::memory::paging::resolve_user_page(from, page).is_none() {
+            return false;
+        }
+        page += 4096;
+    }
+    true
 }
 
 /// 校验并取出用户态交来的 ELF 镜像缓冲区 (`SYS_SPAWN_ELF` / `SYS_SPAWN_ELF_AT` 共用)。
@@ -408,6 +447,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_RECV => {
             // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
+            // 回写缓冲先过信任边界再取消息 (校验不过就不消费邮箱):
+            // 消息含调用方可见的 payload, 写进内核地址 = 任意内核写。
+            if a1 != 0 && !valid_user_buffer(a1, core::mem::size_of::<crate::ipc::Message>() as u64)
+            {
+                return 0;
+            }
             let msg = crate::ipc::receive();
             if a1 != 0 {
                 unsafe {
@@ -732,9 +777,17 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            // 缓冲必须整段落在已映射的用户空间 (长度以 MAX_PRINT_LEN 封顶,
+            // 与 klog::LOG_READ_MAX 同量级), 否则拒绝 —— 裸读内核地址会泄漏
+            // 内核内存, 无界长度会走进未映射页造成内核态缺页停机。
+            if a2 > MAX_PRINT_LEN || !valid_user_buffer(a1, a2) {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
-            crate::video::print(s);
+            match core::str::from_utf8(slice) {
+                Ok(s) => crate::video::print(s),
+                Err(_) => return 0,
+            }
             0
         }
         SYS_SPAWN_ELF => {
@@ -904,6 +957,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_TRY_RECV => {
             // 非阻塞收: 有消息就把完整消息写回 `a1` 并返回 tag; 邮箱空返回 u64::MAX。
+            // 回写缓冲先过信任边界再看邮箱 (校验不过不消费消息, 与 SYS_RECV 一致):
+            // 写进内核地址 = 任意内核写。
+            if a1 != 0 && !valid_user_buffer(a1, core::mem::size_of::<crate::ipc::Message>() as u64)
+            {
+                return u64::MAX;
+            }
             match crate::ipc::try_receive() {
                 Some(msg) => {
                     if a1 != 0 {
@@ -985,4 +1044,53 @@ pub fn init() {
 
     // SFMASK: 进入 syscall 时清除 IF (处理期间关中断, 防止重入)。
     SFMask::write(RFlags::INTERRUPT_FLAG);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用户缓冲范围校验必须把内核虚拟地址整体拒之门外。
+    ///
+    /// 背景 (CVE 级回归): `SYS_RECV`/`SYS_TRY_RECV` 的回写指针与 `SYS_PUTS` 的读指针
+    /// 曾不做任何校验。syscall 全程跑在调用方 CR3 上, 而 `Domain::new` 把内核 PML4
+    /// 条目复制进了每个域的页表 —— 不校验等于把"内核任意读/写"交到用户态手里。
+    /// 这里钉死 `user_range_ok` 对各类内核映射区间的拒绝行为 (映射检查走页表,
+    /// 宿主单测无法覆盖, 由 QEMU 端到端自测兜底)。
+    #[test]
+    fn user_range_ok_rejects_kernel_addresses() {
+        const MSG: u64 = core::mem::size_of::<crate::ipc::Message>() as u64;
+
+        // 拒绝: 零地址 / 零长度。
+        assert!(!user_range_ok(0, MSG));
+        assert!(!user_range_ok(crate::memory::paging::USER_SPACE_BASE, 0));
+
+        // 拒绝: 恒等映射 (P4[0]) —— 低物理内存直映区。
+        assert!(!user_range_ok(0x0000_0000_0010_0000, MSG));
+        // 拒绝: offset 映射 (P4[256]) —— 全部物理内存的内核视图。
+        assert!(!user_range_ok(0xFFFF_8000_0000_0000, MSG));
+        // 拒绝: 内核堆 (P4[136])。
+        assert!(!user_range_ok(0x0000_4444_4444_0000, MSG));
+        // 拒绝: 内核高半区 (P4[511]) —— CAP_TABLE / 调度器等静态数据所在。
+        assert!(!user_range_ok(0xFFFF_FFFF_8000_0000, MSG));
+
+        // 拒绝: 区间起点在用户空间但**终点**跨进 P4[2] (越过用户空间上界)。
+        let tail = 0x0000_00FF_FFFF_FFF0;
+        assert!(crate::memory::paging::is_user_address(tail));
+        assert!(!user_range_ok(tail, 0x20));
+
+        // 拒绝: 长度回绕 (ptr + len 溢出 u64)。
+        assert!(!user_range_ok(
+            crate::memory::paging::USER_SPACE_BASE,
+            u64::MAX
+        ));
+
+        // 放行: P4[1] 用户空间内的整段区间。
+        assert!(user_range_ok(crate::memory::paging::USER_SPACE_BASE, MSG));
+        assert!(user_range_ok(
+            crate::memory::paging::USER_SPACE_BASE,
+            1 << 20
+        ));
+        assert!(user_range_ok(0x0000_00FF_FFFF_FFF0, 0x10));
+    }
 }
