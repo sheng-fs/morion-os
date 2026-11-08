@@ -73,6 +73,15 @@ const PORT_PRC: u32 = 1 << 21;
 /// Warm Port Reset (bit31)：**只有它能把已退回 USB2 的 USB3 设备重新拉回 SuperSpeed**。
 /// 普通 Port Reset 只会在当前速率上复位。USB2 端口上写这一位无效，故可以无脑先试。
 const PORT_WPR: u32 = 1 << 31;
+/// SuperSpeed 端口在控制器 `RS=1` 后要经历 RxDetect → Polling → U0，
+/// 真机实测几百毫秒内 `CCS` 才会置 1。控制器刚启动就普查会把 SS 口误判成“没插设备”。
+const LINK_POLL_MS: u32 = 10;
+/// 一个控制器都没看到设备时最多等这么久（避免 13 台空控制器拖慢启动）。
+const LINK_WAIT_EMPTY_MS: u32 = 250;
+/// 至少看到一个设备后，再给同控制器的其它端口留这么久（USB3 训练慢）。
+const LINK_WAIT_MIN_MS: u32 = 600;
+/// 硬上限。
+const LINK_WAIT_MAX_MS: u32 = 1200;
 
 // ---------------------------------------------------------------------------
 // 运行时寄存器（MMIO + RTSOFF；interrupter 0 = +0x20）
@@ -196,7 +205,7 @@ impl Ring {
     /// 下一个待取 TRB 的物理地址（含 DCS）—— Evaluate Context 要交回**当前**位置，
     /// 不能写环首，否则控制器会把已执行过的 TRB 再跑一遍。
     fn deq_pa(&self) -> u64 {
-        self.pa + (self.enq as u64) * 16 | u64::from(self.pcs)
+        (self.pa + (self.enq as u64) * 16) | u64::from(self.pcs)
     }
 
     /// 压入一个 TRB（自动补 cycle bit、处理回绕）。
@@ -534,10 +543,14 @@ impl Xhci {
 
     /// 手动复位一个端口（`Address Device` 失败后的兜底），返回终态 PORTSC。
     ///
-    /// 规范 (xHCI 4.19.1.2.4)：只有 PED=0 时才能写 PR=1，所以先禁用再复位。
+    /// 规范 (xHCI 4.19.5)：只有 PED=0 时才能触发复位；USB3 端口要写 **Warm Port Reset**
+    /// （bit31，链路重新训练，能回 SuperSpeed），USB2 端口写 **Port Reset**（bit4）。
+    /// 二者不能同时置 1。
     fn reset_port(&self, port: u32) -> u32 {
         let reg = self.op + OP_PORT_BASE + ((port as u64 - 1) * OP_PORT_STRIDE);
         let mut sc = rd32(reg);
+        // 禁用前先记住速率：USB3 设备复位后速度字段可能读回 0，事后就分不出来了。
+        let speed = (sc >> 10) & 0xF;
         if sc & PORT_PED != 0 {
             port_write(reg, sc, PORT_PED); // 写 PED=1 = 禁用
             let mut t = 0u32;
@@ -549,14 +562,20 @@ impl Xhci {
         sc = rd32(reg);
         port_write(reg, sc, PORT_CSC | PORT_PRC); // 先清挂起的变化位
         sc = rd32(reg);
-        port_write(reg, sc, PORT_PP | PORT_PR);
-        let mut t = 0u32;
-        while t < 500 {
-            if rd32(reg) & PORT_PR == 0 {
-                break;
+        if speed == 4 || speed == 5 {
+            port_write(reg, sc, PORT_PP | PORT_WPR);
+            let mut t = 0u32;
+            while t < 500 && rd32(reg) & PORT_WPR != 0 {
+                sys_sleep(1);
+                t += 1;
             }
-            sys_sleep(1);
-            t += 1;
+        } else {
+            port_write(reg, sc, PORT_PP | PORT_PR);
+            let mut t = 0u32;
+            while t < 500 && rd32(reg) & PORT_PR != 0 {
+                sys_sleep(1);
+                t += 1;
+            }
         }
         if let Some(sc) = wait_ready(reg, 500) {
             port_write(reg, sc, PORT_CSC | PORT_PRC);
@@ -564,102 +583,168 @@ impl Xhci {
         rd32(reg)
     }
 
-    /// 找到一个可用端口，返回 (端口号, 速度)。
+    /// 控制器 `RS=1` 后等各端口把链路训练完（USB3 的 `CCS` 不是立刻置 1）。
     ///
-    /// **USB3 连接器在控制器上占两个端口**（一个 SuperSpeed，一个 USB2 伴随口）。
-    /// 设备以 SS 工作时，伴随口报告 `CCS=1 / PED=0 / PLS=4(Disabled)` —— 这是正常的，
-    /// 它归 SS 口所有；此时去复位它会把设备踢回 High Speed（真机实测 spd 从 4 掉到 3，
-    /// 随后首笔 GET_DESCRIPTOR 报 cc=3 Babble）。
-    ///
-    /// 故顺序是：① 先只读普查，**优先挑已经是 SuperSpeed 且已使能**的端口；
-    /// ② 没有就等控制器自己把链路训练完（USB3 比 USB2 慢，给 1.5 s）；
-    /// ③ 仍不行才手动复位，且跳过伴随口。
-    fn find_port(&self) -> Option<(u32, u32)> {
-        // ① 只读普查：找已经 Enable(U0) 的端口，SS 优先。
-        let mut ready: Option<(u32, u32)> = None;
+    /// 之前的实现上电后只等 10 ms 就普查，真机上 SS 口还在 `PLS=5 (RxDetect)`、
+    /// `CCS=0`，于是被当成“空端口”跳过；同一控制器的 USB2 口先连上，设备名额被它占掉，
+    /// U 盘永远轮不到。这里至少等到“连接数不再变化”，并给 SS 口留够时间。
+    fn wait_connect(&self) {
+        let mut saw = false;
+        let mut last = 0u32;
+        let mut stable = 0u32;
+        let mut t = 0u32;
+        while t < LINK_WAIT_MAX_MS {
+            let mut n = 0u32;
+            let mut training = false;
+            let mut p = 1u32;
+            while p <= self.num_ports {
+                let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
+                let sc = rd32(reg);
+                if sc & PORT_CCS != 0 {
+                    n += 1;
+                }
+                // USB3 端口在 RxDetect(5)/Polling(7)/Recovery(8) 时链路还没训练完，
+                // 不能因为连接数暂时稳定就收工。
+                let pls = (sc & PORT_PLS_MASK) >> 5;
+                if sc & PORT_CCS == 0 && matches!(pls, 5 | 7 | 8) {
+                    training = true;
+                }
+                p += 1;
+            }
+            if n > 0 {
+                saw = true;
+            }
+            if n == last {
+                stable += LINK_POLL_MS;
+            } else {
+                last = n;
+                stable = 0;
+            }
+            // 没有设备：很快放弃；有设备：至少等 LINK_WAIT_MIN_MS，再等
+            // “连接数稳定 + 没有端口还在训练”。
+            if !saw && t >= LINK_WAIT_EMPTY_MS {
+                break;
+            }
+            if saw && t >= LINK_WAIT_MIN_MS && stable >= 150 && !training {
+                break;
+            }
+            sys_sleep(LINK_POLL_MS as u64);
+            t += LINK_POLL_MS;
+        }
+    }
+
+    /// 挑一个已经使能（PED=1 / PLS=U0）的端口，**SuperSpeed 优先**。
+    fn pick_ready(&self) -> Option<(u32, u32)> {
+        let mut best: Option<(u32, u32)> = None;
         let mut p = 1u32;
         while p <= self.num_ports {
             let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
-            let mut sc = rd32(reg);
-            if sc & PORT_PP == 0 {
-                port_write(reg, sc, PORT_PP);
-                sys_sleep(20);
-                sc = rd32(reg);
+            let sc = rd32(reg);
+            if !port_ready(sc) {
+                p += 1;
+                continue;
             }
-            if sc & PORT_CCS != 0 && sc & PORT_PED != 0 && sc & PORT_PLS_MASK == 0 {
-                let speed = (sc >> 10) & 0xF;
-                let ss = speed == 4 || speed == 5;
-                if ss || ready.is_none() {
-                    ready = Some((p, speed));
-                    if ss {
-                        break;
-                    }
-                }
+            let speed = (sc >> 10) & 0xF;
+            if speed == 4 || speed == 5 {
+                port_write(reg, sc, PORT_CSC | PORT_PRC);
+                self.log_port(p, "auto-ss", rd32(reg));
+                return Some((p, speed));
+            }
+            if best.is_none() {
+                best = Some((p, speed));
             }
             p += 1;
         }
-        if let Some((port, speed)) = ready {
+        if let Some((port, speed)) = best {
             let reg = self.op + OP_PORT_BASE + ((port as u64 - 1) * OP_PORT_STRIDE);
             let sc = rd32(reg);
             port_write(reg, sc, PORT_CSC | PORT_PRC);
             self.log_port(port, "auto", rd32(reg));
             return Some((port, speed));
         }
+        None
+    }
 
-        // ② 没有现成的：等控制器自己训练链路，然后才考虑复位。
+    /// 找到一个可用端口，返回 (端口号, 速度)。
+    ///
+    /// USB3 连接器在控制器上会占两个 PORTSC（SS 口 + USB2 伴随口），但**不能**用
+    /// “`CCS=1 / PED=0 / PLS=4`” 去猜伴随口 —— 刚启动时真正的 SS 口也是这个状态，
+    /// 之前正是这条判断把 U 盘所在的 SS 口跳过了。
+    ///
+    /// 正确顺序：
+    /// ① 已有使能端口 → 直接取（SS 优先）；
+    /// ② 已连接但未使能的端口 → 先等链路训练，再写 **Warm Reset**（USB3 专属；
+    ///    USB2 端口上该位被忽略），SS 一旦就绪立即返回；
+    /// ③ 仍不行 → 普通 Port Reset 兜底。
+    fn find_port(&self) -> Option<(u32, u32)> {
+        // ① 已经训练好的端口。
+        if let Some(v) = self.pick_ready() {
+            return Some(v);
+        }
+
+        // ② 已连接但还没使能：先等，再 Warm Reset 重新训练。
         let mut p = 1u32;
         while p <= self.num_ports {
             let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
             let sc = rd32(reg);
-            if sc & PORT_CCS == 0 {
-                p += 1;
-                continue;
-            }
-            // USB2 伴随口（CCS=1 但 Disabled）跟着 SS 口走，别碰。
-            if sc & PORT_PED == 0 && (sc & PORT_PLS_MASK) >> 5 == 4 {
-                self.log_port(p, "companion", sc);
+            if sc & PORT_CCS == 0 || port_ready(sc) {
                 p += 1;
                 continue;
             }
             self.log_port(p, "pre", sc);
-            if let Some(sc) = wait_ready(reg, 1500) {
+            // 先给控制器自己完成 Polling → U0 的时间。
+            if let Some(sc) = wait_ready(reg, 300) {
                 port_write(reg, sc, PORT_CSC | PORT_PRC);
-                let sc = rd32(reg);
-                if sc & PORT_PED != 0 {
-                    self.log_port(p, "auto", sc);
-                    return Some((p, (sc >> 10) & 0xF));
+                let speed = (sc >> 10) & 0xF;
+                self.log_port(p, "trained", rd32(reg));
+                if speed == 4 || speed == 5 {
+                    return Some((p, speed));
                 }
+                p += 1;
+                continue;
             }
-
-            // ②' Warm Reset：USB3 设备被固件/上次枚举留在 USB2 模式时，普通 PR 只会在
-            // 当前速率上原地复位；Warm Reset 才能让链路重新训练回 SuperSpeed。
-            // USB2 端口上这一位无效（写了被忽略），所以可以无脑先试。
+            // Warm Reset：USB3 链路重新训练；USB2 端口上写这一位无效（RsvdZ）。
             let sc = rd32(reg);
             port_write(reg, sc, PORT_PP | PORT_WPR);
             let mut t = 0u32;
-            while t < 500 {
-                if rd32(reg) & PORT_WPR == 0 {
-                    break;
-                }
+            while t < 500 && rd32(reg) & PORT_WPR != 0 {
                 sys_sleep(1);
                 t += 1;
             }
-            if let Some(sc) = wait_ready(reg, 1000) {
+            if let Some(sc) = wait_ready(reg, 600) {
                 port_write(reg, sc, PORT_CSC | PORT_PRC);
                 let sc = rd32(reg);
                 if sc & PORT_PED != 0 {
                     self.log_port(p, "warm", sc);
-                    return Some((p, (sc >> 10) & 0xF));
+                    let speed = (sc >> 10) & 0xF;
+                    if speed == 4 || speed == 5 {
+                        return Some((p, speed));
+                    }
                 }
             }
+            p += 1;
+        }
 
-            // ③ 兜底: 手动端口复位, 最多 3 次。
+        // ②' 没有 SS 口，退而求其次用任意已使能端口（USB2 设备）。
+        if let Some(v) = self.pick_ready() {
+            return Some(v);
+        }
+
+        // ③ 兜底：普通端口复位（USB2）/ Warm Reset（USB3），最多 3 次。
+        let mut p = 1u32;
+        while p <= self.num_ports {
+            let reg = self.op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
+            if rd32(reg) & PORT_CCS == 0 {
+                p += 1;
+                continue;
+            }
             let mut tries = 0u32;
             while tries < 3 {
                 self.log_port(p, "retry", self.reset_port(p));
-                if rd32(reg) & PORT_PED != 0 && rd32(reg) & PORT_PLS_MASK == 0 {
-                    self.log_port(p, "post", rd32(reg));
-                    return Some((p, (rd32(reg) >> 10) & 0xF));
+                let sc = rd32(reg);
+                if port_ready(sc) {
+                    self.log_port(p, "post", sc);
+                    return Some((p, (sc >> 10) & 0xF));
                 }
                 sys_sleep(50);
                 tries += 1;
@@ -1415,37 +1500,6 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
 
     wr32(op + OP_USBSTS, 0x105C);
 
-    // 端口上电并汇总"有没有设备"。
-    let mut present = false;
-    print("xhci: ctrl#");
-    print_u64(idx as u64);
-    print(" ports=");
-    print_u64(num_ports as u64);
-    let mut p = 1u32;
-    while p <= num_ports {
-        let reg = op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
-        let mut sc = rd32(reg);
-        if sc & PORT_PP == 0 {
-            port_write(reg, sc, PORT_PP);
-            sys_sleep(10);
-            sc = rd32(reg);
-        }
-        print(" 0x");
-        print_hex(sc as u64);
-        if sc & PORT_CCS != 0 {
-            present = true;
-        }
-        p += 1;
-    }
-    println(if present {
-        " (device present)"
-    } else {
-        " (no device)"
-    });
-    if !present {
-        return ProbeOutcome::None;
-    }
-
     // ERST：1 段，段表项 = {环基址, 环 TRB 数}。
     wr32(rt + RT_IR0 + IR_ERSTSZ, 1);
     wr64(base(ERST_PAGE), pbase(EVT_PAGE));
@@ -1480,6 +1534,44 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     print("xhci: ctrl#");
     print_u64(idx as u64);
     println(" started (controller running)");
+
+    // 端口上电 + 等 USB3 链路训练。**必须在 RS=1 之后**：控制器停机时端口状态机
+    // 不跑，SS 口会一直停在 RxDetect(CCS=0)，之前的 10 ms 上电等待等于没等。
+    let mut present = false;
+    let mut p = 1u32;
+    while p <= num_ports {
+        let reg = op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
+        let sc = rd32(reg);
+        if sc & PORT_PP == 0 {
+            port_write(reg, sc, PORT_PP);
+        }
+        p += 1;
+    }
+    hc.wait_connect();
+
+    print("xhci: ctrl#");
+    print_u64(idx as u64);
+    print(" ports=");
+    print_u64(num_ports as u64);
+    let mut p = 1u32;
+    while p <= num_ports {
+        let reg = op + OP_PORT_BASE + ((p as u64 - 1) * OP_PORT_STRIDE);
+        let sc = rd32(reg);
+        print(" 0x");
+        print_hex(sc as u64);
+        if sc & PORT_CCS != 0 {
+            present = true;
+        }
+        p += 1;
+    }
+    println(if present {
+        " (device present)"
+    } else {
+        " (no device)"
+    });
+    if !present {
+        return ProbeOutcome::None;
+    }
 
     // 全端口普查：真机只能靠这几行看清 SuperSpeed / USB2 两条 lane 的分布
     // （USB3 连接器 = 1 个 SS 口 + 1 个 USB2 伴随口，两者会同时报 CCS）。
