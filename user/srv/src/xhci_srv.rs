@@ -1274,9 +1274,15 @@ struct IfaceInfo {
 ///
 /// ⚠️ 复合设备很常见（键盘带多媒体键、摄像头带麦克风）：端点必须按**所属接口**归类，
 /// 不能拿"最后一个接口的类别"去判断整台设备 —— 旧实现会把 HID 键盘判成不支持。
+///
+/// ⚠️ 只收 **bAlternateSetting = 0** 的端点：`SET_CONFIGURATION` 之后每个接口都回到
+/// alt 0，别的 alt 必须显式 `SET_INTERFACE` 才生效。UAS 盘（如 thinkplus 256GB）就是
+/// alt0 = BOT(0x50) / alt1 = UAS(0x62)；把 alt1 的 EP3/EP4 当成 Bulk 对，设备根本不在
+/// 那两条管子上收包，BOT 的第一条 CBW 就会超时（真机表现 `storage-inquiry-fail`）。
 fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
     let mut info = IfaceInfo::default();
     let mut cur = (0u8, 0u8, 0u8); // 当前接口的 (class, subclass, proto)
+    let mut alt0 = true; // 当前接口是否 alt 0（描述符顺序：接口后紧跟它的端点）
     let mut off = 0u32;
     while off + 2 <= total {
         let len = rd8(buf_va + off as u64) as u32;
@@ -1288,14 +1294,17 @@ fn parse_config(buf_va: u64, total: u32) -> IfaceInfo {
         if dtype == 4 && len >= 9 {
             // Interface descriptor
             cur = (rd8(base + 5), rd8(base + 6), rd8(base + 7));
-            if info.n_ifaces == 0 {
+            alt0 = rd8(base + 3) == 0;
+            if alt0 && info.n_ifaces == 0 {
                 info.class = cur.0;
                 info.subclass = cur.1;
                 info.proto = cur.2;
             }
-            info.n_ifaces += 1;
-        } else if dtype == 5 && len >= 7 {
-            // Endpoint descriptor
+            if alt0 {
+                info.n_ifaces += 1;
+            }
+        } else if dtype == 5 && len >= 7 && alt0 {
+            // Endpoint descriptor（只认当前接口的 alt 0）
             let addr = rd8(base + 2);
             let attr = rd8(base + 3);
             let mps = (rd8(base + 4) as u16) | ((rd8(base + 5) as u16) << 8);
