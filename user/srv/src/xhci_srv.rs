@@ -699,14 +699,47 @@ impl Xhci {
         fence();
         wr32(self.db + (self.slot as u64) * 4, 1); // DCI 1 = EP0
         match self.wait_event(TRB_TRANSFER_EVENT, self.slot, 1) {
-            Some(e) => trb_cc(&e) == CC_SUCCESS,
-            None => false,
+            Some(e) => {
+                let cc = trb_cc(&e);
+                if cc == CC_SUCCESS || cc == CC_SHORT_PACKET {
+                    return true;
+                }
+                // 真机诊断: 完成码 + 残余长度 (4 = 事务错误, 6 = Stall)
+                print("xhci: EP0 req=");
+                print_u64(req as u64);
+                print(" cc=");
+                print_u64(cc as u64);
+                print(" residual=");
+                print_u64((e.status & 0x00FF_FFFF) as u64);
+                println("");
+                false
+            }
+            None => {
+                print("xhci: EP0 req=");
+                print_u64(req as u64);
+                println(" no completion event");
+                false
+            }
         }
     }
 
-    /// 读设备描述符（前 8 字节）——Address Device 后确认链路通。
+    /// 读设备描述符（前 `want` 字节）——Address Device 后确认链路通。
+    ///
+    /// 真机上有设备在 SET_ADDRESS 之后要几十毫秒才应答第一个控制传输，一次失败就
+    /// 放弃会把整台控制器判死；故先给稳定时间，再重试。
     fn get_device_descriptor(&mut self, want: u16) -> bool {
-        self.control(0x80, 6, 1 << 8, 0, want, true, self.data_pa)
+        sys_sleep(50);
+        let mut attempt = 0u32;
+        while attempt < 3 {
+            if self.control(0x80, 6, 1 << 8, 0, want, true, self.data_pa) {
+                return true;
+            }
+            attempt += 1;
+            if attempt < 3 {
+                sys_sleep(50);
+            }
+        }
+        false
     }
 }
 
@@ -1412,20 +1445,26 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     print_u64(default_mps as u64);
     println("");
     let mut slot = slot;
-    let mut addressed = false;
+    let mut ready = false;
     let mut attempt = 0u32;
     while attempt < 3 {
         attempt += 1;
         if address_device(&mut hc, slot, speed, port, default_mps) {
-            addressed = true;
-            break;
+            hc.log("device addressed");
+            if hc.get_device_descriptor(18) {
+                ready = true;
+                break;
+            }
+            println("xhci: GET_DESCRIPTOR(device) FAILED");
+        } else {
+            println("xhci: Address Device FAILED");
         }
         if attempt == 3 {
             break;
         }
-        // 真机上 HID/复合设备第一次 SET_ADDRESS 偶发不应答 (cc=4):
+        // 真机上第一次 SET_ADDRESS / 第一笔控制传输偶发不应答:
         // 复位端口让设备回默认地址, 并用一个新 slot 再试 (失败的 slot 可能已进 Error)。
-        print("xhci: address retry ");
+        print("xhci: retry ");
         print_u64(attempt as u64);
         println("");
         let sc = hc.reset_port(port);
@@ -1439,16 +1478,10 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
             }
             _ => break,
         }
-        sys_sleep(20);
+        sys_sleep(50);
     }
-    if !addressed {
-        println("xhci: Address Device FAILED");
-        return ProbeOutcome::None;
-    }
-    hc.log("device addressed");
-
-    if !hc.get_device_descriptor(18) {
-        println("xhci: GET_DESCRIPTOR(device) FAILED");
+    if !ready {
+        println("xhci: device unusable on this controller");
         return ProbeOutcome::None;
     }
     let bmax0 = rd8(hc.data_va + 7) as u16;
