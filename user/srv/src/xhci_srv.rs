@@ -96,6 +96,8 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
+/// Evaluate Context（用于按 bMaxPacketSize0 修正 EP0 的包长）。
+const TRB_EVALUATE_CONTEXT: u32 = 13;
 const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
@@ -186,6 +188,12 @@ impl Ring {
         unsafe {
             core::ptr::write_volatile((self.va + ((RING_TRBS - 1) * 16) as u64) as *mut Trb, link);
         }
+    }
+
+    /// 下一个待取 TRB 的物理地址（含 DCS）—— Evaluate Context 要交回**当前**位置，
+    /// 不能写环首，否则控制器会把已执行过的 TRB 再跑一遍。
+    fn deq_pa(&self) -> u64 {
+        self.pa + (self.enq as u64) * 16 | u64::from(self.pcs)
     }
 
     /// 压入一个 TRB（自动补 cycle bit、处理回绕）。
@@ -1473,26 +1481,55 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     println("");
     let mut slot = slot;
     let mut ready = false;
-    let mut attempt = 0u32;
-    while attempt < 3 {
-        attempt += 1;
-        if address_device(&mut hc, slot, speed, port, default_mps) {
+    // EP0 的最大包长可能和「按端口速度推断」的不一致：真机 cc=3 (Babble) + residual=10
+    // 说明设备只回了 8 字节（8 = 全速默认包长），而我们按高速声明了 64 → 控制器报 babble。
+    // 故按 默认 → 8 → 16 → 32 依次重试，每次失败都复位端口、换新 slot 重来。
+    let mut mps_list = [default_mps; 4];
+    let mut n_mps = 1usize;
+    for m in [8u16, 16, 32] {
+        if m < default_mps {
+            mps_list[n_mps] = m;
+            n_mps += 1;
+        }
+    }
+    let mut ci = 0usize;
+    while ci < n_mps {
+        let mps = mps_list[ci];
+        ci += 1;
+        if address_device(&mut hc, slot, speed, port, mps) {
             hc.log("device addressed");
-            if hc.get_device_descriptor(18) {
-                ready = true;
-                break;
+            // USB 2.0 §9.2.6.3：第一次只读 8 字节（设备保证一个包就够），拿到
+            // bMaxPacketSize0 后按它更新 EP0，再读完整的 18 字节。跳过这一步，
+            // 真机会在 18 字节那次传输上报 cc=3 (Babble)。
+            if hc.get_device_descriptor(8) {
+                let b0 = rd8(hc.data_va + 7) as u16;
+                if matches!(b0, 8 | 16 | 32 | 64) && b0 != mps {
+                    if evaluate_ep0_mps(&mut hc, slot, b0) {
+                        print("xhci: EP0 mps -> ");
+                        print_u64(b0 as u64);
+                        println("");
+                    } else {
+                        println("xhci: EP0 mps update FAILED (continuing)");
+                    }
+                }
+                if hc.get_device_descriptor(18) {
+                    ready = true;
+                    break;
+                }
             }
             println("xhci: GET_DESCRIPTOR(device) FAILED");
         } else {
             println("xhci: Address Device FAILED");
         }
-        if attempt == 3 {
+        if ci == n_mps {
             break;
         }
         // 真机上第一次 SET_ADDRESS / 第一笔控制传输偶发不应答:
         // 复位端口让设备回默认地址, 并用一个新 slot 再试 (失败的 slot 可能已进 Error)。
         print("xhci: retry ");
-        print_u64(attempt as u64);
+        print_u64(ci as u64);
+        print(" mps=");
+        print_u64(mps_list[ci] as u64);
         println("");
         let sc = hc.reset_port(port);
         hc.log_port(port, "retry", sc);
@@ -1910,6 +1947,25 @@ fn address_device(hc: &mut Xhci, slot: u32, speed: u32, port: u32, mps: u16) -> 
             println("xhci: Address Device: no completion event");
             false
         }
+    }
+}
+
+/// Evaluate Context：只改 EP0 的 Max Packet Size。
+///
+/// USB 2.0 §9.2.6.3 要求主机先读设备描述符的前 8 字节拿到 `bMaxPacketSize0`，
+/// 再按它更新默认控制管道的包长。真机上跳过这步会出现
+/// `cc=3 (Babble) residual=10`（设备按 8 字节包应答，控制器按 64 字节的 TD 判违规）。
+fn evaluate_ep0_mps(hc: &mut Xhci, slot: u32, mps: u16) -> bool {
+    let (_, ep_base) = clear_input(hc);
+    wr32(hc.input_va + 4, 0b11); // A0 slot + A1 EP0
+    restore_slot_ctx(hc, 1);
+    let ep0 = input_ep_ctx(hc, ep_base, 1);
+    wr32(ep0 + 4, ((mps as u32) << 16) | (4 << 3) | (3 << 1));
+    // ⚠️ 必须交回**当前**入队位置：写环首会让控制器重放已完成的 TRB。
+    wr64(ep0 + 8, hc.ep0.deq_pa());
+    match hc.context_cmd(TRB_EVALUATE_CONTEXT, slot) {
+        Some(e) => trb_cc(&e) == CC_SUCCESS,
+        None => false,
     }
 }
 
