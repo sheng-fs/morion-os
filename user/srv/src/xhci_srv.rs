@@ -1037,6 +1037,9 @@ impl Xhci {
     }
 
     /// WRITE(10)（0x2A）：把私有数据页的 `count` 个扇区写入 `lba`（安全门由调用方把关）。
+    ///
+    /// 写完立刻发 SYNCHRONIZE CACHE(10)：U 盘自己的写缓存不刷到闪存的话，关机/拔盘后
+    /// 文件会"写成功但不见了"（真机 `/usb` 空分区的根因之一）。
     fn scsi_write10(&mut self, lba: u32, count: u16) -> bool {
         let mut cb = [0u8; 16];
         cb[0] = 0x2A;
@@ -1046,7 +1049,20 @@ impl Xhci {
         cb[5] = lba as u8;
         cb[7] = (count >> 8) as u8;
         cb[8] = count as u8;
-        self.scsi_cmd(&cb, (count as u32) * SECTOR, false)
+        if !self.scsi_cmd(&cb, (count as u32) * SECTOR, false) {
+            return false;
+        }
+        // 不支持该命令的盘（少数）只记一次日志，不让整笔写失败。
+        if !self.scsi_sync_cache() {
+            err_once("SYNCHRONIZE CACHE(10) failed (write may not be durable)");
+        }
+        true
+    }
+
+    /// SYNCHRONIZE CACHE(10)（0x35）：把 U 盘内部写缓存刷到闪存。
+    fn scsi_sync_cache(&mut self) -> bool {
+        let cb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        self.scsi_cmd(&cb, 0, false)
     }
 }
 
@@ -1895,23 +1911,18 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
         println("xhci: READ(10) sector 0 FAILED");
         return ProbeOutcome::None;
     }
-    let mut sig = [0u8; 16];
-    let mut sig_ok = true;
-    let mut i = 0u64;
-    while i < 16 {
-        sig[i as usize] = rd8(hc.data_va + i);
-        if sig[i as usize] != SIG[i as usize] {
-            sig_ok = false;
-        }
-        i += 1;
-    }
+    let sector = unsafe { core::slice::from_raw_parts(hc.data_va as *const u8, 512) };
+    let is_test = is_test_sig(sector, &SIG);
+    let sig_kind = if is_test {
+        "test"
+    } else {
+        boot_sig_kind(sector)
+    };
 
     print("USB1 xhci OK, cap=");
     print_u64(cap_sectors);
-    print(", sector0 sig=");
-    print_sig(&sig);
-    print(", sig=");
-    print(if sig_ok { "ok" } else { "BAD" });
+    print(", sector0=");
+    print(sig_kind);
     println("");
 
     if !attach_to_block(cap_sectors) {

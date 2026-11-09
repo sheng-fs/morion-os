@@ -1869,5 +1869,7 @@ pub fn run() {
                 sys_reply(u64::MAX);
             }
         }
+        // 请求处理完也落一次盘（同 exfat_srv）：避免最后一批写留在暂存区。
+        block_wb_flush();
     }
 }

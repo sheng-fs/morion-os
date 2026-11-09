@@ -994,16 +994,33 @@ fn xhci_rw(is_read: bool, lba: u64, count: u64, buf: u64) -> bool {
 fn ahci_attach_selftest(sectors: u32, vol: u64) {
     let scratch = VOL_SCRATCH_VADDR as *mut u8;
     // ① 读扇区 0: 确认「卷层 → AHCI 后端 → 磁盘」这条读链路端到端打通。
-    let sig_ok = ahci_rw(true, 0, 1, VOL_SCRATCH_VADDR)
-        && unsafe { core::slice::from_raw_parts(scratch, 16) == &AHCI_SIG[..] };
+    let read_ok = ahci_rw(true, 0, 1, VOL_SCRATCH_VADDR);
+    let (is_test, kind) = if read_ok {
+        let sector = unsafe { core::slice::from_raw_parts(scratch, 512) };
+        let is_test = is_test_sig(sector, &AHCI_SIG);
+        (
+            is_test,
+            if is_test {
+                "test"
+            } else {
+                boot_sig_kind(sector)
+            },
+        )
+    } else {
+        (false, "none")
+    };
     print("block: ahci volume attached (vol=");
     print_u64(vol);
     print(", sectors=");
     print_u64(sectors as u64);
     print(", sig=");
-    print(if sig_ok { "ok" } else { "BAD" });
+    print(kind);
     println(")");
-    if !sig_ok || sectors < 2 {
+    if !read_ok || sectors < 2 {
+        return;
+    }
+    if !is_test {
+        println("block: ahci volume is not a Morion test image - write self-test skipped");
         return;
     }
 
@@ -1048,16 +1065,33 @@ fn ahci_attach_selftest(sectors: u32, vol: u64) {
 fn xhci_attach_selftest(sectors: u32, vol: u64) {
     let scratch = VOL_SCRATCH_VADDR as *mut u8;
     // ① 读扇区 0: 确认「卷层 → xHCI 后端 → U 盘」这条读链路端到端打通。
-    let sig_ok = xhci_rw(true, 0, 1, VOL_SCRATCH_VADDR)
-        && unsafe { core::slice::from_raw_parts(scratch, 16) == &XHCI_SIG[..] };
+    let read_ok = xhci_rw(true, 0, 1, VOL_SCRATCH_VADDR);
+    let (is_test, kind) = if read_ok {
+        let sector = unsafe { core::slice::from_raw_parts(scratch, 512) };
+        let is_test = is_test_sig(sector, &XHCI_SIG);
+        (
+            is_test,
+            if is_test {
+                "test"
+            } else {
+                boot_sig_kind(sector)
+            },
+        )
+    } else {
+        (false, "none")
+    };
     print("block: usb volume attached (vol=");
     print_u64(vol);
     print(", sectors=");
     print_u64(sectors as u64);
     print(", sig=");
-    print(if sig_ok { "ok" } else { "BAD" });
+    print(kind);
     println(")");
-    if !sig_ok || sectors < 2 {
+    if !read_ok || sectors < 2 {
+        return;
+    }
+    if !is_test {
+        println("block: usb volume is not a Morion test image - write self-test skipped");
         return;
     }
 

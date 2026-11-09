@@ -483,6 +483,41 @@ pub fn block_write_dev(dev: u64, lba: u32, count: u16, buf: *mut u8) -> bool {
     }
 }
 
+/// 引导扇区类型（仅用于日志，不参与写自测的安全门）。
+///
+/// 真盘的扇区 0 不是 Morion 测试签名，旧代码会直接打 `sig=BAD`，看起来像盘坏了；
+/// 这里把它分类成 `gpt` / `mbr` / `exfat` / `fat32` / `ntfs` / `none`。
+pub fn boot_sig_kind(sector: &[u8]) -> &'static str {
+    if sector.len() < 512 {
+        return "none";
+    }
+    if &sector[3..11] == b"EXFAT   " {
+        return "exfat";
+    }
+    if &sector[3..11] == b"NTFS    " {
+        return "ntfs";
+    }
+    if &sector[82..90] == b"FAT32   " {
+        return "fat32";
+    }
+    if sector[510] == 0x55 && sector[511] == 0xAA {
+        let mut i = 0usize;
+        while i < 4 {
+            if sector[446 + i * 16 + 4] == 0xEE {
+                return "gpt";
+            }
+            i += 1;
+        }
+        return "mbr";
+    }
+    "none"
+}
+
+/// 是否是宿主测试镜像签名（只有这种盘才允许跑写自测）。
+pub fn is_test_sig(sector: &[u8], sig: &[u8; 16]) -> bool {
+    sector.len() >= 16 && &sector[..16] == sig
+}
+
 /// 读一个 16 位小端无符号整数 (引导扇区字段)。
 pub fn read_u16(ptr: *const u8) -> u16 {
     unsafe {

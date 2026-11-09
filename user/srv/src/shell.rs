@@ -185,6 +185,12 @@ pub fn run() {
         println("shell: alloc result buf FAILED");
         return;
     }
+    // 写入数据也必须走 shell 自己的共享写页：`vfs::write` 默认的 WRITE_BUF 是 app 的
+    // 地址，shell 域没有映射/共享它；用错页的后果是文件数据全 0（目录项正常、内容为空）。
+    if sys_alloc_page(vfs::SHELL_WRITE_BUF) != 1 {
+        println("shell: alloc write buf FAILED");
+        return;
+    }
     if sys_share_page(vfs::SHELL_RESULT_BUF, vfs::FAT32_DOMAIN) != 1
         || sys_share_page(vfs::SHELL_RESULT_BUF, vfs::TMPFS_DOMAIN) != 1
         || sys_share_page(vfs::SHELL_RESULT_BUF, vfs::MFS_DOMAIN) != 1
@@ -192,6 +198,15 @@ pub fn run() {
         || sys_share_page(vfs::SHELL_RESULT_BUF, vfs::EXFAT_DOMAIN) != 1
     {
         println("shell: share result buf FAILED");
+        return;
+    }
+    if sys_share_page(vfs::SHELL_WRITE_BUF, vfs::FAT32_DOMAIN) != 1
+        || sys_share_page(vfs::SHELL_WRITE_BUF, vfs::TMPFS_DOMAIN) != 1
+        || sys_share_page(vfs::SHELL_WRITE_BUF, vfs::MFS_DOMAIN) != 1
+        || sys_share_page(vfs::SHELL_WRITE_BUF, vfs::EXT2_DOMAIN) != 1
+        || sys_share_page(vfs::SHELL_WRITE_BUF, vfs::EXFAT_DOMAIN) != 1
+    {
+        println("shell: share write buf FAILED");
         return;
     }
     // G3b: 帧缓冲归用户态后, 把 shell 的输出**镜像**一份到屏幕控制台 (`gfx_srv`) —— 内核终端
@@ -689,7 +704,7 @@ fn shell_dmesg(st: &ShellState, arg: &str) {
             if n == 0 {
                 break;
             }
-            let w = vfs::write(fd, woff, &buf[..n]);
+            let w = vfs::write_into(fd, woff, &buf[..n], vfs::SHELL_WRITE_BUF);
             if w != n as u64 {
                 println("dmesg: write FAILED (dumped prefix only)");
                 break;

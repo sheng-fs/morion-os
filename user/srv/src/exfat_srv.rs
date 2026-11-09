@@ -73,15 +73,23 @@ fn exfat_upcase_unit(u: u16) -> u16 {
     read_u16(exfat_at(exfat_upc(), off % EXFAT_SECTOR_SIZE as usize))
 }
 
-/// exFAT NameHash: 每个码元先对散列循环右移 1 位再累加其 upcase 值, 末尾再右移一次。
+/// exFAT NameHash：先按 upcase 表转大写，再**按 UTF-16 的两个字节分别**累加。
+///
+/// 规范/内核/exfatprogs 的实现是：
+///   hash = (hash << 15) | (hash >> 1); hash += ch & 0xFF;
+///   hash = (hash << 15) | (hash >> 1); hash += ch >> 8;
+/// 不是把整个 u16 一次性加进去。ASCII 名字的高字节为 0，这一多出来的旋转
+/// 正是之前哈希与 Linux/Windows 对不上的原因。
 fn exfat_name_hash(units: &[u16], len: usize) -> u16 {
     let mut h: u16 = 0;
     let mut i = 0usize;
     while i < len {
-        h = h.rotate_right(1).wrapping_add(exfat_upcase_unit(units[i]));
+        let u = exfat_upcase_unit(units[i]);
+        h = h.rotate_right(1).wrapping_add(u & 0xFF);
+        h = h.rotate_right(1).wrapping_add(u >> 8);
         i += 1;
     }
-    h.rotate_right(1)
+    h
 }
 
 /// UTF-8 名字 → UTF-16 码元 (仅 BMP; 补充平面 (4 字节序列) 不支持)。
@@ -138,6 +146,7 @@ fn exfat_build_set(
 ) -> Option<usize> {
     let mut units = [0u16; 255];
     let nu = exfat_encode_name(name, &mut units)?;
+    let name_hash = exfat_name_hash(&units, nu);
     let name_entries = nu.div_ceil(EXFAT_NAME_UNITS_PER_ENTRY);
     let total = 2 + name_entries;
     let (ts, ten) = exfat_encode_time(mtime);
@@ -169,7 +178,7 @@ fn exfat_build_set(
         *stream.add(1) = EXFAT_SF_ALLOC | if no_fat_chain { EXFAT_SF_NOFATCHAIN } else { 0 };
         *stream.add(3) = nu as u8; // NameLength (UTF-16 码元数)
     }
-    write_u16(exfat_atm(stream, 4), exfat_name_hash(&units, nu));
+    write_u16(exfat_atm(stream, 4), name_hash);
     write_u64(exfat_atm(stream, 8), valid_len);
     write_u32(exfat_atm(stream, 20), first_cluster);
     write_u64(exfat_atm(stream, 24), data_len);
@@ -2125,5 +2134,8 @@ pub fn run() {
                 sys_reply(u64::MAX);
             }
         }
+        // 请求处理完也落一次盘：顶层只在"下一请求"到来时 flush，若用户写完立刻
+        // 关机/拔盘，最后一批写会留在暂存区。
+        block_wb_flush();
     }
 }

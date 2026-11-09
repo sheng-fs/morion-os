@@ -19,7 +19,7 @@
 
 use crate::common::*;
 use libdevice::grant::DeviceGrant;
-use libdevice::mmio::{fence, rd16, rd32, rd8, wr32, wr8};
+use libdevice::mmio::{fence, rd16, rd32, wr32, wr8};
 use morion::syscall::*;
 
 const PAGE: u64 = 4096;
@@ -103,11 +103,6 @@ struct Ahci {
     data_pa: u64,
     data_va: u64,
     port: u64,
-}
-
-/// 按 ASCII 打印一段定长字节（用于打签名）。
-fn print_sig(sig: &[u8; 16]) {
-    print(unsafe { core::str::from_utf8_unchecked(&sig[..]) });
 }
 
 /// 永不返回的保活循环（无设备 / 初始化失败时用）。
@@ -397,24 +392,19 @@ pub fn run() {
         println("ahci: READ DMA EXT sector 0 failed");
         idle();
     }
-    let mut sig = [0u8; 16];
-    let mut sig_ok = true;
-    let mut i = 0u64;
-    while i < 16 {
-        sig[i as usize] = rd8(a.data_va + i);
-        if sig[i as usize] != SIG[i as usize] {
-            sig_ok = false;
-        }
-        i += 1;
-    }
+    let sector = unsafe { core::slice::from_raw_parts(a.data_va as *const u8, 512) };
+    let is_test = is_test_sig(sector, &SIG);
+    let kind = if is_test {
+        "test"
+    } else {
+        boot_sig_kind(sector)
+    };
 
     // marker：只读链路的端到端取证（IDENTIFY + LBA48 DMA READ）。
     print("AHCI1 ahci OK, cap=");
     print_u64(cap_sectors);
-    print(", sector0 sig=");
-    print_sig(&sig);
-    print(", sig=");
-    print(if sig_ok { "ok" } else { "BAD" });
+    print(", sector0=");
+    print(kind);
     println("");
 
     // 03b：把盘挂进 block_srv 的卷层（异步通知，随后回调做读写校验）。
