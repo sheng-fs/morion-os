@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use morion_boot::boot::loader::{Elf64Header, Elf64ProgramHeader};
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
@@ -1435,17 +1437,17 @@ fn render_header(fb: &mut Fb, _theme: &ThemeConfig) {
     }
 }
 
-// 整屏渲染: 背景 (cover) -> 顶栏 -> 菜单。每次选择变化都从背景重画,
-// 避免半透明叠加 (double-blend) 导致面板越画越暗。
-fn render_screen(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) {
+// 静态层 (背景 + 顶栏 + 菜单面板/标题/页脚) 只画一次。
+// 选择变化时只恢复旧/新两行的面板像素并重画这两项，避免每次按键整屏重绘。
+fn render_background(fb: &mut Fb, theme: &ThemeConfig) {
     if let Some(bg) = BmpImage::parse(BG_BMP) {
         draw_bmp_cover(fb, &bg);
     }
     render_header(fb, theme);
-    render_menu(fb, theme, entries, sel);
 }
 
-fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) {
+/// 菜单的静态部分：遮罩、面板、标题、分割线、页脚、滚动箭头。
+fn render_menu_chrome(fb: &mut Fb, theme: &ThemeConfig, entry_count: usize) {
     let tw = theme.menu_w;
     let th = theme.menu_h;
     let tx = theme.menu_x;
@@ -1501,7 +1503,7 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
 
     // 如果条目数量超出菜单显示区域, 绘制上下滚动箭头
     let visible_count = (th - 100) / (theme.item_height + theme.spacing);
-    if entries.len() > visible_count as usize {
+    if entry_count > visible_count as usize {
         if let Some(arrow_up) = BmpImage::parse(ARROW_UP_BMP) {
             let ax = tx + tw as i32 - arrow_up.w as i32 - 16;
             let ay = line_y + 8;
@@ -1513,60 +1515,120 @@ fn render_menu(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
             draw_bmp(fb, &arrow_down, ax, ay);
         }
     }
+}
 
-    // 渲染每个菜单项
+/// 单个菜单项。选中项画高亮 + selected 图标，未选中项用面板底色覆盖。
+fn render_menu_item(
+    fb: &mut Fb,
+    theme: &ThemeConfig,
+    entry: &BootEntry,
+    index: usize,
+    selected: bool,
+) {
+    let tw = theme.menu_w;
+    let tx = theme.menu_x;
+    let ty = theme.menu_y;
     let item_start_y = ty + 58;
-    for (i, entry) in entries.iter().enumerate() {
-        let iy = item_start_y + i as i32 * (theme.item_height as i32 + theme.spacing as i32);
-        let ir = Rect::new(tx + 16, iy, tw - 32, theme.item_height);
+    let iy = item_start_y + index as i32 * (theme.item_height as i32 + theme.spacing as i32);
+    let ir = Rect::new(tx + 16, iy, tw - 32, theme.item_height);
 
-        if i == sel {
-            let hl_c = Color::rgba(
-                theme.hl_color.r,
-                theme.hl_color.g,
-                theme.hl_color.b,
-                (theme.hl_alpha * 255.0) as u8,
-            );
-            fb.fill_rounded(ir, 8, hl_c);
-            // 选中项：在高亮左边绘制 selected 图标 (蓝色对勾/方形 32x32)
-            if let Some(sel_bmp) = BmpImage::parse(SELECTED_BMP) {
-                let ix = ir.x - 4;
-                let iy_img = iy + (theme.item_height as i32 - sel_bmp.h as i32) / 2;
-                draw_bmp(fb, &sel_bmp, ix, iy_img);
-            }
-        } else {
-            // 非选中项：用面板底色覆盖（清除可能的高亮残留）
-            fb.fill_rounded(ir, 8, panel_c);
+    if selected {
+        let hl_c = Color::rgba(
+            theme.hl_color.r,
+            theme.hl_color.g,
+            theme.hl_color.b,
+            (theme.hl_alpha * 255.0) as u8,
+        );
+        fb.fill_rounded(ir, 8, hl_c);
+        // 选中项：在高亮左边绘制 selected 图标 (蓝色对勾/方形 32x32)
+        if let Some(sel_bmp) = BmpImage::parse(SELECTED_BMP) {
+            let ix = ir.x - 4;
+            let iy_img = iy + (theme.item_height as i32 - sel_bmp.h as i32) / 2;
+            draw_bmp(fb, &sel_bmp, ix, iy_img);
         }
-
-        let tc = if i == sel {
-            theme.hl_text_color
-        } else {
-            theme.text_color
-        };
-        draw_text(
-            fb,
-            entry.icon,
-            ir.x + 40,
-            iy + (theme.item_height as i32 - 16) / 2 + 2,
-            tc,
-        );
-        draw_text(
-            fb,
-            entry.title,
-            ir.x + 72,
-            iy + (theme.item_height as i32 - 16) / 2 + 2,
-            tc,
-        );
-        let info_w = text_width(entry.info);
-        draw_text(
-            fb,
-            entry.info,
-            ir.x + ir.w as i32 - info_w - 16,
-            iy + (theme.item_height as i32 - 16) / 2 + 2,
-            Color::rgb(0x88, 0x88, 0x88),
-        );
+    } else {
+        // 非选中项：用面板底色覆盖（清除可能的高亮残留）
+        let panel_c = Color::rgba(0x10, 0x15, 0x22, (theme.menu_alpha * 255.0) as u8);
+        fb.fill_rounded(ir, 8, panel_c);
     }
+
+    let tc = if selected {
+        theme.hl_text_color
+    } else {
+        theme.text_color
+    };
+    draw_text(
+        fb,
+        entry.icon,
+        ir.x + 40,
+        iy + (theme.item_height as i32 - 16) / 2 + 2,
+        tc,
+    );
+    draw_text(
+        fb,
+        entry.title,
+        ir.x + 72,
+        iy + (theme.item_height as i32 - 16) / 2 + 2,
+        tc,
+    );
+    let info_w = text_width(entry.info);
+    draw_text(
+        fb,
+        entry.info,
+        ir.x + ir.w as i32 - info_w - 16,
+        iy + (theme.item_height as i32 - 16) / 2 + 2,
+        Color::rgb(0x88, 0x88, 0x88),
+    );
+}
+
+/// 菜单面板的静态像素快照：只保存一次，选择变化时按行恢复。
+struct MenuCache {
+    rect: Rect,
+    pixels: Vec<Color>,
+}
+
+impl MenuCache {
+    fn capture(fb: &Fb, rect: Rect) -> Self {
+        let mut pixels = Vec::with_capacity((rect.w as usize) * (rect.h as usize));
+        for y in rect.y..rect.y + rect.h as i32 {
+            for x in rect.x..rect.x + rect.w as i32 {
+                pixels.push(fb.get_pixel(x, y));
+            }
+        }
+        Self { rect, pixels }
+    }
+
+    fn restore_item(&self, fb: &mut Fb, theme: &ThemeConfig, index: usize) {
+        let y =
+            theme.menu_y + 58 + index as i32 * (theme.item_height as i32 + theme.spacing as i32);
+        self.restore_row(fb, y, theme.item_height);
+    }
+
+    fn restore_row(&self, fb: &mut Fb, y: i32, h: u32) {
+        let y0 = y.max(self.rect.y);
+        let y1 = (y + h as i32).min(self.rect.y + self.rect.h as i32);
+        for yy in y0..y1 {
+            let row = (yy - self.rect.y) as usize * self.rect.w as usize;
+            for x in self.rect.x..self.rect.x + self.rect.w as i32 {
+                let c = self.pixels[row + (x - self.rect.x) as usize];
+                fb.pixel(x, yy, c);
+            }
+        }
+    }
+}
+
+/// 初始渲染：背景/顶栏/面板只画一次，快照面板，再画所有菜单项。
+fn render_init(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) -> MenuCache {
+    render_background(fb, theme);
+    render_menu_chrome(fb, theme, entries.len());
+    let cache = MenuCache::capture(
+        fb,
+        Rect::new(theme.menu_x, theme.menu_y, theme.menu_w, theme.menu_h),
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        render_menu_item(fb, theme, entry, i, i == sel);
+    }
+    cache
 }
 
 // ============================================================
@@ -1737,8 +1799,8 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
     let mut remaining_us: u64 = timeout_us;
 
     // 4. 主循环
-    // 初始整屏渲染 (背景 + 顶栏 + 菜单)
-    render_screen(&mut fb, &theme, &entries[..], sel);
+    // 初始整屏渲染 (背景 + 顶栏 + 菜单)；同时缓存面板静态像素，供后续按键增量重绘。
+    let menu_cache = render_init(&mut fb, &theme, &entries[..], sel);
 
     loop {
         let prev_sel = sel;
@@ -1794,9 +1856,12 @@ fn efi_main(_image: uefi::Handle, mut st: SystemTable<Boot>) -> Status {
             remaining_us = timeout_us;
         }
 
-        // 选择变化时整屏重绘 (背景 + 顶栏 + 菜单)
+        // 只恢复旧/新两项：背景、顶栏、面板和其余条目保持原像素。
         if sel != prev_sel {
-            render_screen(&mut fb, &theme, &entries[..], sel);
+            menu_cache.restore_item(&mut fb, &theme, prev_sel);
+            render_menu_item(&mut fb, &theme, &entries[prev_sel], prev_sel, false);
+            menu_cache.restore_item(&mut fb, &theme, sel);
+            render_menu_item(&mut fb, &theme, &entries[sel], sel, true);
         }
 
         // 倒计时步进: 每轮休眠 10ms
