@@ -161,7 +161,7 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::halt();
     };
 
-    crate::pager::deliver_fault(
+    let ok = crate::pager::deliver_fault(
         pager,
         crate::pager::PageFaultInfo {
             fault_domain,
@@ -169,6 +169,14 @@ extern "x86-interrupt" fn page_fault_handler(
             error_code: error_code.bits(),
         },
     );
+    if !ok {
+        // 分页器邮箱已满, 消息被静默丢弃 —— 若继续阻塞当前任务, 它将
+        // 永远等不到 reply, 内核静默挂死。比 panic 更糟, 所以直接 halt
+        // 并留下诊断。正常邮箱容量 16, 耗尽说明分页器域长时间不响应,
+        // 本身就是 bug 的信号。
+        crate::video::println("KERNEL PANIC: pager mailbox full, page fault dropped");
+        crate::halt();
+    }
     crate::scheduler::block_current(fault_domain);
 }
 

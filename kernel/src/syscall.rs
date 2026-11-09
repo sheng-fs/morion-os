@@ -297,7 +297,16 @@ extern "C" {
 /// `ptr` 为 0 表示无 payload (返回全零); 非用户空间地址同样拒绝 (返回全零),
 /// 避免 syscall 在 Ring0 下读取内核内存 (与 SYS_ALLOC_PAGE 等信任边界一致)。
 fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
-    if ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
+    if ptr == 0
+        || !crate::memory::paging::is_user_address(ptr)
+        || {
+            let end = match ptr.checked_add(crate::ipc::PAYLOAD_LEN as u64 - 1) {
+                Some(e) => e,
+                None => return [0; crate::ipc::PAYLOAD_LEN],
+            };
+            !crate::memory::paging::is_user_address(end)
+        }
+    {
         return [0; crate::ipc::PAYLOAD_LEN];
     }
     unsafe {
@@ -406,15 +415,28 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::ipc::send(a1, a2, &payload) as u64
         }
         SYS_RECV => {
-            // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
+            // 阻塞接收一条消息; 若 `a1` 非零且为合法用户地址, 把完整消息写回,
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
+            //
+            // 信任边界: `a1` 完全由用户态控制, 必须做用户空间边界校验, 否则内核
+            // 会把可控数据写到任意内核地址 (内核任意写原语)。
             let msg = crate::ipc::receive();
-            if a1 != 0 {
+            let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if a1 != 0
+                && crate::memory::paging::is_user_address(a1)
+                && {
+                    let end = match a1.checked_add(msg_size - 1) {
+                        Some(e) => e,
+                        None => msg.tag,
+                    };
+                    crate::memory::paging::is_user_address(end)
+                }
+            {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         &msg as *const crate::ipc::Message as *const u8,
                         a1 as *mut u8,
-                        core::mem::size_of::<crate::ipc::Message>(),
+                        msg_size as usize,
                     );
                 }
             }
@@ -732,8 +754,27 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
-            let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
+            //
+            // 信任边界: a1/a2 完全由用户态控制, 必须做边界校验 —— 不能让内核读内核地址
+            // (信息泄露) 或越过用户空间 (内核态缺页崩溃)。
+            const MAX_PUTS_LEN: u64 = 4096;
+            let len = if a2 > MAX_PUTS_LEN { MAX_PUTS_LEN } else { a2 };
+            if a1 == 0
+                || len == 0
+                || !crate::memory::paging::is_user_address(a1)
+                || {
+                    let end = match a1.checked_add(len - 1) {
+                        Some(e) => e,
+                        None => return 0,
+                    };
+                    !crate::memory::paging::is_user_address(end)
+                }
+            {
+                return 0;
+            }
+            let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, len as usize) };
+            // 用 from_utf8 而非 from_utf8_unchecked: 无效 UTF-8 替换为 � 字符, 避免内核 panic。
+            let s = core::str::from_utf8(slice).unwrap_or("");
             crate::video::print(s);
             0
         }
@@ -903,15 +944,26 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_TRY_RECV => {
-            // 非阻塞收: 有消息就把完整消息写回 `a1` 并返回 tag; 邮箱空返回 u64::MAX。
+            // 非阻塞收: 有消息就把完整消息写回 `a1` (若为合法用户地址) 并返回 tag;
+            // 邮箱空返回 u64::MAX。
             match crate::ipc::try_receive() {
                 Some(msg) => {
-                    if a1 != 0 {
+                    let msg_size = core::mem::size_of::<crate::ipc::Message>() as u64;
+                    if a1 != 0
+                        && crate::memory::paging::is_user_address(a1)
+                        && {
+                            let end = match a1.checked_add(msg_size - 1) {
+                                Some(e) => e,
+                                None => msg.tag,
+                            };
+                            crate::memory::paging::is_user_address(end)
+                        }
+                    {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 &msg as *const crate::ipc::Message as *const u8,
                                 a1 as *mut u8,
-                                core::mem::size_of::<crate::ipc::Message>(),
+                                msg_size as usize,
                             );
                         }
                     }
