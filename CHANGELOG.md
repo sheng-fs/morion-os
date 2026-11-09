@@ -6,6 +6,28 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 2026-11-09
+
+**USB/exFAT 写入持久化与签名诊断修复。**
+
+### 修复
+
+- **shell 写缓冲**：分配/共享 `SHELL_WRITE_BUF`，`dmesg` 写文件改走它。之前误用
+  app 的 `WRITE_BUF`，exFAT 收到全 0 数据（目录项正常、文件内容为空）。
+- **exFAT NameHash**：按 UTF-16 低/高字节分两次 rotate + add，对齐 Linux/内核/
+  exfatprogs；之前整个 u16 一次累加，宿主会判目录项损坏、看到空分区。
+- **exFAT / FAT32**：每个请求处理完也 `block_wb_flush`，避免最后一批写滞留。
+- **xHCI**：`WRITE(10)` 成功后发 `SYNCHRONIZE CACHE(10)`，把 U 盘内部缓存刷到闪存。
+- **签名诊断**：扇区 0 分类为 `test/gpt/mbr/exfat/fat32/ntfs/none`；真机日志打印
+  `sector0=gpt` / `sig=gpt` 和 `write self-test skipped`，不再误报 `sig=BAD`。
+
+### 验证
+
+- 真机 `dmesg usb/usb.log` 后接回 Linux：`PERSIST/usb.log` 存在、13587 字节，
+  `head`/`tail` 可读。
+- QEMU（AHCI + qemu-xhci + usb-storage exFAT）：`fsck.exfat` 为
+  `clean. directories 1, files 1`，宿主可读到 `log.txt`。
+
 ## [Unreleased] — 2026-11-08
 
 **真机 USB 3.2 10Gbps 存储 + 持久化分区打通。**

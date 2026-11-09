@@ -41,13 +41,32 @@ exfat-dbg: vol=2 cluster=32768 clusters=16320 root=4 bitmap=2040 upcase=5836
 5. **持久化数据分区**：新增 `make SAFE=1 usbimg-persist`，在 ESP 后追加 512MiB exFAT；
    ESP 仍是唯一 FAT32 卷，因此 `/` 不会误落到数据分区。
 
+## 持久化验证（2026-11-09）
+
+真机 `dmesg usb/usb.log` 报告写入 13597 字节；把同一块 U 盘接回 Linux 后：
+
+```
+/run/media/jinjun/PERSIST/usb.log   13587 字节
+head: Morion OS Kernel / Stage 1: CPU initialization
+tail: [morion@morion /]$ dmesg usb/usb.log
+```
+
+文件可见、可读，说明写入已经真正落盘。修复点：
+
+- **shell**：分配/共享 `SHELL_WRITE_BUF`，`dmesg` 写文件改走它（之前误用 app 的
+  `WRITE_BUF`，exFAT 收到全 0 数据，目录项正常但内容为空）。
+- **exFAT NameHash**：按 UTF-16 低/高字节分两次 rotate + add（对齐内核/exfatprogs）；
+  之前把整个 u16 一次累加，Linux/Windows 会判目录项损坏，表现为空分区。
+- **exFAT / FAT32**：每个请求处理完也 `block_wb_flush`，最后一批写不再滞留。
+- **xHCI**：`WRITE(10)` 成功后发 `SYNCHRONIZE CACHE(10)`，把 U 盘内部缓存刷到闪存。
+- **签名诊断**：扇区 0 分类为 `test/gpt/mbr/exfat/fat32/ntfs/none`；真机日志现在是
+  `sector0=gpt` / `sig=gpt`，并明确打印 `write self-test skipped`，不再误报 `sig=BAD`。
+
+QEMU 回归（AHCI + qemu-xhci + usb-storage exFAT）：写入后 `fsck.exfat` 为
+`clean. directories 1, files 1`，Linux 挂载可读到 `log.txt`。
+
 ## 已知问题
 
-- **PERSIST 写入跨关机/拔盘不持久**：MorionOS 内 `touch` / `dmesg` 报告成功，
-  但把 U 盘接回 Linux 后 `/usb` 是空的。需要补：
-  - exFAT 写回缓存的显式 flush；
-  - BOT 写路径的 `SYNCHRONIZE CACHE(10)`；
-  - 关机/重启前的文件系统 sync。
 - 每台控制器目前只枚举一台设备：06:00.3 上的 U 盘优先，外接键盘让位；
   内置键盘（i8042）可用。
 - 只打印 Hub（class 09），不扫描下游；没有 Route String / TT。
@@ -56,11 +75,10 @@ exfat-dbg: vol=2 cluster=32768 clusters=16320 root=4 bitmap=2040 upcase=5836
 
 ## 下一步
 
-1. 写入持久化：exFAT flush + SYNCHRONIZE CACHE + 关机 sync，再验证 `ok.txt` 跨重启。
-2. 多设备 / 多 slot：一台控制器同时保留 U 盘与键盘。
-3. Hub + TT + Hub 中断端点：扫描内置 Hub 下游的键盘/鼠标/蓝牙。
-4. UAS 后端；端口变更事件 / 热插拔；可选 MSI-X。
-5. `USB CENSUS` 诊断模式：一次启动输出完整控制器/端口/Hub/设备树。
+1. 多设备 / 多 slot：一台控制器同时保留 U 盘与键盘。
+2. Hub + TT + Hub 中断端点：扫描内置 Hub 下游的键盘/鼠标/蓝牙。
+3. UAS 后端；端口变更事件 / 热插拔；可选 MSI-X。
+4. `USB CENSUS` 诊断模式：一次启动输出完整控制器/端口/Hub/设备树。
 
-> 构建说明：真机验证镜像的版本串是 `20a5dd4`；exFAT 修复在构建前已进入工作树，
-> 随后提交为 `25ff28b`。
+> 构建说明：2026-11-08 真机验证镜像的版本串是 `20a5dd4`；exFAT 修复随后提交为
+> `25ff28b`。2026-11-09 的持久化/签名修复提交为 `474e22a`。
