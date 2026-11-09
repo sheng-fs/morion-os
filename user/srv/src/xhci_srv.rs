@@ -1913,11 +1913,7 @@ fn probe_controller(g: &DeviceGrant, idx: u32) -> ProbeOutcome {
     }
     let sector = unsafe { core::slice::from_raw_parts(hc.data_va as *const u8, 512) };
     let is_test = is_test_sig(sector, &SIG);
-    let sig_kind = if is_test {
-        "test"
-    } else {
-        boot_sig_kind(sector)
-    };
+    let sig_kind = if is_test { "test" } else { boot_sig_kind(sector) };
 
     print("USB1 xhci OK, cap=");
     print_u64(cap_sectors);

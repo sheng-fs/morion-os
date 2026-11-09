@@ -998,14 +998,7 @@ fn ahci_attach_selftest(sectors: u32, vol: u64) {
     let (is_test, kind) = if read_ok {
         let sector = unsafe { core::slice::from_raw_parts(scratch, 512) };
         let is_test = is_test_sig(sector, &AHCI_SIG);
-        (
-            is_test,
-            if is_test {
-                "test"
-            } else {
-                boot_sig_kind(sector)
-            },
-        )
+        (is_test, if is_test { "test" } else { boot_sig_kind(sector) })
     } else {
         (false, "none")
     };
@@ -1069,14 +1062,7 @@ fn xhci_attach_selftest(sectors: u32, vol: u64) {
     let (is_test, kind) = if read_ok {
         let sector = unsafe { core::slice::from_raw_parts(scratch, 512) };
         let is_test = is_test_sig(sector, &XHCI_SIG);
-        (
-            is_test,
-            if is_test {
-                "test"
-            } else {
-                boot_sig_kind(sector)
-            },
-        )
+        (is_test, if is_test { "test" } else { boot_sig_kind(sector) })
     } else {
         (false, "none")
     };
