@@ -1019,9 +1019,41 @@ fn ascii_upper(c: u8) -> u8 {
     }
 }
 
+/// 名字字符合法性: 拒绝 NUL / C0 控制字符 / DEL 与 FAT 保留字符。
+///
+/// 路径规范化 (`vfs::normalize_abs`) 已挡住控制字符与 `.`/`..`; 这里补上 FAT 自己的
+/// 保留字符, 避免把非法名字写进目录项 (还会让后续解析产生歧义)。
+fn fat_name_ok(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|&c| {
+            c >= 0x20
+                && c != 0x7F
+                && !matches!(
+                    c,
+                    b'"' | b'*'
+                        | b'+'
+                        | b','
+                        | b'/'
+                        | b':'
+                        | b';'
+                        | b'<'
+                        | b'='
+                        | b'>'
+                        | b'?'
+                        | b'['
+                        | b'\\'
+                        | b']'
+                        | b'|'
+                )
+        })
+}
+
 /// 把路径段 (如 "hello.txt" / "dir1") 转成 FAT 8.3 短名 (11 字节, 大写 + 空格填充)。
-/// 扩展名按最后一个 '.' 分隔; 主名 > 8 或扩展名 > 3 视为不合法, 返回 None。
+/// 扩展名按最后一个 '.' 分隔; 主名 > 8 或扩展名 > 3、或含 FAT 非法字符时返回 None。
 fn short_name_from_query(name: &[u8]) -> Option<[u8; 11]> {
+    if !fat_name_ok(name) {
+        return None;
+    }
     let mut dot = None;
     for (i, &c) in name.iter().enumerate() {
         if c == b'.' {
@@ -1032,7 +1064,7 @@ fn short_name_from_query(name: &[u8]) -> Option<[u8; 11]> {
         Some(d) => (&name[..d], &name[d + 1..]),
         None => (name, &[]),
     };
-    if base.len() > 8 || ext.len() > 3 {
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
         return None;
     }
     let mut sn = [b' '; 11];
@@ -1221,13 +1253,18 @@ fn find_entry_sn(
 
 /// 按正斜杠路径 (如 "/dir1/nested.txt") 从根目录解析到最终条目。
 /// 忽略空段 (连续 '/' 或前导 '/'), 中间段必须是目录, 末段返回条目。
+///
+/// 解析前先做统一的绝对路径规范化 (`vfs::normalize_abs`): `..` 在挂载点根处钳制、
+/// NUL/控制字符/超长分量被拒绝 —— `..` 绝不会跑到本文件系统之外。
 fn resolve_path(
     bpb: &Fat32Bpb,
     path: &str,
     dir_buf: *mut u8,
     fat_buf: *mut u8,
 ) -> Option<DirEntryInfo> {
-    let bytes = path.as_bytes();
+    let mut canon = [0u8; TMP_PATH_MAX];
+    let cn = vfs::normalize_abs(path.as_bytes(), &mut canon, vfs::PATH_COMP_MAX)?;
+    let bytes = &canon[..cn];
     let mut cur_cluster = bpb.root_cluster;
     let mut i = 0usize;
 
@@ -1257,15 +1294,16 @@ fn resolve_path(
     None
 }
 
-/// 解析 open 路径: 空路径或单个 "/" 视为根目录, 其余按正斜杠路径解析。
+/// 解析 open 路径: 规范化后单个 "/" 视为根目录, 其余按正斜杠路径解析。
 fn resolve_open_path(
     bpb: &Fat32Bpb,
     path: &str,
     dir_buf: *mut u8,
     fat_buf: *mut u8,
 ) -> Option<DirEntryInfo> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
+    let mut canon = [0u8; TMP_PATH_MAX];
+    let cn = vfs::normalize_abs(path.as_bytes(), &mut canon, vfs::PATH_COMP_MAX)?;
+    if cn == 1 {
         return Some(DirEntryInfo {
             start_cluster: bpb.root_cluster,
             file_size: 0,
@@ -1286,7 +1324,9 @@ fn resolve_parent(
     dir_buf: *mut u8,
     fat_buf: *mut u8,
 ) -> Option<(u32, [u8; 11])> {
-    let bytes = path.as_bytes();
+    let mut canon = [0u8; TMP_PATH_MAX];
+    let cn = vfs::normalize_abs(path.as_bytes(), &mut canon, vfs::PATH_COMP_MAX)?;
+    let bytes = &canon[..cn];
     let mut cur_cluster = bpb.root_cluster;
     let mut i = 0usize;
 
@@ -2106,6 +2146,10 @@ pub fn run() {
                     None => u64::MAX,
                 };
                 sys_reply(n);
+            }
+            // FAT32 没有权限位 / 属主字段: 明确回「不支持」, 不假装成功。
+            vfs::VFS_CHMOD_TAG | vfs::MFS_CHOWN_TAG => {
+                sys_reply(vfs::err_reply(vfs::VFS_ENOTSUP));
             }
             _ => {
                 sys_reply(u64::MAX);

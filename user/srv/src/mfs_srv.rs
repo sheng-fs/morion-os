@@ -3732,6 +3732,10 @@ fn mfs_name_to_fat(name: &[u8], out: &mut [u8; 11]) {
 /// 与 tmpfs 的 8.3 规整 (`tmp_normalize`) 不同: MFS v2 起名字是长度 ≤ `MFS_NAME_MAX`
 /// 的任意字节串, 大小写敏感、按字节精确匹配 (与 ext2 一致), 不做大写化或截断。
 /// 端到端长度另受单条 IPC 路径 (payload) 限制。返回长度; 越界/空分量返回 None。
+///
+/// **安全约束**: `..` 只能在 MFS 自己的树里回退 —— 到达服务根 (`/`) 后不再上移, 故
+/// 无论路径来自客户端还是软链接展开, 都不可能越过挂载点。NUL / 控制字符一律拒绝
+/// (它们既不是合法名字, 也可能截断下游解析)。
 fn mfs_normalize(path: &str, out: &mut [u8]) -> Option<usize> {
     let bytes = path.as_bytes();
     if bytes.first() != Some(&b'/') || out.is_empty() {
@@ -3750,11 +3754,14 @@ fn mfs_normalize(path: &str, out: &mut [u8]) -> Option<usize> {
             i += 1;
         }
         let seg = &bytes[start..i];
+        if seg.iter().any(|&c| c == 0 || c < 0x20 || c == 0x7F) {
+            return None;
+        }
         if seg == b"." {
             continue;
         }
         if seg == b".." {
-            // 回退一级 (已在根时不动)。
+            // 回退一级 (已在挂载点根时不动 —— 不越出本文件系统)。
             if n > 1 {
                 let mut k = n - 1;
                 while k > 0 && out[k - 1] != b'/' {
@@ -5451,7 +5458,19 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
 fn mfs_symlink(target: &str, linkpath: &str, owner: u16, cred: Cred) -> u64 {
     let tb = target.as_bytes();
     if tb.is_empty() || tb.len() > MFS_LINK_MAX {
-        return u64::MAX;
+        return mfs_err(MFS_EINVAL);
+    }
+    // 目标字符串会被原样存盘、解析时再展开: NUL / 控制字符会截断或混淆解析,
+    // 一律拒绝。绝对目标还要能通过本文件系统的规范化 —— `..` 在服务根处钳制,
+    // 因此链接目标不可能被解析到挂载点之外 (见 `mfs_resolve_ex`)。
+    if tb.iter().any(|&b| b == 0 || b < 0x20 || b == 0x7F) {
+        return mfs_err(MFS_EINVAL);
+    }
+    if tb[0] == b'/' {
+        let mut tc = [0u8; MFS_PATH_MAX];
+        if mfs_normalize(target, &mut tc).is_none() {
+            return mfs_err(MFS_EINVAL);
+        }
     }
     let mut canon = [0u8; MFS_PATH_MAX];
     let n = match mfs_normalize(linkpath, &mut canon) {

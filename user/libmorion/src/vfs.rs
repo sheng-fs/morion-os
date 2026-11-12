@@ -32,6 +32,21 @@ pub fn mfs_errno(v: u64) -> u64 {
     }
 }
 
+/// 错误码: 该文件系统**不支持**这个操作。
+///
+/// FAT32 / exFAT / ext2 没有权限位与属主概念, `chmod` / `chown` 一律回这个码, 而不是
+/// 假装成功或与「路径不存在」混用同一个通用失败。它与 MFS 的错误码同处一个波段,
+/// 客户端统一归一化成 `u64::MAX` 并把原始码记进 [`mfs_last_errno`]。
+pub const VFS_ENOTSUP: u64 = 12;
+
+/// 把错误码编码成文件服务失败波段 (高 16 位全 1), 供非 MFS 服务复用。
+///
+/// 该波段与 MFS 的 `mfs_err(...)` 完全一致: fd 编码把能力句柄放最高 16 位且句柄
+/// 索引 < 32, 成功值 (字节数 / 条目数) 也远小于此, 故不会冲突。
+pub fn err_reply(code: u64) -> u64 {
+    0xFFFF_FFFF_FFFF_0000 | (code & 0xFFFF)
+}
+
 /// 最近一次文件服务调用看到的错误码 (0 = 无错误)。供需要区分 `ENOENT` / `EACCES`
 /// 的调用方读取 —— 对外的返回值仍是 `u64::MAX` (见下)。
 static mut MFS_LAST_ERRNO: u64 = 0;
@@ -397,24 +412,101 @@ fn mount_lookup(path: &str) -> Option<(u64, u32, usize)> {
     Some((domain, vol_enc, prefix_len))
 }
 
-/// 把绝对路径 `path` 解析为 (目标服务域, 卷编码, 相对挂载点根的路径)。
+/// 路径分量的最大字节数 (各文件系统自定; MFS / FAT 长名 / exFAT / ext2 都是 255)。
+pub const PATH_COMP_MAX: usize = 255;
+
+/// **所有文件服务共用**的绝对路径规范化规则。
 ///
-/// 相对路径保留前导 '/' (服务端一律按以 '/' 开头的绝对路径处理子路径)。例如
-/// `/tmp/a` 在 `/tmp`→tmpfs 下得到 `("/a", tmpfs)`; `/h.txt` 在 `/`→fat32 下
-/// 得到 `("/h.txt", fat32)`。
-fn route(path: &str) -> Option<(u64, u32, &str)> {
-    let (domain, vol_enc, prefix_len) = mount_lookup(path)?;
-    if prefix_len > path.len() {
+/// - 必须以 '/' 开头 (服务命名空间里没有"当前目录"概念);
+/// - 拒绝 NUL、C0 控制字符与 DEL —— 它们既不能出现在盘上名字里, 也可能被用来
+///   截断/混淆下游解析;
+/// - 折叠重复 '/'、丢弃 '.'; `..` 在**挂载点根处钳制**, 绝不越出 (根是服务树顶);
+/// - 拒绝超长分量 (`comp_max`) 与超长结果 (`out.len()`), 不静默截断成另一条路径。
+///
+/// 返回规范化后的字节数; 路径非法时返回 `None`。输出总以 '/' 开头, 根即 `"/"`。
+pub fn normalize_abs(path: &[u8], out: &mut [u8], comp_max: usize) -> Option<usize> {
+    if path.first() != Some(&b'/') || out.is_empty() {
         return None;
     }
-    // 根挂载 ("/", 前缀长度 1): 路径本身就是服务内绝对路径, 原样下发。
-    if prefix_len == 1 {
-        return Some((domain, vol_enc, path));
+    out[0] = b'/';
+    let mut n = 1usize;
+    let mut i = 1usize;
+    while i < path.len() {
+        if path[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < path.len() && path[i] != b'/' {
+            i += 1;
+        }
+        let seg = &path[start..i];
+        if seg.iter().any(|&b| b == 0 || b < 0x20 || b == 0x7F) {
+            return None;
+        }
+        if seg == b"." {
+            continue;
+        }
+        if seg == b".." {
+            // 回退一级: 已在挂载点根时不动 —— 这是「不越出挂载点」的关键。
+            if n > 1 {
+                let mut k = n - 1;
+                while k > 0 && out[k - 1] != b'/' {
+                    k -= 1;
+                }
+                n = if k > 1 { k - 1 } else { 1 };
+            }
+            continue;
+        }
+        if seg.len() > comp_max {
+            return None;
+        }
+        let sep = usize::from(n > 1);
+        if n + sep + seg.len() > out.len() {
+            return None;
+        }
+        if sep == 1 {
+            out[n] = b'/';
+            n += 1;
+        }
+        out[n..n + seg.len()].copy_from_slice(seg);
+        n += seg.len();
     }
-    // 其它挂载点: 去掉挂载前缀, 余下部分自带前导 '/' (如 `/tmp/D1` → `/D1`);
-    // 恰好等于挂载点时余下为空, 即子树根 `/`。
-    let rest = &path[prefix_len..];
-    Some((domain, vol_enc, if rest.is_empty() { "/" } else { rest }))
+    Some(n)
+}
+
+/// 把绝对路径 `path` 规范化后交给挂载层解析, 返回
+/// `(目标服务域, 卷编码, 挂载点前缀长度, 规范化路径长度)`; 规范化结果写进 `out`。
+///
+/// 规范化在**挂载层之前**完成: 于是 `/mfs/../tmp/a` 会正确路由到 tmpfs, 而不是把
+/// `..` 交给某个文件服务去解释 —— 任何 `..` 都不可能把请求带出挂载点。
+fn route(path: &str, out: &mut [u8; PAYLOAD_LEN]) -> Option<(u64, u32, usize, usize)> {
+    let n = normalize_abs(path.as_bytes(), out, PATH_COMP_MAX)?;
+    // 必须留出结尾 NUL 的位置 (子路径随后写进 payload / 共享页)。
+    if n >= out.len() {
+        return None;
+    }
+    let canon = unsafe { core::str::from_utf8_unchecked(&out[..n]) };
+    let (domain, vol_enc, prefix_len) = mount_lookup(canon)?;
+    if prefix_len == 0 || prefix_len > n {
+        return None;
+    }
+    Some((domain, vol_enc, prefix_len, n))
+}
+
+/// 从 `route` 写好的规范化路径中取出**服务内子路径** (去掉挂载点前缀)。
+///
+/// 根挂载 (前缀长度 1) 原样下发; 其它挂载点去掉前缀后自带前导 '/'; 恰好等于挂载点
+/// 时余下为空, 即子树根 `/`。
+fn route_sub(canon: &[u8], prefix_len: usize) -> &str {
+    let rest: &[u8] = if prefix_len == 1 {
+        canon
+    } else if prefix_len >= canon.len() {
+        b"/"
+    } else {
+        &canon[prefix_len..]
+    };
+    unsafe { core::str::from_utf8_unchecked(rest) }
 }
 
 /// 把「服务域 + 服务内局部 fd」打包为对外 fd, 并在高 16 位带上能力句柄索引。
@@ -639,6 +731,10 @@ impl DirEntry {
 /// `mode` / `owner` / `nlink` / 三个时间是 MFS 提供的节点元数据 (见 roadmap M5);
 /// 其它文件服务没有对应概念, 一律填默认值 (`mode` 按目录/文件给 0755/0644, 时间为 0)。
 /// 时间单位是 Unix 秒 (UTC), 0 表示"未知"。
+///
+/// **跨文件系统的权限语义**: 只有 MFS 的 `mode`/`uid`/`gid` 是**真权限** (落盘并参与
+/// 访问判定); FAT32 / exFAT / ext2 上的 `mode` 只是给 `ls -l` 的显示缺省值, 不强制,
+/// 其 `chmod`/`chown` 会显式返回 [`VFS_ENOTSUP`]。不要用非 MFS 的 `mode` 做安全决策。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Stat {
@@ -718,9 +814,10 @@ fn wrap_open(domain: u64, local: u64) -> u64 {
 
 /// 打开文件或目录, 成功返回 fd (已编码目标服务域 + 能力句柄), 失败返回 `u64::MAX`。
 pub fn open(path: &str) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
-            let payload = path_payload(sub);
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
+            let payload = path_payload(route_sub(&canon[..n], plen));
             wrap_open(
                 domain,
                 sys_call_payload(domain, with_vol(VFS_OPEN_TAG, vol_enc), &payload),
@@ -833,9 +930,10 @@ pub fn close(fd: u64) -> u64 {
 /// 创建/打开文件: 若 `path` 已存在则直接打开 (不截断), 否则创建空文件。
 /// 成功返回 fd (已编码目标服务域 + 能力句柄), 失败返回 `u64::MAX`。
 pub fn creat(path: &str) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
-            let payload = path_payload(sub);
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
+            let payload = path_payload(route_sub(&canon[..n], plen));
             wrap_open(
                 domain,
                 sys_call_payload(domain, with_vol(VFS_CREAT_TAG, vol_enc), &payload),
@@ -847,9 +945,10 @@ pub fn creat(path: &str) -> u64 {
 
 /// 创建目录 `path`, 成功返回 1, 失败返回 `u64::MAX`。
 pub fn mkdir(path: &str) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
-            let payload = path_payload(sub);
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
+            let payload = path_payload(route_sub(&canon[..n], plen));
             sys_call_payload(domain, with_vol(VFS_MKDIR_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
@@ -858,9 +957,10 @@ pub fn mkdir(path: &str) -> u64 {
 
 /// 删除文件 `path` (不删目录), 成功返回 1, 失败返回 `u64::MAX`。
 pub fn unlink(path: &str) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
-            let payload = path_payload(sub);
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
+            let payload = path_payload(route_sub(&canon[..n], plen));
             sys_call_payload(domain, with_vol(VFS_UNLINK_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
@@ -869,9 +969,10 @@ pub fn unlink(path: &str) -> u64 {
 
 /// 删除空目录 `path`, 成功返回 1, 失败返回 `u64::MAX`。
 pub fn rmdir(path: &str) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
-            let payload = path_payload(sub);
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
+            let payload = path_payload(route_sub(&canon[..n], plen));
             sys_call_payload(domain, with_vol(VFS_RMDIR_TAG, vol_enc), &payload)
         }
         None => u64::MAX,
@@ -889,14 +990,15 @@ pub fn stat(path: &str) -> u64 {
 
 /// 同 `stat`, 但结果写入 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn stat_into(path: &str, buf: u64) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
             let req = PathReq {
                 aux: 0,
                 _pad: 0,
                 buf,
             };
-            write_cstr(sub, buf);
+            write_cstr(route_sub(&canon[..n], plen), buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
                     &req as *const PathReq as *const u8,
@@ -922,20 +1024,20 @@ pub fn readlink(path: &str) -> u64 {
 /// 绝对目标必然落在同一挂载点内 (`symlink_into` 对跨挂载点的绝对目标直接拒绝),
 /// 所以剥/加前缀是互逆的。相对目标原样返回。
 pub fn readlink_into(path: &str, buf: u64) -> u64 {
-    let (domain, vol_enc, sub) = match route(path) {
+    let mut canon = [0u8; PAYLOAD_LEN];
+    let (domain, vol_enc, plen, clen) = match route(path, &mut canon) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let prefix_len = match mount_lookup(path) {
-        Some((_, _, n)) => n,
-        None => 0,
-    };
+    // 前缀取自规范化路径 (与挂载层用的是同一份), 避免 `..` 让长度对不上原字符串。
+    let mut prefix = [0u8; MOUNT_PREFIX_MAX];
+    prefix[..plen].copy_from_slice(&canon[..plen]);
     let req = PathReq {
         aux: 0,
         _pad: 0,
         buf,
     };
-    write_cstr(sub, buf);
+    write_cstr(route_sub(&canon[..clen], plen), buf);
     let payload = unsafe {
         core::slice::from_raw_parts(
             &req as *const PathReq as *const u8,
@@ -949,17 +1051,17 @@ pub fn readlink_into(path: &str, buf: u64) -> u64 {
     let n = n as usize;
     // 目标串已在 `buf` 里; 需要加回挂载前缀时就地右移 (长度不变或变长, 不能原地覆盖)。
     let raw = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
-    if prefix_len == 0 || raw[0] != b'/' || prefix_len + n > PAYLOAD_LEN - 1 {
+    if plen == 0 || raw[0] != b'/' || plen + n > PAYLOAD_LEN - 1 {
         return n as u64;
     }
     let mut out = [0u8; PAYLOAD_LEN];
-    out[..prefix_len].copy_from_slice(&path.as_bytes()[..prefix_len]);
-    out[prefix_len..prefix_len + n].copy_from_slice(raw);
+    out[..plen].copy_from_slice(&prefix[..plen]);
+    out[plen..plen + n].copy_from_slice(raw);
     unsafe {
-        core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, prefix_len + n);
-        *(buf as *mut u8).add(prefix_len + n) = 0;
+        core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, plen + n);
+        *(buf as *mut u8).add(plen + n) = 0;
     }
-    (prefix_len + n) as u64
+    (plen + n) as u64
 }
 
 /// 取**链接自身**的元数据 (不跟随软链接), 成功返回 `size_of::<Stat>()`, 失败 `u64::MAX`。
@@ -972,14 +1074,15 @@ pub fn lstat(path: &str) -> u64 {
 
 /// 同 `lstat`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn lstat_into(path: &str, buf: u64) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
             let req = PathReq {
                 aux: 0,
                 _pad: 0,
                 buf,
             };
-            write_cstr(sub, buf);
+            write_cstr(route_sub(&canon[..n], plen), buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
                     &req as *const PathReq as *const u8,
@@ -994,21 +1097,26 @@ pub fn lstat_into(path: &str, buf: u64) -> u64 {
 
 /// 修改权限位为 `mode` (低 12 位), 成功返回 1, 失败 `u64::MAX`。
 ///
-/// 权限位当前只存储与显示, 不参与访问判定 (没有多用户概念)。
+/// **权限语义按文件系统区分**:
+/// - MFS: 真权限 —— 权限位随 inode 落盘并参与每次访问判定 (`uid 0` 直通 rwx 位);
+/// - FAT32 / exFAT / ext2: 盘上没有权限位与属主, 服务显式返回 `ENOTSUP`
+///   (对外仍是 `u64::MAX`, 原始码见 [`mfs_last_errno`] == [`VFS_ENOTSUP`]),
+///   **不会假装成功**。这些 FS 上 `stat` 看到的 `mode` 只是显示用的缺省值。
 pub fn chmod(path: &str, mode: u32) -> u64 {
     chmod_into(path, mode, RESULT_BUF)
 }
 
 /// 同 `chmod`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
             let req = PathReq {
                 aux: mode,
                 _pad: 0,
                 buf,
             };
-            write_cstr(sub, buf);
+            write_cstr(route_sub(&canon[..n], plen), buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
                     &req as *const PathReq as *const u8,
@@ -1022,20 +1130,24 @@ pub fn chmod_into(path: &str, mode: u32, buf: u64) -> u64 {
 }
 
 /// 改属主 / 属组 (04b, 仅 MFS; 只有 `uid 0` 能成功)。成功返回 1, 失败 `u64::MAX`。
+///
+/// 非 MFS 文件系统不记录属主, 服务显式返回 `ENOTSUP` (见 [`VFS_ENOTSUP`]);
+/// 跨 FS 时不存在"部分生效"的语义 —— 要么 MFS 真正改了 uid/gid, 要么明确拒绝。
 pub fn chown(path: &str, uid: u16, gid: u16) -> u64 {
     chown_into(path, uid, gid, RESULT_BUF)
 }
 
 /// 同 `chown`, 但把路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn chown_into(path: &str, uid: u16, gid: u16, buf: u64) -> u64 {
-    match route(path) {
-        Some((domain, vol_enc, sub)) => {
+    let mut canon = [0u8; PAYLOAD_LEN];
+    match route(path, &mut canon) {
+        Some((domain, vol_enc, plen, n)) => {
             let req = PathReq {
                 aux: ((uid as u32) << 16) | gid as u32,
                 _pad: 0,
                 buf,
             };
-            write_cstr(sub, buf);
+            write_cstr(route_sub(&canon[..n], plen), buf);
             let payload = unsafe {
                 core::slice::from_raw_parts(
                     &req as *const PathReq as *const u8,
@@ -1079,11 +1191,13 @@ pub fn rename(src: &str, dst: &str) -> u64 {
 ///
 /// 两条路径经共享页传 (IPC payload 装不下), 布局 `src\0dst\0`。
 pub fn rename_into(src: &str, dst: &str, buf: u64) -> u64 {
-    let (sd, senc, ssub) = match route(src) {
+    let mut sb = [0u8; PAYLOAD_LEN];
+    let mut db = [0u8; PAYLOAD_LEN];
+    let (sd, senc, splen, sn) = match route(src, &mut sb) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let (dd, denc, dsub) = match route(dst) {
+    let (dd, denc, dplen, dn) = match route(dst, &mut db) {
         Some(x) => x,
         None => return u64::MAX,
     };
@@ -1091,6 +1205,8 @@ pub fn rename_into(src: &str, dst: &str, buf: u64) -> u64 {
     if sd != dd || senc != denc {
         return u64::MAX;
     }
+    let ssub = route_sub(&sb[..sn], splen);
+    let dsub = route_sub(&db[..dn], dplen);
     let req = TwoPathReq {
         a_len: ssub.len() as u32,
         b_len: dsub.len() as u32,
@@ -1126,17 +1242,21 @@ pub fn link(src: &str, dst: &str) -> u64 {
 
 /// 同 `link`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 pub fn link_into(src: &str, dst: &str, buf: u64) -> u64 {
-    let (sd, senc, ssub) = match route(src) {
+    let mut sb = [0u8; PAYLOAD_LEN];
+    let mut db = [0u8; PAYLOAD_LEN];
+    let (sd, senc, splen, sn) = match route(src, &mut sb) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    let (dd, denc, dsub) = match route(dst) {
+    let (dd, denc, dplen, dn) = match route(dst, &mut db) {
         Some(x) => x,
         None => return u64::MAX,
     };
     if sd != dd || senc != denc {
         return u64::MAX; // 跨文件服务 / 跨卷不支持
     }
+    let ssub = route_sub(&sb[..sn], splen);
+    let dsub = route_sub(&db[..dn], dplen);
     let req = TwoPathReq {
         a_len: ssub.len() as u32,
         b_len: dsub.len() as u32,
@@ -1160,33 +1280,49 @@ pub fn symlink(target: &str, linkpath: &str) -> u64 {
 /// 同 `symlink`, 但把两条路径写进 `buf` 指定的共享页 (须已共享给目标文件服务域)。
 ///
 /// 只有 `linkpath` 走挂载层路由: `target` 是**存进链接节点的字符串**, 由服务端在解析
-/// 时才解释 (绝对 / 相对), 因此不在这里查它的所属文件系统。
+/// 时才解释 (绝对 / 相对)。
 ///
-/// 但绝对目标要先**换命名空间**: 文件服务只看得见自己那棵子树 (挂载点就是它的根),
-/// 不认识 `/mfs` 这一层挂载前缀 —— 直接存 `/mfs/a` 会变成服务内部的 `ROOT/mfs/a`,
-/// 解析必然失败。若目标落在**同一个**挂载点内, 这里剥掉前缀 (`/mfs/a` -> `/a`);
-/// 落在别的文件系统 (或未挂载路径) 上则**拒绝创建**: 服务端解析不到, 存下去只会是一个
-/// 悬空链接 —— 与其静默留个死链, 不如当场报错 (跨文件系统的软链接不支持, 见
-/// docs/roadmap-fs.md M5c)。相对目标不受影响, 原样存。
+/// **绝对目标的安全规则**:
+/// 1. 先做全局规范化 (`normalize_abs`) —— `..` 在全局根处钳制, 所以
+///    `/mfs/../../etc/shadow` 会先变成 `/etc/shadow`, 不可能借 `..` 跳到别的挂载点;
+/// 2. 规范化后必须与链接自身**同一个挂载点**(同域、同卷、同前缀), 否则拒绝创建 ——
+///    服务端只看得见自己那棵子树, 跨挂载点目标必然悬空; 这也挡住了"用软链接指向
+///    `/etc/shadow` 之类其它挂载点里的敏感路径";
+/// 3. 同挂载点内再剥掉前缀 (`/mfs/a` -> `/a`), 与服务端命名空间对齐。
+///
+/// 相对目标原样存 (服务端解析时 `..` 同样在挂载点根处钳制), 但拒绝 NUL / 控制字符
+/// 与超长目标。
 pub fn symlink_into(target: &str, linkpath: &str, buf: u64) -> u64 {
-    let (ld, lenc, lsub) = match route(linkpath) {
+    let mut lb = [0u8; PAYLOAD_LEN];
+    let (ld, lenc, lplen, ln) = match route(linkpath, &mut lb) {
         Some(x) => x,
         None => return u64::MAX,
     };
-    if target.is_empty() {
+    let lsub = route_sub(&lb[..ln], lplen);
+    if target.is_empty() || target.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7F) {
         return u64::MAX;
     }
-    let mut tgt = target;
-    if target.as_bytes()[0] == b'/' {
-        match mount_lookup(target) {
-            Some((td, tenc, tplen)) if td == ld && tenc == lenc => {
-                let rest = &target[tplen..];
-                tgt = if rest.is_empty() { "/" } else { rest };
-            }
-            // 别的挂载点 / 没有挂载点: 服务端无法解析, 不做悬空链接。
+    let mut tb = [0u8; PAYLOAD_LEN];
+    let tgt: &str = if target.as_bytes()[0] == b'/' {
+        let tn = match normalize_abs(target.as_bytes(), &mut tb, PATH_COMP_MAX) {
+            Some(n) if n < tb.len() => n,
             _ => return u64::MAX,
+        };
+        let norm = unsafe { core::str::from_utf8_unchecked(&tb[..tn]) };
+        let (td, tenc, tplen) = match mount_lookup(norm) {
+            Some(x) => x,
+            None => return u64::MAX,
+        };
+        if td != ld || tenc != lenc || tplen != lplen || tb[..tplen] != lb[..lplen] {
+            return u64::MAX;
         }
-    }
+        route_sub(&tb[..tn], tplen)
+    } else {
+        if target.len() > PAYLOAD_LEN - 1 {
+            return u64::MAX;
+        }
+        target
+    };
     // 两条路径要一起塞进共享页, 服务端按 `a_len + 1 + b_len` 校验, 这里先挡一次
     // (超长直接失败, 不写出一份会被服务端拒绝的请求)。
     if tgt.len() + 1 + lsub.len() > PAYLOAD_LEN - 1 {

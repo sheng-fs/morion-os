@@ -451,7 +451,18 @@ fn exfat_rewrite_set(parent_first: u32, name: &[u8], e: &ExfatEntry) -> bool {
     exfat_dir_put_set(loc, set.as_ptr(), total)
 }
 
+/// 把绝对路径规范化到 exFAT 服务命名空间; 返回的 `&str` 借用 `out`。
+///
+/// 复用 `vfs::normalize_abs`: `..` 在挂载点根处钳制 (绝不越出), NUL / 控制字符 /
+/// 超长分量被拒绝。
+fn exfat_norm<'a>(path: &str, out: &'a mut [u8; TMP_PATH_MAX]) -> Option<&'a str> {
+    let n = vfs::normalize_abs(path.as_bytes(), out, vfs::PATH_COMP_MAX)?;
+    Some(unsafe { core::str::from_utf8_unchecked(&out[..n]) })
+}
+
 /// 把绝对路径拆成 (父目录路径, 最后一段名字字节); 父目录为根时返回 `"/"`。
+///
+/// `path` 必须已经过 [`exfat_norm`] (不含 `.`/`..`、无重复 '/')。
 fn exfat_split_parent(path: &str) -> Option<(&str, &[u8])> {
     let b = path.as_bytes();
     if b.is_empty() || b[0] != b'/' || b.len() > TMP_PATH_MAX {
@@ -478,7 +489,12 @@ fn exfat_split_parent(path: &str) -> Option<(&str, &[u8])> {
 
 /// 创建文件 / 目录 (已存在且类型匹配则直接打开), 返回 fd。
 fn exfat_create(path: &str, is_dir: bool, vol: u64) -> u64 {
-    if path.is_empty() || path == "/" {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = match exfat_norm(path, &mut nb) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
+    if path == "/" {
         return u64::MAX;
     }
     if let Some(e) = exfat_resolve(path) {
@@ -535,6 +551,11 @@ fn exfat_create(path: &str, is_dir: bool, vol: u64) -> u64 {
 
 /// 删除文件 (`want_dir = false`) 或空目录 (`want_dir = true`)。
 fn exfat_remove(path: &str, want_dir: bool) -> u64 {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = match exfat_norm(path, &mut nb) {
+        Some(p) => p,
+        None => return u64::MAX,
+    };
     let (pdir, name) = match exfat_split_parent(path) {
         Some(v) => v,
         None => return u64::MAX,
@@ -701,7 +722,9 @@ fn exfat_fd_parent(fd: &ExfatFd, out: &mut [u8; vfs::DIR_LONG_MAX]) -> Option<(u
     if plen == 0 || plen > TMP_PATH_MAX {
         return None;
     }
-    let path = unsafe { core::str::from_utf8_unchecked(&fd.path[..plen]) };
+    let raw = unsafe { core::str::from_utf8_unchecked(&fd.path[..plen]) };
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = exfat_norm(raw, &mut nb)?;
     let (pdir, name) = exfat_split_parent(path)?;
     if name.len() > vfs::DIR_LONG_MAX {
         return None;
@@ -1281,11 +1304,13 @@ fn exfat_make_direntry(e: &ExfatEntry) -> vfs::DirEntry {
 // ---------------------------------------------------------------------------
 
 /// 把绝对路径解析为 entry (根目录是特例: 没有 entry set, 直接返回根簇)。
+///
+/// 解析前先做统一的绝对路径规范化: `..` 在挂载点根处钳制, NUL / 控制字符被拒绝,
+/// 因此路径不可能逃出本文件系统。
 fn exfat_resolve(path: &str) -> Option<ExfatEntry> {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = exfat_norm(path, &mut nb)?;
     let bytes = path.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'/' {
-        return None;
-    }
     let mut cur = ExfatEntry::EMPTY;
     cur.is_dir = true;
     cur.first_cluster = unsafe { EXFAT_ROOT_CLUSTER };
@@ -2129,7 +2154,11 @@ pub fn run() {
                 };
                 sys_reply(n);
             }
-            // 其余未实现 tag (rename/chmod/link 等) 一律拒绝。
+            // exFAT 没有权限位 / 属主字段: 明确回「不支持」, 不假装成功。
+            vfs::VFS_CHMOD_TAG | vfs::MFS_CHOWN_TAG => {
+                sys_reply(vfs::err_reply(vfs::VFS_ENOTSUP));
+            }
+            // 其余未实现 tag (rename/link 等) 一律拒绝。
             _ => {
                 sys_reply(u64::MAX);
             }

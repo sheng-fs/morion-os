@@ -51,6 +51,25 @@ pub enum Capability {
 /// 每域能力槽数量。
 pub const CAP_SLOTS: usize = 32;
 
+/// 能力槽项: 能力本身 + **委派来源**。
+///
+/// 来源是「撤销」正确性的根。`Capability` 是纯值、没有身份, 只记值的话 `revoke`
+/// 无法区分「本域自己持有的根能力」与「别人复制给我的一分子」—— 要么漏掉副本,
+/// 要么误伤其它域的独立授权。
+///
+/// - `parent = None`: 内核/权威方 `grant` 的根能力;
+/// - `parent = Some((域, 槽))`: 由该槽经 `delegate` **复制**而来 (`SYS_CAP_SEND`)。
+///
+/// 槽号用 `u16` 足够 (`CAP_SLOTS = 32`)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CapEntry {
+    cap: Capability,
+    parent: Option<(u64, u16)>,
+}
+
+/// 一个域的能力行 (定长, 按槽号索引)。
+type CapRow = [Option<CapEntry>; CAP_SLOTS];
+
 /// `SYS_CAP_SEND` 的 `kind` 编码 —— 能力是枚举, 而 syscall 参数只有整数,
 /// 故用 `(kind, arg)` 两段表示 (与用户态 `syscall::CAP_KIND_*` 一致)。
 pub const CAP_KIND_SEND_TO: u64 = 0;
@@ -126,7 +145,7 @@ pub fn pack_audit(cap: Capability) -> u64 {
 }
 
 /// 全局能力表: 每个域一个能力槽数组。
-static CAP_TABLE: Mutex<Vec<[Option<Capability>; CAP_SLOTS]>> = Mutex::new(Vec::new());
+static CAP_TABLE: Mutex<Vec<CapRow>> = Mutex::new(Vec::new());
 
 /// 每域句柄槽数量 (「能力即句柄」: 每个打开的内核对象/服务句柄占一个槽)。
 const HANDLE_SLOTS: usize = 32;
@@ -240,10 +259,17 @@ pub fn handle_drop(domain: u64, handle: u64) -> bool {
     ok
 }
 
+/// `table` 中域 `domain` 是否持有 `cap`。域不在表里 (未建/已销毁) 一律 false ——
+/// 不能用 `table[domain]` 直接索引: 域号来自 syscall 参数, 越界会 panic (内核 DoS)。
+fn holds_in(table: &[CapRow], domain: u64, cap: Capability) -> bool {
+    table
+        .get(domain as usize)
+        .is_some_and(|row| row.iter().flatten().any(|e| e.cap == cap))
+}
+
 /// 检查某域是否持有指定能力 (须在关中断下调用)。
 pub fn has(domain: u64, cap: Capability) -> bool {
-    let table = CAP_TABLE.lock();
-    table[domain as usize].contains(&Some(cap))
+    holds_in(&CAP_TABLE.lock(), domain, cap)
 }
 
 /// 域 `domain` 是否持有**覆盖 I/O 端口 `port`** 的能力（D0）。
@@ -252,9 +278,9 @@ pub fn has(domain: u64, cap: Capability) -> bool {
 /// `[base, base + len)` 即放行。这是 `SYS_PORT_*` 的门禁判据。
 pub fn has_port(domain: u64, port: u16) -> bool {
     let table = CAP_TABLE.lock();
-    table.get(domain as usize).is_some_and(|slots| {
-        slots.iter().any(|slot| match slot {
-            Some(Capability::IoPort(base, len)) => port_in_range(*base, *len, port),
+    table.get(domain as usize).is_some_and(|row| {
+        row.iter().flatten().any(|e| match e.cap {
+            Capability::IoPort(base, len) => port_in_range(base, len, port),
             _ => false,
         })
     })
@@ -273,9 +299,9 @@ fn port_in_range(base: u16, len: u16, port: u16) -> bool {
 /// 这是 `SYS_NET_BIND` 的门禁判据。
 pub fn has_net_port(domain: u64, port: u16) -> bool {
     let table = CAP_TABLE.lock();
-    table.get(domain as usize).is_some_and(|slots| {
-        slots.iter().any(|slot| match slot {
-            Some(Capability::Net(lo, hi)) => net_port_in_range(*lo, *hi, port),
+    table.get(domain as usize).is_some_and(|row| {
+        row.iter().flatten().any(|e| match e.cap {
+            Capability::Net(lo, hi) => net_port_in_range(lo, hi, port),
             _ => false,
         })
     })
@@ -297,7 +323,7 @@ pub fn audit_slot(domain: u64, slot: u64) -> Option<Option<Capability>> {
     // 槽越界必须与"空槽"区分开: 前者返回 `None` (审计者据此判定表尾), 后者是 `Some(None)`。
     // 若这里用 `.flatten()` 把两者都压成 `None`, 越界会被误报成空槽 -> 审计者扫不到表尾。
     let cell = row.get(slot as usize)?;
-    Some(*cell)
+    Some(cell.map(|e| e.cap))
 }
 
 /// 把 `from` 域句柄槽 `handle` 里的对象标识**移入** `to` 域的空槽,
@@ -349,6 +375,22 @@ pub fn handle_move(from: u64, to: u64, handle: u64) -> u64 {
     out
 }
 
+/// 在 `table` 里给 `domain` 签发一条**根**能力 (来源为空), 成功返回 true。
+///
+/// 域不在表里 (已销毁/越界) 或槽位耗尽返回 false (不 panic)。
+fn grant_in(table: &mut [CapRow], domain: u64, cap: Capability) -> bool {
+    let Some(row) = table.get_mut(domain as usize) else {
+        return false;
+    };
+    for slot in row.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(CapEntry { cap, parent: None });
+            return true;
+        }
+    }
+    false
+}
+
 /// 向某域授予能力 (占用一个空槽)。
 pub fn grant(domain: u64, cap: Capability) -> bool {
     // 保存/恢复中断状态: boot 期 (IF=0) 调用时不能提前开启中断,
@@ -356,43 +398,108 @@ pub fn grant(domain: u64, cap: Capability) -> bool {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut table = CAP_TABLE.lock();
-    let mut ok = false;
-    for slot in table[domain as usize].iter_mut() {
-        if slot.is_none() {
-            *slot = Some(cap);
-            ok = true;
-            break;
-        }
-    }
+    let ok = grant_in(&mut table, domain, cap);
     drop(table);
     if was_enabled {
         x86_64::instructions::interrupts::enable();
     }
     if !ok {
-        // 能力槽耗尽 (该域需要的凭证比 CAP_SLOTS 多)。必须吵出来: 调用方拿到 false 后
-        // 若静静丢掉, 表现就是运行期莫名其妙的"权限缺失", 极难定位。
+        // 能力槽耗尽 (该域需要的凭证比 CAP_SLOTS 多)，或域已不存在。必须吵出来:
+        // 调用方拿到 false 后若静静丢掉, 表现就是运行期莫名其妙的"权限缺失", 极难定位。
         crate::video::println("[WARN] capability table full: grant dropped");
     }
     ok
 }
 
-/// 撤销某域的指定能力。
+/// 撤销域 `domain` 的 `cap` 及其**全部派生副本**。
+///
+/// 语义:
+///   1. 摘掉该域所有 `cap` 槽 (同一能力可能被重复 `grant`, 不止一个槽);
+///   2. 沿委派来源做**级联**: 任何以这些槽为 `parent` 的复制件 (可能跨域、可多跳)
+///      一并失效 —— 否则撤销只作用于本域, 已 `SYS_CAP_SEND` 出去的副本还能继续用。
+///   3. **不动**其它域自己 `grant` 得到的同值能力 (它们没有这条来源链)。
+///
+/// 返回 false = 该域没有这条能力 / 域不存在。
+fn revoke_in(table: &mut [CapRow], domain: u64, cap: Capability) -> bool {
+    if table.get(domain as usize).is_none() {
+        return false;
+    }
+
+    // 第一步: 本域所有直接命中的槽 (可能就是多个)。
+    let mut revoked: Vec<(u64, u16)> = Vec::new();
+    {
+        let row = &mut table[domain as usize];
+        for (i, slot) in row.iter_mut().enumerate() {
+            if slot.is_some_and(|e| e.cap == cap) {
+                *slot = None;
+                revoked.push((domain, i as u16));
+            }
+        }
+    }
+    if revoked.is_empty() {
+        return false;
+    }
+
+    // 第二步: 广度优先找派生副本。每个槽只会被摘一次 (摘掉后变 `None`), 故必然终止。
+    let mut i = 0;
+    while i < revoked.len() {
+        let parent = revoked[i];
+        i += 1;
+        for (d, row) in table.iter_mut().enumerate() {
+            for (s, slot) in row.iter_mut().enumerate() {
+                if slot.is_some_and(|e| e.parent == Some(parent)) {
+                    *slot = None;
+                    revoked.push((d as u64, s as u16));
+                }
+            }
+        }
+    }
+    true
+}
+
+/// 撤销某域的指定能力 (含已委派出去的副本)。
 pub fn revoke(domain: u64, cap: Capability) -> bool {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut table = CAP_TABLE.lock();
-    let mut ok = false;
-    for slot in table[domain as usize].iter_mut() {
-        if *slot == Some(cap) {
-            *slot = None;
-            ok = true;
-            break;
-        }
-    }
+    let ok = revoke_in(&mut table, domain, cap);
+    drop(table);
     if was_enabled {
         x86_64::instructions::interrupts::enable();
     }
     ok
+}
+
+/// 在 `table` 里把 `cap` 从 `from` 复制给 `to`, 并记录来源槽。
+///
+/// 约束:
+///   - **不允许放大**: `from` 没持有 `cap` 就失败 (没有的能力给不出去);
+///   - `to` 已持有同值能力时幂等返回 true, 不占新槽;
+///   - `to` 不在表里 (不存在) 或槽满返回 false, 不改变状态。
+fn delegate_in(table: &mut [CapRow], from: u64, to: u64, cap: Capability) -> bool {
+    // 先定位来源槽 (复制件要记住它, 撤销才能级联)。
+    let Some(parent) = table.get(from as usize).and_then(|row| {
+        row.iter()
+            .position(|slot| slot.is_some_and(|e| e.cap == cap))
+    }) else {
+        return false;
+    };
+    let Some(row) = table.get_mut(to as usize) else {
+        return false;
+    };
+    if row.iter().flatten().any(|e| e.cap == cap) {
+        return true; // 幂等: 不重复占槽
+    }
+    for slot in row.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(CapEntry {
+                cap,
+                parent: Some((from, parent as u16)),
+            });
+            return true;
+        }
+    }
+    false
 }
 
 /// 把 `cap` 从 `from` 域**委派**给 `to` 域 (「能力随 IPC 传递」)。
@@ -401,33 +508,12 @@ pub fn revoke(domain: u64, cap: Capability) -> bool {
 /// 没有的能力给不出去, 这是能力安全模型的根。检查与写入在**同一把锁**内完成,
 /// 避免「检查后被抢先」。
 ///
-/// `to` 已经持有该能力时直接返回成功且不占新槽 (幂等), 免得重复委派把 16 个槽位耗光。
+/// `to` 已经持有该能力时直接返回成功且不占新槽 (幂等), 免得重复委派把槽位耗光。
 pub fn delegate(from: u64, to: u64, cap: Capability) -> bool {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
     let mut table = CAP_TABLE.lock();
-
-    let mut ok = false;
-    let held = table
-        .get(from as usize)
-        .map(|slots| slots.contains(&Some(cap)))
-        .unwrap_or(false);
-    if held {
-        if let Some(slots) = table.get_mut(to as usize) {
-            if slots.contains(&Some(cap)) {
-                ok = true;
-            } else {
-                for slot in slots.iter_mut() {
-                    if slot.is_none() {
-                        *slot = Some(cap);
-                        ok = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
+    let ok = delegate_in(&mut table, from, to, cap);
     drop(table);
     if was_enabled {
         x86_64::instructions::interrupts::enable();
@@ -447,7 +533,10 @@ mod tests {
     #[test]
     fn destroy_and_reuse_domain_clears_caps_and_handles() {
         init(3);
-        CAP_TABLE.lock()[1][0] = Some(Capability::SendTo(2));
+        CAP_TABLE.lock()[1][0] = Some(CapEntry {
+            cap: Capability::SendTo(2),
+            parent: None,
+        });
         HANDLE_TABLE.lock()[1][0] = Some(0xDEAD_BEEF);
         assert!(has(1, Capability::SendTo(2)));
 
@@ -457,11 +546,90 @@ mod tests {
         assert!(HANDLE_TABLE.lock()[1].iter().all(|slot| slot.is_none()));
 
         // 槽位复用 (同一个 id 再建域): 又摆一份旧值, `add_domain` 必须把它清零。
-        CAP_TABLE.lock()[1][0] = Some(Capability::Spawn);
+        CAP_TABLE.lock()[1][0] = Some(CapEntry {
+            cap: Capability::Spawn,
+            parent: None,
+        });
         HANDLE_TABLE.lock()[1][0] = Some(0xDEAD_BEEF);
         add_domain(1);
         assert!(!has(1, Capability::Spawn));
         assert!(HANDLE_TABLE.lock()[1].iter().all(|slot| slot.is_none()));
+    }
+
+    // ---- 以下是纯函数测试: 只用局部的表, 不碰全局 `CAP_TABLE`, 不与并行用例互相清表。 ----
+
+    fn local_table(n: usize) -> Vec<CapRow> {
+        let mut t = Vec::new();
+        for _ in 0..n {
+            t.push([None; CAP_SLOTS]);
+        }
+        t
+    }
+
+    fn entry(cap: Capability, parent: Option<(u64, u16)>) -> Option<CapEntry> {
+        Some(CapEntry { cap, parent })
+    }
+
+    /// 委派必须是**复制**且**不可放大**: 自己没持有就失败; 成功后源仍持有, 副本记下来源;
+    /// 重复委派幂等, 不占新槽。
+    #[test]
+    fn delegate_cannot_amplify_and_records_provenance() {
+        let mut t = local_table(2);
+        assert!(!delegate_in(&mut t, 0, 1, Capability::SendTo(2))); // 没有的能力给不出去
+        assert!(!holds_in(&t, 1, Capability::SendTo(2)));
+
+        assert!(grant_in(&mut t, 0, Capability::SendTo(2)));
+        assert!(delegate_in(&mut t, 0, 1, Capability::SendTo(2)));
+        assert!(holds_in(&t, 0, Capability::SendTo(2)), "复制语义: 源仍持有");
+        assert!(holds_in(&t, 1, Capability::SendTo(2)));
+        assert_eq!(t[1][0].unwrap().parent, Some((0, 0)));
+
+        // 幂等: 再来一次不新增槽。
+        assert!(delegate_in(&mut t, 0, 1, Capability::SendTo(2)));
+        assert_eq!(t[1].iter().flatten().count(), 1);
+    }
+
+    /// 撤销必须让**后续使用**失败: 本域直接槽 (含重复 `grant` 的多份) 与经 `SYS_CAP_SEND`
+    /// 复制出去的多跳副本一并失效。
+    #[test]
+    fn revoke_clears_all_copies_and_delegated_descendants() {
+        let mut t = local_table(4);
+        // 域 0: 两条 mfs 根能力 (重复 grant); 域 1 复制自 (0,0); 域 2 再复制自 (1,0)。
+        t[0][0] = entry(Capability::SendTo(3), None);
+        t[0][1] = entry(Capability::SendTo(3), None);
+        t[1][0] = entry(Capability::SendTo(3), Some((0, 0)));
+        t[2][0] = entry(Capability::SendTo(3), Some((1, 0)));
+        // 不相关的能力: 必须原样保留。
+        t[3][0] = entry(Capability::MapInto(9), None);
+
+        assert!(revoke_in(&mut t, 0, Capability::SendTo(3)));
+        for d in 0..3 {
+            assert!(
+                !holds_in(&t, d, Capability::SendTo(3)),
+                "域 {d} 的副本应随撤销失效"
+            );
+        }
+        assert!(holds_in(&t, 3, Capability::MapInto(9)), "无关能力不受影响");
+        assert!(t[0].iter().all(Option::is_none));
+    }
+
+    /// 撤销**不受牵连**别的域独立 `grant` 的同值能力 (没有委派来源链); 也拒绝不存在的域。
+    #[test]
+    fn revoke_spares_independent_grants_and_rejects_unknown_domain() {
+        let mut t = local_table(2);
+        t[0][0] = entry(Capability::SendTo(7), None);
+        t[1][0] = entry(Capability::SendTo(7), None); // 另一条权威根, 非域 0 的副本
+
+        assert!(revoke_in(&mut t, 0, Capability::SendTo(7)));
+        assert!(!holds_in(&t, 0, Capability::SendTo(7)));
+        assert!(holds_in(&t, 1, Capability::SendTo(7)), "独立授权不应被误伤");
+
+        // 不存在的域: 一律失败且不 panic / 不扩表。
+        assert!(!revoke_in(&mut t, 9, Capability::SendTo(7)));
+        assert!(!grant_in(&mut t, 9, Capability::Spawn));
+        assert!(!delegate_in(&mut t, 9, 0, Capability::Spawn));
+        assert!(!holds_in(&t, 9, Capability::Spawn));
+        assert_eq!(t.len(), 2);
     }
 
     /// D0: `IoPort` 是**半开区间** `[base, base + len)`；`decode` 用 `(base << 16) | len`

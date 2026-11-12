@@ -659,12 +659,23 @@ fn ext2_dir_find(dir: &Ext2Inode, name: &[u8], ci: bool) -> Option<(u32, u8)> {
     None
 }
 
+/// 把绝对路径规范化到 ext2 服务命名空间; 返回的 `&str` 借用 `out`。
+///
+/// 复用 `vfs::normalize_abs`: `..` 在挂载点根处钳制 (绝不越出), NUL / 控制字符 /
+/// 超长分量被拒绝。
+fn ext2_norm<'a>(path: &str, out: &'a mut [u8; TMP_PATH_MAX]) -> Option<&'a str> {
+    let n = vfs::normalize_abs(path.as_bytes(), out, vfs::PATH_COMP_MAX)?;
+    Some(unsafe { core::str::from_utf8_unchecked(&out[..n]) })
+}
+
 /// 把绝对路径解析为 (inode 号, 是否目录)。路径必须以 '/' 开头。
+///
+/// 解析前先做统一的绝对路径规范化 (`..` 在挂载点根处钳制), 因此路径不可能逃出
+/// 本文件系统。
 fn ext2_resolve(path: &str) -> Option<(u32, bool)> {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = ext2_norm(path, &mut nb)?;
     let bytes = path.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'/' {
-        return None;
-    }
     let mut ino = EXT2_ROOT_INO;
     let mut i = 1usize;
     while i < bytes.len() {
@@ -847,6 +858,8 @@ fn ext2_write_data(ino: u32, offset: u32, count: u32, src: *const u8) -> Option<
 }
 
 /// 拆分绝对路径为 (父目录路径, 末段名字); 非法 (末段为空 / "." / "..") 返回 None。
+///
+/// `path` 必须已经过 [`ext2_norm`]。
 fn ext2_split_parent(path: &str) -> Option<(&str, &str)> {
     let b = path.as_bytes();
     if b.is_empty() || b[0] != b'/' {
@@ -1005,6 +1018,8 @@ fn ext2_dir_add(dir_ino: u32, dir: &mut Ext2Inode, name: &[u8], child: u32, ftyp
 
 /// 在 `path` 的父目录中新建空普通文件, 返回新 inode 号; 名字冲突 / 失败返回 None。
 fn ext2_creat(path: &str) -> Option<u32> {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = ext2_norm(path, &mut nb)?;
     let (parent, name) = ext2_split_parent(path)?;
     let name_b = name.as_bytes();
     let (pino, is_dir) = ext2_resolve(parent)?;
@@ -1039,6 +1054,8 @@ fn ext2_creat(path: &str) -> Option<u32> {
 
 /// 删除 `path` 指向的普通文件: 摘除目录项并释放其数据块与 inode。成功返回 1。
 fn ext2_unlink(path: &str) -> Option<u64> {
+    let mut nb = [0u8; TMP_PATH_MAX];
+    let path = ext2_norm(path, &mut nb)?;
     let (parent, name) = ext2_split_parent(path)?;
     let (pino, is_dir) = ext2_resolve(parent)?;
     if !is_dir {
@@ -1464,6 +1481,10 @@ pub fn run() {
                     .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 sys_reply(ext2_unlink(path).unwrap_or(u64::MAX));
+            }
+            // ext2 服务不实现权限位 / 属主改动 (只读兼容定位): 明确回「不支持」。
+            vfs::VFS_CHMOD_TAG | vfs::MFS_CHOWN_TAG => {
+                sys_reply(vfs::err_reply(vfs::VFS_ENOTSUP));
             }
             // 未实现的写类 tag (MKDIR / RMDIR / TRUNCATE / RENAME / ...) 一律拒绝。
             _ => {

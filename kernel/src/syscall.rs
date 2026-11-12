@@ -241,6 +241,16 @@ pub struct FbInfo {
 /// 为一个请求遍历过多页; 真正的页数上限在 `exec::MAX_IMAGE_PAGES`。
 const MAX_ELF_LEN: u64 = 1024 * 1024;
 
+/// `SYS_LOG_READ` 单次可写的最大字节数 (1 MiB) —— 与 [`crate::klog::handle_read`]
+/// 内部的上限保持一致: 校验按同一长度逐页确认, 合法调用不会被多查页面。
+const LOG_READ_MAX: u64 = 1024 * 1024;
+
+/// `SYS_UNAME` 的最大输出长度 (含结尾 NUL) —— 与 [`crate::version::handle`] 一致。
+const UNAME_MAX: u64 = 96;
+
+/// `SYS_PCI_INFO` 回写的一条记录长度 (3 个 u64)。
+const PCI_REC_BYTES: u64 = 3 * 8;
+
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
 static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
@@ -322,12 +332,13 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // 系统调用分发
 // ---------------------------------------------------------------------------
-/// 从用户地址 `ptr` 读取一条固定大小 IPC payload (96 字节)。
+/// 从用户地址 `ptr` 读取一段固定大小 IPC payload (96 字节)。
 ///
-/// `ptr` 为 0 表示无 payload (返回全零); 非用户空间地址同样拒绝 (返回全零),
-/// 避免 syscall 在 Ring0 下读取内核内存 (与 SYS_ALLOC_PAGE 等信任边界一致)。
+/// `ptr` 为 0 表示无 payload (返回全零); 非用户空间 / 未映射的地址同样返回全零 ——
+/// 与 [`user_buf_ok`] 同构 (逐页确认已映射), 坏指针不会把内核拖进 Ring0 缺页
+/// (内核态 #PF 直接停机), 也不会读到内核内存。
 fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
-    if !user_range_ok(ptr, crate::ipc::PAYLOAD_LEN as u64) {
+    if !user_buf_ok(ptr, crate::ipc::PAYLOAD_LEN as u64) {
         return [0; crate::ipc::PAYLOAD_LEN];
     }
     unsafe {
@@ -638,7 +649,8 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             if !crate::memory::paging::is_user_address(a1) {
                 return 0;
             }
-            let paddr = match crate::memory::frame_allocator::allocate_frame() {
+            // 交给用户态的帧必须清零, 否则读到上一任占用者的残留数据 (跨域泄露)。
+            let paddr = match crate::memory::frame_allocator::allocate_zeroed_frame() {
                 Some(p) => p,
                 None => return 0,
             };
@@ -714,18 +726,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 // 否则会在 2 MiB 大页上映射 4 KiB 页, 触发 ParentEntryHugePage panic。
                 0
             } else {
-                match crate::memory::frame_allocator::allocate_frame() {
+                // 匿名帧必须清零: 分配器不保证新帧内容为 0, 不清的话用户态读到的是
+                // 上一任占用者释放后的残留数据 (见 frame_allocator::allocate_zeroed_frame)。
+                match crate::memory::frame_allocator::allocate_zeroed_frame() {
                     Some(p) => {
-                        // 匿名帧必须清零: 分配器不保证新帧内容为 0, 若不清理,
-                        // 用户态读到的会是上一任占用者释放后残留的数据。
-                        // 物理地址 < 4 GiB, 位于恒等映射内, 可直接按虚拟地址写。
-                        unsafe {
-                            core::ptr::write_bytes(
-                                p as *mut u8,
-                                0,
-                                crate::memory::frame_allocator::FRAME_SIZE,
-                            );
-                        }
                         crate::memory::paging::map_user_page(
                             a1,
                             a2,
@@ -1004,10 +1008,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 return 0;
             }
             let size = core::mem::size_of::<FbInfo>() as u64;
-            if a1 == 0
-                || !crate::memory::paging::is_user_address(a1)
-                || !crate::memory::paging::is_user_address(a1 + size - 1)
-            {
+            if !user_buf_ok(a1, size) {
                 return 0;
             }
             let (width, height, stride, bpp) = crate::video::fb_geometry();
@@ -1110,7 +1111,15 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_DOMAIN_COUNT => crate::domain::alive_count() as u64,
         SYS_FRAME_FREE => crate::memory::frame_allocator::free_frames() as u64,
         // 并行开发接线层: 三条转发臂, 实现分散在各自模块 (见 docs/dev-workflow.md)。
-        SYS_UNAME => crate::version::handle(a1, a2, a3),
+        SYS_UNAME => {
+            // version::handle 只做范围校验; 这里补逐页映射确认 (按最大输出 96 字节截断,
+            // 合法调用方声明的就是自己的缓冲大小)。
+            if user_buf_ok(a1, a2.min(UNAME_MAX)) {
+                crate::version::handle(a1, a2, a3)
+            } else {
+                0
+            }
+        }
         SYS_DEVICE_INFO => crate::device::syscall_info(a1, a2, a3),
         SYS_DEVICE_GRANT => crate::device::syscall_grant(a1, a2, a3),
         SYS_ENCLAVE_MAP => crate::device::syscall_enclave_map(a1, a2, a3),
@@ -1163,7 +1172,14 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::net::owner(a1 as u16)
         }
         SYS_LOG_TOTAL => crate::klog::total(),
-        SYS_LOG_READ => crate::klog::handle_read(a1, a2, a3),
+        SYS_LOG_READ => {
+            // klog::handle_read 只做范围校验; 这里补上逐页"已映射"确认 —— 坏指针
+            // 不能让内核在 Ring0 缺页。长度按 handle_read 的 1 MiB 上限对齐。
+            if !user_buf_ok(a1, a2.min(LOG_READ_MAX)) {
+                return 0;
+            }
+            crate::klog::handle_read(a1, a2, a3)
+        }
         SYS_LOG_OLDEST => crate::klog::oldest(),
         SYS_CONSOLE_LINE_EDIT => {
             crate::video::set_line_edit(a1);
@@ -1171,7 +1187,15 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         // 进程身份 (多用户最小闭环): 查 / 设置本域 uid:gid, 或只读查询别的域。
         SYS_CRED => handle_cred(crate::scheduler::current_domain(), a1, a2, a3),
-        SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
+        SYS_PCI_INFO => {
+            // a2 = 用户缓冲 (3 个 u64): pci::syscall_info 只做范围校验, 这里补逐页
+            // 映射确认, 避免向未映射地址回写导致内核缺页停机。
+            if user_buf_ok(a2, PCI_REC_BYTES) {
+                crate::arch::pci::syscall_info(a1, a2)
+            } else {
+                0
+            }
+        }
         SYS_POWEROFF => {
             // 关机是不可逆的全局操作: 只给"能造进程"的可信域 (app/shell/init)。
             if !crate::cap::has(

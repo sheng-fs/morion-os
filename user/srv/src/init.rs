@@ -71,31 +71,70 @@ const POLL_MS: u64 = 40;
 /// 盘上服务目录 (FAT32 根卷)。
 const SERVICE_DIR: &str = "/system/services/";
 
-/// 最小权限策略 (② 能力审计): 高价值凭证的**允许持有者**白名单。
+/// r8169_srv 的固定域号 (内核 `main.rs` 建域顺序; 它不在 `BOOT_DOMAINS` 里,
+/// 但仍是引导期静态域, 由 `cap/ipc/pager::add_domain` 单独补行)。
+const R8169_DOMAIN: u64 = 26;
+
+/// 一条最小权限规则。
 ///
-/// 只钉这四类"独占 / 危险"凭证 —— `SendTo` / `MapInto` / `Irq` 是常规流通能力, 百来条,
-/// 设全局上限只会变成噪音。判据来源: 内核 `main.rs` 引导期 `cap::grant` 的实际签发
-/// (域号见那里的域布局注释)。任何**不在**白名单里的持有都记一次违规。
-const POLICY: [(u64, &[u64]); 4] = [
+/// 规则只有两种, 且**默认拒绝**写在 `holder_allowed` 的兜底分支里:
+/// - [`Rule::Routine`]: 常规流通能力 (`SendTo` / `MapInto`), 任意存活域可持有 ——
+///   包括运行时 `SYS_SPAWN_ELF` 建的 27/28… 域 (它们按设计就要访问文件服务);
+/// - [`Rule::Only`]: 特权能力, **只有列出的静态域**可持有。
+///
+/// **动态域 (≥ 27) 的判定规则**: 它们不会出现在任何 `Only` 白名单里 (白名单只列
+/// 静态域号), 故一旦持有 `Spawn` / `MMIO` / `Fb` / `IoPort` / `Irq` / `Net` 中
+/// 任意一种, 审计即记 `VIOLATION`。这不是"忘了登记"——新加的运行时域**必须**
+/// 走 `Routine` 种类; 要授予特权能力, 得同时在这里显式登记它的域号 (并说明理由)。
+enum Rule {
+    Routine,
+    Only(&'static [u64]),
+}
+
+/// 最小权限策略 (② 能力审计): **按种类**登记规则; 未登记的种类一律拒绝。
+///
+/// 覆盖内核当前全部 8 种能力 (`CAP_KIND_SEND_TO/MAP_INTO/IRQ/MMIO/SPAWN/FB/IO_PORT/NET`)。
+/// 今后新增能力种类而这里没登记时, `holder_allowed` 的兜底分支会把它判成违规 ——
+/// 不会再像旧策略那样"白名单外的种类默认放行"。
+///
+/// 判据来源: 内核 `main.rs` / `device.rs` 引导期 `cap::grant` 的实际签发
+/// (域号见 `main.rs` 的域布局注释)。
+const POLICY: [(u64, Rule); 8] = [
+    // 常规流通能力: 任意域 (含动态 spawn) 可持有。
+    (CAP_KIND_SEND_TO, Rule::Routine),
+    (CAP_KIND_MAP_INTO, Rule::Routine),
+    // 中断: 仅静态驱动 —— kbd(4, IRQ1) / block(5, NVMe MSI-X) / net(16, virtio-net MSI-X)
+    // / vblk(17, MSI-X)。
+    (CAP_KIND_IRQ, Rule::Only(&[4, 5, 16, 17])),
+    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22)
+    // / e1000(24) / **r8169(26)**。
+    (CAP_KIND_MMIO, Rule::Only(&[5, 16, 17, 18, 19, 22, 24, R8169_DOMAIN])),
     // 造进程: 仅 app(7) / shell(8) / init(14) —— 其余域一概不该有。
-    (CAP_KIND_SPAWN, &[7, 8, 14]),
-    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22) / e1000(24) / r8169(26)。
-    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19, 22, 24, 26]),
+    (CAP_KIND_SPAWN, Rule::Only(&[7, 8, 14])),
     // 帧缓冲: 全局唯一凭证, 仅 gfx_srv(15)。
-    (CAP_KIND_FB, &[15]),
+    (CAP_KIND_FB, Rule::Only(&[15])),
     // I/O 端口: 仅 block(5, IDE PIT) / kbd(4, PS/2) / mfs(11) / exfat(13) (CMOS RTC)。
-    (CAP_KIND_IO_PORT, &[4, 5, 11, 13]),
+    (CAP_KIND_IO_PORT, Rule::Only(&[4, 5, 11, 13])),
+    // 网络端口: 仅 app(7) / shell(8) 的客户端源端口段 + httpd(23) 的 :80。
+    (CAP_KIND_NET, Rule::Only(&[7, 8, 23])),
 ];
 
 /// 正向要求: 这些域**必须**持有这些能力 (缺了说明授权遗漏或审计读取失灵)。
 ///
 /// 有它"审计通过"才不是空话 —— 若 `SYS_CAP_AUDIT` 读不到任何能力 (门禁拒了 / 编码坏了),
-/// 这几条会立刻把它暴露成 `MISSING`。选 `Spawn` 是因为它**无条件**签发 (不依赖是否探测到
-/// 某台 PCI 设备), 故在任意测试配置下都成立。
-const REQUIRED: [(u64, u64); 3] = [
-    (7, CAP_KIND_SPAWN),  // app
-    (8, CAP_KIND_SPAWN),  // shell
-    (14, CAP_KIND_SPAWN), // init (本域)
+/// 这些条目会立刻暴露成 `MISSING`。只选**无条件**签发的能力 (不依赖是否探测到某台
+/// PCI 设备), 故任意测试配置下都成立; 设备相关的 MMIO 不能放进这里 (无该网卡时合法缺失)。
+const REQUIRED: [(u64, u64); 10] = [
+    (4, CAP_KIND_IRQ),     // kbd: IRQ1 (无条件)
+    (5, CAP_KIND_IO_PORT), // block: IDE 端口区间 (无条件)
+    (6, CAP_KIND_SEND_TO), // fat32_srv → block_srv
+    (7, CAP_KIND_SPAWN),   // app
+    (8, CAP_KIND_SPAWN),   // shell
+    (11, CAP_KIND_IO_PORT), // mfs_srv: CMOS RTC
+    (14, CAP_KIND_SPAWN),  // init (本域)
+    (15, CAP_KIND_FB),     // gfx_srv: 帧缓冲
+    (21, CAP_KIND_SEND_TO), // netstack_srv → net_srv
+    (23, CAP_KIND_NET),    // httpd_srv: :80
 ];
 
 /// 每个被监督域「上一轮已发现它没有存活任务」的标记（两连击去抖，见 [`run`]）。
@@ -291,11 +330,16 @@ fn audit() {
     }
 }
 
-/// `domain` 是否被允许持有 `kind` 类能力 (不在 [`POLICY`] 里的种类一律放行)。
+/// `domain` 是否被允许持有 `kind` 类能力。
+///
+/// **默认拒绝**: 未在 [`POLICY`] 登记的能力种类一律不通过 (新增种类必须先明确规则);
+/// 登记为 [`Rule::Only`] 的种类, 只有白名单里的静态域通过 —— 动态 spawn 的 27/28…
+/// 天然不在白名单, 持有一律记违规。
 fn holder_allowed(domain: u64, kind: u64) -> bool {
     match POLICY.iter().find(|(k, _)| *k == kind) {
-        Some((_, allow)) => allow.contains(&domain),
-        None => true,
+        Some((_, Rule::Routine)) => true,
+        Some((_, Rule::Only(allow))) => allow.contains(&domain),
+        None => false,
     }
 }
 
@@ -324,6 +368,7 @@ fn cap_name(kind: u64) -> &'static str {
         CAP_KIND_SPAWN => "Spawn",
         CAP_KIND_FB => "Fb",
         CAP_KIND_IO_PORT => "IoPort",
+        CAP_KIND_NET => "Net",
         _ => "Unknown",
     }
 }

@@ -39,6 +39,16 @@ pub const USER_STACK_TOP: u64 = USER_SPACE_BASE + 0x40_1000;
 /// 用户栈页数 (自 `USER_STACK_TOP` 向下增长)。
 pub const USER_STACK_PAGES: u64 = 8;
 
+/// 用户栈底 —— 栈最下面一页的起始地址 (`USER_STACK_TOP` 之下 `USER_STACK_PAGES` 页)。
+pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_PAGES * 0x1000;
+
+/// 用户栈**守护页** —— 栈底再向下一页, 加载器**不映射**它。
+///
+/// 栈溢出越过 [`USER_STACK_BOTTOM`] 时先落到这一页: 未映射 → 缺页异常 (交给分页器 /
+/// 终止进程), 而不是静默踩进相邻的段或堆映射。ELF 加载侧 (`elf::parse`) 拒绝任何
+/// 覆盖本页的段, 保证它始终是空洞。
+pub const USER_STACK_GUARD_PAGE: u64 = USER_STACK_BOTTOM - 0x1000;
+
 /// 内核堆起始虚拟地址 (未使用的上半区地址)
 const HEAP_START: u64 = 0x4444_4444_0000;
 /// 内核堆大小 (至少容纳 7 个 32 KiB 内核栈 + 调度器/IPC/Cap/分页器/分配器元数据)
@@ -499,7 +509,10 @@ pub fn free_user_space(pml4_phys: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{flags_for, is_identity_mapped, is_user_address, UserPagePerm, USER_SPACE_BASE};
+    use super::{
+        flags_for, is_identity_mapped, is_user_address, UserPagePerm, USER_SPACE_BASE,
+        USER_STACK_BOTTOM, USER_STACK_GUARD_PAGE, USER_STACK_PAGES, USER_STACK_TOP,
+    };
     use x86_64::structures::paging::PageTableFlags;
 
     /// 引导模块可达性判定 (E3b): 恒等映射覆盖帧分配器可管理的全部物理内存 (32 GiB),
@@ -567,5 +580,20 @@ mod tests {
         assert!(is_user_address(USER_SPACE_BASE));
         assert!(is_user_address(USER_SPACE_BASE + 0x3000));
         assert!(is_user_address(0x0000_00FF_FFFF_FFFF)); // P4[1] 末尾
+    }
+
+    /// 栈守护页布局: 它在栈底正下方一页, 与 8 个栈页首尾相接且本身仍是用户地址
+    /// (加载器不映射它, 于是栈溢出必然触发缺页而不是踩进相邻映射)。
+    #[test]
+    fn stack_guard_page_sits_below_stack() {
+        assert_eq!(
+            USER_STACK_BOTTOM,
+            USER_STACK_TOP - USER_STACK_PAGES * 0x1000
+        );
+        assert_eq!(USER_STACK_BOTTOM - USER_STACK_GUARD_PAGE, 0x1000);
+        assert!(USER_STACK_GUARD_PAGE & 0xFFF == 0, "守护页须页对齐");
+        // 守护页与整个栈都在用户空间 (否则校验/映射路径的地址口径就不一致了)。
+        assert!(is_user_address(USER_STACK_GUARD_PAGE));
+        assert!(is_user_address(USER_STACK_TOP - 1));
     }
 }

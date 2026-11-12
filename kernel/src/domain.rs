@@ -96,21 +96,37 @@ pub fn alive_count() -> usize {
 
 /// 销毁一个域: 回收它的用户地址空间与**全部**域相关内核状态, 槽位归还以便复用。
 ///
-/// 顺序是有讲究的 —— **先摘掉状态, 再释放页与帧**:
-///   1. 从域表摘除自己 (之后任何走 `pml4_of` 的路径都不会再碰到它),
-///      同时取回 PML4 物理地址;
-///   2. 释放用户地址空间: 逐页按 `release_user_frame` 的记账规则归还, 再回收
+/// 顺序是有讲究的 —— **先清状态, 再摘槽位, 最后释放页与帧**:
+///   1. 确认目标存在;
+///   2. 清掉各子系统里属于它的行: 能力 + 句柄、邮箱、分页器、中断注册 —— 此时槽位
+///      **仍被占用**, 所以 `slot_for` 不会把同一个 id 分给新域, 不存在「新域刚拿到
+///      能力就被旧域的销毁路径清掉」的窗口 (反之先摘槽位再清表就有);
+///   3. 摘除域表槽位并取回 PML4 物理地址 (此后槽位才可复用; 复用时 `cap::add_domain`
+///      / `ipc::add_domain` 会再清一次行, 保证新域零能力、零消息);
+///   4. 释放用户地址空间: 逐页按 `release_user_frame` 的记账规则归还, 再回收
 ///      PDPT/PD/PT 页表帧, 最后释放 PML4 帧;
-///   3. 清掉各子系统里属于它的行: 能力 + 句柄、邮箱、分页器、中断注册;
-///   4. 摘除并终止它的全部任务, 并唤醒正在等它的任务 (否则对端永久挂死)。
+///   5. 摘除并终止它的全部任务, 并唤醒正在等它的任务 (否则对端永久挂死)。
 ///
 /// 返回 `false` = 该域不存在 (或已销毁)。
 ///
 /// **不允许自我销毁**: 调用者必须是**别的域** —— 销毁自己会拆掉正在使用的内核栈与
 /// 页表。门禁留在 syscall 侧 (`SYS_DOMAIN_DESTROY`: 目标的分页器 == 调用者),
 /// 而 `exec::spawn_elf` 正是把"加载者"登记为分页器的, 所以"谁加载谁负责"天然成立。
+///
+/// **锁顺序**: 本函数只在很短的临界区里持有 `DOMAINS`, 再去取 cap/ipc/pager/irq 的锁;
+/// 不能在持 `DOMAINS` 时等这些锁 —— `ipc::deliver` 会在中断上下文取邮箱锁, 而
+/// `DOMAINS` 锁不是中断安全的 (单核上「持锁时来中断」会自旋死锁)。
 pub fn destroy(id: u64) -> bool {
-    // 1. 摘除域表槽位 (取回 pml4, 供后面释放用)。
+    // 1. 目标不存在直接失败 (不摘槽位, 避免把"创建"与"销毁"混在一起)。
+    if !is_alive(id) {
+        return false;
+    }
+    // 2. 各子系统的按域状态。槽位仍被占, 新域不可能复用这个 id。
+    crate::cap::remove_domain(id);
+    crate::ipc::remove_domain(id);
+    crate::pager::remove_domain(id);
+    crate::irq::remove_domain(id);
+    // 3. 摘除域表槽位 (取回 pml4, 供后面释放用)。
     let pml4 = {
         let mut domains = DOMAINS.lock();
         match domains.get_mut(id as usize).and_then(|slot| slot.take()) {
@@ -118,15 +134,10 @@ pub fn destroy(id: u64) -> bool {
             None => return false,
         }
     };
-    // 2. 地址空间 (逐页记账 + 页表帧 + PML4 帧)。
+    // 4. 地址空间 (逐页记账 + 页表帧 + PML4 帧)。
     crate::memory::paging::free_user_space(pml4);
     frame_allocator::free_frame(pml4);
-    // 3. 各子系统的按域状态。
-    crate::cap::remove_domain(id);
-    crate::ipc::remove_domain(id);
-    crate::pager::remove_domain(id);
-    crate::irq::remove_domain(id);
-    // 4. 任务 (含唤醒等待者)。
+    // 5. 任务 (含唤醒等待者)。
     crate::scheduler::remove_domain(id);
     true
 }

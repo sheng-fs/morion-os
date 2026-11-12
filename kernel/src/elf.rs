@@ -7,7 +7,9 @@
 //! 每个字段都是"先校验、再使用"：越界、重叠、超大、非用户空间一律拒绝，
 //! 且不分配任何资源、不 panic —— 调用方拿到 `None` 就干净地失败。
 
-use crate::memory::paging::{USER_SPACE_BASE, USER_SPACE_END};
+use crate::memory::paging::{
+    USER_SPACE_BASE, USER_SPACE_END, USER_STACK_GUARD_PAGE, USER_STACK_TOP,
+};
 
 /// 最多接受的 `PT_LOAD` 段数（正常产物 3~5 段；给足余量但不允许无限）。
 pub const MAX_SEGMENTS: usize = 32;
@@ -166,6 +168,12 @@ pub fn parse(bytes: &[u8]) -> Option<Image> {
         }
         let mem_end = p_vaddr.checked_add(p_memsz)?;
         if mem_end > USER_SPACE_END {
+            return None;
+        }
+        // 段不得压到用户栈及其**守护页**上: 栈由加载器在固定位置单独映射, 段若落在栈页
+        // 上会让 `map_user_page` 撞已映射页 panic; 落在守护页上则把空洞填掉 —— 栈溢出
+        // 就不再触发缺页, 而是直接踩进相邻映射 (静默破坏)。首尾相接仍合法。
+        if p_vaddr < USER_STACK_TOP && mem_end > USER_STACK_GUARD_PAGE {
             return None;
         }
 
@@ -375,6 +383,32 @@ mod tests {
         // 完全包含第一段也算重叠。
         let contain = two_segments(USER_SPACE_BASE, 0x4000);
         assert!(parse(&contain).is_none(), "段被完全包含应拒绝");
+    }
+
+    /// 用户栈与其守护页不得被 `PT_LOAD` 覆盖: 前者会让加载器撞已映射页, 后者会把
+    /// 栈溢出的"空洞"填掉 (溢出不再缺页而是静默踩进相邻映射)。
+    #[test]
+    fn rejects_segment_overlapping_stack_guard() {
+        let ph = 64;
+        let place = |b: &mut alloc::vec::Vec<u8>, vaddr: u64, memsz: u64| {
+            b[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+            b[ph + 16..ph + 24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+            b[ph + 32..ph + 40].copy_from_slice(&0x10u64.to_le_bytes()); // p_filesz
+            b[ph + 40..ph + 48].copy_from_slice(&memsz.to_le_bytes()); // p_memsz
+        };
+
+        let mut bad = sample();
+        place(&mut bad, USER_STACK_GUARD_PAGE, 0x1000);
+        assert!(parse(&bad).is_none(), "覆盖守护页的段应拒绝");
+
+        let mut bad = sample();
+        place(&mut bad, USER_STACK_TOP - 0x1000, 0x1000);
+        assert!(parse(&bad).is_none(), "覆盖栈页的段应拒绝");
+
+        // 紧挨守护页下方 (段末 == 守护页起点) 是合法布局。
+        let mut ok = sample();
+        place(&mut ok, USER_STACK_GUARD_PAGE - 0x1000, 0x1000);
+        assert!(parse(&ok).is_some(), "守护页下方的段应接受");
     }
 
     /// 首尾相接（一个的 end == 另一个的 start）是正常布局，必须接受。

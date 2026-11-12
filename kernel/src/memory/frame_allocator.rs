@@ -219,6 +219,23 @@ pub fn allocate_frame() -> Option<u64> {
     None
 }
 
+/// 分配一个物理帧并**清零**, 返回其物理地址。
+///
+/// 交给用户态的新帧必须先清零: 分配器只翻位图, 帧里仍是上一任占用者释放后的残留数据
+/// —— 直接映射出去就是跨域信息泄露。清零经**恒等映射**直接写: 分配器只会交出
+/// `< MAX_MANAGED_FRAMES` 的帧, 全部落在 `paging` 建立的 32 GiB 恒等映射内, 故要求
+/// 调用时页表已就绪 (所有 syscall 路径都满足)。
+///
+/// 只在"新帧要交给用户态"的路径使用 (`SYS_ALLOC_PAGE` / `SYS_MAP_ANON`); 页表帧、
+/// 内核堆等自身会整页写的路径仍走 [`allocate_frame`], 免得启动期做无谓的双份写。
+pub fn allocate_zeroed_frame() -> Option<u64> {
+    let addr = allocate_frame()?;
+    unsafe {
+        core::ptr::write_bytes(addr as *mut u8, 0, FRAME_SIZE);
+    }
+    Some(addr)
+}
+
 /// 分配连续 `count` 个物理帧 (物理连续、页对齐), 返回首帧物理地址。
 ///
 /// 用于 DMA 缓冲 / NVMe 队列: 设备要求队列与数据缓冲物理连续且页对齐。

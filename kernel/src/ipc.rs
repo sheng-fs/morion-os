@@ -77,19 +77,9 @@ fn set_mailbox(id: u64, box_: VecDeque<Message>) {
     boxes[idx] = box_;
 }
 
-/// 发送消息到目标域 (非阻塞)。
-/// 返回是否成功 (无能力或邮箱满则失败)。
-pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {
-    x86_64::instructions::interrupts::disable();
-
-    let from = crate::scheduler::current_domain();
-
-    // 能力强制: 调用者必须持有向目标域发送消息的能力, 否则拒绝。
-    if !crate::cap::has(from, Capability::SendTo(to)) {
-        x86_64::instructions::interrupts::enable();
-        return false;
-    }
-
+/// 构造一条消息。**`from` 只能由内核填** —— 用户态 syscall 接口里没有这个参数
+/// (`SYS_SEND` 只有 `to/tag/payload`), 故 `msg.from` 无法被调用方伪造。
+fn make_message(from: u64, to: u64, tag: u64, payload: &[u8]) -> Message {
     let mut msg = Message {
         from,
         to,
@@ -98,16 +88,54 @@ pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {
     };
     let n = payload.len().min(PAYLOAD_LEN);
     msg.payload[..n].copy_from_slice(&payload[..n]);
+    msg
+}
 
+/// 把 `msg` 放进 `to` 的邮箱; 返回是否投递成功。
+///
+/// `to` 越界 (域表没有这一行) 一律失败 —— 不能用 `boxes[to]` 直接索引, 否则
+/// 用户可控的域号会变成内核 panic (DoS)。`respect_cap` 为 true 时遵守邮箱容量上限;
+/// `call`/`reply` 走 false (回复路径不能因为队列满而丢弃)。
+fn push_message(
+    boxes: &mut [VecDeque<Message>],
+    to: u64,
+    msg: Message,
+    respect_cap: bool,
+) -> bool {
+    let Some(mbox) = boxes.get_mut(to as usize) else {
+        return false;
+    };
+    if respect_cap && mbox.len() >= MAILBOX_CAP {
+        return false;
+    }
+    mbox.push_back(msg);
+    true
+}
+
+/// 发送消息到目标域 (非阻塞)。
+/// 返回是否成功 (目标域不存在 / 无能力 / 邮箱满则失败)。
+pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {
+    x86_64::instructions::interrupts::disable();
+
+    let from = crate::scheduler::current_domain();
+
+    // 目标域必须存在: 邮箱表按域 id 索引, 不校验会让用户可控的 `to` 越界 panic。
+    // (中断已关, 不会与 `domain::destroy` 抢 `DOMAINS` 锁。)
+    if !crate::domain::is_alive(to) {
+        x86_64::instructions::interrupts::enable();
+        return false;
+    }
+
+    // 能力强制: 调用者必须持有向目标域发送消息的能力, 否则拒绝。
+    if !crate::cap::has(from, Capability::SendTo(to)) {
+        x86_64::instructions::interrupts::enable();
+        return false;
+    }
+
+    let msg = make_message(from, to, tag, payload);
     let ok = {
         let mut boxes = MAILBOXES.lock();
-        let mbox = &mut boxes[to as usize];
-        if mbox.len() >= MAILBOX_CAP {
-            false
-        } else {
-            mbox.push_back(msg);
-            true
-        }
+        push_message(&mut boxes, to, msg, true)
     };
 
     if ok {
@@ -121,25 +149,15 @@ pub fn send(to: u64, tag: u64, payload: &[u8]) -> bool {
 ///
 /// 用于缺页异常等内核发起的消息转发 (区别于 `send`, 后者做能力强制且
 /// 以当前域为发送者)。调用者须保证中断已关闭 (IF=0), 本函数不改变中断位。
+///
+/// 这里**只做邮箱表边界检查**, 不查 `domain::is_alive`: 本函数可能在中断上下文
+/// 被调用 (IRQ 通知), 而 `DOMAINS` 锁不是中断安全的 —— 在那个上下文再取它会把
+/// 「持锁时来中断」变成自旋死锁。目标域号来自内核 (缺页域 / 中断注册者), 不是用户输入。
 pub fn deliver(from: u64, to: u64, tag: u64, payload: &[u8]) -> bool {
-    let mut msg = Message {
-        from,
-        to,
-        tag,
-        payload: [0; PAYLOAD_LEN],
-    };
-    let n = payload.len().min(PAYLOAD_LEN);
-    msg.payload[..n].copy_from_slice(&payload[..n]);
-
+    let msg = make_message(from, to, tag, payload);
     let ok = {
         let mut boxes = MAILBOXES.lock();
-        let mbox = &mut boxes[to as usize];
-        if mbox.len() >= MAILBOX_CAP {
-            false
-        } else {
-            mbox.push_back(msg);
-            true
-        }
+        push_message(&mut boxes, to, msg, true)
     };
 
     if ok {
@@ -157,7 +175,7 @@ pub fn receive() -> Message {
 
         let got = {
             let mut boxes = MAILBOXES.lock();
-            boxes[me as usize].pop_front()
+            boxes.get_mut(me as usize).and_then(|mbox| mbox.pop_front())
         };
 
         match got {
@@ -186,7 +204,7 @@ pub fn try_receive() -> Option<Message> {
 
     let got = {
         let mut boxes = MAILBOXES.lock();
-        boxes[me as usize].pop_front()
+        boxes.get_mut(me as usize).and_then(|mbox| mbox.pop_front())
     };
 
     match got {
@@ -221,24 +239,21 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
         x86_64::instructions::interrupts::enable();
         return failed();
     }
-    // 目标域已无存活任务: 直接失败, 不必白等一轮 —— 请求发过去也没人取。
-    if crate::scheduler::live_tasks(to) == 0 {
+    // 目标域必须存在, 且已无存活任务时直接失败, 不必白等一轮 —— 请求发过去也没人取。
+    if !crate::domain::is_alive(to) || crate::scheduler::live_tasks(to) == 0 {
         x86_64::instructions::interrupts::enable();
         return failed();
     }
 
-    // 构造并投递请求。
-    let mut msg = Message {
-        from: me,
-        to,
-        tag,
-        payload: [0; PAYLOAD_LEN],
-    };
-    let n = payload.len().min(PAYLOAD_LEN);
-    msg.payload[..n].copy_from_slice(&payload[..n]);
-    {
+    // 构造并投递请求 (回复路径不设容量上限: 请求队列满时宁可排队也不能丢)。
+    let msg = make_message(me, to, tag, payload);
+    let queued = {
         let mut boxes = MAILBOXES.lock();
-        boxes[to as usize].push_back(msg);
+        push_message(&mut boxes, to, msg, false)
+    };
+    if !queued {
+        x86_64::instructions::interrupts::enable();
+        return failed();
     }
     crate::scheduler::wake_one(to);
 
@@ -251,9 +266,10 @@ pub fn call(to: u64, tag: u64, payload: &[u8]) -> Message {
 
         let reply = {
             let mut boxes = MAILBOXES.lock();
-            let mbox = &mut boxes[me as usize];
-            let idx = mbox.iter().position(|m| m.from == to);
-            idx.and_then(|i| mbox.remove(i))
+            boxes.get_mut(me as usize).and_then(|mbox| {
+                let idx = mbox.iter().position(|m| m.from == to);
+                idx.and_then(|i| mbox.remove(i))
+            })
         };
 
         if let Some(r) = reply {
@@ -286,26 +302,23 @@ pub fn reply(tag: u64, payload: &[u8]) -> bool {
     let me = crate::scheduler::current_domain();
     let target = crate::scheduler::current_reply_target();
 
-    if target == u64::MAX {
+    // 回复目标来自 `receive` 记录的内核侧 `msg.from`; 为 `u64::MAX` 或该域已不存在
+    // (调用者在等待期间退出) 时不投递, 也绝不越界索引邮箱表。
+    if target == u64::MAX || !crate::domain::is_alive(target) {
         x86_64::instructions::interrupts::enable();
         return false;
     }
 
-    let mut msg = Message {
-        from: me,
-        to: target,
-        tag,
-        payload: [0; PAYLOAD_LEN],
-    };
-    let n = payload.len().min(PAYLOAD_LEN);
-    msg.payload[..n].copy_from_slice(&payload[..n]);
-    {
+    let msg = make_message(me, target, tag, payload);
+    let ok = {
         let mut boxes = MAILBOXES.lock();
-        boxes[target as usize].push_back(msg);
+        push_message(&mut boxes, target, msg, false)
+    };
+    if ok {
+        crate::scheduler::wake_one(target);
     }
-    crate::scheduler::wake_one(target);
     x86_64::instructions::interrupts::enable();
-    true
+    ok
 }
 
 #[cfg(test)]
@@ -332,5 +345,51 @@ mod tests {
         add_domain(1);
         assert!(MAILBOXES.lock()[1].is_empty());
         assert_eq!(MAILBOXES.lock().len(), 3);
+    }
+
+    // ---- 以下只测纯函数 (局部邮箱表), 不碰全局 `MAILBOXES`, 避免并行用例互相清表。 ----
+
+    fn local_boxes(n: usize) -> Vec<VecDeque<Message>> {
+        (0..n).map(|_| VecDeque::new()).collect()
+    }
+
+    /// `msg.from` 由内核填写 (syscall 没有这个入参), payload 超长时按 `PAYLOAD_LEN` 截断。
+    #[test]
+    fn make_message_sets_from_and_truncates_payload() {
+        let long = [0xEEu8; PAYLOAD_LEN + 32];
+        let msg = make_message(7, 3, 0xAB, &long);
+        assert_eq!(msg.from, 7);
+        assert_eq!(msg.to, 3);
+        assert_eq!(msg.tag, 0xAB);
+        assert!(msg.payload.iter().all(|&b| b == 0xEE));
+
+        let short = make_message(1, 2, 9, &[1, 2, 3]);
+        assert_eq!(&short.payload[..3], &[1, 2, 3]);
+        assert!(short.payload[3..].iter().all(|&b| b == 0));
+    }
+
+    /// 目标域越界必须**失败而不是 panic**, 且不扩表 (用户可控域号的 DoS 防线)。
+    #[test]
+    fn push_rejects_unknown_target() {
+        let mut boxes = local_boxes(2);
+        let msg = make_message(0, 5, 1, &[]);
+        assert!(!push_message(&mut boxes, 5, msg, true));
+        assert_eq!(boxes.len(), 2);
+    }
+
+    /// `send` 路径受邮箱容量约束; `call`/`reply` 路径 (respect_cap=false) 不丢弃。
+    #[test]
+    fn push_respects_capacity_for_send_only() {
+        let mut boxes = local_boxes(1);
+        for i in 0..MAILBOX_CAP {
+            assert!(push_message(&mut boxes, 0, make_message(1, 0, i as u64, &[]), true));
+        }
+        let full = make_message(1, 0, 0xFF, &[]);
+        assert!(!push_message(&mut boxes, 0, full, true), "满队列应拒绝 send");
+        assert!(
+            push_message(&mut boxes, 0, full, false),
+            "回复路径不受容量上限约束"
+        );
+        assert_eq!(boxes[0].len(), MAILBOX_CAP + 1);
     }
 }

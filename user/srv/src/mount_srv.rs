@@ -24,6 +24,32 @@ use morion::vfs;
 const MOUNT_MAX: usize = 16;
 /// 挂载点前缀最大长度 (含前导 '/', 不含结尾 NUL)。
 const MOUNT_PREFIX_MAX: usize = 24;
+/// 引导期长期服务域数 (与内核 `domain.rs` 的 `BOOT_DOMAINS` 对齐)。
+///
+/// 仅作为 `SYS_CRED` 查询失败时的回退: `id < 本值` = 引导期服务域 (uid 0)。
+const MOUNT_BOOT_DOMAINS: u64 = 26;
+
+/// 请求者是否有权改全局命名空间 (只有 `uid 0` / 引导期服务域可以)。
+///
+/// 运行期新建域默认 `uid 1000`, 不能挂载 / 卸载 —— 否则任何应用都能把别人的路径
+/// 改道到自己的服务上 ("挂载点伪造")。
+fn mount_privileged(domain: u64) -> bool {
+    match sys_cred_of(domain) {
+        Some((uid, _)) => uid == 0,
+        None => domain < MOUNT_BOOT_DOMAINS,
+    }
+}
+
+/// 规范化挂载点前缀: 必须是绝对路径、`..` 在根处钳制、无 NUL/控制字符/超长分量。
+///
+/// 返回规范化后的长度 (写进 `out`), 供存储与查表共用同一份字节。
+fn mount_norm_prefix(prefix: &str, out: &mut [u8; MOUNT_PREFIX_MAX]) -> Option<usize> {
+    let n = vfs::normalize_abs(prefix.as_bytes(), out, MOUNT_PREFIX_MAX - 1)?;
+    if n == 0 || n >= MOUNT_PREFIX_MAX {
+        return None;
+    }
+    Some(n)
+}
 
 /// 一条挂载记录: 挂载点前缀 → 文件服务域 (可选绑定一个卷)。
 #[derive(Clone, Copy)]
@@ -98,14 +124,20 @@ fn mount_find(prefix: &str) -> Option<usize> {
 /// `vol_enc` 为 0 表示「该服务的默认卷」(服务自己认领的那一个); 非 0 表示把该
 /// 挂载点绑定到 `vol_enc - 1` 号卷 (M1b 多卷挂载), 该编码随每次请求下发。
 ///
-/// 拒绝: 空前缀 / 非绝对路径 / 前缀过长 / 域号为 0 / 该前缀已被占用
-/// (重复挂载同一前缀需先 `MNTD`, 避免静默改写别人的命名空间)。
+/// 拒绝: 空前缀 / 非绝对路径 / 前缀过长 / 含 NUL 或非法分量 (`..` 在根处钳制) /
+/// 域号为 0 或挂载服务自身 / 该前缀已被占用 (重复挂载同一前缀需先 `MNTD`, 避免
+/// 静默改写别人的命名空间)。
 fn mount_add(prefix: &str, domain: u64, vol_enc: u32) -> u64 {
-    let b = prefix.as_bytes();
-    if b.is_empty() || b[0] != b'/' || b.len() >= MOUNT_PREFIX_MAX || domain == 0 {
+    if domain == 0 || domain == vfs::MOUNT_DOMAIN {
         return u64::MAX;
     }
-    if mount_find(prefix).is_some() {
+    let mut nb = [0u8; MOUNT_PREFIX_MAX];
+    let n = match mount_norm_prefix(prefix, &mut nb) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    let canon = unsafe { core::str::from_utf8_unchecked(&nb[..n]) };
+    if mount_find(canon).is_some() {
         return u64::MAX;
     }
     for i in 0..MOUNT_MAX {
@@ -114,9 +146,9 @@ fn mount_add(prefix: &str, domain: u64, vol_enc: u32) -> u64 {
             e.used = true;
             e.domain = domain;
             e.vol_enc = vol_enc;
-            e.plen = b.len() as u8;
+            e.plen = n as u8;
             e.prefix = [0; MOUNT_PREFIX_MAX];
-            e.prefix[..b.len()].copy_from_slice(b);
+            e.prefix[..n].copy_from_slice(&nb[..n]);
             return (i + 1) as u64;
         }
     }
@@ -143,6 +175,10 @@ fn mount_auto(domain: u64) -> u64 {
 /// 命名直接用卷号, 故同一台机器上多个服务挂各自的额外卷也不会撞名, 且挂载点与
 /// block_srv 卷表一一对应 (`/usb3` = 卷 3)。已经挂过同一卷时静默成功 (幂等)。
 fn mount_auto_vol(domain: u64, vol: u64) -> u64 {
+    // 卷编码只有 8 位 (`vfs::enc_of_vol`), 卷号 > 254 会与 `0 = 默认卷` 冲突。
+    if vol > 254 {
+        return u64::MAX;
+    }
     let mut buf = [0u8; MOUNT_PREFIX_MAX];
     buf[..4].copy_from_slice(b"/usb");
     let digits = dec_to_str(vol, &mut buf[4..]);
@@ -190,12 +226,18 @@ fn dec_to_str(v: u64, dst: &mut [u8]) -> usize {
 }
 
 /// 卸载挂载点 `prefix`, 成功返回 1。
-/// 根 `/` 不可卸载 (否则整个命名空间失去根)。
+/// 根 `/` 不可卸载 (否则整个命名空间失去根); 前缀先规范化, `..` 不能借卸载绕过根限制。
 fn mount_del(prefix: &str) -> u64 {
-    if prefix == "/" {
+    let mut nb = [0u8; MOUNT_PREFIX_MAX];
+    let n = match mount_norm_prefix(prefix, &mut nb) {
+        Some(n) => n,
+        None => return u64::MAX,
+    };
+    let canon = unsafe { core::str::from_utf8_unchecked(&nb[..n]) };
+    if canon == "/" {
         return u64::MAX;
     }
-    match mount_find(prefix) {
+    match mount_find(canon) {
         Some(i) => {
             mount_at_mut(i).used = false;
             1
@@ -252,9 +294,19 @@ pub fn run() {
                     .position(|&b| b == 0)
                     .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
+                // 先规范化查询路径: `..` 在根处钳制, 于是 `/mfs/../../x` 会按 `/x`
+                // 路由, 绝不会因为前缀匹配而落回 `/mfs` 子树。
+                let mut nb = [0u8; PAYLOAD_LEN];
+                let canon = match vfs::normalize_abs(path.as_bytes(), &mut nb, vfs::PATH_COMP_MAX) {
+                    Some(n) => unsafe { core::str::from_utf8_unchecked(&nb[..n]) },
+                    None => {
+                        sys_reply(u64::MAX);
+                        continue;
+                    }
+                };
                 // 回复布局: `[63:40] 卷编码 | [39:32] 服务域 | [31:0] 前缀长度`
                 // (libvfs 按同布局解出, 见 `vfs::mount_lookup`)。
-                let r = match mount_resolve(path) {
+                let r = match mount_resolve(canon) {
                     Some((domain, vol_enc, prefix_len)) => {
                         ((vol_enc as u64) << 40) | (domain << 32) | prefix_len as u64
                     }
@@ -263,6 +315,11 @@ pub fn run() {
                 sys_reply(r);
             }
             vfs::VFS_MOUNT_TAG => {
+                // 只有有权域 (uid 0 / 引导期服务域) 才能改全局命名空间。
+                if !mount_privileged(msg.from) {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 // payload = MountReq { domain, prefix[24] }; 前缀为空则自动分配。
                 let req = unsafe { &*(msg.payload.as_ptr() as *const vfs::MountReq) };
                 let plen = req
@@ -279,11 +336,19 @@ pub fn run() {
                 sys_reply(r);
             }
             vfs::VFS_MOUNT_VOL_TAG => {
+                if !mount_privileged(msg.from) {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 // payload = MountVolReq { domain, vol }: 把某服务的额外卷挂到 `/usb<卷号>`。
                 let req = unsafe { &*(msg.payload.as_ptr() as *const vfs::MountVolReq) };
                 sys_reply(mount_auto_vol(req.domain, req.vol));
             }
             vfs::VFS_UMOUNT_TAG => {
+                if !mount_privileged(msg.from) {
+                    sys_reply(u64::MAX);
+                    continue;
+                }
                 let len = msg
                     .payload
                     .iter()
