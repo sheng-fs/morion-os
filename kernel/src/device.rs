@@ -300,6 +300,153 @@ pub fn bind_dma_window(
     Some(iova_base)
 }
 
+// ---------------------------------------------------------------------------
+// 性能飞地: 运行期设备窗口映射 (§6.2 最小切片)
+// ---------------------------------------------------------------------------
+
+/// `SYS_ENCLAVE_MAP` 的错误码（从 `u64::MAX` 向下编号）。
+///
+/// 成功返回值是**实际生效的 IOVA**（非 0、页对齐，且受 AGAW ≤ 57 约束），因此不会与这些
+/// 哨兵混淆。任何一步不支持都返回其中之一，并且**设备上下文保持原状** —— 既有驱动继续
+/// 走启动时建立的恒等窗口。
+pub const ENCLAVE_ERR_NO_DEVICE: u64 = u64::MAX;
+pub const ENCLAVE_ERR_NO_CAP: u64 = u64::MAX - 1;
+pub const ENCLAVE_ERR_BAD_WINDOW: u64 = u64::MAX - 2;
+pub const ENCLAVE_ERR_UNSUPPORTED: u64 = u64::MAX - 3;
+pub const ENCLAVE_ERR_CONFLICT: u64 = u64::MAX - 4;
+
+/// 单次飞地窗口的长度上限（1 GiB）—— 先在这里挡住，避免拿一个巨大长度去逐页建表。
+const ENCLAVE_MAX_BYTES: u64 = 1 << 30;
+
+/// 判断 `[iova, iova + bytes)` 是否可作为飞地 DMA 窗口（纯函数，便于单测）。
+///
+/// 规则沿用 `syscall::user_buf_ok` 的风格：起点/终点都要合法、长度非零、加法不溢出。
+/// 具体是：IOVA 非 0 且页对齐、长度非零且页对齐、整段不得落在**用户虚拟地址**空间
+/// （IOVA 是设备可见地址，不是 CPU 虚拟地址）、不超过单次上限、且不超出该设备已授权的
+/// DMA 块（`dma_bytes`）。
+fn enclave_window_ok(iova: u64, bytes: u64, dma_bytes: u64) -> bool {
+    if iova == 0 || bytes == 0 || bytes > ENCLAVE_MAX_BYTES {
+        return false;
+    }
+    if (iova & (PAGE - 1)) != 0 || (bytes & (PAGE - 1)) != 0 {
+        return false;
+    }
+    if paging::is_user_address(iova) {
+        return false;
+    }
+    let Some(end) = iova.checked_add(bytes) else {
+        return false;
+    };
+    if paging::is_user_address(end - 1) {
+        return false;
+    }
+    bytes <= dma_bytes && (dma_bytes & (PAGE - 1)) == 0
+}
+
+/// 确认 / 建立 **BAR 窗口**在 `domain` 里的映射（幂等）：已映射到同一物理页就当成功。
+///
+/// 走与 [`paging::map_mmio`] 相同的口径（USER + 可写 + 非缓存 + NX）。已有映射且目标物理页
+/// 一致时**不重复映射** —— `map_to` 撞已映射页会 panic，那会毁掉既有驱动。
+fn ensure_bar_window(domain: u64, bar_vaddr: u64, bar_paddr: u64, bar_bytes: u64) -> bool {
+    if bar_vaddr == 0 || bar_bytes == 0 || (bar_bytes & (PAGE - 1)) != 0 {
+        return false;
+    }
+    if !paging::is_user_address(bar_vaddr) {
+        return false;
+    }
+    let pages = bar_bytes / PAGE;
+    // 第一遍只检查、不映射：任何一页指向别的物理页就整体拒绝，不留半截窗口。
+    for i in 0..pages {
+        let va = bar_vaddr + i * PAGE;
+        let pa = bar_paddr + i * PAGE;
+        if let Some(mapped) = paging::resolve_user_page(domain, va) {
+            if (mapped & !(PAGE - 1)) != pa {
+                return false;
+            }
+        }
+    }
+    // 第二遍补齐缺失页（已映射到同一物理页的不重复映射 —— `map_to` 撞已映射页会 panic）。
+    for i in 0..pages {
+        let va = bar_vaddr + i * PAGE;
+        let pa = bar_paddr + i * PAGE;
+        if paging::resolve_user_page(domain, va).is_none() {
+            paging::map_mmio(domain, va, pa);
+        }
+    }
+    true
+}
+
+/// `SYS_ENCLAVE_MAP` 的处理入口（性能飞地 §6.2 最小切片）。
+///
+/// `a1` = 设备选择（[`DEVICE_SELF`] 或显式 `pci_addr`）；`a2` = 期望 IOVA（页对齐）；
+/// `a3` = 窗口字节数。成功返回**实际生效的 IOVA**，失败返回 `ENCLAVE_ERR_*`。
+///
+/// 顺序刻意如此：先把所有**只读校验**做完（设备归属 → `Mmio` 能力门禁 → 窗口合法性），
+/// 再幂等确认 BAR 映射，最后建独立 IOVA 窗口并切设备上下文。任何一步失败都**不触碰
+/// 设备上下文** —— 未调用本入口的域完全走原有恒等映射，行为零变化。
+pub fn syscall_enclave_map(a1: u64, a2: u64, a3: u64) -> u64 {
+    let me = crate::scheduler::current_domain();
+    let (bus, dev, func, bar_paddr, cfg_paddr) = {
+        let bindings = BINDINGS.lock();
+        let Some(e) = bindings.iter().find(|e| e.domain == me) else {
+            return ENCLAVE_ERR_NO_DEVICE; // 本域没有授权设备。
+        };
+        if !selects(a1, e.bus, e.dev, e.func) {
+            return ENCLAVE_ERR_NO_DEVICE; // 申请的不是本域那台设备。
+        }
+        (e.bus, e.dev, e.func, e.bar_paddr, e.cfg_paddr)
+    };
+
+    // 能力门禁：只允许持有该设备 BAR `Mmio` 凭证的域（`grant` 一并签发）。
+    if !crate::cap::has(me, crate::cap::Capability::Mmio(bar_paddr)) {
+        crate::video::println("dev: enclave map denied (no Mmio capability)");
+        return ENCLAVE_ERR_NO_CAP;
+    }
+
+    let iova = a2;
+    let bytes = a3;
+    let mut desc = unsafe { core::ptr::read_volatile(cfg_paddr as *const DeviceGrant) };
+    if desc.magic != DEVICE_GRANT_MAGIC {
+        return ENCLAVE_ERR_NO_DEVICE;
+    }
+    if !enclave_window_ok(iova, bytes, desc.dma_bytes) {
+        return ENCLAVE_ERR_BAD_WINDOW;
+    }
+    // 幂等：已绑定就返回既有窗口，不重复建表、不改设备上下文。
+    if desc.dma_window_bound() {
+        return desc.dma_iova;
+    }
+
+    // 先确认 IOMMU 能给出独立上下文：不支持时**完全不碰** BAR 映射 / 设备上下文，
+    // 立刻回错误 —— 这正是"不支持就保持原状"。
+    let Some(mut window) = crate::arch::iommu::IovaWindow::create(me, iova, bytes) else {
+        return ENCLAVE_ERR_UNSUPPORTED;
+    };
+
+    if !ensure_bar_window(me, desc.bar_vaddr, desc.bar_paddr, desc.bar_bytes) {
+        return ENCLAVE_ERR_CONFLICT;
+    }
+    if !window.map_contiguous(iova, desc.dma_paddr, bytes) {
+        return ENCLAVE_ERR_UNSUPPORTED;
+    }
+    if !window.attach_device(bus, dev, func) {
+        let _ = window.unmap(iova, bytes);
+        return ENCLAVE_ERR_UNSUPPORTED;
+    }
+
+    // 回写描述页：后续同域调用可直接复用这条窗口。
+    desc.dma_iova = iova;
+    desc.dma_iova_bytes = bytes;
+    unsafe { core::ptr::write_volatile(cfg_paddr as *mut DeviceGrant, desc) };
+
+    crate::video::print("dev: enclave window mapped iova=0x");
+    crate::video::print_hex(iova);
+    crate::video::print(" bytes=0x");
+    crate::video::print_hex(bytes);
+    crate::video::println("");
+    iova
+}
+
 /// 无该类型设备时的降级: 仅映射一个**零描述页**到约定地址, 让驱动读到
 /// `magic == 0` (不等于 [`DEVICE_GRANT_MAGIC`]) 后自行优雅退出, 而不是读未映射地址
 /// 触发缺页死循环。
@@ -722,5 +869,73 @@ mod tests {
     fn info_packing() {
         assert_eq!(pack_info(0x1AF4, 0x1001, 0x000102), 0x1AF4_1001_0000_0102);
         assert_eq!(pack_info(0, 0, 0), 0);
+    }
+
+    /// 飞地窗口校验: 页对齐 / 非零 / 非用户地址 / 长度越界 / 加法溢出都必须拒绝。
+    #[test]
+    fn enclave_window_bounds_and_alignment() {
+        // 7 页 DMA 块（与 `main.rs` 给 NVMe 的 `dma_pages: 7` 同量级）。
+        const DMA: u64 = 7 * 4096;
+        const IOVA: u64 = 0x1000_0000; // 256 MiB
+
+        assert!(enclave_window_ok(IOVA, DMA, DMA));
+        assert!(enclave_window_ok(IOVA, 4096, DMA)); // 子窗口允许
+
+        // IOVA 必须页对齐、且不能占用 0（DeviceGrant 的"未绑定"哨兵）。
+        assert!(!enclave_window_ok(IOVA + 1, 4096, DMA));
+        assert!(!enclave_window_ok(0, 4096, DMA));
+
+        // 长度非零且页对齐。
+        assert!(!enclave_window_ok(IOVA, 0, DMA));
+        assert!(!enclave_window_ok(IOVA, 4097, DMA));
+
+        // 长度越界: 超出已授权 DMA 块 / 超出单次上限（1 GiB）。
+        assert!(!enclave_window_ok(IOVA, DMA + 4096, DMA));
+        assert!(!enclave_window_ok(IOVA, ENCLAVE_MAX_BYTES, DMA));
+
+        // 用户虚拟地址不能当 IOVA: 起点或终点任一落入都拒。
+        assert!(!enclave_window_ok(
+            crate::memory::paging::USER_SPACE_BASE,
+            4096,
+            4096
+        ));
+        assert!(!enclave_window_ok(
+            crate::memory::paging::USER_SPACE_BASE - 0x1000,
+            0x2000,
+            0x2000
+        ));
+
+        // 加法溢出。
+        assert!(!enclave_window_ok(u64::MAX & !0xFFF, 0x2000, DMA));
+    }
+
+    /// 能力门禁的判据是**精确匹配该 BAR 的 `Mmio` 凭证**: 别的 BAR / 别的能力种类都不认。
+    #[test]
+    fn enclave_capability_gate_requires_exact_mmio() {
+        use crate::cap::Capability;
+        let bar = 0x8000_0000u64;
+        let held = Capability::Mmio(bar);
+        assert_eq!(held, Capability::Mmio(bar));
+        assert_ne!(held, Capability::Mmio(bar + 0x1000));
+        assert_ne!(held, Capability::Irq(0));
+        assert_ne!(held, Capability::Fb);
+    }
+
+    /// 五个错误码互不相同, 且都落在任何合法 IOVA 之上（AGAW ≤ 57 位）。
+    #[test]
+    fn enclave_error_codes_do_not_collide_with_iova() {
+        const ERRS: [u64; 5] = [
+            ENCLAVE_ERR_NO_DEVICE,
+            ENCLAVE_ERR_NO_CAP,
+            ENCLAVE_ERR_BAD_WINDOW,
+            ENCLAVE_ERR_UNSUPPORTED,
+            ENCLAVE_ERR_CONFLICT,
+        ];
+        for (i, a) in ERRS.iter().enumerate() {
+            for b in &ERRS[i + 1..] {
+                assert_ne!(a, b);
+            }
+            assert!(*a > 1u64 << 57);
+        }
     }
 }

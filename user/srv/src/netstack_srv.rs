@@ -44,9 +44,104 @@ fn kind_svc_name(kind: u64) -> &'static str {
     }
 }
 
-/// 本机静态配置（与网卡驱动的 DHCP 回落值一致）。
+/// 本机静态配置（确定性自测与 DHCP 失败时的参照值）。
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
+/// QEMU user-mode 内置 DNS（未取得 DHCP 租约时的回落值）。
+const DEFAULT_DNS: [u8; 4] = [10, 0, 2, 3];
+
+/// 私有扩展 op（与 `morion::net` 的同名常量逐值对应；避免改动共享的 `common.rs` 契约）：
+/// `sock` 未用，`port` = QTYPE（1=A / 28=AAAA），`len` = 域名长度，`buf` = 域名/结果。
+const NETS_OP_DNS: u64 = 17;
+
+// ---------------------------------------------------------------------------
+// DHCP 客户端 / 默认路由 / DNS 缓存（N10）
+// ---------------------------------------------------------------------------
+
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_XID: u32 = 0x4D4F_5044; // "MOPD"
+const DHCP_MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+const DHCP_BOOTP_FIXED: u64 = 236;
+const DHCP_MIN_MSG: u64 = 300;
+/// 启动期有界等待（毫秒）与重发间隔。
+const DHCP_ACQUIRE_MS: u64 = 2500;
+const DHCP_RESEND_MS: u64 = 500;
+/// 未拿到 option 51 时的缺省租期（秒）。
+const DHCP_DEFAULT_LEASE: u32 = 3600;
+
+/// DHCP 状态机状态。
+const DHCP_OFF: u8 = 0;
+const DHCP_SELECTING: u8 = 1;
+const DHCP_REQUESTING: u8 = 2;
+const DHCP_BOUND: u8 = 3;
+const DHCP_RENEWING: u8 = 4;
+
+/// 每条链路的 IPv4 配置表（DHCP 写入；`ip == 0` 表示无租约/无路由）。
+#[derive(Clone, Copy)]
+struct DhcpCfg {
+    state: u8,
+    ip: [u8; 4],
+    mask: [u8; 4],
+    gw: [u8; 4],
+    dns: [u8; 4],
+    server: [u8; 4],
+    lease_secs: u32,
+    t1_secs: u32,
+    /// 续期/重发时刻（主循环 tick，约 10ms/单位）。
+    renew_at: u64,
+    /// 租约到期时刻。
+    expire_at: u64,
+}
+
+impl DhcpCfg {
+    const fn new() -> DhcpCfg {
+        DhcpCfg {
+            state: DHCP_OFF,
+            ip: [0; 4],
+            mask: [0; 4],
+            gw: [0; 4],
+            dns: [0; 4],
+            server: [0; 4],
+            lease_secs: 0,
+            t1_secs: 0,
+            renew_at: 0,
+            expire_at: 0,
+        }
+    }
+}
+
+/// DNS 缓存条目（16 条，带 TTL）。
+const DNS_CACHE_MAX: usize = 16;
+const DNS_NAME_MAX: usize = 64;
+
+#[derive(Clone, Copy)]
+struct DnsEntry {
+    used: bool,
+    qtype: u16,
+    name: [u8; DNS_NAME_MAX],
+    name_len: usize,
+    addr: [u8; 16],
+    expires: u64,
+}
+
+impl DnsEntry {
+    const fn new() -> DnsEntry {
+        DnsEntry {
+            used: false,
+            qtype: 0,
+            name: [0; DNS_NAME_MAX],
+            name_len: 0,
+            addr: [0; 16],
+            expires: 0,
+        }
+    }
+}
 
 const MAX_SOCKS: usize = 4;
 const MAX_TCONS: usize = 6;
@@ -138,6 +233,8 @@ struct Link {
     mac: u64,
     gw_mac: Option<[u8; 6]>,
     up: bool,
+    /// 本链路当前 IPv4（DHCP 租约；`0.0.0.0` = 未配置）。
+    ip: [u8; 4],
     /// IPv6（V6.1）：SLAAC 全局地址、路由器地址、路由器 MAC、是否已配置。
     v6_global: [u8; 16],
     v6_gw: [u8; 16],
@@ -154,6 +251,7 @@ impl Link {
             mac: 0,
             gw_mac: None,
             up: false,
+            ip: [0; 4],
             v6_global: [0; 16],
             v6_gw: [0; 16],
             gw6_mac: None,
@@ -219,6 +317,12 @@ struct Stack {
     nics: usize,
     socks: [Sock; MAX_SOCKS],
     tcons: [TcpConn; MAX_TCONS],
+    /// DHCP 租约/路由配置表（按网卡索引）。
+    dhcp: [DhcpCfg; NIC_MAX],
+    /// DNS 缓存（有界，带 TTL）。
+    dns: [DnsEntry; DNS_CACHE_MAX],
+    /// DNS 查询事务 id 递增器。
+    dns_seq: u16,
 }
 
 impl Stack {
@@ -228,6 +332,9 @@ impl Stack {
             nics: 0,
             socks: [Sock::new(); MAX_SOCKS],
             tcons: [TcpConn::new(); MAX_TCONS],
+            dhcp: [DhcpCfg::new(); NIC_MAX],
+            dns: [DnsEntry::new(); DNS_CACHE_MAX],
+            dns_seq: 0,
         }
     }
 }
@@ -258,7 +365,8 @@ fn build_arp_request(l: &Link, target: [u8; 4]) -> u64 {
     wr8(f + 19, 4);
     wr16be(f + 20, 0x0001); // oper = request
     put_mac(f + 22, mac_bytes(l.mac));
-    for (i, b) in OUR_IP.iter().enumerate() {
+    // 发送方协议地址用本链路当前 IPv4（DHCP 未完成时为 0.0.0.0）。
+    for (i, b) in l.ip.iter().enumerate() {
         wr8(f + 28 + i as u64, *b);
     }
     put_mac(f + 32, [0; 6]);
@@ -269,8 +377,10 @@ fn build_arp_request(l: &Link, target: [u8; 4]) -> u64 {
 }
 
 /// 把 UDP 数据报构造进链路共享页（负载从 `payload_va` 拷入），返回帧长。
+#[allow(clippy::too_many_arguments)]
 fn build_udp(
     l: &Link,
+    src_ip: [u8; 4],
     dst_mac: [u8; 6],
     dst_ip: [u8; 4],
     sport: u16,
@@ -291,7 +401,7 @@ fn build_udp(
     wr8(ip + 8, 64);
     wr8(ip + 9, IP_PROTO_UDP);
     wr16be(ip + 10, 0);
-    for (i, b) in OUR_IP.iter().enumerate() {
+    for (i, b) in src_ip.iter().enumerate() {
         wr8(ip + 12 + i as u64, *b);
         wr8(ip + 16 + i as u64, dst_ip[i]);
     }
@@ -310,6 +420,813 @@ fn build_udp(
         );
     }
     14 + 20 + 8 + plen
+}
+
+// ---------------------------------------------------------------------------
+// N10 — DHCP 客户端（DORA / T1 续期）、默认路由与 DNS 缓存
+// ---------------------------------------------------------------------------
+
+/// 打印点分 IPv4。
+fn print_ip4(ip: [u8; 4]) {
+    print_u64(ip[0] as u64);
+    print(".");
+    print_u64(ip[1] as u64);
+    print(".");
+    print_u64(ip[2] as u64);
+    print(".");
+    print_u64(ip[3] as u64);
+}
+
+fn ip4_is_zero(ip: [u8; 4]) -> bool {
+    ip == [0u8; 4]
+}
+
+/// 目的地址是否落在 `ip/mask` 子网内。
+fn in_subnet(dst: [u8; 4], ip: [u8; 4], mask: [u8; 4]) -> bool {
+    let mut i = 0;
+    while i < 4 {
+        if (dst[i] & mask[i]) != (ip[i] & mask[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// 解析出的 DHCP 报文。
+#[derive(Clone, Copy)]
+struct DhcpMsg {
+    kind: u8,
+    ip: [u8; 4],
+    mask: [u8; 4],
+    gw: [u8; 4],
+    dns: [u8; 4],
+    server: [u8; 4],
+    lease: u32,
+}
+
+/// 从 UDP 载荷解析 DHCP（BOOTREPLY + xid + magic cookie + options）。
+fn dhcp_parse(payload: u64, len: u64, xid: u32) -> Option<DhcpMsg> {
+    if len < DHCP_BOOTP_FIXED + 4 || rd8(payload) != 2 || rd32be(payload + 4) != xid {
+        return None;
+    }
+    let mut m = DhcpMsg {
+        kind: 0,
+        ip: [
+            rd8(payload + 16),
+            rd8(payload + 17),
+            rd8(payload + 18),
+            rd8(payload + 19),
+        ],
+        mask: [0; 4],
+        gw: [0; 4],
+        dns: [0; 4],
+        server: [0; 4],
+        lease: 0,
+    };
+    let ck = payload + DHCP_BOOTP_FIXED;
+    if [rd8(ck), rd8(ck + 1), rd8(ck + 2), rd8(ck + 3)] != DHCP_MAGIC {
+        return None;
+    }
+    let end = payload + len;
+    let mut o = ck + 4;
+    while o < end {
+        let code = rd8(o);
+        if code == 255 {
+            break;
+        }
+        if code == 0 {
+            o += 1;
+            continue;
+        }
+        if o + 2 > end {
+            break;
+        }
+        let olen = rd8(o + 1) as u64;
+        if o + 2 + olen > end {
+            break;
+        }
+        let d = o + 2;
+        if olen >= 4 {
+            let v = [rd8(d), rd8(d + 1), rd8(d + 2), rd8(d + 3)];
+            match code {
+                1 => m.mask = v,
+                3 => m.gw = v,
+                6 => m.dns = v,
+                54 => m.server = v,
+                51 => m.lease = rd32be(d),
+                _ => {}
+            }
+        }
+        if code == 53 && olen >= 1 {
+            m.kind = rd8(d);
+        }
+        o += 2 + olen;
+    }
+    if m.kind == 0 {
+        return None;
+    }
+    Some(m)
+}
+
+/// 在 `va` 处拼一条 DHCP 报文（请求或自测用的应答）；返回帧长。
+///
+/// `reply = Some` 时按 BOOTREPLY 写 yiaddr / siaddr 与 1/3/6/51/54 选项（确定性自测用）。
+#[allow(clippy::too_many_arguments)]
+fn dhcp_build_at(
+    va: u64,
+    mac: u64,
+    xid: u32,
+    msg: u8,
+    req_ip: [u8; 4],
+    server: [u8; 4],
+    reply: Option<&DhcpMsg>,
+) -> u64 {
+    put_mac(va, [0xff; 6]);
+    put_mac(va + 6, mac_bytes(mac));
+    wr16be(va + 12, ETH_IPV4);
+    let ip = va + 14;
+    wr8(ip, 0x45);
+    wr8(ip + 1, 0);
+    wr16be(ip + 2, (20 + 8 + DHCP_MIN_MSG) as u16);
+    wr16be(ip + 4, 0);
+    wr16be(ip + 6, 0x4000); // DF
+    wr8(ip + 8, 64);
+    wr8(ip + 9, IP_PROTO_UDP);
+    wr16be(ip + 10, 0);
+    let src = reply.map(|r| r.server).unwrap_or([0; 4]);
+    for (i, b) in src.iter().enumerate() {
+        wr8(ip + 12 + i as u64, *b);
+        wr8(ip + 16 + i as u64, 255);
+    }
+    wr16be(ip + 10, csum(ip, 20));
+
+    let udp = ip + 20;
+    let (sport, dport) = if reply.is_some() {
+        (DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
+    } else {
+        (DHCP_CLIENT_PORT, DHCP_SERVER_PORT)
+    };
+    wr16be(udp, sport);
+    wr16be(udp + 2, dport);
+    wr16be(udp + 4, (8 + DHCP_MIN_MSG) as u16);
+    wr16be(udp + 6, 0); // IPv4 UDP 校验和可选
+
+    let bootp = udp + 8;
+    let mut i = 0u64;
+    while i < DHCP_MIN_MSG {
+        wr8(bootp + i, 0);
+        i += 1;
+    }
+    wr8(bootp, if reply.is_some() { 2 } else { 1 });
+    wr8(bootp + 1, 1); // htype
+    wr8(bootp + 2, 6); // hlen
+    wr32be(bootp + 4, xid);
+    wr16be(bootp + 10, 0x8000); // broadcast
+    if let Some(r) = reply {
+        for (k, b) in r.ip.iter().enumerate() {
+            wr8(bootp + 16 + k as u64, *b);
+        }
+        for (k, b) in r.server.iter().enumerate() {
+            wr8(bootp + 20 + k as u64, *b);
+        }
+    }
+    let mb = mac_bytes(mac);
+    let mut j = 0u64;
+    while j < 6 {
+        wr8(bootp + 28 + j, mb[j as usize]);
+        j += 1;
+    }
+
+    let ck = bootp + DHCP_BOOTP_FIXED;
+    let mut m = 0u64;
+    while m < 4 {
+        wr8(ck + m, DHCP_MAGIC[m as usize]);
+        m += 1;
+    }
+    let mut o = ck + 4;
+    wr8(o, 53);
+    wr8(o + 1, 1);
+    wr8(o + 2, msg);
+    o += 3;
+    if let Some(r) = reply {
+        let opts: [(u8, [u8; 4]); 4] = [(1, r.mask), (3, r.gw), (6, r.dns), (54, r.server)];
+        for (code, v) in opts.iter() {
+            wr8(o, *code);
+            wr8(o + 1, 4);
+            for (k, b) in v.iter().enumerate() {
+                wr8(o + 2 + k as u64, *b);
+            }
+            o += 6;
+        }
+        wr8(o, 51);
+        wr8(o + 1, 4);
+        wr32be(o + 2, r.lease);
+        o += 6;
+    } else if msg == DHCP_REQUEST {
+        wr8(o, 50);
+        wr8(o + 1, 4);
+        for (k, b) in req_ip.iter().enumerate() {
+            wr8(o + 2 + k as u64, *b);
+        }
+        o += 6;
+        wr8(o, 54);
+        wr8(o + 1, 4);
+        for (k, b) in server.iter().enumerate() {
+            wr8(o + 2 + k as u64, *b);
+        }
+        o += 6;
+    }
+    wr8(o, 55);
+    wr8(o + 1, 5);
+    wr8(o + 2, 1);
+    wr8(o + 3, 3);
+    wr8(o + 4, 6);
+    wr8(o + 5, 51);
+    wr8(o + 6, 54);
+    o += 7;
+    wr8(o, 255);
+    14 + 20 + 8 + DHCP_MIN_MSG
+}
+
+/// 发一条 DHCP 请求（DISCOVER / REQUEST）。
+fn dhcp_send(st: &Stack, nic: usize, msg: u8) -> bool {
+    let cfg = st.dhcp[nic];
+    let l = st.links[nic];
+    let len = dhcp_build_at(l.io, l.mac, DHCP_XID, msg, cfg.ip, cfg.server, None);
+    link_tx(&l, len)
+}
+
+/// 把 ACK 写入配置表（并刷新链路 IPv4 / 网关 MAC 缓存）。
+fn dhcp_apply(st: &mut Stack, nic: usize, m: &DhcpMsg, now: u64) {
+    let lease = if m.lease == 0 {
+        DHCP_DEFAULT_LEASE
+    } else {
+        m.lease
+    };
+    let mask = if ip4_is_zero(m.mask) {
+        [255, 255, 255, 0]
+    } else {
+        m.mask
+    };
+    {
+        let c = &mut st.dhcp[nic];
+        c.state = DHCP_BOUND;
+        c.ip = m.ip;
+        c.mask = mask;
+        c.gw = m.gw;
+        c.dns = m.dns;
+        c.server = m.server;
+        c.lease_secs = lease;
+        c.t1_secs = lease / 2;
+        c.renew_at = now + c.t1_secs as u64 * 100;
+        c.expire_at = now + lease as u64 * 100;
+    }
+    st.links[nic].ip = m.ip;
+    st.links[nic].gw_mac = None; // 网关可能变化，下次按新网关重新 ARP
+}
+
+/// 处理一帧 DHCP 应答；识别并处理返回 `true`。
+fn dhcp_input(st: &mut Stack, nic: usize, n: u64, now: u64) -> bool {
+    let io = st.links[nic].io;
+    let info = match ipv4_parse(io, n) {
+        Some(i) => i,
+        None => return false,
+    };
+    if info.proto != IP_PROTO_UDP || info.payload_len < 8 {
+        return false;
+    }
+    let udp = info.payload_off;
+    if rd16be(udp + 2) != DHCP_CLIENT_PORT {
+        return false;
+    }
+    let ulen = rd16be(udp + 4) as u64;
+    if ulen < 8 || ulen > info.payload_len {
+        return false;
+    }
+    let m = match dhcp_parse(udp + 8, ulen - 8, DHCP_XID) {
+        Some(m) => m,
+        None => return false,
+    };
+    match m.kind {
+        DHCP_OFFER if st.dhcp[nic].state == DHCP_SELECTING => {
+            st.dhcp[nic].ip = m.ip;
+            st.dhcp[nic].server = m.server;
+            st.dhcp[nic].state = DHCP_REQUESTING;
+            print("netstack: DHCPOFFER ");
+            print_ip4(m.ip);
+            print(" from ");
+            print_ip4(m.server);
+            println("");
+        }
+        DHCP_ACK => {
+            dhcp_apply(st, nic, &m, now);
+            print("NET-DHCP bound nic=");
+            print_u64(nic as u64);
+            print(" ip=");
+            print_ip4(m.ip);
+            print(" mask=");
+            print_ip4(st.dhcp[nic].mask);
+            print(" gw=");
+            print_ip4(m.gw);
+            print(" dns=");
+            print_ip4(m.dns);
+            print(" lease=");
+            print_u64(st.dhcp[nic].lease_secs as u64);
+            print("s t1=");
+            print_u64(st.dhcp[nic].t1_secs as u64);
+            println("s");
+        }
+        DHCP_NAK => {
+            st.dhcp[nic].state = DHCP_SELECTING;
+            st.dhcp[nic].ip = [0; 4];
+            st.links[nic].ip = [0; 4];
+            println("netstack: DHCPNAK, restart discovery");
+        }
+        _ => {}
+    }
+    true
+}
+
+/// 启动期有界 DORA（DISCOVER → OFFER → REQUEST → ACK）。
+fn dhcp_acquire(st: &mut Stack, nic: usize) -> bool {
+    st.dhcp[nic] = DhcpCfg::new();
+    st.links[nic].ip = [0; 4];
+    st.dhcp[nic].state = DHCP_SELECTING;
+    let _ = dhcp_send(st, nic, DHCP_DISCOVER);
+    print("netstack: nic");
+    print_u64(nic as u64);
+    println(" DHCPDISCOVER (broadcast)");
+    let mut ms = 0u64;
+    let mut last = 0u64;
+    while ms < DHCP_ACQUIRE_MS {
+        while let Some(n) = link_rx(&st.links[nic]) {
+            if !dhcp_input(st, nic, n, 0) {
+                handle_frame(st, nic, n, 0);
+            }
+        }
+        if st.dhcp[nic].state == DHCP_BOUND {
+            return true;
+        }
+        if ms - last >= DHCP_RESEND_MS {
+            let msg = if st.dhcp[nic].state == DHCP_REQUESTING {
+                DHCP_REQUEST
+            } else {
+                DHCP_DISCOVER
+            };
+            let _ = dhcp_send(st, nic, msg);
+            last = ms;
+        }
+        sys_sleep(10);
+        ms += 10;
+    }
+    false
+}
+
+/// 主循环里推进租约：T1 到点发 REQUEST 续期，到期重新 DISCOVER。
+fn dhcp_tick(st: &mut Stack, now: u64) {
+    let mut nic = 0;
+    while nic < st.nics {
+        let c = st.dhcp[nic];
+        if c.state == DHCP_BOUND && now >= c.renew_at {
+            let _ = dhcp_send(st, nic, DHCP_REQUEST);
+            st.dhcp[nic].state = DHCP_RENEWING;
+            st.dhcp[nic].renew_at = now + 500; // 5s 后重发
+            print("NET-DHCP renewing nic=");
+            print_u64(nic as u64);
+            print(" ip=");
+            print_ip4(c.ip);
+            println("");
+        } else if c.state == DHCP_RENEWING {
+            if now >= c.expire_at {
+                st.dhcp[nic].state = DHCP_SELECTING;
+                st.dhcp[nic].ip = [0; 4];
+                st.links[nic].ip = [0; 4];
+                st.dhcp[nic].renew_at = now + 500;
+                let _ = dhcp_send(st, nic, DHCP_DISCOVER);
+                println("netstack: DHCP lease expired, rediscover");
+            } else if now >= c.renew_at {
+                let _ = dhcp_send(st, nic, DHCP_REQUEST);
+                st.dhcp[nic].renew_at = now + 500;
+            }
+        } else if c.state == DHCP_SELECTING && now >= c.renew_at && c.renew_at != 0 {
+            let _ = dhcp_send(st, nic, DHCP_DISCOVER);
+            st.dhcp[nic].renew_at = now + 500;
+        }
+        nic += 1;
+    }
+}
+
+/// DHCP 确定性自证：构造假 ACK → 解析 → 写入配置表 → 校验路由判定，随后回滚。
+fn dhcp_selftest(st: &mut Stack, nic: usize) -> bool {
+    let want = DhcpMsg {
+        kind: DHCP_ACK,
+        ip: [10, 0, 2, 15],
+        mask: [255, 255, 255, 0],
+        gw: [10, 0, 2, 2],
+        dns: [10, 0, 2, 3],
+        server: [10, 0, 2, 2],
+        lease: 3600,
+    };
+    let va = st.links[nic].io + SCRATCH_OFF;
+    let mac = st.links[nic].mac;
+    let len = dhcp_build_at(va, mac, DHCP_XID, DHCP_ACK, [0; 4], [0; 4], Some(&want));
+    let got = match dhcp_parse(va + 14 + 20 + 8, len - 42, DHCP_XID) {
+        Some(g) => g,
+        None => return false,
+    };
+    let parsed_ok = got.kind == DHCP_ACK
+        && got.ip == want.ip
+        && got.mask == want.mask
+        && got.gw == want.gw
+        && got.dns == want.dns
+        && got.lease == want.lease;
+    let saved_cfg = st.dhcp[nic];
+    let saved_ip = st.links[nic].ip;
+    dhcp_apply(st, nic, &got, 0);
+    let cfg = st.dhcp[nic];
+    let applied_ok = cfg.state == DHCP_BOUND
+        && cfg.ip == want.ip
+        && cfg.gw == want.gw
+        && cfg.dns == want.dns
+        && cfg.t1_secs == 1800
+        && st.links[nic].ip == want.ip
+        && in_subnet(want.dns, cfg.ip, cfg.mask)
+        && !in_subnet([10, 0, 3, 1], cfg.ip, cfg.mask);
+    st.dhcp[nic] = saved_cfg;
+    st.links[nic].ip = saved_ip;
+    parsed_ok && applied_ok
+}
+
+/// 按目的地址选出口：先匹配子网，再落到有默认网关的链路。
+fn route_link(st: &Stack, dst: [u8; 4]) -> Option<usize> {
+    let mut i = 0;
+    while i < st.nics {
+        let c = st.dhcp[i];
+        if st.links[i].up
+            && c.state == DHCP_BOUND
+            && !ip4_is_zero(c.ip)
+            && in_subnet(dst, c.ip, c.mask)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < st.nics {
+        let c = st.dhcp[i];
+        if st.links[i].up && c.state == DHCP_BOUND && !ip4_is_zero(c.gw) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 无路由时的统一失败日志。
+fn no_route(dst: [u8; 4]) {
+    print("netstack: no route to ");
+    print_ip4(dst);
+    println(" (no DHCP lease/default route)");
+}
+
+fn is_local_ip(st: &Stack, ip: [u8; 4]) -> bool {
+    if ip == OUR_IP {
+        return true;
+    }
+    let mut i = 0;
+    while i < st.nics {
+        if !ip4_is_zero(st.dhcp[i].ip) && st.dhcp[i].ip == ip {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 本机地址所在链路（用于回环投递）。
+fn local_nic(st: &Stack, ip: [u8; 4]) -> Option<usize> {
+    let mut i = 0;
+    while i < st.nics {
+        if st.dhcp[i].ip == ip {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// --- DNS 缓存与查询 -------------------------------------------------------
+
+/// 把域名规范化为小写（DNS 名大小写不敏感）。
+fn dns_norm(name: &[u8], out: &mut [u8; DNS_NAME_MAX]) -> usize {
+    let n = name.len().min(DNS_NAME_MAX);
+    let mut i = 0;
+    while i < n {
+        let c = name[i];
+        out[i] = if c.is_ascii_uppercase() { c + 32 } else { c };
+        i += 1;
+    }
+    n
+}
+
+fn dns_cache_get(
+    st: &Stack,
+    name: &[u8; DNS_NAME_MAX],
+    nlen: usize,
+    qtype: u16,
+    now: u64,
+) -> Option<[u8; 16]> {
+    let mut i = 0;
+    while i < DNS_CACHE_MAX {
+        let e = &st.dns[i];
+        if e.used
+            && e.qtype == qtype
+            && e.name_len == nlen
+            && e.name[..nlen] == name[..nlen]
+            && now < e.expires
+        {
+            return Some(e.addr);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn dns_cache_put(
+    st: &mut Stack,
+    name: &[u8; DNS_NAME_MAX],
+    nlen: usize,
+    qtype: u16,
+    addr: &[u8; 16],
+    ttl: u32,
+    now: u64,
+) {
+    if ttl == 0 {
+        return;
+    }
+    let mut idx = (now as usize) % DNS_CACHE_MAX;
+    let mut i = 0;
+    while i < DNS_CACHE_MAX {
+        if !st.dns[i].used || now >= st.dns[i].expires {
+            idx = i;
+            break;
+        }
+        i += 1;
+    }
+    let e = &mut st.dns[idx];
+    e.used = true;
+    e.qtype = qtype;
+    e.name = *name;
+    e.name_len = nlen;
+    e.addr = *addr;
+    e.expires = now + ttl as u64 * 100;
+}
+
+/// 在 VA 缓冲区里跳过一个 DNS 名字（支持压缩指针）。
+fn dns_skip_va(mut p: u64, end: u64) -> u64 {
+    loop {
+        if p >= end {
+            return end;
+        }
+        let c = rd8(p);
+        if c == 0 {
+            return p + 1;
+        }
+        if c & 0xc0 == 0xc0 {
+            return p + 2;
+        }
+        p += 1 + c as u64;
+    }
+}
+
+/// 从 DNS 应答里取第一条匹配 `qtype` 的记录（地址、长度、TTL）。
+fn dns_parse_reply(va: u64, len: u64, xid: u16, qtype: u16) -> Option<([u8; 16], usize, u32)> {
+    if len < 12 || rd16be(va) != xid {
+        return None;
+    }
+    let qd = rd16be(va + 4) as usize;
+    let an = rd16be(va + 6) as usize;
+    let end = va + len;
+    let mut p = va + 12;
+    let mut i = 0;
+    while i < qd {
+        p = dns_skip_va(p, end);
+        p += 4;
+        if p > end {
+            return None;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < an {
+        p = dns_skip_va(p, end);
+        if p + 10 > end {
+            return None;
+        }
+        let rtype = rd16be(p);
+        let rclass = rd16be(p + 2);
+        let ttl = rd32be(p + 4);
+        let rdlen = rd16be(p + 8) as usize;
+        let d = p + 10;
+        if d + rdlen as u64 > end {
+            return None;
+        }
+        let want = if qtype == 1 { 4 } else { 16 };
+        if rtype == qtype && rclass == 1 && rdlen == want {
+            let mut a = [0u8; 16];
+            let mut k = 0;
+            while k < want {
+                a[k] = rd8(d + k as u64);
+                k += 1;
+            }
+            return Some((a, want, ttl));
+        }
+        p = d + rdlen as u64;
+        j += 1;
+    }
+    None
+}
+
+/// 组装 DNS 查询（QTYPE 1=A / 28=AAAA）；返回报文长度。
+fn dns_build_query(va: u64, name: &[u8], qtype: u16, xid: u16) -> Option<u64> {
+    if name.is_empty() || name.len() > DNS_NAME_MAX {
+        return None;
+    }
+    wr16be(va, xid);
+    wr16be(va + 2, 0x0100); // RD
+    wr16be(va + 4, 1);
+    wr16be(va + 6, 0);
+    wr16be(va + 8, 0);
+    wr16be(va + 10, 0);
+    let mut p = va + 12;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= name.len() {
+        if i == name.len() || name[i] == b'.' {
+            let seg = i - start;
+            if seg == 0 || seg > 63 {
+                return None;
+            }
+            wr8(p, seg as u8);
+            p += 1;
+            let mut k = 0;
+            while k < seg {
+                wr8(p, name[start + k]);
+                p += 1;
+                k += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    wr8(p, 0);
+    p += 1;
+    wr16be(p, qtype);
+    p += 2;
+    wr16be(p, 1); // IN
+    p += 2;
+    Some(p - va)
+}
+
+/// 本链路的 DNS 服务器：优先 DHCP option 6，否则回落 slirp 缺省值。
+fn dns_server_of(st: &Stack, nic: usize) -> [u8; 4] {
+    let d = st.dhcp[nic].dns;
+    if ip4_is_zero(d) {
+        DEFAULT_DNS
+    } else {
+        d
+    }
+}
+
+/// `NETS_OP_DNS`：查询 A/AAAA；命中缓存返回 1，走网络成功返回 2，失败 0。
+fn sock_dns(st: &mut Stack, req: &NetSReq, now: u64) -> u64 {
+    if req.buf == 0
+        || req.len == 0
+        || req.len > DNS_NAME_MAX as u64
+        || sys_virt_to_phys(req.buf) == 0
+    {
+        return 0;
+    }
+    let qtype = req.port as u16;
+    if qtype != 1 && qtype != 28 {
+        return 0;
+    }
+    let raw = unsafe { core::slice::from_raw_parts(req.buf as *const u8, req.len as usize) };
+    let mut name = [0u8; DNS_NAME_MAX];
+    let nlen = dns_norm(raw, &mut name);
+    if nlen == 0 {
+        return 0;
+    }
+    if let Some(a) = dns_cache_get(st, &name, nlen, qtype, now) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(a.as_ptr(), req.buf as *mut u8, a.len());
+        }
+        print("netstack: dns cache hit ");
+        print(if qtype == 1 { "A " } else { "AAAA " });
+        print(unsafe { core::str::from_utf8_unchecked(&name[..nlen]) });
+        println("");
+        return 1;
+    }
+    // 选出口：优先按 DNS 服务器地址路由；没有租约时明确失败。
+    let mut have = false;
+    let mut i = 0;
+    while i < st.nics {
+        if st.dhcp[i].state == DHCP_BOUND {
+            have = true;
+            break;
+        }
+        i += 1;
+    }
+    if !have {
+        print("netstack: dns fail (no DHCP lease, server ");
+        print_ip4(DEFAULT_DNS);
+        println(")");
+        return 0;
+    }
+    let first = dns_server_of(st, i);
+    let nic = match route_link(st, first) {
+        Some(n) => n,
+        None => {
+            no_route(first);
+            return 0;
+        }
+    };
+    let server = dns_server_of(st, nic);
+    if st.links[nic].gw_mac.is_none() {
+        arp_learn_gw(st, nic);
+    }
+    let gw_mac = match st.links[nic].gw_mac {
+        Some(m) => m,
+        None => {
+            print("netstack: dns fail (no neighbor for ");
+            print_ip4(server);
+            println(")");
+            return 0;
+        }
+    };
+    st.dns_seq = st.dns_seq.wrapping_add(1);
+    let xid = 0x4d50u16 ^ st.dns_seq;
+    let l = st.links[nic];
+    let qva = l.io + 512;
+    let qlen = match dns_build_query(qva, &name[..nlen], qtype, xid) {
+        Some(n) => n,
+        None => {
+            println("netstack: dns fail (bad name)");
+            return 0;
+        }
+    };
+    let sport = 50000 + nic as u16;
+    let flen = build_udp(&l, l.ip, gw_mac, server, sport, 53, qva, qlen);
+    if !link_tx(&l, flen) {
+        println("netstack: dns fail (tx error)");
+        return 0;
+    }
+    let mut waited = 0u64;
+    while waited < 800 {
+        while let Some(n) = link_rx(&l) {
+            if let Some(a) = dns_reply_frame(&l, n, server, sport, xid, qtype) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(a.0.as_ptr(), req.buf as *mut u8, a.1);
+                }
+                dns_cache_put(st, &name, nlen, qtype, &a.0, a.2, now);
+                return 2;
+            }
+            handle_frame(st, nic, n, now);
+        }
+        sys_sleep(10);
+        waited += 10;
+    }
+    print("netstack: dns timeout (server ");
+    print_ip4(server);
+    print(", qtype=");
+    print_u64(qtype as u64);
+    println(")");
+    0
+}
+
+/// 检查一帧是否为本次 DNS 查询的应答，是则返回解析结果。
+fn dns_reply_frame(
+    l: &Link,
+    n: u64,
+    server: [u8; 4],
+    sport: u16,
+    xid: u16,
+    qtype: u16,
+) -> Option<([u8; 16], usize, u32)> {
+    let info = ipv4_parse(l.io, n)?;
+    if info.proto != IP_PROTO_UDP || info.src != server || info.payload_len < 8 {
+        return None;
+    }
+    let udp = info.payload_off;
+    if rd16be(udp + 2) != sport || rd16be(udp) != 53 {
+        return None;
+    }
+    let ulen = rd16be(udp + 4) as u64;
+    if ulen < 8 || ulen > info.payload_len {
+        return None;
+    }
+    dns_parse_reply(udp + 8, ulen - 8, xid, qtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,9 +2004,11 @@ fn icmpv6_probe(st: &mut Stack, nic: usize) {
 
 /// 学某网卡的网关 MAC（发 ARP 请求 + 有界收包）。取不到则保持 `None`。
 fn arp_learn_gw(st: &mut Stack, nic: usize) {
+    let gw = st.dhcp[nic].gw;
+    let target = if ip4_is_zero(gw) { GW_IP } else { gw };
     let mut tries = 0u64;
     while st.links[nic].gw_mac.is_none() && tries < 40 {
-        let len = build_arp_request(&st.links[nic], GW_IP);
+        let len = build_arp_request(&st.links[nic], target);
         let _ = link_tx(&st.links[nic], len);
         for _ in 0..5 {
             if let Some(n) = link_rx(&st.links[nic]) {
@@ -1111,7 +2030,8 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
     if et == ETH_ARP {
         if n >= 42 && rd16be(f + 20) == 0x0002 {
             let sip = [rd8(f + 28), rd8(f + 29), rd8(f + 30), rd8(f + 31)];
-            if sip == GW_IP {
+            let gw = st.dhcp[nic].gw;
+            if sip == GW_IP || (!ip4_is_zero(gw) && sip == gw) {
                 st.links[nic].gw_mac = Some([
                     rd8(f + 22),
                     rd8(f + 23),
@@ -1165,7 +2085,7 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
         }
         return;
     }
-    if proto == IP_PROTO_UDP && dst_ip == OUR_IP {
+    if proto == IP_PROTO_UDP {
         let udp = ip + ihl;
         // 已收到且落在 IP 负载内的字节数（IP 总长可能小于帧长，帧尾还有填充）。
         let total = rd16be(ip + 2) as u64;
@@ -1173,6 +2093,14 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
         let avail = (n - (14 + ihl)).min(ipay);
         // UDP 头 8 字节不全时一个字段都不能读，否则 dport 会越读缓冲区末尾。
         if avail < 8 {
+            return;
+        }
+        // DHCP 回包的目的通常是广播/尚未配置的地址，必须在「目的 = 本机」判断之前处理。
+        if rd16be(udp + 2) == DHCP_CLIENT_PORT {
+            let _ = dhcp_input(st, nic, n, now);
+            return;
+        }
+        if !is_local_ip(st, dst_ip) {
             return;
         }
         let dport = rd16be(udp + 2);
@@ -2589,13 +3517,10 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
     if req.buf == 0 || req.len == 0 || req.len > PAY_MAX as u64 || sys_virt_to_phys(req.buf) == 0 {
         return 0;
     }
-    let (sport, nic) = match sock_slot(st, req.sock) {
+    let (sport, sock_nic) = match sock_slot(st, req.sock) {
         Some(s) => (s.port, s.nic),
         None => return 0,
     };
-    if nic >= st.nics || !st.links[nic].up {
-        return 0;
-    }
     let dst = [
         ((req.addr >> 24) & 0xff) as u8,
         ((req.addr >> 16) & 0xff) as u8,
@@ -2604,19 +3529,40 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
     ];
     let dport = req.port as u16;
     if dst == OUR_IP {
-        deliver(st, nic, dport, req.buf, req.len); // 回环（用途确定性自测）
+        deliver(st, sock_nic, dport, req.buf, req.len); // 回环（用途确定性自测）
         return 1;
     }
+    if let Some(ln) = local_nic(st, dst) {
+        deliver(st, ln, dport, req.buf, req.len); // 本机租约地址 → 栈内回环
+        return 1;
+    }
+    // 发送前按目的地址选接口（子网匹配优先，其次默认路由）。
+    let nic = match route_link(st, dst) {
+        Some(n) => n,
+        None => {
+            no_route(dst);
+            return 0;
+        }
+    };
+    if !st.links[nic].up {
+        return 0;
+    }
+    let src = st.dhcp[nic].ip;
     match st.links[nic].gw_mac {
         Some(gm) => {
-            let len = build_udp(&st.links[nic], gm, dst, sport, dport, req.buf, req.len);
+            let len = build_udp(&st.links[nic], src, gm, dst, sport, dport, req.buf, req.len);
             if link_tx(&st.links[nic], len) {
                 1
             } else {
                 0
             }
         }
-        None => 0,
+        None => {
+            print("netstack: no nexthop MAC for ");
+            print_ip4(dst);
+            println("");
+            0
+        }
     }
 }
 
@@ -2654,11 +3600,11 @@ fn sock_sendto6(st: &mut Stack, req: &NetSReq) -> u64 {
     if req.buf == 0 || req.len > PAY_MAX as u64 || sys_virt_to_phys(req.buf) == 0 {
         return 0;
     }
-    let (sport, nic) = match sock_slot(st, req.sock) {
+    let (sport, sock_nic) = match sock_slot(st, req.sock) {
         Some(s) => (s.port, s.nic),
         None => return 0,
     };
-    if nic >= st.nics || !st.links[nic].up {
+    if sock_nic >= st.nics || !st.links[sock_nic].up {
         return 0;
     }
     let dst6 = get_v6(req.buf);
@@ -2666,12 +3612,24 @@ fn sock_sendto6(st: &mut Stack, req: &NetSReq) -> u64 {
     let pl = req.buf + 16;
     if let Some(v4) = v4_mapped(&dst6) {
         if v4 == OUR_IP {
-            deliver(st, nic, dport, pl, req.len);
+            deliver(st, sock_nic, dport, pl, req.len);
             return 1;
         }
+        if let Some(ln) = local_nic(st, v4) {
+            deliver(st, ln, dport, pl, req.len);
+            return 1;
+        }
+        let nic = match route_link(st, v4) {
+            Some(n) => n,
+            None => {
+                no_route(v4);
+                return 0;
+            }
+        };
+        let src = st.dhcp[nic].ip;
         return match st.links[nic].gw_mac {
             Some(gm) => {
-                let len = build_udp(&st.links[nic], gm, v4, sport, dport, pl, req.len);
+                let len = build_udp(&st.links[nic], src, gm, v4, sport, dport, pl, req.len);
                 if link_tx(&st.links[nic], len) {
                     1
                 } else {
@@ -2681,6 +3639,7 @@ fn sock_sendto6(st: &mut Stack, req: &NetSReq) -> u64 {
             None => 0,
         };
     }
+    let nic = sock_nic;
     let ll = link_local_from_mac(mac_bytes(st.links[nic].mac));
     if v6_is_loopback(&dst6) || v6_eq(&dst6, &ll) || v6_eq(&dst6, &st.links[nic].v6_global) {
         deliver(st, nic, dport, pl, req.len);
@@ -2757,6 +3716,7 @@ fn unpack_ip4(v: u64) -> [u8; 4] {
 fn build_echo4(
     io: u64,
     mac: [u8; 6],
+    src: [u8; 4],
     dst_mac: [u8; 6],
     dst: [u8; 4],
     id: u16,
@@ -2777,7 +3737,7 @@ fn build_echo4(
     wr8(ip + 8, 64);
     wr8(ip + 9, IP_PROTO_ICMP);
     wr16be(ip + 10, 0);
-    for (i, b) in OUR_IP.iter().enumerate() {
+    for (i, b) in src.iter().enumerate() {
         wr8(ip + 12 + i as u64, *b);
         wr8(ip + 16 + i as u64, dst[i]);
     }
@@ -2826,8 +3786,8 @@ fn sock_netinfo(st: &Stack, req: &NetSReq) -> u64 {
                 nic: i as u64,
                 kind: l.kind,
                 up: if l.up { 1 } else { 0 },
-                v4: pack_ip4(OUR_IP),
-                gw4: pack_ip4(GW_IP),
+                v4: pack_ip4(st.dhcp[i].ip),
+                gw4: pack_ip4(st.dhcp[i].gw),
                 mac: l.mac,
                 v6_up: if l.v6_up { 1 } else { 0 },
                 v6: l.v6_global,
@@ -2845,13 +3805,19 @@ fn sock_netinfo(st: &Stack, req: &NetSReq) -> u64 {
 
 /// `NETS_OP_PING4`：发 ICMP echo 到 `addr`，有界等待应答。回复 1（收到）/ 0。
 fn sock_ping4(st: &mut Stack, req: &NetSReq, now: u64) -> u64 {
-    let nic = req_nic(st, req);
+    let dst = unpack_ip4(req.addr);
+    if dst == OUR_IP || is_local_ip(st, dst) {
+        return 1; // ping 本机
+    }
+    let nic = match route_link(st, dst) {
+        Some(n) => n,
+        None => {
+            no_route(dst);
+            return 0;
+        }
+    };
     if !st.links[nic].up {
         return 0;
-    }
-    let dst = unpack_ip4(req.addr);
-    if dst == OUR_IP {
-        return 1; // ping 本机
     }
     if st.links[nic].gw_mac.is_none() {
         arp_learn_gw(st, nic);
@@ -2866,6 +3832,7 @@ fn sock_ping4(st: &mut Stack, req: &NetSReq, now: u64) -> u64 {
     let len = build_echo4(
         st.links[nic].io,
         mac_bytes(st.links[nic].mac),
+        st.dhcp[nic].ip,
         gw,
         dst,
         id,
@@ -3003,6 +3970,7 @@ fn serve_app(st: &mut Stack, now: u64) {
             NETS_OP_NETINFO => sock_netinfo(st, &req),
             NETS_OP_PING4 => sock_ping4(st, &req, now),
             NETS_OP_PING6 => sock_ping6(st, &req, now),
+            NETS_OP_DNS => sock_dns(st, &req, now),
             _ => 0,
         };
         let _ = sys_reply(reply);
@@ -3072,7 +4040,21 @@ pub fn run() {
         }
         st.links[i].mac = mac;
         st.links[i].up = true;
-        arp_learn_gw(st, i);
+        // N10: 先用确定性假 ACK 验证解析/配置表（可注入的假租约路径），再走真实 DORA。
+        if i == 0 {
+            if dhcp_selftest(st, i) {
+                println("NET-DHCP selftest OK (fake offer/ack -> lease applied)");
+            } else {
+                println("NET-DHCP selftest FAILED");
+            }
+        }
+        if dhcp_acquire(st, i) {
+            arp_learn_gw(st, i);
+        } else {
+            print("NET-DHCP timeout nic=");
+            print_u64(i as u64);
+            println(" (no DHCP server), no default route");
+        }
         let svc = kind_svc_name(tbl.entries[i].kind);
         if i == 0 {
             print("netstack: up (frame link to ");
@@ -3173,6 +4155,7 @@ pub fn run() {
             nic += 1;
         }
         tcp_tick_all(st, now);
+        dhcp_tick(st, now);
         sys_sleep(10);
     }
 }

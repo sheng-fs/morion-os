@@ -1,0 +1,15 @@
+[package]
+name = "morion-enclave"
+version = "0.1.0"
+edition = "2021"
+authors = ["Morion OS Team"]
+license = "MIT"
+description = "MorionOS 性能飞地最小示例 (申请设备窗口 → 读寄存器)"
+
+[[bin]]
+name = "morion-enclave"
+path = "src/main.rs"
+
+[dependencies]
+morion = { path = "../../libmorion" }
+libdevice = { path = "../../libdevice" }

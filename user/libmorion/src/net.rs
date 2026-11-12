@@ -28,7 +28,12 @@ const NETS_OP_SENDTO6: u64 = 13;
 const NETS_OP_NETINFO: u64 = 14;
 const NETS_OP_PING4: u64 = 15;
 const NETS_OP_PING6: u64 = 16;
+/// DNS 查询（私有扩展，与 `netstack_srv` 本地常量一致）：`port` = QTYPE，`len` = 域名长度，
+/// 共享页 `buf` 先放域名、成功后就地写入 16 字节地址。回复 1 = 缓存命中，2 = 网络应答，0 = 失败。
+const NETS_OP_DNS: u64 = 17;
 const NETS_PAYLOAD_MAX: u64 = 1472;
+/// DNS 域名最大长度（与 netstack 缓存一致）。
+const DNS_NAME_MAX: u64 = 64;
 
 /// 一条链路的状态快照（与 `common::NetLinkInfo` 逐字段一致；shell `net` 命令用）。
 #[repr(C)]
@@ -317,78 +322,11 @@ pub const fn ip4(a: u8, b: u8, c: u8, d: u8) -> u32 {
 // N8 — DNS 最小客户端（A 记录）
 // ---------------------------------------------------------------------------
 
-/// slirp 内置 DNS 服务地址（`10.0.2.3`）。
-const NET_DNS: u32 = ip4(10, 0, 2, 3);
-/// DNS 服务端口与本地源端口（源端口须落在应用的 `Net` 能力范围内）。
-const DNS_PORT: u16 = 53;
-/// DNS 客户端源端口**基址**：实际端口按域派生 = `base + domain_id()`。
-///
-/// 内核的端口归属表**一个端口只归一个域**（`kernel/src/net.rs`），若所有客户端都用同一个
-/// 源端口，先绑的域会把端口占住（引导期域不会销毁 → 归属不清），别的域再也绑不上 ——
-/// 表现为「app 能解析、shell 不能」。故源端口按域错开；调用方（app / shell）的 `Net` 能力
-/// 范围须覆盖 `base + 自己的域号`。
-const DNS_LOCAL_PORT_BASE: u16 = 12345;
-
-/// 本域的 DNS 源端口（`base + domain_id`）。
-fn dns_local_port() -> u16 {
-    DNS_LOCAL_PORT_BASE + crate::syscall::domain_id() as u16
-}
-/// 查询 id（固定值，便于解析时校验；同时用于自证）。
+/// 查询 id（仅用于确定性自证里的报文样例）。
 const DNS_ID: u16 = 0x4D4F;
 
-fn wr8b(b: &mut [u8], p: usize, v: u8) {
-    b[p] = v;
-}
-fn wr16b(b: &mut [u8], p: usize, v: u16) {
-    b[p] = (v >> 8) as u8;
-    b[p + 1] = v as u8;
-}
 fn rd16b(b: &[u8], p: usize) -> u16 {
     ((b[p] as u16) << 8) | b[p + 1] as u16
-}
-
-/// 组装 DNS 查询（QTYPE 由 `qtype` 给出：1=A，28=AAAA）；写入 `out`，返回报文长度（0 = 非法）。
-fn dns_build(name: &str, qtype: u16, out: &mut [u8]) -> usize {
-    if out.len() < 12 + name.len() + 6 || name.is_empty() {
-        return 0;
-    }
-    // 头部：id / flags(RD) / qd=1 / 其余 0。
-    wr16b(out, 0, DNS_ID);
-    wr16b(out, 2, 0x0100);
-    wr16b(out, 4, 1);
-    wr16b(out, 6, 0);
-    wr16b(out, 8, 0);
-    wr16b(out, 10, 0);
-    let mut p = 12usize;
-    // QNAME：按 '.' 切分，每段前置长度；非法(空段/超长)则失败。
-    let bytes = name.as_bytes();
-    let mut start = 0usize;
-    let mut idx = 0usize;
-    while idx <= bytes.len() {
-        if idx == bytes.len() || bytes[idx] == b'.' {
-            let seg = idx - start;
-            if seg == 0 || seg > 63 {
-                return 0;
-            }
-            wr8b(out, p, seg as u8);
-            p += 1;
-            let mut k = 0;
-            while k < seg {
-                wr8b(out, p, bytes[start + k]);
-                p += 1;
-                k += 1;
-            }
-            start = idx + 1;
-        }
-        idx += 1;
-    }
-    wr8b(out, p, 0); // 根标签
-    p += 1;
-    wr16b(out, p, qtype); // QTYPE
-    p += 2;
-    wr16b(out, p, 1); // QCLASS = IN
-    p += 2;
-    p
 }
 
 /// 跳过一个 DNS 名字（支持 0xC0 压缩指针）。
@@ -458,39 +396,35 @@ pub fn dns_selftest() -> Option<[u8; 4]> {
     dns_parse_a(&msg)
 }
 
-/// 最小 `getaddrinfo`：向 slirp 内置 DNS 查 `name` 的 A 记录。成功写入 `out_ip`。
-pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
+/// 经 netstack 解析 DNS（服务端带 TTL 缓存，命中时不再发包）。
+fn dns_query(name: &str, qtype: u16, out: &mut [u8; 16]) -> bool {
     if !ensure() {
         return false;
     }
-    let mut q = [0u8; 256];
-    let qn = dns_build(name, 1, &mut q);
-    if qn == 0 {
+    let n = name.len().min(DNS_NAME_MAX as usize);
+    if n == 0 {
         return false;
     }
-    let sock = socket();
-    if sock == 0 {
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), share_vaddr() as *mut u8, n);
+    }
+    if call(NETS_OP_DNS, 0, qtype as u64, 0, n as u64) == 0 {
         return false;
     }
-    let mut ok = false;
-    if bind(sock, dns_local_port()) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
-        let mut rbuf = [0u8; 512];
-        let mut i = 0;
-        while i < 50 {
-            let n = recvfrom(sock, &mut rbuf);
-            if n > 0 {
-                if let Some(ip) = dns_parse_a(&rbuf[..n as usize]) {
-                    *out_ip = ip;
-                    ok = true;
-                }
-                break;
-            }
-            sys_sleep(20);
-            i += 1;
-        }
+    unsafe {
+        core::ptr::copy_nonoverlapping(share_vaddr() as *const u8, out.as_mut_ptr(), 16);
     }
-    let _ = close(sock);
-    ok
+    true
+}
+
+/// 最小 `getaddrinfo`：向 DHCP 下发的 DNS 查 `name` 的 A 记录。成功写入 `out_ip`。
+pub fn getaddrinfo(name: &str, out_ip: &mut [u8; 4]) -> bool {
+    let mut a = [0u8; 16];
+    if !dns_query(name, 1, &mut a) {
+        return false;
+    }
+    *out_ip = [a[0], a[1], a[2], a[3]];
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -554,39 +488,9 @@ pub fn dns_selftest_aaaa() -> Option<[u8; 16]> {
     dns_parse_aaaa(&msg)
 }
 
-/// 最小 `getaddrinfo`（AAAA）：向 slirp 内置 DNS 查 `name` 的 AAAA 记录。成功写入 `out_ip`。
+/// 最小 `getaddrinfo`（AAAA）：向 DHCP 下发的 DNS 查 `name` 的 AAAA 记录。成功写入 `out_ip`。
 pub fn getaddrinfo6(name: &str, out_ip: &mut [u8; 16]) -> bool {
-    if !ensure() {
-        return false;
-    }
-    let mut q = [0u8; 256];
-    let qn = dns_build(name, 28, &mut q);
-    if qn == 0 {
-        return false;
-    }
-    let sock = socket();
-    if sock == 0 {
-        return false;
-    }
-    let mut ok = false;
-    if bind(sock, dns_local_port()) && sendto(sock, DNS_PORT, NET_DNS, &q[..qn]) {
-        let mut rbuf = [0u8; 512];
-        let mut i = 0;
-        while i < 50 {
-            let n = recvfrom(sock, &mut rbuf);
-            if n > 0 {
-                if let Some(ip) = dns_parse_aaaa(&rbuf[..n as usize]) {
-                    *out_ip = ip;
-                    ok = true;
-                }
-                break;
-            }
-            sys_sleep(20);
-            i += 1;
-        }
-    }
-    let _ = close(sock);
-    ok
+    dns_query(name, 28, out_ip)
 }
 
 /// 双栈解析：先试 A，再试 AAAA。

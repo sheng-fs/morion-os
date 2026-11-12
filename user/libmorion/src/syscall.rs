@@ -122,6 +122,12 @@ pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
 /// `0` = 查自己 → 打包的 `(uid << 32) | gid`; `1` = 设置自己 (`uid`, `gid`, 返回 1/0,
 /// 只允许降权); `2` = 只读查询指定域 (`参数1` = 域号, 域不存在返回 `u64::MAX`)。
 pub const SYS_CRED: u64 = 67;
+/// 性能飞地运行期**设备窗口映射**（§6.2 最小切片）:
+/// `(设备选择, 期望 IOVA, 窗口字节数)` → 实际 IOVA / `u64::MAX - n`（错误码）。
+///
+/// 调用域须持有该设备 BAR 的 `Mmio` 能力；成功时内核把 BAR 映射进本域并把已授权 DMA 块
+/// 绑到独立 IOMMU 上下文。见 [`sys_enclave_map`]。
+pub const SYS_ENCLAVE_MAP: u64 = 68;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
 /// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn`。
@@ -280,6 +286,62 @@ pub const MSI_VECTOR_BASE: u64 = 0x50;
 /// 内核因此不必懂设备协议。没有绑定设备时返回 `u64::MAX`。
 pub fn sys_device_config_read(offset: u64) -> u64 {
     unsafe { syscall(SYS_DEVICE_CONFIG_READ, offset, 0, 0) }
+}
+
+/// `SYS_ENCLAVE_MAP` 的设备选择哨兵: 申请**本域**已被绑定的那台设备
+/// （= 内核 `device::DEVICE_SELF`）。
+pub const ENCLAVE_DEVICE_SELF: u64 = u64::MAX;
+
+/// `SYS_ENCLAVE_MAP` 的错误码（与内核 `device::ENCLAVE_ERR_*` 逐一对齐）。
+pub const ENCLAVE_ERR_NO_DEVICE: u64 = u64::MAX;
+pub const ENCLAVE_ERR_NO_CAP: u64 = u64::MAX - 1;
+pub const ENCLAVE_ERR_BAD_WINDOW: u64 = u64::MAX - 2;
+pub const ENCLAVE_ERR_UNSUPPORTED: u64 = u64::MAX - 3;
+pub const ENCLAVE_ERR_CONFLICT: u64 = u64::MAX - 4;
+
+/// 飞地设备窗口句柄（最小封装）。
+///
+/// 建立成功后:
+/// - [`iova`](Self::iova) 是设备可见的 DMA 基址 —— 驱动应把它（而不是物理地址）写进
+///   描述符;
+/// - [`bytes`](Self::bytes) 是窗口覆盖的字节数。
+///
+/// BAR 寄存器仍从 `libdevice::grant::DeviceGrant::load()` 给出的 `bar_vaddr` 读取。
+#[derive(Clone, Copy, Debug)]
+pub struct EnclaveWindow {
+    iova: u64,
+    bytes: u64,
+}
+
+impl EnclaveWindow {
+    /// 实际生效的 IOVA 基址（设备可见的 DMA 地址）。
+    pub fn iova(&self) -> u64 {
+        self.iova
+    }
+
+    /// 窗口字节数。
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// 申请一个**性能飞地设备窗口**（`SYS_ENCLAVE_MAP`）。
+///
+/// `device` 取 [`ENCLAVE_DEVICE_SELF`]（本域已绑定设备）或显式 `(bus<<16)|(dev<<8)|func`;
+/// `iova` 是期望的设备可见地址（页对齐、非 0、非用户虚拟地址），`bytes` 是窗口长度
+/// （页对齐、非 0、不超过已授权 DMA 块）。
+///
+/// 成功返回 [`EnclaveWindow`]；失败返回内核错误码（`ENCLAVE_ERR_*`），此时设备仍走原来的
+/// 恒等映射，既有驱动不受影响。
+pub fn sys_enclave_map(device: u64, iova: u64, bytes: u64) -> Result<EnclaveWindow, u64> {
+    let ret = unsafe { syscall(SYS_ENCLAVE_MAP, device, iova, bytes) };
+    // 所有错误码都从 `u64::MAX` 向下编号，而合法 IOVA 受 AGAW ≤ 57 位约束 ——
+    // 因此 `>= ENCLAVE_ERR_CONFLICT`（最小的哨兵）即可判定失败。
+    if ret >= ENCLAVE_ERR_CONFLICT {
+        Err(ret)
+    } else {
+        Ok(EnclaveWindow { iova: ret, bytes })
+    }
 }
 
 /// 读系统名/版本/构建号 (V1), 写入 `buf`, 返回写入字节数 (不含结尾 NUL); 失败 0。
