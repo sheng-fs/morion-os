@@ -19,11 +19,33 @@ const SHELL_LINE_MAX: usize = 128;
 const CWD_MAX: usize = 128;
 /// 解析后绝对路径的静态缓冲大小。
 const PATH_MAX: usize = 256;
+/// 进程内环境变量槽数 (最小实现: 固定槽位, 不分配堆)。
+const ENV_SLOTS: usize = 8;
+/// 环境变量名 / 值最大长度。
+const ENV_NAME_MAX: usize = 24;
+const ENV_VAL_MAX: usize = 64;
 
-/// shell 运行时状态: 当前工作目录 (绝对路径, 以 '/' 开头)。
+/// 一条环境变量 (`name_len == 0` = 空槽)。
+#[derive(Clone, Copy)]
+struct EnvVar {
+    name_len: u8,
+    val_len: u8,
+    name: [u8; ENV_NAME_MAX],
+    val: [u8; ENV_VAL_MAX],
+}
+
+const ENV_EMPTY: EnvVar = EnvVar {
+    name_len: 0,
+    val_len: 0,
+    name: [0; ENV_NAME_MAX],
+    val: [0; ENV_VAL_MAX],
+};
+
+/// shell 运行时状态: 当前工作目录 (绝对路径, 以 '/' 开头) 与环境变量表。
 struct ShellState {
     cwd: [u8; CWD_MAX],
     cwd_len: usize,
+    env: [EnvVar; ENV_SLOTS],
 }
 
 impl ShellState {
@@ -34,6 +56,37 @@ impl ShellState {
         let n = path.len().min(CWD_MAX);
         self.cwd[..n].copy_from_slice(&path.as_bytes()[..n]);
         self.cwd_len = n;
+    }
+
+    fn env_find(&self, name: &str) -> Option<usize> {
+        let b = name.as_bytes();
+        self.env
+            .iter()
+            .position(|e| e.name_len as usize == b.len() && &e.name[..b.len()] == b)
+    }
+
+    /// 写入 / 覆盖一条环境变量; 名字或值过长 (或槽位已满) 返回 false。
+    fn env_set(&mut self, name: &str, val: &str) -> bool {
+        let nb = name.as_bytes();
+        let vb = val.as_bytes();
+        if nb.is_empty() || nb.len() > ENV_NAME_MAX || vb.len() > ENV_VAL_MAX {
+            return false;
+        }
+        let idx = match self.env_find(name) {
+            Some(i) => i,
+            None => match self.env.iter().position(|e| e.name_len == 0) {
+                Some(i) => i,
+                None => return false,
+            },
+        };
+        let e = &mut self.env[idx];
+        e.name = [0; ENV_NAME_MAX];
+        e.val = [0; ENV_VAL_MAX];
+        e.name[..nb.len()].copy_from_slice(nb);
+        e.val[..vb.len()].copy_from_slice(vb);
+        e.name_len = nb.len() as u8;
+        e.val_len = vb.len() as u8;
+        true
     }
 }
 
@@ -132,6 +185,11 @@ const COMMANDS: &[&str] = &[
     "uname",
     "version",
     "pwd",
+    "whoami",
+    "id",
+    "su",
+    "env",
+    "export",
     "ls",
     "cat",
     "run",
@@ -252,12 +310,16 @@ pub fn run() {
         }
     }
 
-    // 初始工作目录为根。
+    // 初始工作目录为根, 初始身份由内核给出 (引导期服务域 = root)。
     let mut st = ShellState {
         cwd: [0; CWD_MAX],
         cwd_len: 1,
+        env: [ENV_EMPTY; ENV_SLOTS],
     };
     st.cwd[0] = b'/';
+    st.env_set("USER", "root");
+    st.env_set("HOME", "/home/root");
+    st.env_set("PATH", "/");
 
     // G4: **输入完全在用户态** —— 内核只把按键字节搬进队列, 行编辑/回显由
     // `morion::console::readline` 做 (它经 `SYS_KEY_READ` 阻塞, 有键才醒)。
@@ -324,6 +386,11 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  uname          print system name / release / machine");
             println("  version        print version and build");
             println("  pwd            print working directory");
+            println("  whoami         print the current user name");
+            println("  id             print uid / gid of this process");
+            println("  su <user|uid>  switch identity (root only; users: root, user)");
+            println("  env            print environment variables");
+            println("  export K=V     set an environment variable");
             println("  ls [-l] [path] list directory (-l: long form)");
             println("  cat <file>     print file content");
             println("  run <file>     load a .mex program from a file and run it (new domain)");
@@ -382,6 +449,11 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "uname" => shell_uname(),
         "version" => shell_version(),
         "pwd" => println(st.cwd_str()),
+        "whoami" => shell_whoami(),
+        "id" => shell_id(),
+        "su" => shell_su(st, arg),
+        "env" => shell_env(st),
+        "export" => shell_export(st, arg),
         "ls" => shell_ls(st, if arg.is_empty() { "." } else { arg }),
         "cat" => shell_cat(st, arg),
         "run" => shell_run(st, arg),
@@ -1049,6 +1121,225 @@ fn shell_version() {
         print(")");
     }
     println("");
+}
+
+// ---------------------------------------------------------------------------
+// 多用户 (最小闭环): 身份查询 / 切换 + 进程内环境变量
+// ---------------------------------------------------------------------------
+
+/// uid → 用户名; 未知 uid 返回 `None` (调用方打印数字)。
+fn shell_user_name(uid: u16) -> Option<&'static str> {
+    match uid {
+        0 => Some("root"),
+        1000 => Some("user"),
+        _ => None,
+    }
+}
+
+/// 打印用户名 (未知 uid 打 `uid:<数字>`)。
+fn print_user(uid: u16) {
+    match shell_user_name(uid) {
+        Some(name) => print(name),
+        None => {
+            print("uid:");
+            print_u64(uid as u64);
+        }
+    }
+}
+
+/// `su` 的目标解析: 支持 `root` / `user` 两个约定名, 以及十进制 uid
+/// (数字 uid 的 gid 取同值, 0 仍为 `0:0`)。
+fn parse_user(spec: &str) -> Option<(u16, u16)> {
+    match spec {
+        "root" => Some((0, 0)),
+        "user" | "morion" => Some((1000, 1000)),
+        _ => {
+            let uid = parse_u16_dec(spec)?;
+            Some((uid, if uid == 0 { 0 } else { uid }))
+        }
+    }
+}
+
+/// 把 `uid` 的十进制写法写进 `out`, 返回长度。
+fn uid_decimal(uid: u16, out: &mut [u8]) -> usize {
+    let mut tmp = [0u8; 5];
+    let mut n = 0;
+    let mut v = uid;
+    loop {
+        tmp[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == tmp.len() {
+            break;
+        }
+    }
+    let m = n.min(out.len());
+    for i in 0..m {
+        out[i] = tmp[n - 1 - i];
+    }
+    m
+}
+
+/// 家目录约定 `/home/<user>`, 写进 `out`, 返回长度。
+fn build_home(uid: u16, out: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    for &b in b"/home/" {
+        out[n] = b;
+        n += 1;
+    }
+    match shell_user_name(uid) {
+        Some(name) => {
+            let b = name.as_bytes();
+            out[n..n + b.len()].copy_from_slice(b);
+            n + b.len()
+        }
+        None => n + uid_decimal(uid, &mut out[n..]),
+    }
+}
+
+/// 切到家目录: 存在才 `cd`; 不存在只提示 (约定如此, 不自动创建)。
+fn enter_home(st: &mut ShellState, home: &str) {
+    let fd = vfs::open(home);
+    if fd == u64::MAX {
+        print("su: home directory ");
+        print(home);
+        println(" not found (staying put; create it with mkdir if you want one)");
+        return;
+    }
+    let n = vfs::readdir_into(fd, vfs::SHELL_RESULT_BUF);
+    vfs::close(fd);
+    if n == u64::MAX {
+        print("su: home ");
+        print(home);
+        println(" is not a directory");
+        return;
+    }
+    st.set_cwd(home);
+}
+
+/// `whoami` — 打印内核记录的当前用户名。
+fn shell_whoami() {
+    match sys_cred_get() {
+        Some((uid, _)) => {
+            print_user(uid);
+            println("");
+        }
+        None => println("whoami: SYS_CRED failed"),
+    }
+}
+
+/// `id` — 打印当前 uid / gid (与文件服务权限判定同源)。
+fn shell_id() {
+    match sys_cred_get() {
+        Some((uid, gid)) => {
+            print("uid=");
+            print_u64(uid as u64);
+            print("(");
+            print_user(uid);
+            print(") gid=");
+            print_u64(gid as u64);
+            print("(");
+            print_user(gid);
+            print(")");
+            println("");
+        }
+        None => println("id: SYS_CRED failed"),
+    }
+}
+
+/// `su <user|uid>` — 切换身份。只允许 root 降权 (没有口令机制, 非 root 一律拒绝),
+/// 切换成功后家目录 `/home/<user>` 存在就进去。
+fn shell_su(st: &mut ShellState, arg: &str) {
+    if arg.is_empty() {
+        println("su: usage: su <user|uid>   (users: root, user)");
+        return;
+    }
+    let (uid, gid) = match parse_user(arg) {
+        Some(v) => v,
+        None => {
+            print("su: unknown user: ");
+            println(arg);
+            return;
+        }
+    };
+    let (cur_uid, cur_gid) = match sys_cred_get() {
+        Some(v) => v,
+        None => {
+            println("su: cannot read current identity (SYS_CRED failed)");
+            return;
+        }
+    };
+    if cur_uid != 0 && (uid != cur_uid || gid != cur_gid) {
+        println("su: permission denied: only uid 0 may switch users (no password mechanism yet)");
+        return;
+    }
+    if (uid, gid) != (cur_uid, cur_gid) && !sys_cred_set(uid, gid) {
+        println("su: setuid failed (kernel rejected the change)");
+        return;
+    }
+    let mut home = [0u8; CWD_MAX];
+    let hn = build_home(uid, &mut home);
+    let home = unsafe { core::str::from_utf8_unchecked(&home[..hn]) };
+    st.env_set("USER", arg);
+    st.env_set("HOME", home);
+    enter_home(st, home);
+    print("su: now ");
+    print_user(uid);
+    println("");
+}
+
+/// 环境变量名是否合法 (字母或 `_` 开头, 其后字母/数字/`_`)。
+fn valid_env_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let first = b[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    b[1..]
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// `env` — 打印进程内环境变量表 (附动态的 `PWD`)。
+fn shell_env(st: &ShellState) {
+    for e in st.env.iter() {
+        if e.name_len == 0 {
+            continue;
+        }
+        let name = unsafe { core::str::from_utf8_unchecked(&e.name[..e.name_len as usize]) };
+        let val = unsafe { core::str::from_utf8_unchecked(&e.val[..e.val_len as usize]) };
+        print(name);
+        print("=");
+        println(val);
+    }
+    print("PWD=");
+    println(st.cwd_str());
+}
+
+/// `export NAME=VALUE` — 设置/覆盖进程内环境变量; 无参数时等同 `env`。
+fn shell_export(st: &mut ShellState, arg: &str) {
+    if arg.is_empty() {
+        shell_env(st);
+        return;
+    }
+    let (name, val) = match arg.find('=') {
+        Some(i) => (&arg[..i], &arg[i + 1..]),
+        None => {
+            println("export: usage: export NAME=VALUE");
+            return;
+        }
+    };
+    if !valid_env_name(name) {
+        print("export: bad name: ");
+        println(name);
+        return;
+    }
+    if !st.env_set(name, val) {
+        println("export: name/value too long or env table full");
+    }
 }
 
 /// `run <path>` — 从文件系统加载一个可执行文件并启动它（E1/E2）。

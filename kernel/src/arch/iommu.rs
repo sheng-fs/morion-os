@@ -88,6 +88,13 @@ const GCMD_TE: u32 = 1 << 31;
 const GSTS_RTPS: u32 = 1 << 30;
 const GSTS_TES: u32 = 1 << 31;
 
+/// `GCMD.CFI`（bit 23）= 请求**上下文缓存失效**；`GSTS.CFIS`（同一位）= 失效仍在进行。
+///
+/// 运行期改写上下文表项后必须做一次，否则 IOMMU 可能继续用旧的上下文项
+/// （Linux `iommu_flush_context_global` 的口径：置 `CFI`，轮询 `GSTS.CFIS == 0`）。
+const GCMD_CFI: u32 = 1 << 23;
+const GSTS_CFIS: u32 = 1 << 23;
+
 /// `CAP.SAGAW`（bits 12:8）各地址宽度支持位。
 const CAP_SAGAW_30: u64 = 1 << 8;
 const CAP_SAGAW_39: u64 = 1 << 9;
@@ -138,6 +145,30 @@ static IOMMU_BASE: AtomicU64 = AtomicU64::new(0);
 static TARGET_SID: AtomicU64 = AtomicU64::new(0);
 /// 已报告的故障条数（见 [`MAX_FAULT_REPORTS`]）。
 static FAULT_REPORTS: AtomicU64 = AtomicU64::new(0);
+
+/// 翻译打开时选中的 **AGAW**（0 = 翻译没打开 → per-domain 窗口不可用）。
+static ENABLED_AW: AtomicU64 = AtomicU64::new(0);
+/// 根表物理地址（`init` 成功后填入；per-domain 上下文挂接据此找/建总线上下文表）。
+static ROOT_PA: AtomicU64 = AtomicU64::new(0);
+/// **默认恒等窗口**的二级页表顶层物理地址（失败回退时把功能点恢复到这里）。
+static DEFAULT_TOP: AtomicU64 = AtomicU64::new(0);
+/// DMAR 里 DRHD 的个数（`0` = 无 IOMMU；`1` = 支持 per-domain 上下文；`>1` = 只回退用第一条）。
+static DRHD_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 每个 DRHD 的寄存器基址（多 DRHD 时的取证/记录来源，默认路径不读）。
+static DRHD_BASES: spin::Mutex<Vec<u64>> = spin::Mutex::new(Vec::new());
+
+/// DMAR 里 DRHD 的个数（0 = 固件没有 IOMMU，或在 SAFE 构建里被跳过）。
+pub fn drhd_count() -> u64 {
+    DRHD_COUNT.load(Ordering::Relaxed)
+}
+
+/// DMAR 里**全部** DRHD 的寄存器基址（按表内顺序）。
+///
+/// 多 DRHD 时本文件只把第一个用于翻译（见 [`init`]），其余仅记录 —— 真机多单元
+/// （每单元管一部分 PCI 设备）的完整支持还没做。
+pub fn drhd_bases() -> Vec<u64> {
+    DRHD_BASES.lock().clone()
+}
 
 // ---------------------------------------------------------------------------
 // 表结构
@@ -256,6 +287,141 @@ fn devfn(dev: u8, func: u8) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 全部 DRHD 的枚举（DMAR 自扫）
+// ---------------------------------------------------------------------------
+//
+// `arch::acpi` 只把**第一条** DRHD 放进 `DmarSummary`（本批不允许改它），而"多 DRHD 该不该
+// 走 per-domain 上下文"需要每个单元的 base。这里按 ACPI 的同一套结构自扫一遍：只在启动
+// 阶段用一次，读到的字节/结论与 `acpi::parse_dmar` 交叉校验（个数不符就退回摘要）。
+
+/// ACPI 表头长度（RSDP / XSDT / RSDT / DMAR 的公共前缀）。
+const ACPI_HEADER_BYTES: u64 = 36;
+/// DMAR 重映射结构的起始偏移（ACPI 头 36 + 自身固定部分 12）。
+const DMAR_ENTRIES_OFF: usize = 48;
+
+fn le16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+fn le32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn le64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
+}
+
+/// 把恒等映射内的物理地址读成只读字节切片；越界 / 未映射返回 `None`。
+fn phys_bytes(pa: u64, len: u64) -> Option<&'static [u8]> {
+    if pa == 0 || len == 0 || !is_identity_mapped(pa, len) {
+        return None;
+    }
+    // SAFETY: `is_identity_mapped` 已确认整段可读；固件表不会被复用（ACPI 页不在帧分配器池里）。
+    Some(unsafe { core::slice::from_raw_parts(pa as *const u8, len as usize) })
+}
+
+/// 从 RSDP 找到 DMAR 表（只读；任何一步不可达都返回 `None`）。
+fn locate_dmar() -> Option<&'static [u8]> {
+    let rsdp = crate::bootinfo::get().rsdp_addr();
+    let h = phys_bytes(rsdp, 20)?;
+    if !h.starts_with(b"RSD PTR ") {
+        return None;
+    }
+    let (root, xsdt) = if h[15] >= 2 {
+        let hdr = phys_bytes(rsdp, ACPI_HEADER_BYTES)?;
+        (le64(hdr, 24), true)
+    } else {
+        (le32(h, 16) as u64, false)
+    };
+    if root == 0 {
+        return None;
+    }
+    let sig: &[u8; 4] = if xsdt { b"XSDT" } else { b"RSDT" };
+    let hdr = phys_bytes(root, ACPI_HEADER_BYTES)?;
+    if !hdr.starts_with(sig) {
+        return None;
+    }
+    let len = le32(hdr, 4) as u64;
+    if len < ACPI_HEADER_BYTES {
+        return None;
+    }
+    let table = phys_bytes(root, len)?;
+    let ent = if xsdt { 8 } else { 4 };
+    let count = (table.len() as u64 - ACPI_HEADER_BYTES) / ent;
+    let mut i = 0u64;
+    while i < count {
+        let off = ACPI_HEADER_BYTES as usize + (i * ent) as usize;
+        let pa = if xsdt {
+            le64(table, off)
+        } else {
+            le32(table, off) as u64
+        };
+        if let Some(dmar) = dmar_at(pa) {
+            return Some(dmar);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 若 `pa` 处是一张完整的 DMAR 表，返回它的字节切片。
+fn dmar_at(pa: u64) -> Option<&'static [u8]> {
+    if pa == 0 {
+        return None;
+    }
+    let hdr = phys_bytes(pa, ACPI_HEADER_BYTES)?;
+    if !hdr.starts_with(b"DMAR") {
+        return None;
+    }
+    let len = le32(hdr, 4) as u64;
+    if len < ACPI_HEADER_BYTES {
+        return None;
+    }
+    phys_bytes(pa, len)
+}
+
+/// 解析 DMAR 表里的**全部** DRHD 寄存器基址（纯函数，便于单测）。
+///
+/// 扫描规则与 `acpi::parse_dmar` 一致：固定部分 48 字节后是一串
+/// `type(u16) length(u16) ...`，`type == 0` 且长度 ≥ 16 的结构是 DRHD，
+/// 其 `reg_base` 在结构内偏移 8。
+fn parse_drhd_bases(bytes: &[u8]) -> Vec<u64> {
+    let mut bases = Vec::new();
+    if bytes.len() < DMAR_ENTRIES_OFF || !bytes.starts_with(b"DMAR") {
+        return bases;
+    }
+    let len = le32(bytes, 4) as usize;
+    if len < DMAR_ENTRIES_OFF || len > bytes.len() {
+        return bases;
+    }
+    let mut off = DMAR_ENTRIES_OFF;
+    while off + 4 <= len {
+        let ty = le16(bytes, off);
+        let slen = le16(bytes, off + 2) as usize;
+        if slen < 4 || off + slen > len {
+            break;
+        }
+        if ty == 0 && slen >= 16 {
+            bases.push(le64(bytes, off + 8));
+        }
+        off += slen;
+    }
+    bases
+}
+
+/// 自扫得到的所有 DRHD 基址（机器可读不到 DMAR 时为空）。
+fn enumerate_drhds() -> Vec<u64> {
+    locate_dmar().map(parse_drhd_bases).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // 初始化
 // ---------------------------------------------------------------------------
 
@@ -282,6 +448,37 @@ pub fn init(devices: &[PciDevice]) -> bool {
         crate::video::println("[OK] VT-d: no IOMMU in firmware, DMA remapping not enabled");
         return false;
     }
+
+    // 枚举 DMAR 里**全部** DRHD（`acpi` 只暴露第一条）。自扫结果与摘要交叉校验：
+    // 个数不符就以摘要为准 —— 宁可少记录，也不拿不可靠的表去改行为。
+    let scanned = enumerate_drhds();
+    let scan_ok = scanned.len() as u32 == dmar.drhd_count;
+    let drhd_count = if scan_ok {
+        scanned.len() as u64
+    } else {
+        dmar.drhd_count as u64
+    };
+    DRHD_COUNT.store(drhd_count, Ordering::Relaxed);
+    {
+        let mut bases = DRHD_BASES.lock();
+        bases.clear();
+        if scan_ok {
+            bases.extend_from_slice(&scanned);
+        }
+        if bases.is_empty() {
+            bases.push(dmar.first_drhd.reg_base);
+        }
+    }
+    if drhd_count > 1 {
+        // 多 DRHD 超出本批范围：**退回 E1b/E1c 的既有行为**（只用第一条单元），
+        // 但把每台单元的 base 留下来，便于真机定位"哪台设备归哪个单元管"。
+        crate::video::print("[WARN] VT-d: ");
+        crate::video::print_u64(drhd_count);
+        crate::video::print(" DRHD units (multi-unit unsupported), using first base=0x");
+        crate::video::print_hex(dmar.first_drhd.reg_base);
+        crate::video::println("; per-domain contexts disabled");
+    }
+
     let base = dmar.first_drhd.reg_base;
     if !is_identity_mapped(base, TABLE_BYTES) {
         crate::video::println("[WARN] VT-d: IOMMU register block outside identity map, skipping");
@@ -393,6 +590,11 @@ pub fn init(devices: &[PciDevice]) -> bool {
     let gsts = unsafe { rd32(base, REG_GSTS) };
     // E1c: 记录寄存器块地址 —— 空闲任务据此读故障记录 (FSTS/FEDATA/FEADDR)。
     IOMMU_BASE.store(base, Ordering::Release);
+    // 性能飞地地基: 记下 per-domain 上下文需要的三样东西（AGAW / 根表 / 默认窗口表）。
+    // 三者齐全才允许 [`IovaWindow`] 工作；默认路径完全不读它们。
+    ENABLED_AW.store(aw, Ordering::Release);
+    ROOT_PA.store(root_pa, Ordering::Release);
+    DEFAULT_TOP.store(default_top, Ordering::Release);
     // E1c: **打开故障记录**。QEMU 在故障中断被屏蔽时只置 `FSTS.PPF` 而**不写**
     // `FRCD`/`FEDATA`/`FEADDR`，取证就拿不到 SID/原因/地址；把 `FECTL.IM` 清掉即可。
     // 故障事件 MSI 我们没配置（`FEADDR`/`FEDATA` 为 0），中断不会被真正投递
@@ -466,6 +668,330 @@ fn fill_1g_ident(table_pa: u64, limit: u64) {
         write_entry(table_pa, i, slpt_identity_page(iova), 0);
         i += 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// per-domain 独立 IOVA 窗口（性能飞地地基）
+// ---------------------------------------------------------------------------
+
+/// 4 KiB 页粒度二级页表的层级数（AGAW 30 → 2、39 → 3、48 → 4）。
+fn slpt_levels(aw: u64) -> u64 {
+    (aw - 12).div_ceil(9)
+}
+
+/// 二级页表第 `level` 级（0 = 顶层）的页表下标（每级 9 位）。
+fn slpt_index(iova: u64, aw: u64, level: u64) -> u64 {
+    let shift = 12 + 9 * (slpt_levels(aw) - 1 - level);
+    (iova >> shift) & 0x1FF
+}
+
+/// 4 KiB 叶项（**没有** `SLPT_PS`，与 [`slpt_identity_page`] 的大页相反）。
+fn slpt_leaf_4k(pa: u64) -> u64 {
+    (pa & PAGE_MASK) | SLPT_R | SLPT_W
+}
+
+/// 读一个 128 位表项的低 64 位。
+fn read_entry_lo(table_pa: u64, idx: u64) -> u64 {
+    // SAFETY: 调用方保证 `table_pa` 是已分配的恒等映射表页。
+    unsafe { core::ptr::read_volatile((table_pa + idx * ENTRY_BYTES) as *const u64) }
+}
+
+/// `[iova, iova+bytes)` 是否整段页对齐地落在 `[base, limit)` 内（纯函数，便于单测）。
+fn window_range_ok(base: u64, limit: u64, iova: u64, bytes: u64) -> bool {
+    if bytes == 0 || (iova & !PAGE_MASK) != 0 || (bytes & !PAGE_MASK) != 0 {
+        return false;
+    }
+    match iova.checked_add(bytes) {
+        Some(end) => iova >= base && end <= limit,
+        None => false,
+    }
+}
+
+/// 把一页 `paddr` 映射到 4 KiB 叶 `iova`（中间表按需分配）。已存在叶项 / 遇到大页则返回
+/// `false`（不覆盖既有映射）。
+fn slpt_map_4k(top_pa: u64, aw: u64, iova: u64, paddr: u64) -> bool {
+    let levels = slpt_levels(aw);
+    let mut table = top_pa;
+    let mut level = 0;
+    while level + 1 < levels {
+        let idx = slpt_index(iova, aw, level);
+        let e = read_entry_lo(table, idx);
+        if e & 1 == 0 {
+            let Some(next) = alloc_zeroed_page() else {
+                return false;
+            };
+            write_entry(table, idx, slpt_table_entry(next), 0);
+            table = next;
+        } else {
+            if e & SLPT_PS != 0 {
+                return false; // 既有大页叶：4 KiB 映射无法落在它下面。
+            }
+            table = e & PAGE_MASK;
+        }
+        level += 1;
+    }
+    let idx = slpt_index(iova, aw, level);
+    if read_entry_lo(table, idx) & 1 != 0 {
+        return false; // 已有叶项：拒绝重复映射（避免泄漏）。
+    }
+    write_entry(table, idx, slpt_leaf_4k(paddr), 0);
+    true
+}
+
+/// 清掉 `iova` 处的 4 KiB 叶项；路径/叶项不存在（或被大页占据）返回 `false`。
+fn slpt_unmap_4k(top_pa: u64, aw: u64, iova: u64) -> bool {
+    let levels = slpt_levels(aw);
+    let mut table = top_pa;
+    let mut level = 0;
+    while level + 1 < levels {
+        let e = read_entry_lo(table, slpt_index(iova, aw, level));
+        if e & 1 == 0 || e & SLPT_PS != 0 {
+            return false;
+        }
+        table = e & PAGE_MASK;
+        level += 1;
+    }
+    let idx = slpt_index(iova, aw, level);
+    if read_entry_lo(table, idx) & 1 == 0 {
+        return false;
+    }
+    write_entry(table, idx, 0, 0);
+    true
+}
+
+/// 取 `bus` 的上下文表；根项不存在时新建一张并挂进根表。
+fn context_table_for_bus(root_pa: u64, bus: u8) -> Option<u64> {
+    if let Some(pa) = existing_context_table(root_pa, bus) {
+        return Some(pa);
+    }
+    let pa = alloc_zeroed_page()?;
+    let (lo, hi) = root_entry(pa);
+    write_entry(root_pa, bus as u64, lo, hi);
+    Some(pa)
+}
+
+/// 只查 `bus` 已有的上下文表（不分配）。
+fn existing_context_table(root_pa: u64, bus: u8) -> Option<u64> {
+    let e = read_entry_lo(root_pa, bus as u64);
+    if e & 1 == 0 {
+        return None;
+    }
+    let pa = e & PAGE_MASK;
+    if pa == 0 {
+        None
+    } else {
+        Some(pa)
+    }
+}
+
+/// 请求上下文缓存失效并轮询 `GSTS.CFIS`（超时返回 `false`）。
+fn flush_context_cache(base: u64) -> bool {
+    set_gcmd(base, GCMD_CFI);
+    let mut spins = 0u32;
+    // SAFETY: 寄存器块已确认在恒等映射内。
+    while unsafe { rd32(base, REG_GSTS) } & GSTS_CFIS != 0 {
+        spins += 1;
+        if spins > 1_000_000 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 一个**独立 IOMMU 域**的 IOVA 窗口（性能飞地地基）。
+///
+/// 窗口自带一张二级页表（4 KiB 叶，独立于 [`init`] 建好的恒等表）：只有
+/// [`map_contiguous`](Self::map_contiguous) 显式映射过的页才可达，窗口外的 IOVA 不建叶项 →
+/// 设备 DMA 被 IOMMU 拒绝（与 E1c 的越界拒绝同一机制）。
+///
+/// **默认路径零变化**：不调用 [`create`](Self::create) 的域/设备仍走 `init` 的恒等窗口。
+///
+/// 使用顺序是硬要求：先 `map_contiguous`，再 `attach_device`。本批**没有**实现 IOTLB 失效，
+/// 因此只能在设备**开始 DMA 之前**切上下文（授权阶段正好满足）；设备跑起来后改映射必须先停设备。
+pub struct IovaWindow {
+    domain: u64,
+    aw: u64,
+    top_pa: u64,
+    base: u64,
+    limit: u64,
+}
+
+impl IovaWindow {
+    /// 为 `domain` 建一个空窗口 `[iova_base, iova_base + bytes)`（页对齐、非空）。
+    ///
+    /// 只在**单 DRHD 且翻译已打开**时可用；否则打印一行原因并返回 `None`（调用方继续走
+    /// 恒等映射）。空窗口没有任何叶项 —— 在 `map_contiguous` 之前，该域的设备 DMA 会被拒。
+    pub fn create(domain: u64, iova_base: u64, bytes: u64) -> Option<Self> {
+        let aw = ENABLED_AW.load(Ordering::Acquire);
+        if aw == 0 {
+            crate::video::println(
+                "[WARN] VT-d: per-domain IOVA window needs DMA remapping (off), identity unchanged",
+            );
+            return None;
+        }
+        let units = DRHD_COUNT.load(Ordering::Relaxed);
+        if units != 1 {
+            crate::video::print("[WARN] VT-d: per-domain IOVA window unsupported with ");
+            crate::video::print_u64(units);
+            crate::video::println(" DRHD units, identity unchanged");
+            return None;
+        }
+        // IOVA 0 用作 DeviceGrant 的"未绑定"哨兵，窗口不能占用它。
+        if bytes == 0
+            || iova_base == 0
+            || (iova_base & !PAGE_MASK) != 0
+            || (bytes & !PAGE_MASK) != 0
+        {
+            crate::video::println(
+                "[WARN] VT-d: IOVA window must be non-zero, non-empty and page aligned, identity unchanged",
+            );
+            return None;
+        }
+        let Some(limit) = iova_base.checked_add(bytes) else {
+            crate::video::println("[WARN] VT-d: IOVA window overflows, identity unchanged");
+            return None;
+        };
+        // IOVA 必须在该 AGAW 能表示的地址范围内。
+        if limit > (1u64 << aw) {
+            crate::video::println(
+                "[WARN] VT-d: IOVA window exceeds the AGAW range, identity unchanged",
+            );
+            return None;
+        }
+        let Some(top_pa) = alloc_zeroed_page() else {
+            crate::video::println(
+                "[WARN] VT-d: cannot allocate per-domain page table, identity unchanged",
+            );
+            return None;
+        };
+        Some(Self {
+            domain,
+            aw,
+            top_pa,
+            base: iova_base,
+            limit,
+        })
+    }
+
+    /// 该窗口所属的 domain 号（仅用于诊断/记账）。
+    pub fn domain(&self) -> u64 {
+        self.domain
+    }
+
+    /// 窗口 IOVA 基址。
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// 窗口上界（不含）。
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// 把**物理连续**的 `[paddr, paddr+bytes)` 映射到 `iova` 起的 4 KiB 页。
+    ///
+    /// 要求 `iova`/`paddr`/`bytes` 都页对齐，且整段落在窗口内。中途失败会撤掉本次已建的
+    /// 叶项（表页保留），返回 `false` —— 调用方应据此放弃绑定、继续用恒等映射。
+    pub fn map_contiguous(&mut self, iova: u64, paddr: u64, bytes: u64) -> bool {
+        if !window_range_ok(self.base, self.limit, iova, bytes)
+            || (paddr & !PAGE_MASK) != 0
+            || paddr.checked_add(bytes).is_none()
+        {
+            return false;
+        }
+        let pages = bytes >> 12;
+        let mut done = 0u64;
+        while done < pages {
+            let iova_i = iova + (done << 12);
+            let pa_i = paddr + (done << 12);
+            if !slpt_map_4k(self.top_pa, self.aw, iova_i, pa_i) {
+                self.rollback(iova, done);
+                return false;
+            }
+            done += 1;
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        true
+    }
+
+    /// 撤掉 `iova` 起 `bytes` 字节的 4 KiB 叶项；任一页不存在返回 `false`（其余页仍会被撤）。
+    pub fn unmap(&mut self, iova: u64, bytes: u64) -> bool {
+        if !window_range_ok(self.base, self.limit, iova, bytes) {
+            return false;
+        }
+        let pages = bytes >> 12;
+        let mut ok = true;
+        let mut i = 0u64;
+        while i < pages {
+            ok &= slpt_unmap_4k(self.top_pa, self.aw, iova + (i << 12));
+            i += 1;
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        ok
+    }
+
+    /// 把该功能点（`bus:dev.func`）的上下文项切到这个窗口的二级页表。
+    ///
+    /// 只在单 DRHD 下可用；写项后做上下文缓存失效。失效失败或任何前置条件不满足时，
+    /// **恢复默认恒等上下文**并返回 `false` —— 绝不让设备失去 DMA。
+    pub fn attach_device(&self, bus: u8, dev: u8, func: u8) -> bool {
+        let root = ROOT_PA.load(Ordering::Acquire);
+        let base = IOMMU_BASE.load(Ordering::Acquire);
+        let default_top = DEFAULT_TOP.load(Ordering::Acquire);
+        if root == 0 || base == 0 || default_top == 0 {
+            crate::video::println(
+                "[WARN] VT-d: IOMMU context not ready, device keeps identity mapping",
+            );
+            return false;
+        }
+        let Some(ctx_pa) = context_table_for_bus(root, bus) else {
+            crate::video::println(
+                "[WARN] VT-d: cannot get context table, device keeps identity mapping",
+            );
+            return false;
+        };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(self.aw), self.top_pa);
+        write_entry(ctx_pa, devfn(dev, func), lo, hi);
+        if flush_context_cache(base) {
+            return true;
+        }
+        // 回退：恢复默认恒等上下文（该功能点原来就是这条，行为不变）。
+        let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(self.aw), default_top);
+        write_entry(ctx_pa, devfn(dev, func), lo, hi);
+        let _ = flush_context_cache(base);
+        crate::video::println(
+            "[WARN] VT-d: context-cache flush failed, device stays on identity window",
+        );
+        false
+    }
+
+    /// 撤掉本次已建的叶项（尽力而为，表页不回收）。
+    fn rollback(&self, iova: u64, pages: u64) {
+        let mut i = 0u64;
+        while i < pages {
+            slpt_unmap_4k(self.top_pa, self.aw, iova + (i << 12));
+            i += 1;
+        }
+    }
+}
+
+/// 把某功能点恢复成**默认恒等窗口**（per-domain 绑定失败 / 未来释放窗口时用）。
+pub fn detach_device(bus: u8, dev: u8, func: u8) -> bool {
+    let root = ROOT_PA.load(Ordering::Acquire);
+    let base = IOMMU_BASE.load(Ordering::Acquire);
+    let aw = ENABLED_AW.load(Ordering::Acquire);
+    let default_top = DEFAULT_TOP.load(Ordering::Acquire);
+    if root == 0 || base == 0 || aw == 0 || default_top == 0 {
+        return false;
+    }
+    let Some(ctx_pa) = existing_context_table(root, bus) else {
+        return false;
+    };
+    let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(aw), default_top);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    write_entry(ctx_pa, devfn(dev, func), lo, hi);
+    flush_context_cache(base)
 }
 
 /// `GCMD` 置位（读-改-写）。
@@ -658,5 +1184,81 @@ mod tests {
         // 证据判据：本机 QEMU 置 PPF 而不置 FRI，故必须按 `FSTS != 0` 判"有故障"。
         assert_ne!(FSTS_PPF, 0);
         assert_eq!(FSTS_PPF & 0b1, 0);
+    }
+
+    /// 多 DRHD：自扫必须收齐每一条（而不是只看第一条），并跳过 RMRR 等其它结构。
+    #[test]
+    fn drhd_scan_collects_every_unit() {
+        // 固定部分 48 B + 2 条 DRHD（各 16 B）+ 1 条 RMRR（4 B）。
+        const LEN: usize = 48 + 16 + 16 + 4;
+        let mut t = [0u8; LEN];
+        t[0..4].copy_from_slice(b"DMAR");
+        t[4..8].copy_from_slice(&(LEN as u32).to_le_bytes());
+        // DRHD #0: type=0, len=16, flags=INCLUDE_PCI_ALL, segment=0, base=0xFED9_0000。
+        t[48..50].copy_from_slice(&0u16.to_le_bytes());
+        t[50..52].copy_from_slice(&16u16.to_le_bytes());
+        t[52] = 1;
+        t[56..64].copy_from_slice(&0xFED9_0000u64.to_le_bytes());
+        // DRHD #1: 同一张表里的第二台单元。
+        let off = 64;
+        t[off..off + 2].copy_from_slice(&0u16.to_le_bytes());
+        t[off + 2..off + 4].copy_from_slice(&16u16.to_le_bytes());
+        t[off + 8..off + 16].copy_from_slice(&0xFEDA_0000u64.to_le_bytes());
+        // RMRR: type=1, len=4 —— 不是 DRHD，不能被收进来。
+        let off = 80;
+        t[off..off + 2].copy_from_slice(&1u16.to_le_bytes());
+        t[off + 2..off + 4].copy_from_slice(&4u16.to_le_bytes());
+
+        assert_eq!(parse_drhd_bases(&t).as_slice(), &[0xFED9_0000, 0xFEDA_0000]);
+
+        // 非 DMAR / 长度不自洽 → 空（调用方据此退回 `acpi` 摘要）。
+        assert!(parse_drhd_bases(b"NOPE").is_empty());
+        t[4..8].copy_from_slice(&8u32.to_le_bytes());
+        assert!(parse_drhd_bases(&t).is_empty());
+    }
+
+    /// 4 KiB 页表的层级与各级下标：30/39/48 位宽度分别 2/3/4 级，索引各取 9 位。
+    #[test]
+    fn slpt_levels_and_indices() {
+        assert_eq!(slpt_levels(30), 2);
+        assert_eq!(slpt_levels(39), 3);
+        assert_eq!(slpt_levels(48), 4);
+
+        // AGAW 39：顶层（1 GiB/项）—— 1 GiB 对应下标 1。
+        assert_eq!(slpt_index(0x4000_0000, 39, 0), 1);
+        assert_eq!(slpt_index(0x4000_0000, 39, 1), 0);
+        assert_eq!(slpt_index(0x4000_0000, 39, 2), 0);
+        // 第二级（2 MiB/项）与第三级（4 KiB/项）。
+        assert_eq!(slpt_index(0x0020_0000, 39, 1), 1);
+        assert_eq!(slpt_index(0x1000, 39, 2), 1);
+        // AGAW 48：顶层 shift = 39（512 GiB/项）。
+        assert_eq!(slpt_index(1 << 39, 48, 0), 1);
+        assert_eq!(slpt_index(1 << 39, 48, 1), 0);
+        // AGAW 30：顶层 shift = 21（2 MiB/项），无 1 GiB 级。
+        assert_eq!(slpt_index(0x20_0000, 30, 0), 1);
+        assert_eq!(slpt_index(0x1000, 30, 1), 1);
+
+        // 4 KiB 叶项必须**没有** PS 位（否则会被当成 2 MiB/1 GiB 大页）。
+        let e = slpt_leaf_4k(0x1234_5000);
+        assert_eq!(e & PAGE_MASK, 0x1234_5000);
+        assert_eq!(e & (SLPT_R | SLPT_W), SLPT_R | SLPT_W);
+        assert_eq!(e & SLPT_PS, 0);
+    }
+
+    /// 独立窗口的边界计算：页对齐、非空、整段落在 `[base, limit)` 内，溢出即拒。
+    #[test]
+    fn iova_window_bounds() {
+        let base = 0x4000_0000u64;
+        let limit = base + 0x20_0000;
+
+        assert!(window_range_ok(base, limit, base, 0x20_0000));
+        assert!(window_range_ok(base, limit, base + 0x1000, 0x1000));
+        // 越界（哪怕只多一页）、基址之前、非页对齐、空区间、加法溢出。
+        assert!(!window_range_ok(base, limit, base, 0x20_1000));
+        assert!(!window_range_ok(base, limit, base - 0x1000, 0x1000));
+        assert!(!window_range_ok(base, limit, base + 1, 0x1000));
+        assert!(!window_range_ok(base, limit, base, 0));
+        assert!(!window_range_ok(base, limit, base, 0x1001));
+        assert!(!window_range_ok(base, limit, u64::MAX & !0xFFF, 0x2000));
     }
 }

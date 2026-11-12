@@ -45,13 +45,13 @@ pub const DEVICE_MSIX_VADDR: u64 = paging::USER_SPACE_BASE + 0x84_0000;
 ///
 /// 窗口放在 `0x60_0000` 起的空闲带：用户栈是 `[0x3F_9000, 0x40_1000)`（自栈顶向下 8 页），
 /// `0x80_0000` 起是单实例设备窗口，`0xA0_0000` 是 wifi 共享页 —— 中间这一段没人用。
-/// 16 个实例共占 `[0x60_0000, 0x75_0000)`：CFG 16 页 + BAR 16×16 KiB + DMA 16×64 KiB。
+/// 16 个实例共占 `[0x60_0000, 0x7D_0000)`：CFG 16 页 + BAR 16×16 KiB + DMA 16×96 KiB。
 pub const DEVICE_MULTI_CFG_VADDR: u64 = paging::USER_SPACE_BASE + 0x60_0000;
 pub const DEVICE_MULTI_BAR_VADDR: u64 = paging::USER_SPACE_BASE + 0x61_0000;
 pub const DEVICE_MULTI_DMA_VADDR: u64 = paging::USER_SPACE_BASE + 0x65_0000;
-/// 单实例 BAR / DMA 步长（4 页 / 16 页）。
+/// 单实例 BAR / DMA 步长（4 页 / 24 页）。
 pub const DEVICE_MULTI_BAR_STRIDE: u64 = 0x4000;
-pub const DEVICE_MULTI_DMA_STRIDE: u64 = 0x1_0000;
+pub const DEVICE_MULTI_DMA_STRIDE: u64 = 0x1_8000;
 /// 最多同时授权的设备实例数（xHCI 控制器上限；真机见过 13 个）。
 pub const DEVICE_MULTI_SLOTS: u64 = 16;
 
@@ -92,6 +92,20 @@ pub struct DeviceGrant {
     /// MSI-X 表所在 BAR 映射到驱动域的虚拟地址（表在该 BAR 的 `msix_table_offset` 处）。
     /// 0 = 未映射 (未启用 MSI-X); 表与设备 BAR 同根时 = `bar_vaddr`。
     pub msix_table_vaddr: u64,
+    /// 独立 IOVA 窗口基址（0 = 未绑定：DMA 仍按**物理地址**走恒等映射，行为与之前完全一致）。
+    ///
+    /// 非 0 时驱动应把 DMA 描述符里的设备可见地址写成 `dma_iova + 偏移`，而不是
+    /// `dma_paddr + 偏移`；绑定由内核 [`bind_dma_window`] 在设备开始 DMA 前完成。
+    pub dma_iova: u64,
+    /// 独立 IOVA 窗口覆盖的字节数（0 = 未绑定）。
+    pub dma_iova_bytes: u64,
+}
+
+impl DeviceGrant {
+    /// 该设备的 DMA 是否已绑定到独立 IOVA 窗口（`dma_iova != 0`）。
+    pub fn dma_window_bound(&self) -> bool {
+        self.dma_iova != 0
+    }
 }
 
 /// 一次设备授权请求 (由 boot 侧的"设备需求"声明给出)。
@@ -191,6 +205,9 @@ fn grant_at(
         page_size: PAGE as u32,
         _reserved: 0,
         msix_table_vaddr: msix.table_vaddr,
+        // 默认不绑定独立 IOVA 窗口 —— DMA 仍按物理地址（恒等映射），行为零变化。
+        dma_iova: 0,
+        dma_iova_bytes: 0,
     };
     unsafe {
         core::ptr::write(cfg_paddr as *mut DeviceGrant, desc);
@@ -228,6 +245,59 @@ fn grant_at(
     crate::cap::grant(req.domain, crate::cap::Capability::Mmio(bar_paddr));
 
     true
+}
+
+/// 把某台**已授权**设备的物理连续 DMA 块绑定到独立 IOVA 窗口（性能飞地地基，内核内部 API）。
+///
+/// `dma_paddr` / `dma_bytes` 是授权时分配的同一块 DMA（物理连续、页对齐）。成功 =
+/// 新建一个以 `iova_base` 为基的 per-domain 上下文、把该块按 4 KiB 页映射进去、再把设备
+/// 功能点切到新上下文，并把 `dma_iova` / `dma_iova_bytes` 回写进描述页；返回 `Some(iova_base)`。
+///
+/// 任一步不支持（无 IOMMU / 多 DRHD / 表建不起来）都**保持恒等映射**并返回 `None` ——
+/// 现有驱动的 DMA 不受影响。只应在设备**开始 DMA 之前**调用；本批没有 IOTLB 失效。
+pub fn bind_dma_window(
+    domain: u64,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    dma_paddr: u64,
+    dma_bytes: u64,
+    iova_base: u64,
+) -> Option<u64> {
+    let cfg_paddr = {
+        let bindings = BINDINGS.lock();
+        bindings
+            .iter()
+            .find(|e| e.domain == domain && e.bus == bus && e.dev == dev && e.func == func)?
+            .cfg_paddr
+    };
+    // 幂等：已绑定就直接返回既有窗口（不重复建表 / 映射）。
+    let mut desc = unsafe { core::ptr::read_volatile(cfg_paddr as *const DeviceGrant) };
+    if desc.dma_window_bound() {
+        return Some(desc.dma_iova);
+    }
+
+    let mut window = crate::arch::iommu::IovaWindow::create(domain, iova_base, dma_bytes)?;
+    if !window.map_contiguous(iova_base, dma_paddr, dma_bytes) {
+        crate::video::println("dev: DMA window map failed, device keeps identity mapping");
+        return None;
+    }
+    if !window.attach_device(bus, dev, func) {
+        let _ = window.unmap(iova_base, dma_bytes);
+        crate::video::println("dev: DMA window attach failed, device keeps identity mapping");
+        return None;
+    }
+
+    // 回写描述页：驱动从此把设备可见地址写成 `dma_iova + 偏移`。
+    desc.dma_iova = iova_base;
+    desc.dma_iova_bytes = dma_bytes;
+    unsafe { core::ptr::write(cfg_paddr as *mut DeviceGrant, desc) };
+    crate::video::print("dev: DMA window bound iova=0x");
+    crate::video::print_hex(iova_base);
+    crate::video::print(" bytes=0x");
+    crate::video::print_hex(dma_bytes);
+    crate::video::println("");
+    Some(iova_base)
 }
 
 /// 无该类型设备时的降级: 仅映射一个**零描述页**到约定地址, 让驱动读到

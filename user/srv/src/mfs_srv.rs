@@ -4642,7 +4642,7 @@ fn mfs_is_err(v: u64) -> bool {
     (v >> 48) == 0xFFFF
 }
 
-/// 主体身份 (`04b` 静态凭证表)。uid/gid 与落盘字段同宽 (u16)。
+/// 主体身份 (`uid`/`gid` 与落盘字段同宽, u16)。
 #[derive(Clone, Copy)]
 struct Cred {
     uid: u16,
@@ -4651,10 +4651,10 @@ struct Cred {
 
 /// 引导期长期服务域数 (与内核 `kernel/src/domain.rs` 的 `BOOT_DOMAINS` 对齐)。
 ///
-/// 域 id `< 本值` = 引导期服务域 => 系统身份 `0:0`; `>= 本值` = 运行期新建域 =>
-/// 低权身份 `1000:1000`。**域号会复用**, 但本映射是按域号**现算**的确定性函数
-/// (不缓存用户可选身份), 复用后仍是同一档身份, 不存在"继承旧身份"问题。
-/// 目标形态改由认证服务签发 `Cred` 时, 才需要随域销毁失效的凭证表。
+/// **只作为查不到内核身份时的回退**: 域 id `< 本值` = 引导期服务域 => `0:0`,
+/// `>= 本值` = 运行期新建域 => `1000:1000`。正常情况下身份由内核按域记录
+/// (经 `SYS_CRED` 的只读查询取得), 于是 `whoami` / `id` 与 `chmod` / `chown`
+/// 的判定用的是**同一份** uid/gid。
 const MFS_BOOT_DOMAINS: u64 = 26;
 const MFS_UID_ROOT: u16 = 0;
 const MFS_GID_ROOT: u16 = 0;
@@ -4662,6 +4662,11 @@ const MFS_UID_USER: u16 = 1000;
 const MFS_GID_USER: u16 = 1000;
 
 fn mfs_cred_of(domain: u64) -> Cred {
+    // 域号来自内核填写的 `msg.from`, 不可伪造; 身份读内核记录, 因此 `su` 之后
+    // 文件服务的权限判定立即跟随 (不再按域号静态推断)。
+    if let Some((uid, gid)) = sys_cred_of(domain) {
+        return Cred { uid, gid };
+    }
     if domain < MFS_BOOT_DOMAINS {
         Cred {
             uid: MFS_UID_ROOT,

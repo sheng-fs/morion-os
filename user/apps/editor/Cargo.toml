@@ -1,0 +1,18 @@
+[package]
+name = "morion-editor"
+version = "0.1.0"
+edition = "2021"
+authors = ["Morion OS Team"]
+license = "MIT"
+description = "MorionOS 纯文本编辑器骨架 (窗口 + 控件 + VFS)"
+
+[[bin]]
+name = "morion-editor"
+path = "src/main.rs"
+
+[dependencies]
+morion = { path = "../../libmorion" }
+
+# 独立工作区: 本目录在根工作区内, 但暂不加入根 workspace 的 members
+# (第二批接线时由构建系统统一决定)。
+[workspace]

@@ -25,8 +25,8 @@ use crate::gfx::{Fb, Rect};
 use morion::gfx::{
     GfxReq, GFX_OP_BLIT, GFX_OP_CLEAR, GFX_OP_COMPOSE, GFX_OP_EXIT, GFX_OP_FILL, GFX_OP_INFO,
     GFX_OP_MOVE, GFX_OP_PING, GFX_OP_PIXEL, GFX_OP_QUERY, GFX_OP_RECT, GFX_OP_TEXT,
-    GFX_OP_WIN_CREATE, GFX_OP_WIN_DESTROY, GFX_OP_WIN_FLUSH, GFX_OP_WIN_MOVE, GFX_OP_WIN_RAISE,
-    GFX_REPLY_NO_SESSION, GFX_TAG,
+    GFX_OP_WIN_CREATE, GFX_OP_WIN_DESTROY, GFX_OP_WIN_FLUSH, GFX_OP_WIN_FLUSH_RECT,
+    GFX_OP_WIN_FOCUS, GFX_OP_WIN_MOVE, GFX_OP_WIN_RAISE, GFX_REPLY_NO_SESSION, GFX_TAG,
 };
 use morion::syscall::*;
 
@@ -72,6 +72,12 @@ const DESK_BG: u32 = 0x20_28_38;
 const FG: u32 = 0xE0_A0_30;
 /// 终端文字颜色 (浅灰)。
 const TEXT_FG: u32 = 0xD0_D8_E0;
+/// 焦点窗口边框宽度 (像素)。
+const FOCUS_RING: u32 = 2;
+/// 焦点窗口边框颜色 (青绿): 让"哪个窗口收键盘"在无鼠标时也一眼可见。
+const FOCUS_RING_COLOR: u32 = 0x38_C8_A0;
+/// 无焦点窗口的槽位哨兵。
+const NO_FOCUS: usize = usize::MAX;
 
 /// 域 15 入口: 取几何 → 映射 → 画图 + 回读校验 → 接管 → 建合成器, 然后常驻服务请求。
 pub fn run() {
@@ -232,6 +238,8 @@ struct Compositor {
     console: Rect,
     /// 服务内文本终端: 渲染进控制台窗口的**后备表面**。
     term: Term,
+    /// 焦点窗口槽位 ([`NO_FOCUS`] = 无客户端窗口有焦点)。
+    focus: usize,
 }
 
 impl Compositor {
@@ -279,12 +287,107 @@ impl Compositor {
             next_z: 1,
             console: Rect::new(0, 0, cw, ch),
             term,
+            focus: NO_FOCUS,
         })
     }
 
     /// 整屏矩形。
     fn full_rect(&self) -> Rect {
         Rect::new(0, 0, self.fb.width, self.fb.height)
+    }
+
+    /// 窗口外扩 [`FOCUS_RING`] 像素后的矩形（焦点框的画布范围）。
+    fn ring_rect(win: &Win) -> Rect {
+        Rect::new(
+            win.x.saturating_sub(FOCUS_RING),
+            win.y.saturating_sub(FOCUS_RING),
+            win.w.saturating_add(FOCUS_RING * 2),
+            win.h.saturating_add(FOCUS_RING * 2),
+        )
+    }
+
+    /// 当前焦点窗口的边框矩形（无焦点 / 槽已失效返回 `None`）。
+    fn focused_rect(&self) -> Option<Rect> {
+        if self.focus == NO_FOCUS || self.focus >= MAX_WINDOWS {
+            return None;
+        }
+        let win = self.wins[self.focus];
+        if win.used {
+            Some(Compositor::ring_rect(&win))
+        } else {
+            None
+        }
+    }
+
+    /// 在给定屏幕矩形内画焦点窗框（只画四条边，已裁剪到 `r`）。
+    ///
+    /// 放在合成末尾画：窗口内容先上屏，边框再压在最上面 —— 边框属于**装饰**，
+    /// 不参与窗口表面的回读校验。
+    fn draw_focus_ring(&self, r: Rect) {
+        if self.focus == NO_FOCUS || self.focus >= MAX_WINDOWS {
+            return;
+        }
+        let win = self.wins[self.focus];
+        if !win.used {
+            return;
+        }
+        let ring = Compositor::ring_rect(&win).intersect(self.full_rect());
+        let inner_h = ring.h.saturating_sub(FOCUS_RING * 2);
+        let strips = [
+            Rect::new(ring.x, ring.y, ring.w, FOCUS_RING),
+            Rect::new(
+                ring.x,
+                ring.y.saturating_add(ring.h).saturating_sub(FOCUS_RING),
+                ring.w,
+                FOCUS_RING,
+            ),
+            Rect::new(
+                ring.x,
+                ring.y.saturating_add(FOCUS_RING),
+                FOCUS_RING,
+                inner_h,
+            ),
+            Rect::new(
+                ring.x.saturating_add(ring.w).saturating_sub(FOCUS_RING),
+                ring.y.saturating_add(FOCUS_RING),
+                FOCUS_RING,
+                inner_h,
+            ),
+        ];
+        for strip in strips {
+            let q = strip.intersect(r);
+            if q.w != 0 && q.h != 0 {
+                self.fb.rect(q.x, q.y, q.w, q.h, FOCUS_RING_COLOR);
+            }
+        }
+    }
+
+    /// 把焦点切到 `slot`（`None` = 无焦点），并重合成旧 / 新焦点框覆盖的区域。
+    fn set_focus(&mut self, slot: Option<usize>) -> bool {
+        let old = self.focused_rect();
+        self.focus = slot.unwrap_or(NO_FOCUS);
+        let new = self.focused_rect();
+        let r = old
+            .unwrap_or(Rect::new(0, 0, 0, 0))
+            .union(new.unwrap_or(Rect::new(0, 0, 0, 0)));
+        if r.w == 0 || r.h == 0 {
+            return true;
+        }
+        self.composite(r)
+    }
+
+    /// z 序最高的客户端窗口槽位（无窗口返回 `None`）。
+    fn topmost(&self) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, win) in self.wins.iter().enumerate() {
+            if i == CONSOLE || !win.used {
+                continue;
+            }
+            if best.is_none_or(|b| self.wins[b].z < win.z) {
+                best = Some(i);
+            }
+        }
+        best
     }
 
     /// 全屏重合成 (桌面背景 + 所有窗口按 z 序)。
@@ -329,6 +432,8 @@ impl Compositor {
                 return false;
             }
         }
+        // 4) 焦点窗框（纯装饰，压在窗口内容之上）
+        self.draw_focus_ring(r);
         true
     }
 
@@ -410,7 +515,8 @@ impl Compositor {
             surf: req.buf,
             stride,
         };
-        if self.composite(self.wins[slot].rect()) {
+        // 新窗口拿到焦点（同时画出焦点框；旧焦点的框一并擦掉）。
+        if self.set_focus(Some(slot)) {
             WIN_ID_BASE + slot as u64
         } else {
             0
@@ -430,24 +536,31 @@ impl Compositor {
         Some(slot)
     }
 
-    /// 移动窗口 (重合成旧 + 新矩形)。
+    /// 移动窗口 (重合成旧 + 新矩形；焦点窗口连同前后两个焦点框一起重铺)。
     fn win_move(&mut self, req: &GfxReq) -> u64 {
         let id = match self.win_slot(req) {
             Some(i) => i,
             None => return 0,
         };
-        let old = self.wins[id].rect();
+        let focused = self.focus == id;
+        let mut r = self.wins[id].rect();
+        if focused {
+            r = r.union(Compositor::ring_rect(&self.wins[id]));
+        }
         self.wins[id].x = req.x as u32;
         self.wins[id].y = req.y as u32;
-        let new = self.wins[id].rect();
-        if self.composite(old.union(new)) {
+        r = r.union(self.wins[id].rect());
+        if focused {
+            r = r.union(Compositor::ring_rect(&self.wins[id]));
+        }
+        if self.composite(r) {
             1
         } else {
             0
         }
     }
 
-    /// 把窗口置顶并重合成。
+    /// 把窗口置顶并设为焦点, 重合成旧 / 新焦点框覆盖的区域。
     fn win_raise(&mut self, req: &GfxReq) -> u64 {
         let id = match self.win_slot(req) {
             Some(i) => i,
@@ -455,21 +568,32 @@ impl Compositor {
         };
         self.wins[id].z = self.next_z;
         self.next_z += 1;
-        if self.composite(self.wins[id].rect()) {
+        if self.set_focus(Some(id)) {
             1
         } else {
             0
         }
     }
 
-    /// 销毁窗口 (释放槽并重合成其矩形)。
+    /// 销毁窗口 (释放槽；若它正是焦点，把焦点交给 z 序最高的剩余窗口)。
     fn win_destroy(&mut self, req: &GfxReq) -> u64 {
         let id = match self.win_slot(req) {
             Some(i) => i,
             None => return 0,
         };
-        let r = self.wins[id].rect();
+        let was_focus = self.focus == id;
+        let mut r = self.wins[id].rect();
+        if was_focus {
+            r = r.union(Compositor::ring_rect(&self.wins[id]));
+        }
         self.wins[id] = Win::empty();
+        if was_focus {
+            self.focus = NO_FOCUS;
+            if let Some(next) = self.topmost() {
+                self.focus = next;
+                r = r.union(Compositor::ring_rect(&self.wins[next]));
+            }
+        }
         if self.composite(r) {
             1
         } else {
@@ -484,6 +608,60 @@ impl Compositor {
             None => return 0,
         };
         if self.composite(self.wins[id].rect()) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 只重合成窗口内一块脏矩形 (`req.x/y/w/h` = 窗口内坐标)。
+    ///
+    /// 这是合成器的**增量重绘**入口：应用把改动过的小块送上来，服务端只重铺那一块
+    /// (桌面背景 + 相交窗口 + 焦点框)，避免整窗/整屏逐像素重画。
+    fn win_flush_rect(&mut self, req: &GfxReq) -> u64 {
+        let id = match self.win_slot(req) {
+            Some(i) => i,
+            None => return 0,
+        };
+        let (lw, lh) = (req.w as u32, req.h as u32);
+        if lw == 0 || lh == 0 {
+            return 1; // 空脏区 = 无事可做
+        }
+        let win = self.wins[id];
+        let r = Rect::new(
+            win.x.saturating_add(req.x as u32),
+            win.y.saturating_add(req.y as u32),
+            lw,
+            lh,
+        )
+        .intersect(win.rect())
+        .intersect(self.full_rect());
+        if r.w == 0 || r.h == 0 {
+            return 1;
+        }
+        if self.composite(r) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// 焦点查询 / 设置 (`color == 0` 查询；否则设置并置顶)。
+    fn win_focus(&mut self, req: &GfxReq) -> u64 {
+        if req.color == 0 {
+            return if self.focus == NO_FOCUS {
+                0
+            } else {
+                WIN_ID_BASE + self.focus as u64
+            };
+        }
+        let id = match self.win_slot(req) {
+            Some(i) => i,
+            None => return 0,
+        };
+        self.wins[id].z = self.next_z;
+        self.next_z += 1;
+        if self.set_focus(Some(id)) {
             1
         } else {
             0
@@ -545,6 +723,8 @@ fn handle(comp: &mut Compositor, tag: u64, payload: *const u8) -> (u64, bool) {
         GFX_OP_WIN_RAISE => comp.win_raise(&req),
         GFX_OP_WIN_DESTROY => comp.win_destroy(&req),
         GFX_OP_WIN_FLUSH => comp.win_flush(&req),
+        GFX_OP_WIN_FLUSH_RECT => comp.win_flush_rect(&req),
+        GFX_OP_WIN_FOCUS => comp.win_focus(&req),
         GFX_OP_PIXEL => {
             if req.x as u32 >= comp.fb.width || req.y as u32 >= comp.fb.height {
                 u64::MAX

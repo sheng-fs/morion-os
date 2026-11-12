@@ -117,6 +117,11 @@ pub const SYS_LOG_READ: u64 = 59;
 pub const SYS_LOG_OLDEST: u64 = 65;
 /// 控制台行编辑开关: `a1 != 0` 开始, `0` 结束。编辑期间别的域的输出会被内核暂存。
 pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
+/// 进程身份 (多用户最小闭环): `(操作, 参数1, 参数2)`。
+///
+/// `0` = 查自己 → 打包的 `(uid << 32) | gid`; `1` = 设置自己 (`uid`, `gid`, 返回 1/0,
+/// 只允许降权); `2` = 只读查询指定域 (`参数1` = 域号, 域不存在返回 `u64::MAX`)。
+pub const SYS_CRED: u64 = 67;
 /// 读一台 PCI 设备记录 (Phase 0 / P0.3): `a1` = 索引、`a2` = 缓冲 (3 个 u64)。
 pub const SYS_PCI_INFO: u64 = 60;
 /// ACPI S5 软关机 (真机 P0): 无参; 需 `Capability::Spawn`。
@@ -282,6 +287,31 @@ pub fn sys_device_config_read(offset: u64) -> u64 {
 /// `which` 取 [`SYS_UNAME`] 的选择值; 版本常量由内核 `version.rs` **单一维护**。
 pub fn sys_uname(buf: &mut [u8], which: u64) -> u64 {
     unsafe { syscall(SYS_UNAME, buf.as_ptr() as u64, buf.len() as u64, which) }
+}
+
+/// 取本进程的 `(uid, gid)` (内核按域记录); 失败返回 `None`。
+pub fn sys_cred_get() -> Option<(u16, u16)> {
+    unpack_cred(unsafe { syscall(SYS_CRED, 0, 0, 0) })
+}
+
+/// 设置本进程的 `(uid, gid)`: 只有 `uid 0` 能换成别的身份 (即**只允许降权**),
+/// 非 root 只能传入自身当前值。成功返回 `true`。
+pub fn sys_cred_set(uid: u16, gid: u16) -> bool {
+    unsafe { syscall(SYS_CRED, 1, uid as u64, gid as u64) == 1 }
+}
+
+/// 只读查询**指定域**的 `(uid, gid)` —— 文件服务据此按 IPC 的 `msg.from` 判定
+/// 发起者身份 (域号由内核在 IPC 层填写, 不可伪造)。域不存在返回 `None`。
+pub fn sys_cred_of(domain: u64) -> Option<(u16, u16)> {
+    unpack_cred(unsafe { syscall(SYS_CRED, 2, domain, 0) })
+}
+
+/// 解包 `(uid << 32) | gid`; `u64::MAX` 是失败值。
+fn unpack_cred(v: u64) -> Option<(u16, u16)> {
+    if v == u64::MAX {
+        return None;
+    }
+    Some((((v >> 32) & 0xFFFF) as u16, (v & 0xFFFF) as u16))
 }
 
 /// 加载可执行文件 (ELF64 `ET_EXEC`) 并启动, 返回**新域 id** (失败 `u64::MAX`)。
