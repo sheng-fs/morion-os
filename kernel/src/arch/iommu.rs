@@ -5,18 +5,21 @@
 //! 1. 按 `DRHD.reg_base` 访问 IOMMU 寄存器块（QEMU 为 `0xFED90000`，在**恒等映射**内 →
 //!    可直接以物理地址当虚拟地址按 volatile 访问，与 [`crate::arch::apic`] 访问 LAPIC 同一套路）；
 //! 2. 建**根表**（每总线一项）+ **上下文表**（每总线一张，每个 PCI 功能点一项）；
-//! 3. 每个枚举到的 PCI 功能点都挂 **translated** 上下文，二级页表铺**恒等**映射
-//!    （IOVA == 物理地址，覆盖前 4 GiB）；
+//! 3. 每个枚举到的 PCI 功能点都挂 **translated** 上下文；**默认窗口**不是恒等 4 GiB，而是
+//!    **每台已授权设备各自一张**由 [`register_device_range`] 登记表构造的稀疏窗口 —— 只有
+//!    `device::grant*` 授权的 BAR / DMA 物理范围建 4 KiB 恒等叶项（IOVA == 物理地址）；
 //! 4. `GCMD.SRTP` 置根表指针 → `GCMD.TE` 打开翻译，回读 `GSTS` 确认。
 //!
-//! **为什么全部 translated + 恒等**：`TE = 1` 之后**所有**设备的 DMA 都要过 IOMMU 查表，而
-//! 阶段一内核与既有驱动仍按**物理地址**做 DMA —— 只要 IOVA 仍等于物理地址（恒等）它们就照常
-//! 工作，同时每个功能点在 IOMMU 里都有明确一项，不留"表里没有就放行"的隐式口子。
+//! **为什么默认窗口只覆盖登记范围**：`TE = 1` 之后所有设备的 DMA 都要过 IOMMU 查表。若
+//! 像早期实现那样给每个功能点铺 `[0, 4 GiB)` 恒等映射，被攻破的驱动就能 DMA 改写内核、
+//! 页表或其它域的用户页。现在每台设备**开局是一张空表**，授权时才逐段补入自己的 BAR /
+//! DMA 块；未登记页一律没有叶项，越界 DMA（含打向别的设备）被硬件拒绝。设备仍按物理地址
+//! DMA（IOVA == PA）。
 //!
 //! **E1c（受限 IOVA 窗口 + 越界取证）**把 DMA 权限**显式**绑成一条窗口
 //! `IOVA ∈ [0, `[`TARGET_WINDOW_LIMIT`]`)`：窗口外一律**不建叶项**，于是设备发起的越界 DMA
 //! 会被 IOMMU 拒绝。目标设备（NVMe —— 只有它真走查表，virtio 默认绕过 IOMMU）单列一张
-//! **更小的**窗口表（3 GiB，其余设备仍是 4 GiB 恒等 → 行为零变化）；那张表就是 E2/E3 把
+//! **更小的**窗口表（3 GiB；其余设备走上面按登记表构造的默认窗口），那张表就是 E2/E3 把
 //! 飞地那台设备窗口继续收小的唯一落点，改它不会波及其它设备。
 //!
 //! 取证由用户态驱动 `block_srv` 触发（它故意提交一条 PRP 落在窗口外的 NVMe 读，设备就会去打
@@ -96,6 +99,13 @@ const GSTS_TES: u32 = 1 << 31;
 const GCMD_CFI: u32 = 1 << 23;
 const GSTS_CFIS: u32 = 1 << 23;
 
+/// `GCMD.IVA`（bit 25）= 请求**全局 IOTLB 失效**；`GSTS.IVT`（同一位）= 失效仍在进行。
+///
+/// 运行期把新的登记范围补进二级页表后必须做一次，否则 IOMMU 可能继续用旧的翻译
+/// （本批只做全局失效，没有按页/`PSI` 精确失效 —— 见报告里的剩余缺口）。
+const GCMD_IVA: u32 = 1 << 25;
+const GSTS_IVT: u32 = 1 << 25;
+
 /// `CAP.SAGAW`（bits 12:8）各地址宽度支持位。
 const CAP_SAGAW_30: u64 = 1 << 8;
 const CAP_SAGAW_39: u64 = 1 << 9;
@@ -109,6 +119,86 @@ fn window_1g_pages(limit: u64) -> u64 {
 /// `iova` 是否落在允许窗口内。窗口外 = 二级页表里**没有叶项** → 设备发起的 DMA 被 IOMMU 拒绝。
 fn window_permits(iova: u64, limit: u64) -> bool {
     iova < limit
+}
+
+// ---------------------------------------------------------------------------
+// 登记表（默认窗口 = 内核实际授权给设备的物理范围）
+// ---------------------------------------------------------------------------
+
+/// 一段**4 KiB 页对齐**的物理范围（`[base, base + len)`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PhysRange {
+    base: u64,
+    len: u64,
+}
+
+impl PhysRange {
+    fn end(&self) -> u64 {
+        self.base + self.len
+    }
+}
+
+/// 把 `v` 向上对齐到 4 KiB；溢出返回 `None`。
+fn page_align_up(v: u64) -> Option<u64> {
+    let low = v & !PAGE_MASK;
+    if low == 0 {
+        Some(v)
+    } else {
+        v.checked_add(TABLE_BYTES - low)
+    }
+}
+
+/// 把 `[paddr, paddr + bytes)` 规范成页对齐范围（向下对齐起点、向上对齐终点）。
+///
+/// 空区间 / 加法溢出返回 `None` —— 越界或零长度**绝不**登记进窗口。
+fn align_range(paddr: u64, bytes: u64) -> Option<PhysRange> {
+    if bytes == 0 {
+        return None;
+    }
+    let base = paddr & PAGE_MASK;
+    let end = page_align_up(paddr.checked_add(bytes)?)?;
+    if end <= base {
+        return None;
+    }
+    Some(PhysRange {
+        base,
+        len: end - base,
+    })
+}
+
+/// 合并重叠 / 相邻的范围（纯函数）。返回按基址排序、互不相交的区间列表。
+fn merge_ranges(ranges: &[PhysRange]) -> Vec<PhysRange> {
+    let mut sorted: Vec<PhysRange> = ranges.iter().copied().filter(|r| r.len != 0).collect();
+    sorted.sort_unstable_by_key(|r| r.base);
+    let mut out: Vec<PhysRange> = Vec::new();
+    for r in sorted {
+        if let Some(last) = out.last_mut() {
+            let last_end = last.end();
+            if r.base <= last_end {
+                let end = last_end.max(r.end());
+                last.len = end - last.base;
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    out
+}
+
+/// 范围是否完整落在该 AGAW 能表示的地址空间内（越界拒绝）。
+fn range_within_agaw(range: PhysRange, aw: u64) -> bool {
+    aw >= 12 && range.end() <= (1u64 << aw)
+}
+
+/// 失败补登记时一次补入的窗口（64 KiB，按该大小向下对齐故障地址）。
+const HEAL_BYTES: u64 = 64 * 1024;
+/// 补登记次数上限：超过后回退恒等窗口（宁可退化也不让驱动永久 DMA 失败）。
+const MAX_WINDOW_HEALS: u64 = 8;
+
+/// 把故障地址扩成一个 64 KiB 对齐的补登记范围。
+fn heal_range(iova: u64) -> Option<PhysRange> {
+    let base = iova & !(HEAL_BYTES - 1);
+    align_range(base, HEAL_BYTES)
 }
 
 /// `FRCD` Fault Info 高 16 位 = 发起故障的 **SID**（`bus << 8 | dev << 3 | func`）。
@@ -151,8 +241,24 @@ static FAULT_REPORTS: AtomicU64 = AtomicU64::new(0);
 static ENABLED_AW: AtomicU64 = AtomicU64::new(0);
 /// 根表物理地址（`init` 成功后填入；per-domain 上下文挂接据此找/建总线上下文表）。
 static ROOT_PA: AtomicU64 = AtomicU64::new(0);
-/// **默认恒等窗口**的二级页表顶层物理地址（失败回退时把功能点恢复到这里）。
+/// **默认窗口**（每台设备一张，开局为空）的共享空表 —— 未授权设备只能落到这里（无叶项）。
 static DEFAULT_TOP: AtomicU64 = AtomicU64::new(0);
+/// 每台已授权设备的窗口：`top_pa` 是该设备**独有**的二级页表，`ranges` 是登记表。
+struct DeviceWindow {
+    sid: u32,
+    top_pa: u64,
+    ranges: Vec<PhysRange>,
+}
+/// 设备 SID → 独有窗口（`device::grant*` 逐段登记 BAR / DMA 范围时惰性创建）。
+static DEVICE_WINDOWS: spin::Mutex<Vec<DeviceWindow>> = spin::Mutex::new(Vec::new());
+/// 枚举到的全部 PCI 功能点（回退恒等时把这些上下文全部切过去）。
+static DEVICE_FUNCS: spin::Mutex<Vec<(u8, u8, u8)>> = spin::Mutex::new(Vec::new());
+/// E1c 目标设备（NVMe）的窗口表：保持 `[0, TARGET_WINDOW_LIMIT)` 不变。
+static TARGET_TOP: AtomicU64 = AtomicU64::new(0);
+/// 补登记过多 / 建表失败时的兜底恒等窗口（惰性创建）。
+static FALLBACK_TOP: AtomicU64 = AtomicU64::new(0);
+/// 已补登记的窗口次数（超过 [`MAX_WINDOW_HEALS`] 回退恒等）。
+static WINDOW_HEALS: AtomicU64 = AtomicU64::new(0);
 /// DMAR 里 DRHD 的个数（`0` = 无 IOMMU；`1` = 支持 per-domain 上下文；`>1` = 只回退用第一条）。
 static DRHD_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 每个 DRHD 的寄存器基址（多 DRHD 时的取证/记录来源，默认路径不读）。
@@ -428,17 +534,17 @@ fn enumerate_drhds() -> Vec<u64> {
 
 /// 打开 IOMMU 的 DMA 重映射（E1b）。
 ///
-/// `devices` 是 PCI 枚举结果 —— 每个功能点都会拿到一条 **translated + 恒等**的上下文项
-/// （IOVA == 物理地址），阶段一内核与既有驱动照旧按物理地址 DMA 即可。
+/// `devices` 是 PCI 枚举结果 —— 每个功能点都会拿到一条 **translated** 上下文项；默认窗口
+/// 开局为空，随后由 `device::grant*` 调 [`register_device_range`] 逐段补入该设备的 BAR /
+/// DMA 物理范围（IOVA == 物理地址），阶段一内核与既有驱动照旧按物理地址 DMA 即可。
 ///
 /// 返回是否真的把翻译打开（无 IOMMU / 表建不起来 / `GSTS` 未生效 → `false`）。
 pub fn init(devices: &[PciDevice]) -> bool {
     // SAFE 变体 = 真机首次 bring-up: **不打开** DMA 重映射。
     //
-    // 这里只建了 `[0, DEFAULT_WINDOW_LIMIT)` 的恒等窗口, 而真实固件的 DMAR 与 QEMU 差别很大
-    // (多 DRHD / RMRR / 显示引擎扫描输出也走 IOMMU)。一旦打开翻译, 任何一次落在窗口外的
-    // 固件设备 DMA 都会失败 —— 典型表现就是**画面瞬间全黑** (CPU 还活着)。
-    // 显示与存储路线都确认稳定后, 再用普通构建验证 E1b/E1c。
+    // 真实固件的 DMAR 与 QEMU 差别很大 (多 DRHD / RMRR / 显示引擎扫描输出也走 IOMMU)。
+    // 一旦打开翻译, 任何一次落在登记窗口外的固件设备 DMA 都会失败 —— 典型表现就是
+    // **画面瞬间全黑** (CPU 还活着)。显示与存储路线都确认稳定后, 再用普通构建验证 E1b/E1c。
     if crate::version::IS_SAFE {
         crate::video::println("[OK] VT-d: skipped in SAFE build (DMA remapping stays off)");
         return false;
@@ -515,30 +621,41 @@ pub fn init(devices: &[PciDevice]) -> bool {
     // 上下文项里的地址宽度是**索引**（0=30/1=39/2=48/3=57 位）。
     let aw_idx = agaw_index(aw);
 
-    // 1. 二级页表：**E1c 的受限窗口**（恒等，故 IOVA == 物理地址）。
-    //    其余设备用默认窗口（4 GiB，行为零变化）。
-    let Some(default_top) = build_window_slpt(aw, DEFAULT_WINDOW_LIMIT) else {
-        crate::video::println("[WARN] VT-d: cannot allocate second-level page tables");
+    // 1. 二级页表。
+    //
+    // **默认窗口开局为空**：只有 `device::grant*` 通过 [`register_device_range`] 登记过的
+    // BAR / DMA 物理范围才建叶项。这样被攻破的驱动无法 DMA 到未登记的内核页、页表或
+    // 他人用户页 —— 这是本步要修的安全属性。
+    let Some(default_top) = alloc_zeroed_page() else {
+        crate::video::println("[WARN] VT-d: cannot allocate default second-level page table");
         return false;
     };
     // 目标设备（NVMe）单列一张**更小的**窗口表：收窄它的 DMA 权限不会波及其它设备，
     // 也是 E2/E3 把飞地那台设备窗口继续收小的唯一落点。
     let target = crate::arch::pci::find_nvme(devices).map(|(b, d, f, _)| (b, d, f));
-    if let Some((b, d, f)) = target {
+    let target_top = if let Some((b, d, f)) = target {
         TARGET_SID.store(
             ((b as u64) << 8) | ((d as u64) << 3) | f as u64,
             Ordering::Relaxed,
         );
-    }
-    let target_top = if target.is_some() {
         let Some(top) = build_window_slpt(aw, TARGET_WINDOW_LIMIT) else {
             crate::video::println("[WARN] VT-d: cannot allocate target second-level page tables");
             return false;
         };
+        TARGET_TOP.store(top, Ordering::Release);
         Some(top)
     } else {
         None
     };
+    // 登记表从空开始；设备授权发生在 `init` 之后（`device::grant*` 会逐段补进来）。
+    DEVICE_WINDOWS.lock().clear();
+    {
+        let mut funcs = DEVICE_FUNCS.lock();
+        funcs.clear();
+        for d in devices {
+            funcs.push((d.bus, d.dev, d.func));
+        }
+    }
 
     // 2. 根表 + 每总线一张上下文表；每个功能点一条 translated + 窗口内恒等上下文项。
     let Some(root_pa) = alloc_zeroed_page() else {
@@ -608,9 +725,7 @@ pub fn init(devices: &[PciDevice]) -> bool {
     crate::video::print_u64(ctx_buses.len() as u64);
     crate::video::print(" translated=");
     crate::video::print_u64(translated);
-    crate::video::print(" (iova=[0,0x");
-    crate::video::print_hex(DEFAULT_WINDOW_LIMIT);
-    crate::video::print("), aw=");
+    crate::video::print(" (default=registered-only, aw=");
     crate::video::print_u64(aw);
     crate::video::print(") target=");
     match target {
@@ -669,6 +784,281 @@ fn fill_1g_ident(table_pa: u64, limit: u64) {
         write_entry(table_pa, i, slpt_identity_page(iova), 0);
         i += 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 设备授权范围登记（默认窗口由登记表构造）
+// ---------------------------------------------------------------------------
+
+/// 打印 `bus:dev.func`（只用于登记/告警行）。
+fn print_bdf(bus: u8, dev: u8, func: u8) {
+    crate::video::print_u64(bus as u64);
+    crate::video::print(":");
+    crate::video::print_u64(dev as u64);
+    crate::video::print(".");
+    crate::video::print_u64(func as u64);
+}
+
+/// `sid` 是否是 E1c 的目标设备（只有目标窗口确实建好时才算）。
+fn is_target_sid(sid: u64) -> bool {
+    sid == TARGET_SID.load(Ordering::Relaxed) && TARGET_TOP.load(Ordering::Acquire) != 0
+}
+
+/// 某功能点当前应使用的**默认窗口**顶层表。
+///
+/// 优先级：兜底恒等（最后手段） > E1c 目标窗口 > 该设备自己的登记窗口 > 共享空表（拒 DMA）。
+fn default_top_for(sid: u64) -> u64 {
+    let fallback = FALLBACK_TOP.load(Ordering::Acquire);
+    if fallback != 0 {
+        return fallback;
+    }
+    if is_target_sid(sid) {
+        return TARGET_TOP.load(Ordering::Acquire);
+    }
+    device_window_top(sid).unwrap_or_else(|| DEFAULT_TOP.load(Ordering::Acquire))
+}
+
+/// 该 SID 的独有窗口顶层表（不存在 = 尚未授权 / 未登记）。
+fn device_window_top(sid: u64) -> Option<u64> {
+    DEVICE_WINDOWS
+        .lock()
+        .iter()
+        .find(|w| w.sid as u64 == sid)
+        .map(|w| w.top_pa)
+}
+
+/// 读 `iova` 处的 4 KiB 叶项物理地址（不存在 / 被大页占据返回 `None`）。
+fn slpt_leaf_4k_pa(table_pa: u64, aw: u64, iova: u64) -> Option<u64> {
+    let levels = slpt_levels(aw);
+    let mut table = table_pa;
+    let mut level = 0;
+    while level + 1 < levels {
+        let e = read_entry_lo(table, slpt_index(iova, aw, level));
+        if e & 1 == 0 || e & SLPT_PS != 0 {
+            return None;
+        }
+        table = e & PAGE_MASK;
+        level += 1;
+    }
+    let e = read_entry_lo(table, slpt_index(iova, aw, level));
+    if e & 1 == 0 || e & SLPT_PS != 0 {
+        None
+    } else {
+        Some(e & PAGE_MASK)
+    }
+}
+
+/// 把 `iova` 处恒等映射到 `iova`（已映射到同一物理页则视为幂等成功）。
+fn map_identity_page(top_pa: u64, aw: u64, iova: u64) -> bool {
+    if slpt_map_4k(top_pa, aw, iova, iova) {
+        return true;
+    }
+    slpt_leaf_4k_pa(top_pa, aw, iova) == Some(iova)
+}
+
+/// 把一段页对齐范围逐页恒等映射进 `top_pa`。
+fn map_range_into(top_pa: u64, aw: u64, range: PhysRange) -> bool {
+    if !range_within_agaw(range, aw) {
+        return false;
+    }
+    let mut pa = range.base;
+    while pa < range.end() {
+        if !map_identity_page(top_pa, aw, pa) {
+            return false;
+        }
+        pa += TABLE_BYTES;
+    }
+    true
+}
+
+/// 登记一台设备实际会 DMA 的物理范围（BAR / DMA 块），该设备的**独有窗口**按此构造。
+///
+/// - 范围先做 4 KiB 页对齐；同一设备的重复/相邻范围自动合并；
+/// - 首次登记时新建该设备的二级页表并把上下文切过去（授权发生在驱动启动前，无 IOTLB 语义问题）；
+/// - **目标设备（NVMe）**保持 E1c 的 `[0, 3 GiB)` 窗口不变（不改表 —— 它的 BAR0 恰好落在
+///   3 GiB 边界，补进去会破坏 `block_srv` 越界探针的语义）；
+/// - 映射失败**不会**让驱动永久无法 DMA：打印告警并回退恒等窗口；
+/// - 无 IOMMU / SAFE 构建下 `aw == 0`，直接返回 `false`，行为与之前完全一致。
+pub fn register_device_range(
+    bus: u8,
+    dev: u8,
+    func: u8,
+    paddr: u64,
+    bytes: u64,
+    is_dma: bool,
+) -> bool {
+    let aw = ENABLED_AW.load(Ordering::Acquire);
+    if aw == 0 {
+        return false;
+    }
+    let Some(range) = align_range(paddr, bytes) else {
+        return false;
+    };
+    let sid = ((bus as u64) << 8) | ((dev as u64) << 3) | func as u64;
+
+    if is_target_sid(sid) {
+        // E1c 目标窗口保持不变；合法 DMA 块本就在 [0, 3 GiB) 内，无需改表。
+        return true;
+    }
+
+    let (Some(root), Some(base)) = (
+        nonzero(ROOT_PA.load(Ordering::Acquire)),
+        nonzero(IOMMU_BASE.load(Ordering::Acquire)),
+    ) else {
+        return false;
+    };
+
+    let Some((top, created)) = device_window_add(sid, range) else {
+        crate::video::print("[WARN] VT-d: cannot allocate window for ");
+        print_bdf(bus, dev, func);
+        crate::video::println("; falling back to identity");
+        let _ = fallback_to_identity("device window allocation failed");
+        return false;
+    };
+    if created {
+        let Some(ctx_pa) = context_table_for_bus(root, bus) else {
+            crate::video::print("[WARN] VT-d: cannot attach window for ");
+            print_bdf(bus, dev, func);
+            crate::video::println("; falling back to identity");
+            let _ = fallback_to_identity("device window attach failed");
+            return false;
+        };
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(aw), top);
+        write_entry(ctx_pa, devfn(dev, func), lo, hi);
+        if !flush_context_cache(base) {
+            crate::video::println(
+                "[WARN] VT-d: context-cache flush failed after window attach; falling back",
+            );
+            let _ = fallback_to_identity("context-cache flush failed");
+            return false;
+        }
+    }
+
+    if !range_within_agaw(range, aw) {
+        // 高于 AGAW 的 BAR（如 virtio-net BAR4 = 0xC000000000）只被 CPU 访问、不是 DMA 落点；
+        // 跳过映射，但告警保留线索。DMA 块越界则属于严重配置错误。
+        if is_dma {
+            crate::video::print("[WARN] VT-d: ");
+            print_bdf(bus, dev, func);
+            crate::video::print(" dma range 0x");
+            crate::video::print_hex(range.base);
+            crate::video::println(" exceeds the AGAW window, not mapped");
+        }
+        return false;
+    }
+
+    if !map_range_into(top, aw, range) {
+        crate::video::print("[WARN] VT-d: cannot map ");
+        print_bdf(bus, dev, func);
+        crate::video::print(if is_dma { " dma range 0x" } else { " bar range 0x" });
+        crate::video::print_hex(range.base);
+        crate::video::println("; falling back to identity");
+        let _ = fallback_to_identity("device window map failed");
+        return false;
+    }
+    let _ = flush_iotlb_global(base);
+    crate::video::print("[OK] VT-d: grant ");
+    print_bdf(bus, dev, func);
+    crate::video::print(if is_dma { " dma [0x" } else { " bar [0x" });
+    crate::video::print_hex(range.base);
+    crate::video::print(",0x");
+    crate::video::print_hex(range.end());
+    crate::video::println(") mapped");
+    true
+}
+
+/// 把 `range` 记到 `sid` 的登记表；窗口不存在时新建一张。返回 `(top_pa, created)`。
+fn device_window_add(sid: u64, range: PhysRange) -> Option<(u64, bool)> {
+    let mut wins = DEVICE_WINDOWS.lock();
+    if let Some(w) = wins.iter_mut().find(|w| w.sid as u64 == sid) {
+        let mut all = w.ranges.clone();
+        all.push(range);
+        w.ranges = merge_ranges(&all);
+        return Some((w.top_pa, false));
+    }
+    let top = alloc_zeroed_page()?;
+    wins.push(DeviceWindow {
+        sid: sid as u32,
+        top_pa: top,
+        ranges: vec![range],
+    });
+    Some((top, true))
+}
+
+fn nonzero(v: u64) -> Option<u64> {
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// 把**全部**已枚举功能点切到恒等 `[0, 4 GiB)` 窗口（最后手段）。
+///
+/// 只在登记表构造失败或补登记次数超限时调用 —— 安全属性退化，但现有驱动绝不失去 DMA。
+fn fallback_to_identity(reason: &str) -> bool {
+    let aw = ENABLED_AW.load(Ordering::Acquire);
+    let base = IOMMU_BASE.load(Ordering::Acquire);
+    let root = ROOT_PA.load(Ordering::Acquire);
+    if aw < 39 || base == 0 || root == 0 {
+        return false;
+    }
+    if FALLBACK_TOP.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    let Some(top) = build_window_slpt(aw, DEFAULT_WINDOW_LIMIT) else {
+        crate::video::println("[WARN] VT-d: cannot allocate identity fallback page tables");
+        return false;
+    };
+    FALLBACK_TOP.store(top, Ordering::Release);
+    let funcs: Vec<(u8, u8, u8)> = DEVICE_FUNCS.lock().clone();
+    for (bus, dev, func) in funcs {
+        let Some(ctx_pa) = context_table_for_bus(root, bus) else {
+            continue;
+        };
+        let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(aw), top);
+        write_entry(ctx_pa, devfn(dev, func), lo, hi);
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let _ = flush_context_cache(base);
+    let _ = flush_iotlb_global(base);
+    crate::video::print("[WARN] VT-d: ");
+    crate::video::print(reason);
+    crate::video::println("; all devices fall back to identity [0,4GiB)");
+    true
+}
+
+/// 给 `sid` 的**独有窗口**补登记一段落在窗口外的 DMA（64 KiB 对齐），并失效 IOTLB。
+fn heal_window_range(sid: u64, iova: u64) -> bool {
+    let aw = ENABLED_AW.load(Ordering::Acquire);
+    let base = IOMMU_BASE.load(Ordering::Acquire);
+    if aw == 0 {
+        return false;
+    }
+    let Some(range) = heal_range(iova) else {
+        return false;
+    };
+    if !range_within_agaw(range, aw) {
+        return false;
+    }
+    let top = {
+        let mut wins = DEVICE_WINDOWS.lock();
+        let Some(w) = wins.iter_mut().find(|w| w.sid as u64 == sid) else {
+            return false;
+        };
+        let mut all = w.ranges.clone();
+        all.push(range);
+        w.ranges = merge_ranges(&all);
+        w.top_pa
+    };
+    if !map_range_into(top, aw, range) {
+        return false;
+    }
+    if base != 0 {
+        let _ = flush_iotlb_global(base);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +1181,20 @@ fn flush_context_cache(base: u64) -> bool {
     let mut spins = 0u32;
     // SAFETY: 寄存器块已确认在恒等映射内。
     while unsafe { rd32(base, REG_GSTS) } & GSTS_CFIS != 0 {
+        spins += 1;
+        if spins > 1_000_000 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 请求**全局 IOTLB 失效**并轮询 `GSTS.IVT` 清零（超时返回 `false`）。
+fn flush_iotlb_global(base: u64) -> bool {
+    set_gcmd(base, GCMD_IVA);
+    let mut spins = 0u32;
+    // SAFETY: 寄存器块已确认在恒等映射内。
+    while unsafe { rd32(base, REG_GSTS) } & GSTS_IVT != 0 {
         spins += 1;
         if spins > 1_000_000 {
             return false;
@@ -1094,7 +1498,8 @@ impl IovaWindow {
     pub fn attach_device(&self, bus: u8, dev: u8, func: u8) -> bool {
         let root = ROOT_PA.load(Ordering::Acquire);
         let base = IOMMU_BASE.load(Ordering::Acquire);
-        let default_top = DEFAULT_TOP.load(Ordering::Acquire);
+        let sid = ((bus as u64) << 8) | ((dev as u64) << 3) | func as u64;
+        let default_top = default_top_for(sid);
         if root == 0 || base == 0 || default_top == 0 {
             crate::video::println(
                 "[WARN] VT-d: IOMMU context not ready, device keeps identity mapping",
@@ -1133,12 +1538,15 @@ impl IovaWindow {
     }
 }
 
-/// 把某功能点恢复成**默认恒等窗口**（per-domain 绑定失败 / 未来释放窗口时用）。
+/// 把某功能点恢复成**默认窗口**（per-domain 绑定失败 / 未来释放窗口时用）。
+///
+/// 目标设备恢复到 E1c 窗口，其余设备恢复到**登记表构造的默认窗口**（不是恒等 4 GiB）。
 pub fn detach_device(bus: u8, dev: u8, func: u8) -> bool {
     let root = ROOT_PA.load(Ordering::Acquire);
     let base = IOMMU_BASE.load(Ordering::Acquire);
     let aw = ENABLED_AW.load(Ordering::Acquire);
-    let default_top = DEFAULT_TOP.load(Ordering::Acquire);
+    let sid = ((bus as u64) << 8) | ((dev as u64) << 3) | func as u64;
+    let default_top = default_top_for(sid);
     if root == 0 || base == 0 || aw == 0 || default_top == 0 {
         return false;
     }
@@ -1148,7 +1556,11 @@ pub fn detach_device(bus: u8, dev: u8, func: u8) -> bool {
     let (lo, hi) = context_entry(CTX_TT_TRANSLATED, agaw_index(aw), default_top);
     core::sync::atomic::fence(Ordering::SeqCst);
     write_entry(ctx_pa, devfn(dev, func), lo, hi);
-    flush_context_cache(base)
+    let flushed = flush_context_cache(base);
+    if flushed {
+        let _ = flush_iotlb_global(base);
+    }
+    flushed
 }
 
 /// `GCMD` 置位（读-改-写）。
@@ -1215,30 +1627,63 @@ pub fn poll_faults() {
     let sig = ((info as u64) << 32) | (iova & 0xFFFF_FFFF);
     if sig != LAST_FAULT_SIG.load(Ordering::Relaxed) {
         LAST_FAULT_SIG.store(sig, Ordering::Relaxed);
-        crate::video::print("[OK] VT-d: DMA refused target-sid=0x");
-        crate::video::print_hex(TARGET_SID.load(Ordering::Relaxed));
-        crate::video::print(" fsts=0x");
-        crate::video::print_hex(fsts as u64);
-        crate::video::print(" fectl=0x");
-        crate::video::print_hex(fectl as u64);
-        crate::video::print(" frcd[");
-        crate::video::print_u64(idx);
-        crate::video::print("]=0x");
-        crate::video::print_hex(info as u64);
-        if fault_record_valid(info) {
-            crate::video::print(" frcd-sid=0x");
-            crate::video::print_hex(fault_sid(info) as u64);
-            crate::video::print(" reason=0x");
-            crate::video::print_hex(fault_reason(info) as u64);
+        let valid = fault_record_valid(info);
+        let sid = fault_sid(info) as u64;
+        let granted = device_window_top(sid).is_some();
+
+        if valid && !is_target_sid(sid) && granted {
+            // **失败安全**：登记遗漏的合法设备 DMA 不能失败 —— 先打明确告警，再把这个
+            // 64 KiB 范围补进**该设备自己的**窗口。补登记次数超限时回退恒等（见下）。
+            crate::video::print("[WARN] VT-d: DMA outside granted window sid=0x");
+            crate::video::print_hex(sid);
             crate::video::print(" iova=0x");
             crate::video::print_hex(iova);
+            crate::video::println(" (grant omission), extending device window");
+            if heal_window_range(sid, iova) {
+                let heals = WINDOW_HEALS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::video::print("[OK] VT-d: device window extended for 0x");
+                crate::video::print_hex(iova);
+                crate::video::print(" heals=");
+                crate::video::print_u64(heals);
+                crate::video::println("");
+                if heals >= MAX_WINDOW_HEALS {
+                    let _ = fallback_to_identity("window healing limit reached");
+                }
+            } else {
+                let heals = WINDOW_HEALS.fetch_add(1, Ordering::Relaxed) + 1;
+                crate::video::println(
+                    "[WARN] VT-d: cannot extend device window; device DMA may fail",
+                );
+                if heals >= MAX_WINDOW_HEALS {
+                    let _ = fallback_to_identity("window healing failed repeatedly");
+                }
+            }
         } else {
-            // QEMU 只在故障中断**可投递**时才写 FRCD；我们没给 IOMMU 设备开 MSI，故这里为 0。
-            // 设备与地址的证据在 QEMU 自己的 stderr 行里
-            // (`vtd_iommu_translate: detected translation failure (dev=0:2:0, iova=0x...)`)。
-            crate::video::print(" (FRCD 未写: 故障中断未投递)");
+            crate::video::print("[OK] VT-d: DMA refused target-sid=0x");
+            crate::video::print_hex(TARGET_SID.load(Ordering::Relaxed));
+            crate::video::print(" fsts=0x");
+            crate::video::print_hex(fsts as u64);
+            crate::video::print(" fectl=0x");
+            crate::video::print_hex(fectl as u64);
+            crate::video::print(" frcd[");
+            crate::video::print_u64(idx);
+            crate::video::print("]=0x");
+            crate::video::print_hex(info as u64);
+            if valid {
+                crate::video::print(" frcd-sid=0x");
+                crate::video::print_hex(fault_sid(info) as u64);
+                crate::video::print(" reason=0x");
+                crate::video::print_hex(fault_reason(info) as u64);
+                crate::video::print(" iova=0x");
+                crate::video::print_hex(iova);
+            } else {
+                // QEMU 只在故障中断**可投递**时才写 FRCD；我们没给 IOMMU 设备开 MSI，故这里为 0。
+                // 设备与地址的证据在 QEMU 自己的 stderr 行里
+                // (`vtd_iommu_translate: detected translation failure (dev=0:2:0, iova=0x...)`)。
+                crate::video::print(" (FRCD 未写: 故障中断未投递)");
+            }
+            crate::video::println("");
         }
-        crate::video::println("");
         FAULT_REPORTS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1447,6 +1892,80 @@ mod tests {
         assert!(!gappy.free(0, 4));
         assert!(gappy.free(0, 2));
         assert_eq!(gappy.alloc(4), Some(0));
+    }
+
+    /// 登记范围：页对齐（向下对齐起点、向上对齐终点）/ 零长度 / 溢出拒绝。
+    #[test]
+    fn grant_range_alignment_and_rejection() {
+        // 未对齐的起点与长度都被扩到整页。
+        let r = align_range(0x1234, 0x2001).unwrap();
+        assert_eq!(r.base, 0x1000);
+        assert_eq!(r.len, 0x3000);
+        assert_eq!(r.end(), 0x4000);
+
+        // 已对齐的输入不平白多给字节。
+        let r = align_range(0x2000, 0x1000).unwrap();
+        assert_eq!((r.base, r.len), (0x2000, 0x1000));
+
+        // 长度 0 / 加法溢出 -> 拒绝。
+        assert!(align_range(0x2000, 0).is_none());
+        assert!(align_range(u64::MAX & !0xFFF, 0x2000).is_none());
+        assert!(align_range(u64::MAX, 1).is_none());
+
+        // 失败补登记按 64 KiB 向下对齐，且长度固定。
+        let h = heal_range(0x1_0000 + 0x2345).unwrap();
+        assert_eq!(h.base, 0x1_0000);
+        assert_eq!(h.len, HEAL_BYTES);
+    }
+
+    /// 登记表合并：重叠、相邻、包含、重复都合成一条；不相交的保持排序。
+    #[test]
+    fn grant_ranges_merge_and_sort() {
+        let r = |base, len| PhysRange { base, len };
+        // 乱序 + 相邻：1000..2000 与 2000..3000 合成 1000..3000。
+        assert_eq!(
+            merge_ranges(&[r(0x2000, 0x1000), r(0x1000, 0x1000)]),
+            vec![r(0x1000, 0x2000)]
+        );
+        // 重叠：取并集而不是简单相加。
+        assert_eq!(
+            merge_ranges(&[r(0x1000, 0x3000), r(0x2000, 0x3000)]),
+            vec![r(0x1000, 0x4000)]
+        );
+        // 包含 / 重复。
+        assert_eq!(
+            merge_ranges(&[r(0x1000, 0x3000), r(0x1800, 0x1000), r(0x1000, 0x3000)]),
+            vec![r(0x1000, 0x3000)]
+        );
+        // 不相交：保持升序，中间的空洞不合并。
+        assert_eq!(
+            merge_ranges(&[r(0x5000, 0x1000), r(0x1000, 0x1000)]),
+            vec![r(0x1000, 0x1000), r(0x5000, 0x1000)]
+        );
+        // 空范围被忽略。
+        assert!(merge_ranges(&[r(0x1000, 0)]).is_empty());
+        assert!(merge_ranges(&[]).is_empty());
+    }
+
+    /// 越界拒绝：范围必须完整落在 AGAW 可表示地址内（跨边界也不放行）。
+    #[test]
+    fn grant_ranges_reject_out_of_bounds() {
+        let aw = 39u64;
+        let top = 1u64 << aw;
+        let r = |base, len| PhysRange { base, len };
+
+        assert!(range_within_agaw(r(0, 0x1000), aw));
+        assert!(range_within_agaw(r(top - 0x1000, 0x1000), aw));
+        // 终点越过 1<<39 一页即拒。
+        assert!(!range_within_agaw(r(top - 0x1000, 0x2000), aw));
+        assert!(!range_within_agaw(r(top, 0x1000), aw));
+        // 高于 4 GiB 的 BAR（如 virtio-net BAR4 = 0xC000000000）在 39 位下不可表示。
+        assert!(!range_within_agaw(r(0xC000_000000, 0x4000), aw));
+
+        // 30 位窗口同样拒绝跨边界范围。
+        let aw30 = 30u64;
+        assert!(range_within_agaw(r((1 << 30) - 0x1000, 0x1000), aw30));
+        assert!(!range_within_agaw(r((1 << 30) - 0x1000, 0x2000), aw30));
     }
 
     /// 每域 IOVA 分配器：连续、不重叠、可回收；耗尽与非法长度返回 `None`。

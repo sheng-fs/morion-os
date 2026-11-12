@@ -189,6 +189,26 @@ fn grant_at(
         None => return false,
     };
 
+    // 2b. 把该设备**真正会 DMA** 的物理范围登记给 IOMMU：默认窗口只按登记表建叶项，
+    //     未登记的内核页 / 页表 / 他人用户页不建映射，越界 DMA 被硬件拒绝。
+    //     无 IOMMU（或 SAFE 构建）时 `register_device_range` 直接返回 false，行为不变。
+    crate::arch::iommu::register_device_range(
+        req.bus,
+        req.dev,
+        req.func,
+        bar_paddr,
+        req.bar_pages * PAGE,
+        false,
+    );
+    crate::arch::iommu::register_device_range(
+        req.bus,
+        req.dev,
+        req.func,
+        dma_paddr,
+        dma_pages * PAGE,
+        true,
+    );
+
     // 3. 写描述结构到描述页 (恒等映射, 直接以物理地址作为指针写)。
     let desc = DeviceGrant {
         magic: DEVICE_GRANT_MAGIC,

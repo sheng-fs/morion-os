@@ -15,6 +15,7 @@
 #[cfg(target_os = "none")]
 use linked_list_allocator::LockedHeap;
 use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
@@ -335,61 +336,203 @@ fn flags_for(perm: UserPagePerm) -> PageTableFlags {
     }
 }
 
+/// 用户页映射的失败原因。映射路径**绝不 panic** —— 这些错误由调用方 (syscall 层)
+/// 转换成错误码, 或者在内核内部作为"这一页没映射上"处理。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapError {
+    /// 目标虚拟地址**已有映射** (重复映射)。不静默覆盖: 覆盖会让两个虚拟地址背后的
+    /// 引用计数失真, 且旧帧再没人回收。
+    AlreadyMapped,
+    /// 上级页表项是 2 MiB / 1 GiB 大页, 不能再往下建 4 KiB 映射。
+    ParentHugePage,
+    /// 页表帧分配失败 (内存耗尽)。
+    OutOfMemory,
+}
+
+/// 本次映射调用**新建**的中间页表清单 (父表物理地址 + 表项下标)。
+///
+/// 建到一半失败时按逆序摘除并归还: 否则每次失败的映射都白丢 1..3 个页表帧
+/// (用户态可以反复触发, 是一条缓慢的物理内存耗尽路径)。
+struct CreatedTables {
+    slots: [Option<(u64, usize)>; 3],
+    len: usize,
+}
+
+impl CreatedTables {
+    fn new() -> Self {
+        Self {
+            slots: [None; 3],
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, parent_phys: u64, index: usize) {
+        if self.len < self.slots.len() {
+            self.slots[self.len] = Some((parent_phys, index));
+            self.len += 1;
+        }
+    }
+
+    /// 撤销本次调用新建的全部中间页表 (逆序: 先摘父表项, 再归还那帧)。
+    fn rollback(self) {
+        for i in (0..self.len).rev() {
+            let Some((parent_phys, index)) = self.slots[i] else {
+                continue;
+            };
+            let parent = unsafe { &mut *((PHYS_OFFSET + parent_phys) as *mut PageTable) };
+            let child = parent[index].addr().as_u64();
+            parent[index].set_unused();
+            frame_allocator::free_frame(child);
+        }
+    }
+}
+
+/// 在已定位到叶页表的表项上建立映射: 已占用时返回 [`MapError::AlreadyMapped`],
+/// 而不是像 `Mapper::map_to` 那样把"已映射"当异常路径处理。
+///
+/// 抽成纯函数 (只碰一条表项) 以便宿主单测覆盖重复映射。
+fn install_leaf(
+    entry: &mut PageTableEntry,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    if !entry.is_unused() {
+        return Err(MapError::AlreadyMapped);
+    }
+    entry.set_frame(frame, flags);
+    Ok(())
+}
+
+/// 读取一条**非空**中间页表项指向的下一级页表物理地址; 大页项拒绝继续下钻。
+fn child_table_addr(entry: &PageTableEntry) -> Result<u64, MapError> {
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Err(MapError::ParentHugePage);
+    }
+    Ok(entry.addr().as_u64())
+}
+
+/// 确保 `vaddr` 的 PDPT / PD / PT 存在, 返回**叶页表**的物理地址。
+///
+/// 新建的中间表记进 `CreatedTables`, 由调用方在后续失败时回收。
+fn ensure_tables(
+    pml4_phys: u64,
+    vaddr: u64,
+    parent_flags: PageTableFlags,
+) -> Result<(u64, CreatedTables), MapError> {
+    let indices = [
+        ((vaddr >> 39) & 0x1FF) as usize,
+        ((vaddr >> 30) & 0x1FF) as usize,
+        ((vaddr >> 21) & 0x1FF) as usize,
+    ];
+    let mut created = CreatedTables::new();
+    let mut table_phys = pml4_phys;
+    for &index in &indices {
+        let table = unsafe { &mut *((PHYS_OFFSET + table_phys) as *mut PageTable) };
+        if table[index].is_unused() {
+            let Some(next_phys) = frame_allocator::allocate_frame() else {
+                created.rollback();
+                return Err(MapError::OutOfMemory);
+            };
+            // 新页表帧必须整页清零, 否则残留数据会被当成有效表项。
+            unsafe {
+                core::ptr::write_bytes((PHYS_OFFSET + next_phys) as *mut u8, 0, 4096);
+            }
+            table[index].set_addr(PhysAddr::new(next_phys), parent_flags);
+            created.record(table_phys, index);
+            table_phys = next_phys;
+        } else {
+            match child_table_addr(&table[index]) {
+                Ok(next_phys) => {
+                    // 与 `Mapper::map_to` 的行为保持一致: 已存在的中间表项要把本次的
+                    // 父表标志**并进去**。同一 PDPT/PD 下既有 RX 段又有 RW 段, 少了
+                    // WRITABLE 会让用户态的写变成 #PF (err=7, present 但只读)。
+                    let entry = &mut table[index];
+                    if !entry.flags().contains(parent_flags) {
+                        entry.set_flags(entry.flags() | parent_flags);
+                    }
+                    table_phys = next_phys;
+                }
+                Err(e) => {
+                    created.rollback();
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok((table_phys, created))
+}
+
+/// 映射的实现: 先补齐中间页表, 再以"已映射即错误"的方式装叶项。
+fn map_page_with_flags(
+    domain_id: u64,
+    vaddr: u64,
+    paddr: u64,
+    flags: PageTableFlags,
+) -> Result<(), MapError> {
+    let pml4_phys = crate::domain::pml4_of(domain_id);
+    // 与 x86_64 crate `Mapper::map_to` 的口径一致: 中间表项须带同样的 PRESENT /
+    // WRITABLE / USER_ACCESSIBLE 位, 否则用户态走不到叶页。
+    let parent_flags = flags
+        & (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE);
+
+    let (pt_phys, created) = ensure_tables(pml4_phys, vaddr, parent_flags)?;
+    let pt = unsafe { &mut *((PHYS_OFFSET + pt_phys) as *mut PageTable) };
+    let index = ((vaddr >> 12) & 0x1FF) as usize;
+    let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
+
+    match install_leaf(&mut pt[index], frame, flags) {
+        Ok(()) => {
+            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+            // 这些中间表已被页表层级引用, 不再是"半成品", 不能回收。
+            Ok(())
+        }
+        Err(e) => {
+            created.rollback();
+            Err(e)
+        }
+    }
+}
+
 /// 在指定域的页表中, 把用户虚拟地址 `vaddr` 映射到物理帧 `paddr` (USER 权限, 按 `perm`)。
 ///
 /// 用户空间使用独立的 PML4 条目 (P4[1], 基址见 `USER_SPACE_BASE`), 不干扰内核的
 /// 恒等/offset 映射。中间页表 (PDPT/PD/PT) 缺失时自动分配并清零。
-pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64, perm: UserPagePerm) {
-    let pml4 = crate::domain::pml4_of(domain_id);
-    // 通过 offset 映射访问目标域的 PML4。
-    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
-    let mut mapper = unsafe { OffsetPageTable::new(&mut *pml4_virt, VirtAddr::new(PHYS_OFFSET)) };
-
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-    let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
-    let flags = flags_for(perm);
-
-    let mut allocator = KernelFrameAllocator;
-    unsafe {
-        let result = mapper.map_to(page, frame, flags, &mut allocator);
-        if let Err(ref e) = result {
-            let p4 = ((vaddr >> 39) & 0x1FF) as usize;
-            let p3 = ((vaddr >> 30) & 0x1FF) as usize;
-            let p2 = ((vaddr >> 21) & 0x1FF) as usize;
-            let p1 = ((vaddr >> 12) & 0x1FF) as usize;
-            panic!(
-                "map_user_page: map failed {:?} dom={} vaddr=0x{:x} paddr=0x{:x} p4/p3/p2/p1={}/{}/{}/{}",
-                e, domain_id, vaddr, paddr, p4, p3, p2, p1
-            );
-        }
-        result.unwrap().flush();
-    }
+///
+/// **不 panic**: 已映射 / 大页父项 / 内存耗尽都返回错误; syscall 路径用这个入口。
+pub fn try_map_user_page(
+    domain_id: u64,
+    vaddr: u64,
+    paddr: u64,
+    perm: UserPagePerm,
+) -> Result<(), MapError> {
+    map_page_with_flags(domain_id, vaddr, paddr, flags_for(perm))
 }
 
 /// 把物理 MMIO 区域 `paddr` (页对齐) 映射到指定域的 `vaddr` (USER + 非缓存)。
 ///
-/// 与 `map_user_page` 的区别在于额外置 `NO_CACHE` (PCD), 避免 CPU 缓存
-/// 设备寄存器读写。用于 NVMe 等 MMIO 设备 BAR 的映射。
-pub fn map_mmio(domain_id: u64, vaddr: u64, paddr: u64) {
-    let pml4 = crate::domain::pml4_of(domain_id);
-    let pml4_virt = (PHYS_OFFSET + pml4) as *mut PageTable;
-    let mut mapper = unsafe { OffsetPageTable::new(&mut *pml4_virt, VirtAddr::new(PHYS_OFFSET)) };
-
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-    let frame = PhysFrame::containing_address(PhysAddr::new(paddr));
+/// 与 `try_map_user_page` 的区别在于额外置 `NO_CACHE` (PCD), 避免 CPU 缓存
+/// 设备寄存器读写。用于 NVMe 等 MMIO 设备 BAR 的映射。同样**不 panic**。
+pub fn try_map_mmio(domain_id: u64, vaddr: u64, paddr: u64) -> Result<(), MapError> {
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_CACHE
         | PageTableFlags::NO_EXECUTE;
+    map_page_with_flags(domain_id, vaddr, paddr, flags)
+}
 
-    let mut allocator = KernelFrameAllocator;
-    unsafe {
-        mapper
-            .map_to(page, frame, flags, &mut allocator)
-            .expect("map_mmio: map failed")
-            .flush();
-    }
+/// 内核内部 (ELF 加载 / 设备授权 / 网络缓冲) 的映射入口: 失败即"这页没映射上"。
+///
+/// 这些调用点的地址与目标帧都由内核自己决定, 重复映射意味着加载器状态错乱;
+/// 但**仍然不能 panic** (内核停机由用户态可控), 故失败静默丢弃 —— 后续访问会
+/// 以缺页的形式暴露出来。syscall 路径一律走 [`try_map_user_page`]。
+pub fn map_user_page(domain_id: u64, vaddr: u64, paddr: u64, perm: UserPagePerm) {
+    let _ = try_map_user_page(domain_id, vaddr, paddr, perm);
+}
+
+/// 同 [`map_user_page`], 用于 MMIO 映射。
+pub fn map_mmio(domain_id: u64, vaddr: u64, paddr: u64) {
+    let _ = try_map_mmio(domain_id, vaddr, paddr);
 }
 
 /// 遍历指定域的 4 级页表, 把用户虚拟地址 `vaddr` 反查为物理地址。
@@ -510,10 +653,12 @@ pub fn free_user_space(pml4_phys: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        flags_for, is_identity_mapped, is_user_address, UserPagePerm, USER_SPACE_BASE,
-        USER_STACK_BOTTOM, USER_STACK_GUARD_PAGE, USER_STACK_PAGES, USER_STACK_TOP,
+        child_table_addr, flags_for, install_leaf, is_identity_mapped, is_user_address, MapError,
+        UserPagePerm, USER_SPACE_BASE, USER_STACK_BOTTOM, USER_STACK_GUARD_PAGE, USER_STACK_PAGES,
+        USER_STACK_TOP,
     };
-    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
+    use x86_64::PhysAddr;
 
     /// 引导模块可达性判定 (E3b): 恒等映射覆盖帧分配器可管理的全部物理内存 (32 GiB),
     /// 且地址加法回绕要判否。
@@ -595,5 +740,49 @@ mod tests {
         // 守护页与整个栈都在用户空间 (否则校验/映射路径的地址口径就不一致了)。
         assert!(is_user_address(USER_STACK_GUARD_PAGE));
         assert!(is_user_address(USER_STACK_TOP - 1));
+    }
+
+    /// P0 回归: 同一虚拟地址重复映射必须返回 `Err(AlreadyMapped)`, **绝不 panic**,
+    /// 也不能静默覆盖掉原映射 (覆盖会让物理帧引用计数失真)。
+    #[test]
+    fn duplicate_mapping_is_an_error_not_a_panic() {
+        let mut pt = PageTable::new();
+        let flags = flags_for(UserPagePerm::ReadWrite);
+        let first = PhysFrame::containing_address(PhysAddr::new(0x10_0000));
+
+        assert_eq!(install_leaf(&mut pt[0], first, flags), Ok(()));
+        assert_eq!(
+            install_leaf(&mut pt[0], first, flags),
+            Err(MapError::AlreadyMapped),
+            "重复映射必须返回错误"
+        );
+        // 每次用不同的物理帧重复映射, 结果同样是错误, 且原映射保持不变。
+        let second = PhysFrame::containing_address(PhysAddr::new(0x20_0000));
+        assert_eq!(install_leaf(&mut pt[0], second, flags), Err(MapError::AlreadyMapped));
+        assert_eq!(pt[0].addr().as_u64(), 0x10_0000, "原映射不得被覆盖");
+
+        // 不同槽位仍可正常映射。
+        assert_eq!(install_leaf(&mut pt[1], second, flags), Ok(()));
+        assert_eq!(pt[1].addr().as_u64(), 0x20_0000);
+    }
+
+    /// 上级是大页时不能再下钻建 4 KiB 映射 —— 返回错误而不是 `ParentEntryHugePage` panic。
+    #[test]
+    fn huge_parent_entry_is_rejected() {
+        let mut table = PageTable::new();
+        let huge = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE;
+        table[3].set_addr(PhysAddr::new(0x40_0000), huge);
+        assert_eq!(
+            child_table_addr(&table[3]),
+            Err(MapError::ParentHugePage)
+        );
+
+        // 普通表项正常返回下一级表地址。
+        let mut table = PageTable::new();
+        table[4].set_addr(
+            PhysAddr::new(0x30_0000),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        assert_eq!(child_table_addr(&table[4]), Ok(0x30_0000));
     }
 }

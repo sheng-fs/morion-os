@@ -251,6 +251,25 @@ const UNAME_MAX: u64 = 96;
 /// `SYS_PCI_INFO` 回写的一条记录长度 (3 个 u64)。
 const PCI_REC_BYTES: u64 = 3 * 8;
 
+/// 映射类系统调用 (`SYS_ALLOC_PAGE` / `SYS_MAP_ANON` / `SYS_SHARE_PAGE` /
+/// `SYS_MAP_MMIO`) 的**重复映射**错误码: 目标虚拟地址已有映射。
+///
+/// 旧实现会在 `Mapper::map_to` 的 `PageAlreadyMapped` 上 panic —— 任意用户域
+/// 对同一地址调两次即可整机停机。现在映射入口返回 `Result`, 这里只把"已映射"
+/// 单列成错误码 (其余失败仍返回 `0`, 与旧 ABI 一致)。
+const MAP_ERR_ALREADY_MAPPED: u64 = u64::MAX - 3;
+
+/// 键盘输入注入的合法来源: 键盘域固有域号 (`kbd_srv` = 4)。
+const KBD_DOMAIN: u64 = 4;
+/// xHCI 驱动域：USB HID 键盘的解码结果也经 `SYS_KEY_PUSH` 注入键队列。
+/// 它不持 `Irq(1)`（xHCI 全轮询），故必须与 kbd 一起列为合法输入源，
+/// 否则外接 USB 键盘会静默失效。
+const XHCI_DOMAIN: u64 = 19;
+
+/// 键盘中断号 (`kbd_srv` 注册 IRQ1): 持有 `Capability::Irq(1)` 即"显式持有"
+/// 键盘输入能力 —— 用**现有**能力模型表达, 不新增能力种类。
+const KBD_IRQ: u8 = 1;
+
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
 static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
@@ -383,6 +402,35 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
         page += 4096;
     }
     true
+}
+
+/// 映射结果 → syscall 返回值。重复映射单列错误码, 其余失败沿用旧的 `0`。
+///
+/// 抽成纯函数以便宿主单测: 映射本身要真实页表, 这里只校验错误码映射。
+fn map_result_code(r: Result<(), crate::memory::paging::MapError>) -> u64 {
+    match r {
+        Ok(()) => 1,
+        Err(crate::memory::paging::MapError::AlreadyMapped) => MAP_ERR_ALREADY_MAPPED,
+        Err(_) => 0,
+    }
+}
+
+/// `SYS_KEY_PUSH` 的门禁判据 (**纯函数**, 便于单测): 键盘域固有域号, 或显式持有
+/// 键盘中断能力 (`Capability::Irq(1)`) 的域。
+///
+/// 无门禁时任何域都能往内核键队列塞字节 —— 等于给任意域一个"伪造键盘输入"的
+/// 原语 (可以替用户敲命令)。`kbd_srv` 是引导期固定域 (4); 其它域必须自己握住
+/// 键盘能力才算输入源。
+fn key_push_allowed_with(domain: u64, holds_kbd_irq: bool) -> bool {
+    domain == KBD_DOMAIN || domain == XHCI_DOMAIN || holds_kbd_irq
+}
+
+/// `SYS_KEY_PUSH` 的实时门禁 (查能力表)。
+fn key_push_allowed(domain: u64) -> bool {
+    key_push_allowed_with(
+        domain,
+        crate::cap::has(domain, crate::cap::Capability::Irq(KBD_IRQ)),
+    )
 }
 
 /// 给 `SYS_SPAWN_ELF` 新建的**通用应用**补授运行库需要的能力。
@@ -649,20 +697,31 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             if !crate::memory::paging::is_user_address(a1) {
                 return 0;
             }
-            // 交给用户态的帧必须清零, 否则读到上一任占用者的残留数据 (跨域泄露)。
-            let paddr = match crate::memory::frame_allocator::allocate_zeroed_frame() {
-                Some(p) => p,
-                None => return 0,
-            };
             let domain = crate::scheduler::current_domain();
-            crate::memory::paging::map_user_page(
+            let vaddr = a1 & !0xFFF;
+            // 重复映射在**分配帧之前**判掉: 否则新帧既映射不出去, 还得再回收。
+            // (旧实现在这里撞 PageAlreadyMapped panic —— 两次 syscall 即可停掉整机。)
+            if crate::memory::paging::resolve_user_page(domain, vaddr).is_some() {
+                return MAP_ERR_ALREADY_MAPPED;
+            }
+            // 交给用户态的帧必须清零, 否则读到上一任占用者的残留数据 (跨域泄露)。
+            let Some(paddr) = crate::memory::frame_allocator::allocate_zeroed_frame() else {
+                return 0;
+            };
+            let r = crate::memory::paging::try_map_user_page(
                 domain,
-                a1,
+                vaddr,
                 paddr,
                 crate::memory::paging::UserPagePerm::ReadWrite,
             );
-            crate::memory::frame_allocator::inc_ref(paddr);
-            1
+            if r.is_err() {
+                // 半成品: 映射没建立 (中间页表已由映射入口回收), 帧也要还回去。
+                // 此时尚未 inc_ref, 直接 free 才是配平的。
+                crate::memory::frame_allocator::free_frame(paddr);
+            } else {
+                crate::memory::frame_allocator::inc_ref(paddr);
+            }
+            map_result_code(r)
         }
         SYS_SHARE_PAGE => {
             // 把当前域 `vaddr` (a1) 的页共享映射进 `a2` 域同一地址, 需 MapInto 能力。
@@ -673,31 +732,34 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 // 拒绝内核地址被 resolve_user_page 反查后重映射。
                 0
             } else {
-                match crate::memory::paging::resolve_user_page(from, a1) {
+                let vaddr = a1 & !0xFFF;
+                match crate::memory::paging::resolve_user_page(from, vaddr) {
                     Some(paddr) => {
                         // 目标域 `a2` 可能已在 `a1` 有映射: 客户端重启后重共享, 或重复
-                        // 共享同一页。若不处理, map_user_page 会撞 PageAlreadyMapped panic。
-                        if let Some(old) = crate::memory::paging::resolve_user_page(a2, a1) {
-                            if old == paddr {
+                        // 共享同一页。已映射同一帧时幂等成功; 异帧先摘旧映射再换新帧。
+                        if let Some(old) = crate::memory::paging::resolve_user_page(a2, vaddr) {
+                            if old & !0xFFF == paddr & !0xFFF {
                                 // 已映射同一帧: 幂等成功, 不重复 inc_ref。
                                 return 1;
                             }
                             // 异帧: 先摘除旧映射并递减引用计数 (归零才释放), 再映射新帧。
-                            if let Some(u) = crate::memory::paging::unmap_user_page(a2, a1) {
+                            if let Some(u) = crate::memory::paging::unmap_user_page(a2, vaddr) {
                                 let was_last = crate::memory::frame_allocator::dec_ref(u);
                                 if was_last {
                                     crate::memory::frame_allocator::free_frame(u);
                                 }
                             }
                         }
-                        crate::memory::paging::map_user_page(
+                        let r = crate::memory::paging::try_map_user_page(
                             a2,
-                            a1,
+                            vaddr,
                             paddr,
                             crate::memory::paging::UserPagePerm::ReadWrite,
                         );
-                        crate::memory::frame_allocator::inc_ref(paddr);
-                        1
+                        if r.is_ok() {
+                            crate::memory::frame_allocator::inc_ref(paddr);
+                        }
+                        map_result_code(r)
                     }
                     None => 0,
                 }
@@ -726,21 +788,30 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 // 否则会在 2 MiB 大页上映射 4 KiB 页, 触发 ParentEntryHugePage panic。
                 0
             } else {
+                // 缺页地址可能带页内偏移 (CR2 是故障地址), 统一按页起点落映射。
+                let vaddr = a2 & !0xFFF;
+                // 已有映射: 幂等失败, 不覆盖 (旧实现会 panic)。
+                if crate::memory::paging::resolve_user_page(a1, vaddr).is_some() {
+                    return MAP_ERR_ALREADY_MAPPED;
+                }
                 // 匿名帧必须清零: 分配器不保证新帧内容为 0, 不清的话用户态读到的是
                 // 上一任占用者释放后的残留数据 (见 frame_allocator::allocate_zeroed_frame)。
-                match crate::memory::frame_allocator::allocate_zeroed_frame() {
-                    Some(p) => {
-                        crate::memory::paging::map_user_page(
-                            a1,
-                            a2,
-                            p,
-                            crate::memory::paging::UserPagePerm::ReadWrite,
-                        );
-                        crate::memory::frame_allocator::inc_ref(p);
-                        1
-                    }
-                    None => 0,
+                let Some(paddr) = crate::memory::frame_allocator::allocate_zeroed_frame() else {
+                    return 0;
+                };
+                let r = crate::memory::paging::try_map_user_page(
+                    a1,
+                    vaddr,
+                    paddr,
+                    crate::memory::paging::UserPagePerm::ReadWrite,
+                );
+                if r.is_err() {
+                    // 半成品回收: 映射没建立 (中间页表入口已回收), 帧直接归还。
+                    crate::memory::frame_allocator::free_frame(paddr);
+                } else {
+                    crate::memory::frame_allocator::inc_ref(paddr);
                 }
+                map_result_code(r)
             }
         }
         SYS_PAGE_FAULT_REPLY => {
@@ -834,8 +905,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             if crate::cap::has(domain, crate::cap::Capability::Mmio(bar))
                 && crate::memory::paging::is_user_address(a2)
             {
-                crate::memory::paging::map_mmio(domain, a2, bar);
-                1
+                // 映射入口不 panic: 已有映射返回 MAP_ERR_ALREADY_MAPPED。
+                map_result_code(crate::memory::paging::try_map_mmio(
+                    domain,
+                    a2 & !0xFFF,
+                    bar,
+                ))
             } else {
                 0
             }
@@ -1051,7 +1126,17 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
                 }
             }
             for i in 0..pages {
-                crate::memory::paging::map_mmio(domain, a1 + i * 4096, base + i * 4096);
+                match crate::memory::paging::try_map_mmio(domain, a1 + i * 4096, base + i * 4096)
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // 半途失败: 把本次已建立的页逐一摘掉, 不留半张映射。
+                        for j in 0..i {
+                            crate::memory::paging::unmap_user_page(domain, a1 + j * 4096);
+                        }
+                        return map_result_code(Err(e));
+                    }
+                }
             }
             1
         }
@@ -1066,7 +1151,12 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_CONSOLE_READY => crate::video::is_taken_over() as u64,
         SYS_KEY_PUSH => {
-            // 键盘域推一个按键字节进来; 内核只做搬运, 不解释语义。
+            // 键盘域 (或显式持有键盘中断能力的域) 推一个按键字节进来; 内核只做搬运。
+            // 无门禁时任意域都能伪造键盘输入 (可替用户敲命令), 故其它域一律拒绝。
+            let domain = crate::scheduler::current_domain();
+            if !key_push_allowed(domain) {
+                return 0;
+            }
             // 有键按下意味着"用户正在操作", 日志视口回到最新输出 (USB HID 键盘
             // 的方向键走 SYS_CONSOLE_SCROLL, 普通字符则走到这里)。
             crate::video::scroll_to_bottom();
@@ -1296,5 +1386,44 @@ mod tests {
     fn cred_pack_layout() {
         assert_eq!(pack_cred(CRED_ROOT), 0);
         assert_eq!(pack_cred(CRED_USER), (1000u64 << 32) | 1000);
+    }
+
+    /// 重复映射必须是**错误码**, 而不是把内核打崩。
+    ///
+    /// 这是 P0 的回归点: 以前 `SYS_ALLOC_PAGE` / `SYS_MAP_ANON` 对同一地址调两次,
+    /// `map_to` 的 `PageAlreadyMapped` 会 panic。现在映射入口返回 `Err`, 这里校验
+    /// 它被翻译成约定的错误码; 其它失败仍沿用 `0`。
+    #[test]
+    fn already_mapped_becomes_error_code_not_panic() {
+        use crate::memory::paging::MapError;
+        assert_eq!(map_result_code(Ok(())), 1);
+        assert_eq!(
+            map_result_code(Err(MapError::AlreadyMapped)),
+            MAP_ERR_ALREADY_MAPPED
+        );
+        assert_eq!(map_result_code(Err(MapError::OutOfMemory)), 0);
+        assert_eq!(map_result_code(Err(MapError::ParentHugePage)), 0);
+        // 错误码不能与成功的 `1` / 旧的失败值 `0` 混淆。
+        assert_ne!(MAP_ERR_ALREADY_MAPPED, 0);
+        assert_ne!(MAP_ERR_ALREADY_MAPPED, 1);
+    }
+
+    /// `SYS_KEY_PUSH` 门禁: 仅键盘域 (4) 或显式持有键盘中断能力 (`Irq(1)`) 的域。
+    /// 其它域 (含普通应用域 / shell 域) 一律拒绝 —— 否则可伪造键盘输入。
+    #[test]
+    fn key_push_rejects_domains_without_keyboard_capability() {
+        assert!(key_push_allowed_with(KBD_DOMAIN, false), "kbd 域无需能力");
+        assert!(key_push_allowed_with(KBD_DOMAIN, true));
+        assert!(
+            key_push_allowed_with(XHCI_DOMAIN, false),
+            "xHCI 是 USB HID 的输出方, 不持 Irq(1) 也必须放行"
+        );
+        for domain in [0, 1, 7, 8, 14, 15, 26, 100] {
+            assert!(
+                !key_push_allowed_with(domain, false),
+                "域 {domain} 未持有键盘能力, 必须拒绝"
+            );
+        }
+        assert!(key_push_allowed_with(8, true), "显式持有 Irq(1) 的域放行");
     }
 }

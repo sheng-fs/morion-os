@@ -1413,6 +1413,19 @@ fn dir_is_empty(bpb: &Fat32Bpb, dir_cluster: u32, dir_buf: *mut u8, fat_buf: *mu
 /// fat32_srv 打开节点描述符表 (静态, 单任务独占访问, 无需锁)。
 const MAX_FD: usize = 16;
 
+/// 写操作被拒的错误码 (与 MFS 的 `EACCES` 同值; 客户端归一化为 `u64::MAX` 并记
+/// `mfs_last_errno`, 不会与"成功"混淆)。
+const FAT_EACCES: u64 = 2;
+
+/// 调用者是否 root (uid 0)。
+///
+/// FAT32 没有属主 / 权限位模型, 无法做 per-file 判定; 最小可行策略是**写类操作只允许
+/// root**、读类放行。身份按 `msg.from` 经 `SYS_CRED` 查询 (域号由内核填写, 不可伪造)。
+/// 查询失败按"非 root"处理 (fail closed), 绝不静默放行写。
+fn fat_caller_is_root(domain: u64) -> bool {
+    matches!(sys_cred_of(domain), Some((0, _)))
+}
+
 #[derive(Clone, Copy)]
 struct OpenNode {
     is_dir: bool,
@@ -1800,6 +1813,23 @@ pub fn run() {
         block_wb_flush();
 
         let tag = vfs::tag_body(msg.tag);
+        // FAT32 无属主模型: 写类操作 (创建/写/删/改名/建目录/截断) 只允许 uid 0;
+        // 读类 (open/read/readdir/stat) 放行。跨域调用同样按 `msg.from` 的当前身份判定,
+        // 因此 shell 里 `su` 降权后立刻失去写权限。失败回明确 EACCES, 不静默降级。
+        if matches!(
+            tag,
+            vfs::VFS_CREAT_TAG
+                | vfs::VFS_WRITE_TAG
+                | vfs::VFS_MKDIR_TAG
+                | vfs::VFS_UNLINK_TAG
+                | vfs::VFS_RMDIR_TAG
+                | vfs::VFS_RENAME_TAG
+                | vfs::VFS_TRUNCATE_TAG
+        ) && !fat_caller_is_root(msg.from)
+        {
+            sys_reply(vfs::err_reply(FAT_EACCES));
+            continue;
+        }
         // tag 高位携带卷编码 (M1b): 路径类请求由它决定目标卷; fd 类请求由 fd 绑定的卷
         // 决定 (fd 是这些请求 payload 的首字段), 先探一次 fd, 使两类请求都对。
         let mut vol = vfs::vol_from_enc(vfs::tag_vol(msg.tag), unsafe { FAT_VOL });

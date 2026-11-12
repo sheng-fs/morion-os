@@ -529,18 +529,23 @@ static mut MFS_LEAF: MfsLoc = MFS_LOC_EMPTY;
 #[derive(Clone, Copy)]
 struct MfsFd {
     used: bool,
+    /// 打开该 fd 的域号。后续 READ/WRITE/READDIR/TRUNCATE/CLOSE 只认这个域 ——
+    /// `msg.from` 由内核填写, 不可伪造; 跨域 (含 root) 一律拒绝, 防扫号冒用。
+    owner: u64,
     is_dir: bool,
     path_len: u8,
     /// 打开时本服务服务的卷号 (M1b 多卷挂载: fd 类请求靠它找回该卷, 见服务循环)。
     vol: u64,
     /// 04b: 打开者身份与**打开时判定的有效权限位** (R/W/X)。已打开的 fd 在 `chmod`
-    /// 之后仍按这份快照放行 —— 与 Unix 一致 (权限在 open 时判一次)。
+    /// 之后仍按这份快照放行 —— 与 Unix 一致 (权限在 open 时判一次)。`cred.uid`
+    /// 同时是打开时的 uid 快照; `owner` 才是归属判定。
     cred: Cred,
     perm: u8,
     path: [u8; TMP_PATH_MAX],
 }
 const MFS_FD_EMPTY: MfsFd = MfsFd {
     used: false,
+    owner: 0,
     is_dir: false,
     path_len: 0,
     vol: 0,
@@ -4570,12 +4575,13 @@ fn mfs_readdir(ino: u32, out: *mut vfs::DirEntry) -> u64 {
 // fd 表 (按路径)
 // ---------------------------------------------------------------------------
 
-fn mfs_fd_alloc(path: &[u8], is_dir: bool, cred: Cred, perm: u8) -> u64 {
+fn mfs_fd_alloc(path: &[u8], is_dir: bool, owner: u64, cred: Cred, perm: u8) -> u64 {
     for i in 0..MFS_MAX_FD {
         unsafe {
             let s = &mut *core::ptr::addr_of_mut!(MFS_FDS).cast::<MfsFd>().add(i);
             if !s.used {
                 s.used = true;
+                s.owner = owner;
                 s.is_dir = is_dir;
                 s.cred = cred;
                 s.perm = perm;
@@ -4606,7 +4612,18 @@ fn mfs_fd_get(fd: u32) -> Option<MfsFd> {
         }
     }
 }
-fn mfs_fd_free(fd: u32) -> u64 {
+/// 按 `from` 取 fd: 只有**打开者本域**能拿到, 跨域返回 `EACCES`, 未打开/越界返回
+/// `EINVAL`。所有 fd 类请求都必须经这里, 不能直接用 `mfs_fd_get`。
+fn mfs_fd_owned(fd: u32, from: u64) -> Result<MfsFd, u64> {
+    match mfs_fd_get(fd) {
+        Some(f) if f.owner == from => Ok(f),
+        Some(_) => Err(mfs_err(MFS_EACCES)),
+        None => Err(mfs_err(MFS_EINVAL)),
+    }
+}
+
+/// 关闭 fd; 只有打开者本域能关 (`root` 也不行)。关闭后槽位释放, 再访问即 `EINVAL`。
+fn mfs_fd_free(fd: u32, from: u64) -> u64 {
     if fd as usize >= MFS_MAX_FD {
         return 0;
     }
@@ -4614,12 +4631,39 @@ fn mfs_fd_free(fd: u32) -> u64 {
         let s = &mut *core::ptr::addr_of_mut!(MFS_FDS)
             .cast::<MfsFd>()
             .add(fd as usize);
-        if s.used {
+        if s.used && s.owner == from {
             s.used = false;
             1
+        } else if s.used {
+            mfs_err(MFS_EACCES)
         } else {
             0
         }
+    }
+}
+
+/// FS 自测: fd 归属校验。造一个属于域 4242 的 fd, 确认本域可用、别的域 (含 root)
+/// 被拒、关闭后不可再访问。只动内存 fd 表, 不触盘。
+fn mfs_fd_owner_selftest() {
+    let cred = Cred {
+        uid: MFS_UID_USER,
+        gid: MFS_GID_USER,
+    };
+    let fd = mfs_fd_alloc(b"/.fd-owner-selftest", false, 4242, cred, 0o6);
+    if fd == u64::MAX {
+        println("mfs: fd-owner self-test FAILED (fd table full)");
+        return;
+    }
+    let fd = fd as u32;
+    let own_ok = mfs_fd_owned(fd, 4242).is_ok();
+    let foreign_denied = matches!(mfs_fd_owned(fd, 4243), Err(e) if e == mfs_err(MFS_EACCES));
+    let root_denied = matches!(mfs_fd_owned(fd, 0), Err(e) if e == mfs_err(MFS_EACCES));
+    let closed = mfs_fd_free(fd, 4242) == 1;
+    let after_close_denied = mfs_fd_owned(fd, 4242).is_err();
+    if own_ok && foreign_denied && root_denied && closed && after_close_denied {
+        println("mfs: fd-owner self-test OK (foreign/root fd use denied, closed fd rejected)");
+    } else {
+        println("mfs: fd-owner self-test FAILED");
     }
 }
 
@@ -4870,6 +4914,9 @@ pub fn run() {
     // 只认卷层探测为 MFS 的卷: 空白的额外卷不会被自动格式化 (要显式 `mkfs.mfs`)。
     mount_extra_volumes(mfs_a(), VOL_KIND_MFS, unsafe { MFS_VOL }, vfs::MFS_DOMAIN);
 
+    // FS 自测: fd 归属 (跨域/root 冒用被拒, 关闭后不可访问)。
+    mfs_fd_owner_selftest();
+
     let mut msg = Message {
         from: 0,
         to: 0,
@@ -4893,7 +4940,8 @@ pub fn run() {
             tag,
             vfs::VFS_READ_TAG | vfs::VFS_WRITE_TAG | vfs::VFS_READDIR_TAG | vfs::VFS_TRUNCATE_TAG
         ) {
-            if let Some(fd) = mfs_fd_get(read_u32(msg.payload.as_ptr())) {
+            // 只有本域自己的 fd 才能把请求拉到该 fd 所属卷; 别人的 fd 连卷信息都不给。
+            if let Ok(fd) = mfs_fd_owned(read_u32(msg.payload.as_ptr()), msg.from) {
                 vol = fd.vol;
             }
         }
@@ -4930,7 +4978,7 @@ pub fn run() {
                                     mfs_err(MFS_EACCES)
                                 } else {
                                     let perm = mfs_effective_perm(a, is_dir, cred);
-                                    mfs_fd_alloc(&canon[..n], is_dir, cred, perm)
+                                    mfs_fd_alloc(&canon[..n], is_dir, msg.from, cred, perm)
                                 }
                             }
                         }
@@ -4944,8 +4992,8 @@ pub fn run() {
                 let req: vfs::ReadReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::ReadReq)
                 };
-                let n = match mfs_fd_get(req.fd) {
-                    Some(fd) if !fd.is_dir => {
+                let n = match mfs_fd_owned(req.fd, msg.from) {
+                    Ok(fd) if !fd.is_dir => {
                         if fd.perm & MFS_ACC_R == 0 {
                             mfs_err(MFS_EACCES)
                         } else {
@@ -4958,8 +5006,8 @@ pub fn run() {
                             }
                         }
                     }
-                    Some(_) => mfs_err(MFS_EISDIR),
-                    None => mfs_err(MFS_EINVAL),
+                    Ok(_) => mfs_err(MFS_EISDIR),
+                    Err(e) => e,
                 };
                 sys_reply(n);
             }
@@ -4967,8 +5015,8 @@ pub fn run() {
                 let req: vfs::WriteReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::WriteReq)
                 };
-                let n = match mfs_fd_get(req.fd) {
-                    Some(fd) if !fd.is_dir => {
+                let n = match mfs_fd_owned(req.fd, msg.from) {
+                    Ok(fd) if !fd.is_dir => {
                         if fd.perm & MFS_ACC_W == 0 {
                             mfs_err(MFS_EACCES)
                         } else {
@@ -4984,8 +5032,8 @@ pub fn run() {
                             }
                         }
                     }
-                    Some(_) => mfs_err(MFS_EISDIR),
-                    None => mfs_err(MFS_EINVAL),
+                    Ok(_) => mfs_err(MFS_EISDIR),
+                    Err(e) => e,
                 };
                 sys_reply(n);
             }
@@ -4993,8 +5041,8 @@ pub fn run() {
                 let req: vfs::DirReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::DirReq)
                 };
-                let n = match mfs_fd_get(req.fd) {
-                    Some(fd) if fd.is_dir => {
+                let n = match mfs_fd_owned(req.fd, msg.from) {
+                    Ok(fd) if fd.is_dir => {
                         if fd.perm & (MFS_ACC_R | MFS_ACC_X) != (MFS_ACC_R | MFS_ACC_X) {
                             mfs_err(MFS_EACCES)
                         } else {
@@ -5007,14 +5055,15 @@ pub fn run() {
                             }
                         }
                     }
-                    Some(_) => mfs_err(MFS_ENOTDIR),
-                    None => mfs_err(MFS_EINVAL),
+                    Ok(_) => mfs_err(MFS_ENOTDIR),
+                    Err(e) => e,
                 };
                 sys_reply(n);
             }
             vfs::VFS_CLOSE_TAG => {
                 let fd = read_u32(msg.payload.as_ptr());
-                sys_reply(mfs_fd_free(fd));
+                // 跨域关 fd 也算冒用: 只允许打开者本域关闭。
+                sys_reply(mfs_fd_free(fd, msg.from));
             }
             vfs::VFS_CREAT_TAG | vfs::VFS_MKDIR_TAG => {
                 let is_dir = tag == vfs::VFS_MKDIR_TAG;
@@ -5025,7 +5074,7 @@ pub fn run() {
                     .unwrap_or(PAYLOAD_LEN);
                 let path = unsafe { core::str::from_utf8_unchecked(&msg.payload[..len]) };
                 // 创建者域 id 作为 owner 记进元数据 (fire-and-forget 诊断用)。
-                let fd = mfs_create(path, is_dir, msg.from as u16, cred);
+                let fd = mfs_create(path, is_dir, msg.from, cred);
                 sys_reply(fd);
             }
             vfs::VFS_UNLINK_TAG | vfs::VFS_RMDIR_TAG => {
@@ -5042,8 +5091,8 @@ pub fn run() {
                 let req: vfs::TruncateReq = unsafe {
                     core::ptr::read_unaligned(msg.payload.as_ptr() as *const vfs::TruncateReq)
                 };
-                let n = match mfs_fd_get(req.fd) {
-                    Some(fd) if !fd.is_dir => {
+                let n = match mfs_fd_owned(req.fd, msg.from) {
+                    Ok(fd) if !fd.is_dir => {
                         if fd.perm & MFS_ACC_W == 0 {
                             mfs_err(MFS_EACCES)
                         } else {
@@ -5056,8 +5105,8 @@ pub fn run() {
                             }
                         }
                     }
-                    Some(_) => mfs_err(MFS_EISDIR),
-                    None => mfs_err(MFS_EINVAL),
+                    Ok(_) => mfs_err(MFS_EISDIR),
+                    Err(e) => e,
                 };
                 sys_reply(n);
             }
@@ -5346,9 +5395,9 @@ fn mfs_stat_into(block: u32, buf: u64) -> u64 {
 
 /// 创建文件 (`is_dir=false`) 或目录 (`is_dir=true`)。成功返回 fd。
 ///
-/// `owner` = 发起请求的域 id (只记进元数据供 `ls -l` 诊断); `cred` = 发起者身份,
-/// 决定访问判定与新节点的 uid/gid。
-fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
+/// `owner` = 发起请求的域 id (记进元数据供 `ls -l` 诊断, 同时绑定到新建 fd 的归属);
+/// `cred` = 发起者身份, 决定访问判定与新节点的 uid/gid。
+fn mfs_create(path: &str, is_dir: bool, owner: u64, cred: Cred) -> u64 {
     let mut canon = [0u8; TMP_PATH_MAX];
     let n = match mfs_normalize(path, &mut canon) {
         Some(n) => n,
@@ -5371,7 +5420,7 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
             return mfs_err(MFS_EACCES);
         }
         let perm = mfs_effective_perm(mfs_a(), false, cred);
-        return mfs_fd_alloc(&canon[..n], false, cred, perm);
+        return mfs_fd_alloc(&canon[..n], false, owner, cred, perm);
     }
     // 父目录路径与末分量。
     let mut split = n;
@@ -5410,7 +5459,7 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
         mfs_file_set_size(c, 0);
         mfs_file_set_nblocks(c, 0);
     }
-    mfs_init_meta(c, is_dir, ftype, owner, cred, mode);
+    mfs_init_meta(c, is_dir, ftype, owner as u16, cred, mode);
     let magic = if is_dir {
         MFS_MAGIC_DIR
     } else {
@@ -5439,7 +5488,7 @@ fn mfs_create(path: &str, is_dir: bool, owner: u16, cred: Cred) -> u64 {
         } else {
             ((mode >> 6) & 0o7) as u8
         };
-        mfs_fd_alloc(&canon[..n], false, cred, perm)
+        mfs_fd_alloc(&canon[..n], false, owner, cred, perm)
     }
 }
 
