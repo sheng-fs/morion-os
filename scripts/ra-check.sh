@@ -60,6 +60,15 @@ cargo check --package morion-hello --target "$USER_TARGET" -Z json-target-spec \
   -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem \
   --message-format=json
 
+# --- 预装应用（workspace 成员）---
+# 这些 crate 同样是 no_std 用户态程序；不在这里用用户态 target 检查，Problems 面板
+# 会按宿主 target 报 `#[panic_handler] required` 之类的假红。
+for pkg in morion-editor morion-files morion-calc morion-sysinfo morion-enclave; do
+  cargo check --package "$pkg" --target "$USER_TARGET" -Z json-target-spec \
+    -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem \
+    --message-format=json
+done
+
 # --- 引导器 (morion-boot) ---
 cargo check --package morion-boot --target x86_64-unknown-uefi --message-format=json
 

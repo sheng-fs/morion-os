@@ -802,6 +802,18 @@ check: $(KERNEL_EMBED)
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-editor \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-files \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-enclave \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
 	$(CARGO) check --package morion-boot --target $(BOOT_TARGET)
 
 .PHONY: fmt

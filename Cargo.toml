@@ -26,6 +26,8 @@ members = [
     # 预装图形应用 (第三批): 计算器与只读系统信息面板。
     "user/apps/calc",
     "user/apps/sysinfo",
+    # 性能飞地示例（申请设备窗口 → 读寄存器），暂不进镜像，但保持可检查。
+    "user/apps/enclave",
 ]
 
 # 未来添加:
