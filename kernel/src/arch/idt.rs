@@ -161,14 +161,19 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::halt();
     };
 
-    crate::pager::deliver_fault(
+    // 邮箱满 = 消息没投出去。此时再 block_current 会让该任务永远等不到回复
+    // （分页器根本不知道它缺页），表现为整机静默挂死；宁可停机并留下证据。
+    if !crate::pager::deliver_fault(
         pager,
         crate::pager::PageFaultInfo {
             fault_domain,
             fault_addr,
             error_code: error_code.bits(),
         },
-    );
+    ) {
+        crate::video::println("KERNEL PANIC: page-fault message dropped (pager mailbox full)");
+        crate::halt();
+    }
     crate::scheduler::block_current(fault_domain);
 }
 

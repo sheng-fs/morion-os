@@ -533,8 +533,8 @@ fn first_opt(ic: u64, plen: u64, want: u8) -> Option<(u64, u64)> {
     while o + 8 <= end {
         let ot = rd8(o);
         let ol = (rd8(o + 1) as u64) * 8;
-        if ol < 8 {
-            break;
+        if ol < 8 || o + ol > end {
+            break; // 选项长度必须落在报文内，否则不能返回给调用方去读
         }
         if ot == want {
             return Some((o, ol));
@@ -592,6 +592,9 @@ fn icmpv6_input(st: &mut Stack, nic: usize, io: u64, n: u64) -> u64 {
             0
         }
         ICMPV6_NS => {
+            if plen < 24 {
+                return 0; // 目标地址(16 字节)不全，先不读
+            }
             let target = get_v6(ic + 8);
             let ll = link_local_from_mac(mac);
             if v6_eq(&target, &ll) || v6_eq(&target, &st.links[nic].v6_global) {
@@ -1164,11 +1167,22 @@ fn handle_frame(st: &mut Stack, nic: usize, n: u64, now: u64) {
     }
     if proto == IP_PROTO_UDP && dst_ip == OUR_IP {
         let udp = ip + ihl;
+        // 已收到且落在 IP 负载内的字节数（IP 总长可能小于帧长，帧尾还有填充）。
+        let total = rd16be(ip + 2) as u64;
+        let ipay = total.saturating_sub(ihl);
+        let avail = (n - (14 + ihl)).min(ipay);
+        // UDP 头 8 字节不全时一个字段都不能读，否则 dport 会越读缓冲区末尾。
+        if avail < 8 {
+            return;
+        }
         let dport = rd16be(udp + 2);
         let ulen = rd16be(udp + 4) as u64;
-        if ulen >= 8 && n >= 14 + ihl + ulen {
-            deliver(st, nic, dport, udp + 8, ulen - 8);
+        if ulen < 8 {
+            return;
         }
+        // UDP len 可能虚报：与实际可用长度取小，保证投递的负载不越界。
+        let seg = ulen.min(avail);
+        deliver(st, nic, dport, udp + 8, seg - 8);
     }
 }
 

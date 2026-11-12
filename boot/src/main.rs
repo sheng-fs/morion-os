@@ -1617,6 +1617,12 @@ impl MenuCache {
     }
 }
 
+/// 构建标识（提交号 + 构建时刻），画在菜单下方。
+///
+/// 真机刷盘后一眼就能确认运行的是哪次构建：如果这里显示的日期不是刚构建的，
+/// 说明 U 盘里还是旧镜像，而不是某个修复没生效。
+const BUILD_LABEL: &str = concat!("build ", env!("MORION_BUILD_ID"));
+
 /// 初始渲染：背景/顶栏/面板只画一次，快照面板，再画所有菜单项。
 fn render_init(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usize) -> MenuCache {
     render_background(fb, theme);
@@ -1628,6 +1634,14 @@ fn render_init(fb: &mut Fb, theme: &ThemeConfig, entries: &[BootEntry], sel: usi
     for (i, entry) in entries.iter().enumerate() {
         render_menu_item(fb, theme, entry, i, i == sel);
     }
+    // 面板外的静态标识：不在缓存矩形内，增量重绘永远不会碰它。
+    draw_text(
+        fb,
+        BUILD_LABEL,
+        theme.menu_x + 24,
+        theme.menu_y + theme.menu_h as i32 + 16,
+        Color::rgb(140, 140, 152),
+    );
     cache
 }
 

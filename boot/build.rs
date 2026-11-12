@@ -86,6 +86,18 @@ fn main() {
     );
     fs::write(out_dir.join("blur_kernel.rs"), blur_code).unwrap();
 
+    // 构建标识: 提交号 + 构建时刻, 直接画在引导菜单上 —— 真机刷完即可确认
+    // 跑的是哪一次构建, 不必再靠猜"这份镜像里到底有没有某个修复"。
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=MORION_BUILD_ID={git_hash} {}", chrono_now());
+
     // ============================================================
     // 3. 生成版本信息
     // ============================================================
@@ -95,7 +107,7 @@ pub const BOOT_COMMIT: &str = "{}";
 pub const BOOT_BUILD_DATE: &str = "{}";
 "#,
         env!("CARGO_PKG_VERSION"),
-        option_env!("GIT_HASH").unwrap_or("unknown"),
+        git_hash,
         chrono_now(),
     );
     fs::write(out_dir.join("version.rs"), version_code).unwrap();

@@ -8,7 +8,10 @@
 //! 系统调用 ABI (与 System V 对齐):
 //!   - 编号在 `rax`, 参数在 `rdi, rsi, rdx`, 返回值在 `rax`。
 
+use alloc::vec::Vec;
 use core::arch::global_asm;
+
+use spin::Mutex;
 
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
@@ -188,6 +191,15 @@ pub const SYS_LOG_OLDEST: u64 = 65;
 /// 真机 SAFE 变体下屏幕就是内核终端, shell 回显与各驱动的异步日志共用同一个「当前行」；
 /// 不做隔离的话驱动日志会把用户半打完的命令冲掉。见 [`crate::video::set_line_edit`]。
 pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
+/// 进程身份 (多用户最小闭环): `rdi = 操作, rsi = 参数, rdx = 参数`。
+///
+/// 操作: `0` = 查自己 → 打包的 `(uid << 32) | gid`；`1` = 设置自己 (`rsi = uid`,
+/// `rdx = gid`, 返回 1/0)；`2` = 查**指定域** (`rsi = 域号`, 只读, 域不存在返回
+/// `u64::MAX`) —— 文件服务据此按 IPC 的 `msg.from` 判定发起者身份。
+///
+/// 提权门禁在 [`handle_cred`]: 只有 `uid 0` 能换成别的身份, 非 root 只能做"设为自身
+/// 当前值"的空操作。身份按域保存, 域槽位复用后回落到默认值 (见 [`cred_of`])。
+pub const SYS_CRED: u64 = 67;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -292,12 +304,12 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // 系统调用分发
 // ---------------------------------------------------------------------------
-/// 从用户地址 `ptr` 读取一条固定大小 IPC payload (32 字节)。
+/// 从用户地址 `ptr` 读取一条固定大小 IPC payload (96 字节)。
 ///
 /// `ptr` 为 0 表示无 payload (返回全零); 非用户空间地址同样拒绝 (返回全零),
 /// 避免 syscall 在 Ring0 下读取内核内存 (与 SYS_ALLOC_PAGE 等信任边界一致)。
 fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
-    if ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
+    if !user_range_ok(ptr, crate::ipc::PAYLOAD_LEN as u64) {
         return [0; crate::ipc::PAYLOAD_LEN];
     }
     unsafe {
@@ -306,6 +318,42 @@ fn read_user_payload(ptr: u64) -> [u8; crate::ipc::PAYLOAD_LEN] {
         buf.copy_from_slice(src);
         buf
     }
+}
+
+/// 用户缓冲的**纯范围**判定: 起点/终点都在用户空间, 长度非零且不溢出。
+///
+/// 拆出来是为了能在宿主上单测（不触碰页表）。`is_user_address` 只看 PML4 下标，
+/// 所以必须同时校验终止地址 —— 否则 `ptr + len - 1` 可以越过用户空间上界。
+fn user_range_ok(ptr: u64, len: u64) -> bool {
+    if len == 0 || ptr == 0 || !crate::memory::paging::is_user_address(ptr) {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    crate::memory::paging::is_user_address(end - 1)
+}
+
+/// 用户交给内核**读或写**的缓冲是否可安全触碰（范围 + 逐页已映射）。
+///
+/// syscall 跑在调用方的 CR3 上，而每个域都复制了内核 PML4 条目 —— 内核地址同样
+/// 可解引用。不校验就等于给任意域一个“读/写任意内核内存”的原语；地址未映射则
+/// 在 Ring0 缺页（`idt` 对非 USER_MODE 缺页直接停机）。逐页确认与
+/// [`user_elf_image`] 完全同构。
+fn user_buf_ok(ptr: u64, len: u64) -> bool {
+    if !user_range_ok(ptr, len) {
+        return false;
+    }
+    let end = ptr + len;
+    let from = crate::scheduler::current_domain();
+    let mut page = ptr & !0xFFF;
+    while page < end {
+        if crate::memory::paging::resolve_user_page(from, page).is_none() {
+            return false;
+        }
+        page += 4096;
+    }
+    true
 }
 
 /// 校验并取出用户态交来的 ELF 镜像缓冲区 (`SYS_SPAWN_ELF` / `SYS_SPAWN_ELF_AT` 共用)。
@@ -370,6 +418,115 @@ fn restart_in_place(target: u64, image: &[u8]) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 进程身份 (多用户最小闭环)
+// ---------------------------------------------------------------------------
+
+/// 一个域的进程身份 (`uid`/`gid` 与 MFS 落盘字段同宽, `u16`)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Cred {
+    uid: u16,
+    gid: u16,
+}
+
+const CRED_ROOT: Cred = Cred { uid: 0, gid: 0 };
+const CRED_USER: Cred = Cred {
+    uid: 1000,
+    gid: 1000,
+};
+
+/// 一条登记过的身份: 连同登记时的页表根一起记, 域槽位被复用 (新域 = 新页表) 后
+/// 旧身份自动作废, 不会让新域"继承"上一个域的身份。
+#[derive(Clone, Copy)]
+struct CredEntry {
+    pml4: u64,
+    cred: Cred,
+}
+
+/// 按域 id 索引的身份表 (`None` = 未显式设置, 取默认身份)。
+static CREDS: Mutex<Vec<Option<CredEntry>>> = Mutex::new(Vec::new());
+
+/// 域的**默认**身份: 引导期服务域 = `0:0`, 运行期新建域 = `1000:1000`。
+///
+/// 与 `mfs_srv` 早期按域号现算的静态映射一致, 故升级后既有服务的行为不变;
+/// 差别只在 `SYS_CRED` 设置之后 —— 那时以本表为准。
+fn cred_default(domain: u64) -> Cred {
+    if domain < crate::domain::BOOT_DOMAINS {
+        CRED_ROOT
+    } else {
+        CRED_USER
+    }
+}
+
+/// 该域当前身份; 未登记 / 域已销毁重建时返回默认身份。
+fn cred_of(domain: u64) -> Cred {
+    if !crate::domain::is_alive(domain) {
+        return cred_default(domain);
+    }
+    let pml4 = crate::domain::pml4_of(domain);
+    match CREDS.lock().get(domain as usize).and_then(|e| *e) {
+        Some(e) if e.pml4 == pml4 => e.cred,
+        _ => cred_default(domain),
+    }
+}
+
+/// 身份变更门禁: 只有 `uid 0` 可以换成别的身份 (或保持 root); 非 root 只能把
+/// 身份"设置为自身当前值" (空操作) —— 即**只允许降权, 不允许提权**。
+fn cred_change_allowed(cur: Cred, uid: u16, gid: u16) -> bool {
+    if cur.uid == CRED_ROOT.uid {
+        true
+    } else {
+        cur.uid == uid && cur.gid == gid
+    }
+}
+
+/// 记录域的身份 (门禁不通过返回 false, 域不存在也返回 false)。
+fn cred_set(domain: u64, uid: u16, gid: u16) -> bool {
+    if !crate::domain::is_alive(domain) {
+        return false;
+    }
+    if !cred_change_allowed(cred_of(domain), uid, gid) {
+        return false;
+    }
+    let entry = CredEntry {
+        pml4: crate::domain::pml4_of(domain),
+        cred: Cred { uid, gid },
+    };
+    let mut table = CREDS.lock();
+    let idx = domain as usize;
+    if table.len() <= idx {
+        table.resize(idx + 1, None);
+    }
+    table[idx] = Some(entry);
+    true
+}
+
+/// `(uid, gid)` → 打包值 (`uid` 高 32 位, `gid` 低 32 位)。
+fn pack_cred(c: Cred) -> u64 {
+    ((c.uid as u64) << 32) | c.gid as u64
+}
+
+/// `SYS_CRED` 的处理入口: `0` 查自己 / `1` 设置自己 / `2` 查指定域。
+fn handle_cred(domain: u64, op: u64, a1: u64, a2: u64) -> u64 {
+    match op {
+        0 => pack_cred(cred_of(domain)),
+        1 => {
+            if a1 > u16::MAX as u64 || a2 > u16::MAX as u64 {
+                return 0;
+            }
+            cred_set(domain, a1 as u16, a2 as u16) as u64
+        }
+        2 => {
+            // 只读查询: 文件服务按 IPC 的 `msg.from` 判身份, 域不存在时明确失败。
+            if !crate::domain::is_alive(a1) {
+                return u64::MAX;
+            }
+            pack_cred(cred_of(a1))
+        }
+        _ => u64::MAX,
+    }
+}
+
 /// 掩码校验: 每一位都必须是本域**注册过的**向量, 且本域持有对应 `Capability::Irq`。
 ///
 /// 掩码编码 (位 `i` ↔ 向量 `idt::MSI_VECTOR_BASE + i`) 与 `SYS_IRQ_POLL`/`SYS_IRQ_WAIT`
@@ -408,6 +565,13 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_RECV => {
             // 阻塞接收一条消息; 若 `a1` 非零, 把完整消息写回用户缓冲区,
             // 返回消息 tag。这样分页器等可通过 payload 读取缺页信息。
+            //
+            // ⚠️ 必须在 `receive()` **之前**校验: 一是坏指针不能把内核内存写坏,
+            // 二是校验失败时不应吞掉这条消息。
+            let size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if a1 != 0 && !user_buf_ok(a1, size) {
+                return 0;
+            }
             let msg = crate::ipc::receive();
             if a1 != 0 {
                 unsafe {
@@ -732,8 +896,19 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_PUTS => {
             // 从用户地址空间读取字符串并打印 (当前 CR3 即用户域, 可直接访问)。
             // 用 print 而非 println: 换行由用户态通过发送 "\n" 自行控制。
+            //
+            // 信任边界: 指针与长度全由用户态给 —— 不校验就能读内核内存并打到终端;
+            // 超长长度还会让关中断的内核做无界逐页校验 / 撞未映射页停机。
+            // 合法最长调用是 `cat` 的 4 KiB 块, 64 KiB 上限留足余量。
+            const MAX_PUTS_LEN: u64 = 64 * 1024;
+            if a2 == 0 || a2 > MAX_PUTS_LEN || !user_buf_ok(a1, a2) {
+                return 0;
+            }
             let slice = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
+            // `from_utf8_unchecked` 是 UB 入口: 攻击者可以传非法字节。非法就整段不打印。
+            let Ok(s) = core::str::from_utf8(slice) else {
+                return 0;
+            };
             crate::video::print(s);
             0
         }
@@ -904,6 +1079,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_TRY_RECV => {
             // 非阻塞收: 有消息就把完整消息写回 `a1` 并返回 tag; 邮箱空返回 u64::MAX。
+            // 与 `SYS_RECV` 同一条信任边界: 坏指针不消费消息、也不能写内核内存。
+            let size = core::mem::size_of::<crate::ipc::Message>() as u64;
+            if a1 != 0 && !user_buf_ok(a1, size) {
+                return u64::MAX;
+            }
             match crate::ipc::try_receive() {
                 Some(msg) => {
                     if a1 != 0 {
@@ -936,6 +1116,8 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::video::set_line_edit(a1);
             0
         }
+        // 进程身份 (多用户最小闭环): 查 / 设置本域 uid:gid, 或只读查询别的域。
+        SYS_CRED => handle_cred(crate::scheduler::current_domain(), a1, a2, a3),
         SYS_PCI_INFO => crate::arch::pci::syscall_info(a1, a2),
         SYS_POWEROFF => {
             // 关机是不可逆的全局操作: 只给"能造进程"的可信域 (app/shell/init)。
@@ -985,4 +1167,57 @@ pub fn init() {
 
     // SFMASK: 进入 syscall 时清除 IF (处理期间关中断, 防止重入)。
     SFMask::write(RFlags::INTERRUPT_FLAG);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::paging::{USER_SPACE_BASE, USER_SPACE_END};
+
+    /// 用户缓冲范围校验: 内核地址、越界、溢出都必须拒绝。
+    ///
+    /// 这是 `SYS_RECV` / `SYS_TRY_RECV` / `SYS_PUTS` 的信任边界 —— 放行内核地址
+    /// 等于给任意域一个任意读写原语。
+    #[test]
+    fn user_range_rejects_kernel_and_out_of_range() {
+        // 合法: 用户空间起点附近。
+        assert!(user_range_ok(USER_SPACE_BASE, 16));
+        // 内核高半区 / PML4[0] / 空指针。
+        assert!(!user_range_ok(0xFFFF_8000_0000_0000, 16));
+        assert!(!user_range_ok(0, 16));
+        // 零长度。
+        assert!(!user_range_ok(USER_SPACE_BASE, 0));
+        // 起点合法但终点越过用户空间上界（逐字节 + 末尾）。
+        assert!(!user_range_ok(USER_SPACE_END - 8, 16));
+        // 加法溢出。
+        assert!(!user_range_ok(u64::MAX - 4, 16));
+        // 恰好到上界仍是合法的（end-1 在用户空间内）。
+        assert!(user_range_ok(USER_SPACE_END - 16, 16));
+    }
+
+    /// 默认身份: 引导期服务域 = `0:0`, 运行期新建域 = `1000:1000`。
+    #[test]
+    fn cred_default_follows_boot_domain() {
+        assert_eq!(cred_default(0), CRED_ROOT);
+        assert_eq!(cred_default(crate::domain::BOOT_DOMAINS - 1), CRED_ROOT);
+        assert_eq!(cred_default(crate::domain::BOOT_DOMAINS), CRED_USER);
+    }
+
+    /// 身份变更门禁: root 可降权 (或空操作), 非 root 只能空操作, 绝不允许提权。
+    #[test]
+    fn cred_change_only_allows_drop_from_root() {
+        assert!(cred_change_allowed(CRED_ROOT, 1000, 1000));
+        assert!(cred_change_allowed(CRED_ROOT, 0, 0));
+        assert!(cred_change_allowed(CRED_USER, 1000, 1000));
+        assert!(!cred_change_allowed(CRED_USER, 0, 0));
+        assert!(!cred_change_allowed(CRED_USER, 1001, 1001));
+        assert!(!cred_change_allowed(Cred { uid: 500, gid: 500 }, 0, 0));
+    }
+
+    /// 打包布局: uid 在高 32 位、gid 在低 32 位 (用户态按同布局解)。
+    #[test]
+    fn cred_pack_layout() {
+        assert_eq!(pack_cred(CRED_ROOT), 0);
+        assert_eq!(pack_cred(CRED_USER), (1000u64 << 32) | 1000);
+    }
 }

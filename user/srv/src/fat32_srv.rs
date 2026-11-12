@@ -30,6 +30,9 @@ fn block_write(lba: u32, count: u16, buf: *mut u8) -> bool {
 // FAT32 解析与目录遍历
 // ---------------------------------------------------------------------------
 
+/// FAT32 簇数上限 (28 位簇号; 0x0FFF_FFF7 起是坏簇/链尾标记)。
+const FAT32_MAX_CLUSTERS: u32 = 0x0FFF_FFF5;
+
 /// FAT32 BPB 关键布局参数 (从引导扇区解析)。
 struct Fat32Bpb {
     bytes_per_sector: u16,
@@ -38,6 +41,7 @@ struct Fat32Bpb {
     num_fats: u8,
     fat_size: u32,      // 单个 FAT 占用的扇区数
     total_sectors: u32, // BPB_TotSec32 (分区总扇区数)
+    root_entry_count: u16,
     root_cluster: u32,
 }
 
@@ -45,16 +49,69 @@ impl Fat32Bpb {
     /// 从 LBA 0 (引导扇区) 解析 BPB。
     fn parse(sector0: *const u8) -> Self {
         unsafe {
+            // 总扇区数优先取 TotSec32; 小卷 (如仓库里 16 MiB 的 parts.img 分区,
+            // 低于 FAT32 官方下限) 由 mkfs.fat 写在 TotSec16 里, 这里回退读取,
+            // 好让既有的额外 FAT 卷继续可挂载。
+            let total_sectors = match read_u32(sector0.add(32)) {
+                0 => read_u16(sector0.add(19)) as u32,
+                n => n,
+            };
             Fat32Bpb {
                 bytes_per_sector: read_u16(sector0.add(11)),
                 sectors_per_cluster: *sector0.add(13),
                 reserved_sectors: read_u16(sector0.add(14)),
                 num_fats: *sector0.add(16),
                 fat_size: read_u32(sector0.add(36)),
-                total_sectors: read_u32(sector0.add(32)),
+                total_sectors,
+                root_entry_count: read_u16(sector0.add(17)),
                 root_cluster: read_u32(sector0.add(44)),
             }
         }
+    }
+
+    /// 挂载时的几何合法性校验。返回不合法原因; `Ok(())` 表示几何可用于读写。
+    ///
+    /// BPB 完全来自磁盘, 任何字段都可能是恶意/损坏值 —— 先在这里挡住, 后面的
+    /// 扇区换算与 FAT 镜像循环才有边界可依。
+    fn validate_geometry(&self) -> Result<(), &'static str> {
+        let bps = self.bytes_per_sector;
+        let bps_ok = matches!(bps, 512 | 1024 | 2048 | 4096) && bps.is_power_of_two();
+        if !bps_ok {
+            return Err("bad bytes_per_sector");
+        }
+        let spc = self.sectors_per_cluster;
+        if spc == 0 || !spc.is_power_of_two() || spc > 128 {
+            return Err("bad sectors_per_cluster (want 1..=128 power of 2)");
+        }
+        if self.num_fats == 0 || self.num_fats > 2 {
+            return Err("bad num_fats (want 1..=2)");
+        }
+        if self.reserved_sectors == 0 {
+            return Err("reserved_sectors is 0");
+        }
+        if self.fat_size == 0 {
+            return Err("fat_size is 0");
+        }
+        if self.total_sectors == 0 {
+            return Err("total_sectors is 0");
+        }
+        // FAT32 的根目录项数正常为 0; 这里只做容量上限, 不额外收紧。
+        if self.root_entry_count as u64 * 32 > self.total_sectors as u64 * bps as u64 {
+            return Err("root_entry_count exceeds volume");
+        }
+        // 用 u64 推数据区起点, 避免 num_fats * fat_size 在 u32 上回绕。
+        let data_start = self.reserved_sectors as u64 + self.num_fats as u64 * self.fat_size as u64;
+        if data_start >= self.total_sectors as u64 {
+            return Err("data area starts beyond volume");
+        }
+        let clusters = (self.total_sectors as u64 - data_start) / spc as u64;
+        if clusters == 0 {
+            return Err("no data clusters");
+        }
+        if clusters > FAT32_MAX_CLUSTERS as u64 {
+            return Err("cluster count exceeds FAT32 limit");
+        }
+        Ok(())
     }
 
     /// 每簇字节数。
@@ -69,18 +126,34 @@ impl Fat32Bpb {
 
     /// 数据区 (簇 2) 的起始扇区。
     fn data_start_sector(&self) -> u32 {
-        self.reserved_sectors as u32 + self.num_fats as u32 * self.fat_size
+        // 用饱和运算兜底: 合法几何已由 `validate_geometry` 保证不回绕,
+        // 这里保证即便将来有未校验调用也不会 panic。
+        (self.reserved_sectors as u32)
+            .saturating_add((self.num_fats as u32).saturating_mul(self.fat_size))
     }
 
     /// 簇号 -> 起始扇区号 (簇 2 是数据区第一个簇)。
-    fn cluster_to_sector(&self, cluster: u32) -> u32 {
-        self.data_start_sector() + (cluster - 2) * self.sectors_per_cluster as u32
+    /// 簇号越界返回 None, 不把任意簇号换算成任意 LBA。
+    fn cluster_to_sector(&self, cluster: u32) -> Option<u32> {
+        let last = self.max_cluster();
+        if !(2..=last).contains(&cluster) {
+            return None;
+        }
+        Some(self.data_start_sector() + (cluster - 2) * self.sectors_per_cluster as u32)
     }
 
-    /// 数据区总簇数 (簇号有效范围 2..=total_clusters+1)。
+    /// 数据区总簇数 (簇号有效范围 2..=max_cluster)。
     fn total_clusters(&self) -> u32 {
-        let data_sectors = self.total_sectors - self.data_start_sector();
-        data_sectors / self.sectors_per_cluster as u32
+        let data_start = self.data_start_sector();
+        if self.total_sectors <= data_start || self.sectors_per_cluster == 0 {
+            return 0;
+        }
+        (self.total_sectors - data_start) / self.sectors_per_cluster as u32
+    }
+
+    /// 最大合法簇号 (簇数 + 1, 即数据区最后一簇的编号)。
+    fn max_cluster(&self) -> u32 {
+        self.total_clusters().saturating_add(1)
     }
 }
 
@@ -97,17 +170,64 @@ const NT_CASE_BASE_LOWER: u8 = 0x08;
 const NT_CASE_EXT_LOWER: u8 = 0x10;
 
 /// 读 FAT 表中 `cluster` 指向的下一个簇号 (高 4 位保留, 屏蔽为 28 位)。
-fn read_fat_entry(bpb: &Fat32Bpb, cluster: u32, fat_buf: *mut u8) -> u32 {
+///
+/// 簇号越界、或表项偏移已超出 FAT 区时返回链尾标记: 调用方会停止遍历,
+/// 不会把损坏 BPB/簇号换算成 FAT 区之外的任意 LBA。
+///
+/// 底层 `block_read` 失败时返回 `None` —— 缓冲区里是上一次读盘留下的旧数据,
+/// 当 FAT 表项用会把文件指向随机簇; 调用方必须把 `None` 当读盘错误向上传播。
+fn read_fat_entry(bpb: &Fat32Bpb, cluster: u32, fat_buf: *mut u8) -> Option<u32> {
+    let last = bpb.max_cluster();
+    if !(2..=last).contains(&cluster) {
+        return Some(0x0FFF_FFFF);
+    }
     let byte_offset = cluster * 4;
-    let sector = bpb.fat_start_sector() + byte_offset / 512;
+    let sector_off = byte_offset / 512;
+    if sector_off >= bpb.fat_size {
+        return Some(0x0FFF_FFFF);
+    }
+    let sector = bpb.fat_start_sector() + sector_off;
     let index = (byte_offset % 512) / 4;
-    block_read(sector, 1, fat_buf);
-    read_u32(unsafe { fat_buf.add(index as usize * 4) }) & 0x0FFF_FFFF
+    if !block_read(sector, 1, fat_buf) {
+        return None;
+    }
+    Some(read_u32(unsafe { fat_buf.add(index as usize * 4) }) & 0x0FFF_FFFF)
+}
+
+/// FAT 链单步推进的结果。
+enum ChainStep {
+    /// 指向下一个合法簇。
+    Next(u32),
+    /// 链结束 (EOC / 坏簇标记)。
+    End,
+    /// 链损坏: 指向 0/1、自环或卷外簇。
+    Bad,
+    /// 读 FAT 扇区失败 (不是链损坏: 数据不可信, 本次操作必须失败)。
+    Io,
+}
+
+/// 沿 FAT 链走一步。自环 (next == cluster) 与越界后继都判为 Bad,
+/// 使遍历循环能立即退出而不是原地打转。读盘失败返回 Io。
+fn chain_step(bpb: &Fat32Bpb, cluster: u32, fat_buf: *mut u8) -> ChainStep {
+    let next = match read_fat_entry(bpb, cluster, fat_buf) {
+        Some(n) => n,
+        None => return ChainStep::Io,
+    };
+    if next >= 0x0FFF_FFF8 {
+        ChainStep::End
+    } else if next == cluster || !(2..=bpb.max_cluster()).contains(&next) {
+        ChainStep::Bad
+    } else {
+        ChainStep::Next(next)
+    }
 }
 
 /// 把簇 `cluster` 的整簇内容读入 `buf` (至少一簇大小)。
 fn read_cluster(bpb: &Fat32Bpb, cluster: u32, buf: *mut u8) -> bool {
-    let sector = bpb.cluster_to_sector(cluster);
+    let sector = match bpb.cluster_to_sector(cluster) {
+        Some(s) => s,
+        None => return false,
+    };
     block_read(sector, bpb.sectors_per_cluster as u16, buf)
 }
 
@@ -134,15 +254,23 @@ fn read_file_range(
     let mut cluster = start_cluster;
     let mut absolute = 0usize; // 当前簇首字节在文件内的偏移
     let mut copied = 0usize;
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     // 1. 跳过 offset 之前的整簇。
     while absolute + cluster_bytes <= offset as usize {
-        absolute += cluster_bytes;
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            return 0;
+        let next = match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(n) => n,
+            ChainStep::End => return 0,
+            ChainStep::Bad => return u64::MAX,
+            ChainStep::Io => return u64::MAX, // FAT 读盘失败: 不能拿旧数据当链
+        };
+        steps += 1;
+        if steps > max_steps {
+            return u64::MAX; // FAT 链成环
         }
         cluster = next;
+        absolute += cluster_bytes;
     }
 
     // 2. 逐簇拷贝与 [offset, offset+want) 重叠的部分。
@@ -159,9 +287,15 @@ fn read_file_range(
         absolute += cluster_bytes;
 
         if copied < want {
-            let next = read_fat_entry(bpb, cluster, fat_buf);
-            if next >= 0x0FFF_FFF8 {
-                break; // FAT 链提前结束: 数据不完整, 返回已读部分
+            let next = match chain_step(bpb, cluster, fat_buf) {
+                ChainStep::Next(n) => n,
+                ChainStep::End => break, // FAT 链提前结束: 返回已读部分
+                ChainStep::Bad => return u64::MAX,
+                ChainStep::Io => return u64::MAX, // FAT 读盘失败
+            };
+            steps += 1;
+            if steps > max_steps {
+                return u64::MAX; // FAT 链成环
             }
             cluster = next;
         }
@@ -178,9 +312,16 @@ const FAT_EOC: u32 = 0x0FFF_FFFF;
 
 /// 把 `cluster` 对应的 FAT 表项写为 `value` (低 28 位), 并同步写所有 FAT 副本。
 fn write_fat_entry(bpb: &Fat32Bpb, cluster: u32, value: u32, fat_buf: *mut u8) -> bool {
+    let last = bpb.max_cluster();
+    if !(2..=last).contains(&cluster) {
+        return false;
+    }
     let byte_offset = cluster * 4;
     let sector_off = byte_offset / 512;
     let index = (byte_offset % 512) / 4;
+    if sector_off >= bpb.fat_size {
+        return false; // 表项落在 FAT 区之外: 拒绝写
+    }
 
     // 读第一个 FAT 的对应扇区, 改 4 字节槽位 (保留高 4 位保留位)。
     if !block_read(bpb.fat_start_sector() + sector_off, 1, fat_buf) {
@@ -190,7 +331,7 @@ fn write_fat_entry(bpb: &Fat32Bpb, cluster: u32, value: u32, fat_buf: *mut u8) -
     let old = read_u32(slot);
     write_u32(slot, (old & 0xF000_0000) | (value & 0x0FFF_FFFF));
 
-    // 同步写所有 FAT 副本。
+    // 同步写所有 FAT 副本 (num_fats 已在挂载时限定为 1..=2)。
     for k in 0..bpb.num_fats as u32 {
         let sector = bpb.fat_start_sector() + k * bpb.fat_size + sector_off;
         if !block_write(sector, 1, fat_buf) {
@@ -202,7 +343,10 @@ fn write_fat_entry(bpb: &Fat32Bpb, cluster: u32, value: u32, fat_buf: *mut u8) -
 
 /// 把整簇内容 `buf` (至少一簇大小) 写入簇 `cluster`。
 fn write_cluster(bpb: &Fat32Bpb, cluster: u32, buf: *mut u8) -> bool {
-    let sector = bpb.cluster_to_sector(cluster);
+    let sector = match bpb.cluster_to_sector(cluster) {
+        Some(s) => s,
+        None => return false,
+    };
     block_write(sector, bpb.sectors_per_cluster as u16, buf)
 }
 
@@ -214,29 +358,31 @@ fn write_cluster(bpb: &Fat32Bpb, cluster: u32, buf: *mut u8) -> bool {
 static mut FAT_ALLOC_HINT: u32 = 2;
 
 /// 扫描 FAT 表找第一个空闲簇 (表项 == 0), 无空闲返回 None。
-/// 从 `FAT_ALLOC_HINT` 起向后扫描, 扫到表尾回绕到 2, 回到起点仍无空闲则返回 None。
+/// 从 `FAT_ALLOC_HINT` 起向后扫描, 扫到表尾回绕到 2, 扫完枚举的簇数仍无空闲则返回 None。
 fn find_free_cluster(bpb: &Fat32Bpb, fat_buf: *mut u8) -> Option<u32> {
     let total = bpb.total_clusters();
-    let start = unsafe { FAT_ALLOC_HINT }.max(2);
+    let last = bpb.max_cluster();
+    if total == 0 || last < 2 {
+        return None;
+    }
+    // 游标可能来自别的卷/更早的几何, 先夹到本卷合法范围。
+    let start = unsafe { FAT_ALLOC_HINT }.clamp(2, last);
     let mut cluster = start;
+    let mut steps = 0u32;
     loop {
-        if read_fat_entry(bpb, cluster, fat_buf) == 0 {
+        // 读盘失败直接放弃分配: 缓冲区里是旧数据, 不能据此判定"空闲簇"。
+        let entry = read_fat_entry(bpb, cluster, fat_buf)?;
+        if entry == 0 {
             unsafe {
-                FAT_ALLOC_HINT = if cluster + 1 > total + 1 {
-                    2
-                } else {
-                    cluster + 1
-                };
+                FAT_ALLOC_HINT = if cluster == last { 2 } else { cluster + 1 };
             }
             return Some(cluster);
         }
-        cluster += 1;
-        if cluster > total + 1 {
-            cluster = 2;
+        steps += 1;
+        if steps >= total {
+            return None; // 扫完一圈仍无空闲 (或几何与 FAT 不符)
         }
-        if cluster == start {
-            return None; // 扫完一圈仍无空闲
-        }
+        cluster = if cluster >= last { 2 } else { cluster + 1 };
     }
 }
 
@@ -250,7 +396,11 @@ fn update_dir_entry(
     file_size: u32,
     dir_buf: *mut u8,
 ) -> bool {
-    let sector = bpb.cluster_to_sector(dir_cluster) + entry_offset / 512;
+    let sector_base = match bpb.cluster_to_sector(dir_cluster) {
+        Some(s) => s,
+        None => return false,
+    };
+    let sector = sector_base + entry_offset / 512;
     let off = (entry_offset % 512) as usize;
     if !block_read(sector, 1, dir_buf) {
         return false;
@@ -263,22 +413,35 @@ fn update_dir_entry(
 }
 
 /// 释放从 `start_cluster` 开始的簇链: 沿 FAT 链把每个簇表项清零 (标记为空闲),
-/// 直到遇到链结束标记或 0。带链长上限, 防止 FAT 损坏导致的死循环。返回是否完整释放。
+/// 直到遇到链结束标记或 0。步数以本卷簇数为界, 自环/越界后继立即失败。
 fn free_cluster_chain(bpb: &Fat32Bpb, start_cluster: u32, fat_buf: *mut u8) -> bool {
+    let total = bpb.total_clusters();
+    let last = bpb.max_cluster();
     let mut cluster = start_cluster;
     let mut steps = 0u32;
-    while cluster != 0 && cluster < 0x0FFF_FFF8 {
-        if steps >= 4096 {
-            return false; // 链异常过长
+    loop {
+        if cluster == 0 {
+            return true;
         }
-        let next = read_fat_entry(bpb, cluster, fat_buf);
+        if !(2..=last).contains(&cluster) || steps >= total {
+            return false; // 越界或链成环
+        }
+        let next = match read_fat_entry(bpb, cluster, fat_buf) {
+            Some(n) => n,
+            None => return false, // FAT 读盘失败: 不再沿垃圾链继续释放
+        };
         if !write_fat_entry(bpb, cluster, 0, fat_buf) {
             return false;
         }
-        cluster = next;
         steps += 1;
+        if next >= 0x0FFF_FFF8 {
+            return true; // 链尾
+        }
+        if next == cluster || !(2..=last).contains(&next) {
+            return false; // 0/1、自环或卷外后继: 链已损坏
+        }
+        cluster = next;
     }
-    true
 }
 
 /// 写一条完整 32 字节目录项到父目录簇 `dir_cluster` 的 `entry_offset` (簇内字节
@@ -296,7 +459,11 @@ fn write_dir_entry(
     file_size: u32,
     dir_buf: *mut u8,
 ) -> bool {
-    let sector = bpb.cluster_to_sector(dir_cluster) + entry_offset / 512;
+    let sector_base = match bpb.cluster_to_sector(dir_cluster) {
+        Some(s) => s,
+        None => return false,
+    };
+    let sector = sector_base + entry_offset / 512;
     let off = (entry_offset % 512) as usize;
     if !block_read(sector, 1, dir_buf) {
         return false;
@@ -330,6 +497,8 @@ fn find_dir_slot(
 ) -> Option<(u32, u32)> {
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -343,23 +512,32 @@ fn find_dir_slot(
             }
         }
         // 当前簇满, 尝试下一个目录簇。
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            // 链尾: 分配新簇挂接并清零。
-            let free = find_free_cluster(bpb, fat_buf)?;
-            if !write_fat_entry(bpb, cluster, free, fat_buf) {
-                return None;
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                steps += 1;
+                if steps > max_steps {
+                    return None; // 目录簇链成环
+                }
+                cluster = next;
             }
-            if !write_fat_entry(bpb, free, FAT_EOC, fat_buf) {
-                return None;
+            ChainStep::End => {
+                // 链尾: 分配新簇挂接并清零。
+                let free = find_free_cluster(bpb, fat_buf)?;
+                if !write_fat_entry(bpb, cluster, free, fat_buf) {
+                    return None;
+                }
+                if !write_fat_entry(bpb, free, FAT_EOC, fat_buf) {
+                    return None;
+                }
+                zero_bytes(dir_buf, bpb.cluster_bytes() as usize);
+                if !write_cluster(bpb, free, dir_buf) {
+                    return None;
+                }
+                return Some((0, free));
             }
-            zero_bytes(dir_buf, bpb.cluster_bytes() as usize);
-            if !write_cluster(bpb, free, dir_buf) {
-                return None;
-            }
-            return Some((0, free));
+            ChainStep::Bad => return None,
+            ChainStep::Io => return None, // FAT 读盘失败: 不能拿旧数据当链
         }
-        cluster = next;
     }
 }
 
@@ -378,7 +556,11 @@ fn unlink_entry(
     if start_cluster != 0 && !free_cluster_chain(bpb, start_cluster, fat_buf) {
         return false;
     }
-    let sector = bpb.cluster_to_sector(dir_cluster) + entry_offset / 512;
+    let sector_base = match bpb.cluster_to_sector(dir_cluster) {
+        Some(s) => s,
+        None => return false,
+    };
+    let sector = sector_base + entry_offset / 512;
     let off = (entry_offset % 512) as usize;
     if !block_read(sector, 1, dir_buf) {
         return false;
@@ -411,20 +593,32 @@ fn write_file_range(
     let end = offset.saturating_add(count);
     let new_size = node.file_size.max(end);
 
-    // 1. 沿 FAT 链收集现有簇。
+    // 1. 沿 FAT 链收集现有簇 (步数同时受链缓冲与卷内簇数限制)。
     const MAX_CHAIN: usize = 256;
     let mut chain = [0u32; MAX_CHAIN];
     let mut chain_len = 0usize;
     let mut cluster = node.start_cluster;
+    let total = bpb.total_clusters();
+    let last = bpb.max_cluster();
     while cluster != 0 && cluster < 0x0FFF_FFF8 {
-        if chain_len >= MAX_CHAIN {
+        if chain_len >= MAX_CHAIN || chain_len as u32 >= total {
+            return u64::MAX;
+        }
+        if !(2..=last).contains(&cluster) {
             return u64::MAX;
         }
         chain[chain_len] = cluster;
         chain_len += 1;
-        cluster = read_fat_entry(bpb, cluster, fat_buf);
-        if cluster == 0 {
-            break; // 链中途损坏, 停止收集
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                if chain[..chain_len].contains(&next) {
+                    return u64::MAX; // FAT 链成环
+                }
+                cluster = next;
+            }
+            ChainStep::End => break,
+            ChainStep::Bad => return u64::MAX,
+            ChainStep::Io => return u64::MAX, // FAT 读盘失败
         }
     }
     let old_clusters = chain_len;
@@ -721,6 +915,8 @@ fn readdir_into(
     let mut count = 0usize;
     let dst = out as *mut vfs::DirEntry;
     let mut lfn = LfnBuf::new();
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -784,11 +980,18 @@ fn readdir_into(
         }
 
         // 跨簇: 读下一个目录簇。
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            return (count * core::mem::size_of::<vfs::DirEntry>()) as u64;
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                steps += 1;
+                if steps > max_steps {
+                    return u64::MAX; // 目录簇链成环
+                }
+                cluster = next;
+            }
+            ChainStep::End => return (count * core::mem::size_of::<vfs::DirEntry>()) as u64,
+            ChainStep::Bad => return u64::MAX,
+            ChainStep::Io => return u64::MAX, // FAT 读盘失败
         }
-        cluster = next;
     }
 }
 
@@ -892,6 +1095,8 @@ fn find_entry_named(
     let mut lfn = LfnBuf::new();
     // 长名命中先记下, 但继续扫描: 短名命中优先级更高。
     let mut long_hit: Option<DirEntryInfo> = None;
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -932,11 +1137,18 @@ fn find_entry_named(
             }
         }
         // 跨簇: 读下一个目录簇。
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            return long_hit;
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                steps += 1;
+                if steps > max_steps {
+                    return None; // 目录簇链成环
+                }
+                cluster = next;
+            }
+            ChainStep::End => return long_hit,
+            ChainStep::Bad => return None,
+            ChainStep::Io => return None, // FAT 读盘失败: 不能拿旧数据当链
         }
-        cluster = next;
     }
 }
 
@@ -965,6 +1177,8 @@ fn find_entry_sn(
 ) -> Option<DirEntryInfo> {
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -992,11 +1206,16 @@ fn find_entry_sn(
             return Some(entry_info(entry, cluster, i));
         }
         // 跨簇: 读下一个目录簇。
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            return None;
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                steps += 1;
+                if steps > max_steps {
+                    return None; // 目录簇链成环
+                }
+                cluster = next;
+            }
+            ChainStep::End | ChainStep::Bad | ChainStep::Io => return None,
         }
-        cluster = next;
     }
 }
 
@@ -1108,6 +1327,8 @@ fn dir_is_empty(bpb: &Fat32Bpb, dir_cluster: u32, dir_buf: *mut u8, fat_buf: *mu
     let entries_per_cluster = bpb.cluster_bytes() as usize / 32;
     let mut cluster = dir_cluster;
     let mut valid = 0u32;
+    let max_steps = bpb.total_clusters();
+    let mut steps = 0u32;
 
     loop {
         if !read_cluster(bpb, cluster, dir_buf) {
@@ -1135,11 +1356,18 @@ fn dir_is_empty(bpb: &Fat32Bpb, dir_cluster: u32, dir_buf: *mut u8, fat_buf: *mu
             }
         }
         // 跨簇。
-        let next = read_fat_entry(bpb, cluster, fat_buf);
-        if next >= 0x0FFF_FFF8 {
-            return valid <= 2;
+        match chain_step(bpb, cluster, fat_buf) {
+            ChainStep::Next(next) => {
+                steps += 1;
+                if steps > max_steps {
+                    return false; // 目录簇链成环: 按非空处理, 拒绝删除
+                }
+                cluster = next;
+            }
+            ChainStep::End => return valid <= 2,
+            ChainStep::Bad => return false,
+            ChainStep::Io => return false, // FAT 读盘失败: 按非空处理, 拒绝删除
         }
-        cluster = next;
     }
 }
 /// fat32_srv 打开节点描述符表 (静态, 单任务独占访问, 无需锁)。
@@ -1271,8 +1499,9 @@ const FAT32_WB_DESC_VADDR: u64 = 0x0000_0080_0023_0000;
 
 /// 载入卷 `vol` 的 BPB 到 `out`, 并把 `FAT_BPB_VOL` 标成 `vol`。
 ///
-/// 调用者须已把 `FAT_CUR_VOL` 指向 `vol`。几何不合法 (非 512B 扇区 / 簇为 0 /
-/// 簇超过整簇缓冲) 时返回 false —— 请求按失败回复, 不拿错几何去读盘。
+/// 调用者须已把 `FAT_CUR_VOL` 指向 `vol`。几何不合法 (BPB 字段越界 / 非 512B
+/// 扇区 / 簇为 0 / 簇超过整簇缓冲) 时打印原因并返回 false —— 请求按失败回复,
+/// 不拿错几何去读盘。
 fn fat_load_bpb(vol: u64, bpb_buf: *mut u8, out: &mut Fat32Bpb) -> bool {
     if !block_read(0, 1, bpb_buf) {
         return false;
@@ -1282,6 +1511,13 @@ fn fat_load_bpb(vol: u64, bpb_buf: *mut u8, out: &mut Fat32Bpb) -> bool {
         return false;
     }
     let b = Fat32Bpb::parse(bpb_buf as *const u8);
+    if let Err(reason) = b.validate_geometry() {
+        print("fat32: bad BPB on vol=");
+        print_u64(vol);
+        print(": ");
+        println(reason);
+        return false;
+    }
     let cb = b.cluster_bytes();
     if b.bytes_per_sector != 512 || cb == 0 || cb > FAT32_MAX_CLUSTER_BYTES {
         return false;
@@ -1388,11 +1624,17 @@ pub fn run() {
         return;
     }
     let mut bpb = Fat32Bpb::parse(bpb_buf as *const u8);
+    // 几何校验: BPB 字段 (扇区/簇/FAT 数/卷容量) 不合法就失败并说清原因。
+    if let Err(reason) = bpb.validate_geometry() {
+        print("fat32: invalid BPB geometry: ");
+        println(reason);
+        return;
+    }
     unsafe {
         FAT_BPB_VOL = FAT_VOL;
     }
-    // 几何校验: 整簇缓冲按 64 KiB 上限预留, 更大的簇 (以及非 512B 扇区) 直接拒绝,
-    // 绝不用「按小块缓冲算出的偏移」去读盘。
+    // 运行期能力校验: 整簇缓冲按 64 KiB 上限预留, 更大的簇 (以及非 512B 扇区)
+    // 直接拒绝, 绝不用「按小块缓冲算出的偏移」去读盘。
     let cbytes = bpb.cluster_bytes();
     if bpb.bytes_per_sector != 512 || cbytes == 0 || cbytes > FAT32_MAX_CLUSTER_BYTES {
         print("fat32: unsupported geometry bps=");
@@ -1490,7 +1732,7 @@ pub fn run() {
             println("fat32: FS1 self-test entry still present FAILED");
             return;
         }
-        if read_fat_entry(&bpb, free, fat_buf as *mut u8) != 0 {
+        if read_fat_entry(&bpb, free, fat_buf as *mut u8) != Some(0) {
             println("fat32: FS1 self-test cluster not freed FAILED");
             return;
         }

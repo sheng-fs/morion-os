@@ -384,7 +384,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 第一轮真机（笔记本 + USB 启动盘）跑通后补的一组地面能力，全部有 QEMU 取证：
 
 - **启动盘限制**：见 BootInfo version 5。`SAFE` 变体在 Stage 4.5 只保留启动盘链上的块控制器；普通构建不裁剪（否则 QEMU 回归里并列的 NVMe / virtio-blk / AHCI 会被一起隐藏）。
-- **多 xHCI 控制器 + USB HID 键盘**：内核按 class `0C:03:30` 逐个 `device::grant_slot()`（最多 `DEVICE_MULTI_SLOTS = 4` 台），`xhci_srv` 逐台探测；第一个可用设备若是 HID boot keyboard，则配置 Interrupt IN 端点（EP Type 7）、`SET_PROTOCOL(boot)`，按 8 字节报告的新按键注入内核键队列（`SYS_KEY_PUSH`）。
+- **多 xHCI 控制器 + USB HID 键盘**：内核按 class `0C:03:30` 逐个 `device::grant_slot()`（最多 `DEVICE_MULTI_SLOTS = 16` 台），`xhci_srv` 逐台探测、每台控制器最多保留 2 个 slot（存储 + HID）；HID boot keyboard 配置 Interrupt IN 端点（EP Type 7）、`SET_PROTOCOL(boot)`，按 8 字节报告的新按键注入内核键队列（`SYS_KEY_PUSH`）。
 - **PS/2 探测**：`keyboard::init()` 先读 `0x64` 状态端口，`0xFF` 判定 i8042 不存在并打印 `[!!] PS/2 (i8042) not present …`，不再在初始化等待循环里死等（真机只有 USB 键盘时必需）。
 - **ACPI 关机 / 重启**：`arch::acpi::poweroff()` 从 FADT 取 `PM1a/PM1b_CNT_BLK`、从 DSDT `_S5` 包取 `SLP_TYP`（QEMU 为 0、多数真机为 5），读-改-写 PM1 控制块；`reboot()` 走 i8042 `0xFE` → `0xCF9` → 三重故障。对应 `SYS_POWEROFF(61)` / `SYS_REBOOT(62)`，只授给持 `Capability::Spawn` 的可信域（shell）。
 - **诊断**：`init` 对每个被监督域做连续失败预算（4 次后 `giving up`）；`kbd` 打印 `waiting for scancodes` / `first scancode received`；`dmesg` 支持 `-d/-a/-g/path` 与行边界 `Ctrl+C` 中止（`SYS_KEY_TRY_READ(63)`）。

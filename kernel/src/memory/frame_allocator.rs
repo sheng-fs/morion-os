@@ -279,14 +279,17 @@ pub fn free_frame(addr: u64) {
 // 重启循环后期 `malloc FAILED`)。`dec_ref` 归零即回收槽位, 正常路径不会常驻。
 const MAX_SHARED_FRAMES: usize = 1024;
 
-static mut SHARED_FRAMES: [(u64, u8); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
+static mut SHARED_FRAMES: [(u64, u16); MAX_SHARED_FRAMES] = [(0, 0); MAX_SHARED_FRAMES];
 
 /// 增加某物理帧的引用计数 (已存在则递增, 否则插入新槽位)。
+///
+/// 计数为 `u16` 并在 `u16::MAX` 处饱和: 域数远超 256 时也不会回绕成 0 —— 回绕会让
+/// 该帧被当成"无人引用"提前释放, 而其它域的映射仍指向它 (踩内存/重复分配)。
 pub fn inc_ref(addr: u64) {
     unsafe {
         for slot in SHARED_FRAMES.iter_mut() {
             if slot.0 == addr && slot.1 > 0 {
-                slot.1 += 1;
+                slot.1 = slot.1.saturating_add(1);
                 return;
             }
         }
@@ -412,5 +415,22 @@ mod tests {
         release_user_frame(shared);
         assert!(!bitmap_test(11), "计数归零后应释放");
         assert!(!is_tracked(shared));
+
+        // (3) 引用计数把计数推到上限: 饱和在 u16::MAX, 不会回绕成 0。
+        // 回绕成 0 会让 `is_tracked` 变假、下一次 `dec_ref` 直接失败, 帧因此被提前释放。
+        let capped: u64 = 13 * FRAME_SIZE as u64;
+        reserve_frame(capped as usize);
+        let limit = u16::MAX as u32;
+        for _ in 0..limit + 8 {
+            inc_ref(capped); // 多推 8 次, 越过上限
+        }
+        assert!(is_tracked(capped), "计数越过上限后不应回绕为 0");
+        // 逐次递减到归零, 递减次数必须是上限值 (而非回绕后的小数)。
+        let mut drops = 0u32;
+        while !dec_ref(capped) {
+            drops += 1;
+            assert!(drops <= limit, "计数异常: 递减次数超过上限");
+        }
+        assert_eq!(drops + 1, limit, "计数应饱和在 u16::MAX, 而不是回绕");
     }
 }

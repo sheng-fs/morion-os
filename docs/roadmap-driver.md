@@ -330,8 +330,8 @@
 第一轮真机（笔记本 + USB 启动盘）暴露的最后一组驱动问题，已全部在 QEMU 复现并验证：
 
 - **多 xHCI 控制器**：内核按 class `0C:03:30` 遍历，对每台调 `device::grant_slot()`（最多
-  `DEVICE_MULTI_SLOTS = 4`）；描述页 / BAR / DMA 分别映射到 `DEVICE_MULTI_CFG/BAR/DMA_VADDR`
-  + 槽位步长（1 页 / 4 页 / 16 页）。`xhci_srv` 用 `DeviceGrant::load_at(slot)` 逐台探测，
+  `DEVICE_MULTI_SLOTS = 16`）；描述页 / BAR / DMA 分别映射到 `DEVICE_MULTI_CFG/BAR/DMA_VADDR`
+  + 槽位步长（1 页 / 4 页 / 24 页）。`xhci_srv` 用 `DeviceGrant::load_at(slot)` 逐台探测，
   不再只认第一台。真机日志：`[OK] xHCI controller #0/#1/#2 …`。
 - **USB HID boot keyboard**：设备是 HID class 3 / subclass 1 / protocol 1 时，解析配置描述符里的
   Interrupt IN 端点（EP Type 7），`SET_CONFIGURATION` + `SET_PROTOCOL(0)` 后用 `bulkin` 环收

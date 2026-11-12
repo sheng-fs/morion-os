@@ -738,7 +738,9 @@ pub extern "C" fn kernel_main() -> ! {
                 func: d.func,
                 bar_paddr: bar0,
                 bar_pages: 4,
-                dma_pages: 16,
+                // 24 页：控制器级页 + 最多 5 页 scratchpad + 2 组 slot 页
+                // （每组 devctx/EP0/Bin/Bout/data 各 1 页）。
+                dma_pages: 24,
                 msix_vectors: 0,
                 label: "xhci",
             },

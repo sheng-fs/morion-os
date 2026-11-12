@@ -182,6 +182,18 @@ pub fn parse(bytes: &[u8]) -> Option<Image> {
     if image.count == 0 {
         return None;
     }
+    // 段与段的虚拟地址范围不得重叠：否则后一个段可以覆盖前一个段的代码/`.bss`
+    // （加载期内存覆盖）。首尾相接（`end == start`）合法；`memsz == 0` 的段已跳过。
+    for i in 0..image.count {
+        let a = image.segments[i];
+        let a_end = a.vaddr.checked_add(a.memsz)?;
+        for b in &image.segments[i + 1..image.count] {
+            let b_end = b.vaddr.checked_add(b.memsz)?;
+            if a.vaddr < b_end && b.vaddr < a_end {
+                return None;
+            }
+        }
+    }
     // 入口必须在某个已载入段的范围内 —— 否则一开局就跳到没映射的地址上（#PF）。
     let entry_in_segment = image
         .segments()
@@ -334,6 +346,42 @@ mod tests {
         b[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes());
         b[ph + 40..ph + 48].copy_from_slice(&0x1000u64.to_le_bytes());
         let img = parse(&b).expect("应接受带纯 .bss 段的镜像");
+        assert_eq!(img.count, 2);
+    }
+
+    /// 构造两个 PT_LOAD 段：第一个 RX 覆盖入口 `[BASE, BASE+0x2000)`，
+    /// 第二个 RW 的地址/大小由调用方给出（用于拼出重叠或首尾相接）。
+    fn two_segments(second_vaddr: u64, second_memsz: u64) -> alloc::vec::Vec<u8> {
+        let mut b = sample();
+        b[56..58].copy_from_slice(&2u16.to_le_bytes());
+        b.resize(64 + 112 + 0x10, 0);
+        let ph = 64 + 56;
+        b[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 4..ph + 8].copy_from_slice(&(PF_W | 4).to_le_bytes()); // PF_R|PF_W
+        b[ph + 8..ph + 16].copy_from_slice(&0x10u64.to_le_bytes()); // p_offset
+        b[ph + 16..ph + 24].copy_from_slice(&second_vaddr.to_le_bytes());
+        b[ph + 32..ph + 40].copy_from_slice(&0x10u64.to_le_bytes()); // p_filesz
+        b[ph + 40..ph + 48].copy_from_slice(&second_memsz.to_le_bytes());
+        b
+    }
+
+    /// 段与段范围重叠 = 加载期可覆盖前一段的代码/`.bss`，必须拒绝。
+    #[test]
+    fn rejects_overlapping_segments() {
+        // 第二段起于第一段 .bss 内部（BASE+0x1000 < BASE+0x2000）。
+        let overlap = two_segments(USER_SPACE_BASE + 0x1000, 0x1000);
+        assert!(parse(&overlap).is_none(), "段范围重叠应拒绝");
+
+        // 完全包含第一段也算重叠。
+        let contain = two_segments(USER_SPACE_BASE, 0x4000);
+        assert!(parse(&contain).is_none(), "段被完全包含应拒绝");
+    }
+
+    /// 首尾相接（一个的 end == 另一个的 start）是正常布局，必须接受。
+    #[test]
+    fn accepts_adjacent_segments() {
+        let adjacent = two_segments(USER_SPACE_BASE + 0x2000, 0x1000);
+        let img = parse(&adjacent).expect("首尾相接的段应接受");
         assert_eq!(img.count, 2);
     }
 }

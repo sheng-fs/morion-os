@@ -73,14 +73,17 @@ pub fn of(domain: u64) -> Option<u64> {
 /// 缺页信息序列化进消息 payload, 经通用 IPC 邮箱投递; `from` 记为缺页域,
 /// 使分页器 `receive` 后回复目标正确路由回缺页域。
 /// 调用者须保证中断关闭 (IF=0); 本函数不改变中断使能位。
-pub fn deliver_fault(pager: u64, info: PageFaultInfo) {
+///
+/// 返回 `false` 表示邮箱已满、消息没投出去 —— 调用方**不能**再 `block_current`，
+/// 否则缺页任务永远等不到回复（静默死锁）。必须把这个结果当错误处理。
+pub fn deliver_fault(pager: u64, info: PageFaultInfo) -> bool {
     let payload = unsafe {
         core::slice::from_raw_parts(
             &info as *const PageFaultInfo as *const u8,
             core::mem::size_of::<PageFaultInfo>(),
         )
     };
-    crate::ipc::deliver(info.fault_domain, pager, FAULT_TAG, payload);
+    crate::ipc::deliver(info.fault_domain, pager, FAULT_TAG, payload)
 }
 
 #[cfg(test)]
