@@ -68,6 +68,8 @@ pub mod net_srv;
 pub mod netstack_srv;
 #[cfg(feature = "svc-pager")]
 pub mod pager;
+#[cfg(feature = "svc-r8169_srv")]
+pub mod r8169_srv;
 #[cfg(feature = "svc-receiver")]
 pub mod receiver;
 #[cfg(feature = "svc-sender")]

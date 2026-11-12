@@ -3883,6 +3883,11 @@ fn gs3_window_compositor() -> Option<()> {
     }
 
     println("app: GS3 window compositor OK (z-order + clipping verified on framebuffer)");
+    // **收尾**: `gfx_srv` 的窗口表只有 `MAX_WINDOWS = 4` 个槽 (0 = 文本控制台), 自测若把
+    // 两个取证窗口留在表里, 用户应用 (editor / files) 就只剩 1 个可用窗口 —— 第二个应用
+    // `Window::create` 会直接失败。自测窗口本就不该长期占位, 断言完即销毁。
+    let _ = a.destroy();
+    let _ = b.destroy();
     Some(())
 }
 

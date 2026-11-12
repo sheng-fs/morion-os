@@ -79,12 +79,12 @@ const SERVICE_DIR: &str = "/system/services/";
 const POLICY: [(u64, &[u64]); 4] = [
     // 造进程: 仅 app(7) / shell(8) / init(14) —— 其余域一概不该有。
     (CAP_KIND_SPAWN, &[7, 8, 14]),
-    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22) / e1000(24)。
-    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19, 22, 24]),
+    // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22) / e1000(24) / r8169(26)。
+    (CAP_KIND_MMIO, &[5, 16, 17, 18, 19, 22, 24, 26]),
     // 帧缓冲: 全局唯一凭证, 仅 gfx_srv(15)。
     (CAP_KIND_FB, &[15]),
-    // I/O 端口: 仅 block(5, IDE PIT) / mfs(11) / exfat(13) (CMOS RTC)。
-    (CAP_KIND_IO_PORT, &[5, 11, 13]),
+    // I/O 端口: 仅 block(5, IDE PIT) / kbd(4, PS/2) / mfs(11) / exfat(13) (CMOS RTC)。
+    (CAP_KIND_IO_PORT, &[4, 5, 11, 13]),
 ];
 
 /// 正向要求: 这些域**必须**持有这些能力 (缺了说明授权遗漏或审计读取失灵)。

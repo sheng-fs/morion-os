@@ -191,6 +191,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "morion-editor"
+version = "0.1.0"
+dependencies = [
+ "morion",
+]
+
+[[package]]
+name = "morion-files"
+version = "0.1.0"
+dependencies = [
+ "morion",
+]
+
+[[package]]
 name = "morion-hello"
 version = "0.1.0"
 dependencies = [

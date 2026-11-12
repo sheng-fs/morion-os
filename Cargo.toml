@@ -20,6 +20,9 @@ members = [
     "user/hello",
     # 用户态系统服务 (E2b): 14 个服务各自独立 crate → 各自独立 ELF。
     "user/srv",
+    # 预装图形应用 (第二批接线): 独立 crate → 独立 .mex, 由 shell `run` 从文件加载。
+    "user/apps/editor",
+    "user/apps/files",
 ]
 
 # 未来添加:

@@ -12,7 +12,3 @@ path = "src/main.rs"
 
 [dependencies]
 morion = { path = "../../libmorion" }
-
-# 独立工作区: 本目录在根工作区内, 但暂不加入根 workspace 的 members
-# (第二批接线时由构建系统统一决定)。
-[workspace]

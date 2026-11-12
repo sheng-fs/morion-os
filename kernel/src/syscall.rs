@@ -356,6 +356,25 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
     true
 }
 
+/// 给 `SYS_SPAWN_ELF` 新建的**通用应用**补授运行库需要的能力。
+///
+/// `exec::spawn_elf` 已授予"访问文件系统的最小面"(挂载层 / MFS); 但预装图形应用
+/// (`editor` / `files`) 还需要向 `gfx_srv` 提交绘图请求并共享表面页 (`SendTo` +
+/// `MapInto`), 以及读写 `/` (FAT32) 与 `/tmp` (tmpfs)。新域 id 是运行时分配的,
+/// 故只能在此处按固定域名补授 —— 这是 `run <app.mex>` 能跑起来的前提。
+fn grant_app_caps(domain: u64) {
+    /// `gfx_srv` 固定域号 (与 `main.rs` 建域顺序一致)。
+    const GFX_SRV_DOMAIN: u64 = 15;
+    /// `fat32_srv` (挂载于 `/`)。
+    const FAT32_SRV_DOMAIN: u64 = 6;
+    /// `tmpfs_srv` (挂载于 `/tmp`)。
+    const TMPFS_SRV_DOMAIN: u64 = 10;
+    for target in [GFX_SRV_DOMAIN, FAT32_SRV_DOMAIN, TMPFS_SRV_DOMAIN] {
+        crate::cap::grant(domain, crate::cap::Capability::SendTo(target));
+        crate::cap::grant(domain, crate::cap::Capability::MapInto(target));
+    }
+}
+
 /// 校验并取出用户态交来的 ELF 镜像缓冲区 (`SYS_SPAWN_ELF` / `SYS_SPAWN_ELF_AT` 共用)。
 ///
 /// 信任边界: 镜像是用户态给的, 解析与映射全部在核内做 (`elf::parse` 先全量校验), 因此
@@ -921,7 +940,21 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             let Some(image) = user_elf_image(a1, a2) else {
                 return u64::MAX;
             };
-            crate::exec::spawn_elf(image, from).unwrap_or(u64::MAX)
+            // 新域的任务在 `spawn_elf` 内就绪后即可被时钟中断调度; 而"通用应用能力"
+            // 只能在拿到新域 id 之后补 —— 故这段时间关中断, 保证应用**首跑时**能力已就位
+            // (与 `exec::spawn_elf` 内部"授权先于起任务"的约束一致)。
+            let was_enabled = x86_64::instructions::interrupts::are_enabled();
+            if was_enabled {
+                x86_64::instructions::interrupts::disable();
+            }
+            let domain = crate::exec::spawn_elf(image, from);
+            if let Some(d) = domain {
+                grant_app_caps(d);
+            }
+            if was_enabled {
+                x86_64::instructions::interrupts::enable();
+            }
+            domain.unwrap_or(u64::MAX)
         }
         SYS_SPAWN_ELF_AT => {
             // 在**指定域**里加载并启动 (E3c: 监督者把退出/崩溃的服务原地拉起来)。

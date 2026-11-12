@@ -218,6 +218,27 @@ pub fn find_e1000(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
+/// 在枚举结果中查找 **Realtek RTL8168/8111 (r8169 系)** 网卡 (网络控制器 class `02`,
+/// vendor `10EC`, device `8168`), 返回其 PCI 位置与 **BAR0** 的物理基址。
+///
+/// 真机笔记本常见的 RTL8111/8168 有线网卡。与 e1000e/e1000 并列: 同一套帧级 IPC,
+/// 寄存器模型完全不同 (`user/srv/src/r8169_srv.rs`, 全轮询)。BAR0 通常只有 256 字节,
+/// 但按 MMIO 页粒度映射 1 页足够覆盖驱动用到的 `0x00..0xE8`。
+pub fn find_r8169(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x02 || d.vendor != 0x10EC {
+            continue;
+        }
+        if d.device != 0x8168 {
+            continue;
+        }
+        if let Some(bar0) = read_bar0(d.bus, d.dev, d.func) {
+            return Some((d.bus, d.dev, d.func, bar0));
+        }
+    }
+    None
+}
+
 /// 在枚举结果中查找 **virtio-blk** (存储控制器 class `01`, vendor `1AF4`, device `1042`/`1001`),
 /// 返回其 PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
 ///

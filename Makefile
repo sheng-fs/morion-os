@@ -89,13 +89,16 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv httpd_srv e1000_srv wifi_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv httpd_srv e1000_srv wifi_srv r8169_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
 # 可执行文件加载 (E1) 的演示程序: 独立 crate → 独立 ELF, 由 `SYS_SPAWN_ELF` 运行时载入。
 # 主程序用 include_bytes! 把它带进镜像当"运输方式", 自测再写进文件系统读回来跑 (见 roadmap E1)。
 HELLO_ELF     := $(OUT_DIR)/user/hello.elf
+# 预装图形应用 (第二批接线): 独立 crate → 独立 ELF, 打包成 .mex 由 shell `run` 加载。
+EDITOR_MEX    := $(OUT_DIR)/user/editor.mex
+FILES_MEX     := $(OUT_DIR)/user/files.mex
 EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 # 可引导 U 盘镜像 (Phase 0 / P0.4): 与 ISO 同源, 但额外叠了 GPT/ESP 混合布局。
@@ -234,6 +237,39 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/lib
 	$(CP) target/x86_64-morion-user/release/morion-hello $@
 	@echo "  ✓ 演示程序: $@"
 
+# 预装图形应用: 每个应用一份独立 ELF, 拷贝成 `<name>.mex`。
+# 与 hello 同一套用户态目标/链接脚本, 由 shell 的 `run` 从 FAT32 根卷加载。
+APP_SRC := $(shell find user/apps -type f 2>/dev/null) $(shell find user/libmorion -type f 2>/dev/null) user/linker.ld
+
+.PHONY: apps
+apps: $(EDITOR_MEX) $(FILES_MEX)
+
+$(EDITOR_MEX): $(APP_SRC)
+	@echo "==> 构建预装应用 editor (独立 ELF)..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-editor \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-editor $@
+	@echo "  ✓ 预装应用: $@"
+
+$(FILES_MEX): $(APP_SRC)
+	@echo "==> 构建预装应用 files (独立 ELF)..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-files \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-files $@
+	@echo "  ✓ 预装应用: $@"
+
 # 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
 # (内核 `SERVICE_ELFS` 按名 include_bytes!)。用 stamp 让"多产物一次构建"只跑一遍。
 SRV_SRC := $(shell find user/srv user/libmorion user/libdevice -type f 2>/dev/null) user/linker.ld
@@ -273,7 +309,7 @@ $(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED) $(VARIANT_FLAGS)
 # ISO 镜像构建
 # ============================================================
 .PHONY: iso
-iso: kernel boot $(SRV_STAMP) $(ISO_IMAGE)
+iso: kernel boot $(SRV_STAMP) $(EDITOR_MEX) $(FILES_MEX) $(ISO_IMAGE)
 
 $(ISO_IMAGE):
 	@echo "==> 创建可启动 ISO 镜像..."
@@ -318,6 +354,11 @@ $(ISO_IMAGE):
 	@for n in $(SRV_NAMES); do \
 		mcopy -o -i $(EFIBOOT_IMG) $(SRV_DIR)/$$n.elf ::/EFI/morion/services/$$n.elf; \
 	done
+
+	# 预装图形应用: 同时放进 ESP 的 apps/ 目录, 让它们随镜像分发。
+	mmd -i $(EFIBOOT_IMG) ::/apps
+	mcopy -o -i $(EFIBOOT_IMG) $(EDITOR_MEX) ::/apps/editor.mex
+	mcopy -o -i $(EFIBOOT_IMG) $(FILES_MEX) ::/apps/files.mex
 
 	$(CP) $(EFIBOOT_IMG) $(ISO_DIR)/efiboot.img
 
@@ -595,7 +636,7 @@ run-ide: iso $(DISK_IMG)
 #
 # 以及 `/system/services/*.elf` (E3c): 监督者 init 的**重启源** —— 它从这张根盘读回服务
 # 镜像, 用 `SYS_SPAWN_ELF_AT` 把退出的服务原地拉起来。故镜像依赖 $(SRV_STAMP)。
-$(NVME_IMG): $(HELLO_ELF) $(SRV_STAMP) Makefile
+$(NVME_IMG): $(HELLO_ELF) $(EDITOR_MEX) $(FILES_MEX) $(SRV_STAMP) Makefile
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
@@ -608,6 +649,9 @@ $(NVME_IMG): $(HELLO_ELF) $(SRV_STAMP) Makefile
 	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
 	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/hello.mex
+	# 预装图形应用: 放在根卷, 供 shell `run /editor.mex` / `run /files.mex` 加载。
+	mcopy -o -i $(NVME_IMG) $(EDITOR_MEX) ::/editor.mex
+	mcopy -o -i $(NVME_IMG) $(FILES_MEX) ::/files.mex
 	# 服务镜像 (E3c): init 的重启源。与 ESP 上那份同源 —— 都在 build/user/srv/。
 	mmd -i $(NVME_IMG) ::/system
 	mmd -i $(NVME_IMG) ::/system/services

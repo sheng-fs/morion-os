@@ -17,8 +17,10 @@ use morion::gfx::{
 use morion::syscall::{println, sys_alloc_page, sys_share_page, sys_virt_to_phys};
 use morion::vfs;
 
+// 窗口表面必须落在 libmorion 的单表面上限内（`SURFACE_MAX_PAGES` = 256 页 = 1 MiB）:
+// 720 × 360 × 4 B = 1_036_800 B (254 页)，超出会 `Window::create` 返回 None。
 const WIN_W: u32 = 720;
-const WIN_H: u32 = 480;
+const WIN_H: u32 = 360;
 const TITLE_H: u32 = 24;
 const STATUS_H: u32 = 20;
 const AREA_Y: u32 = TITLE_H;

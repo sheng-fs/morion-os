@@ -147,6 +147,8 @@ pub const NIC_KIND_E1000: u64 = 3;
 /// 网卡型号：无线 station（wifi_srv，域 25）——**关联成功后**才以该型号出现在 NIC 表里
 /// （plan §3.4 的抽象：无线关联成功即暴露为一条普通以太链路，与有线驱动同契约）。
 pub const NIC_KIND_WIFI: u64 = 4;
+/// 网卡型号：Realtek RTL8168/8111（r8169_srv，域 26）。
+pub const NIC_KIND_R8169: u64 = 5;
 
 /// 一条网卡接线：驱动服务域 + 帧共享页 VA + 型号。
 #[repr(C)]

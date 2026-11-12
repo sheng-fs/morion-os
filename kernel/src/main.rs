@@ -364,6 +364,10 @@ pub extern "C" fn kernel_main() -> ! {
     // 本轮只固化「驱动↔协议栈」的 L2 链路契约 + 802.11 控制面 IPC (WIFI_OP_SCAN/ASSOC/STATUS)
     // 的**空实现**; 真机接入 (vfio 直通 + 固件 + 802.11/WPA 栈) 后 radio 后端替换, 契约不变。
     let wifi_domain = domain::create();
+    // 域 26 — r8169_srv (Realtek RTL8168/8111 网卡驱动, 真机笔记本常见有线网卡): 仍走
+    // 通用设备授权; 全轮询 (RTL8168 常态用 INTx/MSI, 本内核只有 MSI-X 通路), 不申请向量。
+    // 驱动从**多实例槽 0** 读授权 (`DeviceGrant::load_at(0)`), 故内核用 `grant_slot(.., 0)`。
+    let r8169_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -373,6 +377,12 @@ pub extern "C" fn kernel_main() -> ! {
     cap::init(boot_domains);
     net::init();
     pager::init(boot_domains, pager_domain);
+    // 域 26 (r8169_srv) 超出 BOOT_DOMAINS 的表长, 故按运行时建域的方式补齐三张按域 id
+    // 索引的表 —— 否则对它的能力授权 / 邮箱访问会越界 panic。它随后由引导器的模块表
+    // 用 `exec::spawn_elf_at` 载入 (不经 `SYS_SPAWN_ELF`, 不会重建这些行)。
+    cap::add_domain(r8169_domain);
+    ipc::add_domain(r8169_domain);
+    pager::add_domain(r8169_domain, pager_domain);
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -617,6 +627,40 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // 探测 Realtek RTL8168/8111 (r8169 系) 并授权给域 26（真机有线网卡）。
+    // BAR0 只需 1 页（驱动用到的寄存器到 0xE8）；DMA 27 页（RX/TX 环 + 64×1536B 收包缓冲
+    // + 单帧发送缓冲，布局由驱动自己划分）。全轮询, 不申请中断向量。
+    let mut r8169_found = false;
+    match arch::pci::find_r8169(&pci_devices) {
+        Some((bus, dev, func, bar0)) => {
+            // 驱动入口读 `DeviceGrant::load_at(0)` —— 多实例槽 0。
+            device::grant_slot(
+                device::GrantRequest {
+                    domain: r8169_domain,
+                    bus,
+                    dev,
+                    func,
+                    bar_paddr: bar0,
+                    bar_pages: 1,
+                    dma_pages: 27,
+                    msix_vectors: 0,
+                    label: "r8169",
+                },
+                0,
+            );
+            video::print("[OK] r8169 BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+            r8169_found = true;
+        }
+        None => {
+            // 不授权设备; 但驱动会无条件读槽 0 的描述页, 故仍映射一页**零描述**
+            // （magic=0 → 驱动自行打印 idle），避免读到未映射地址触发缺页。
+            device::grant_empty_multi_from(r8169_domain, 0);
+            video::println("[OK] no r8169 controller, r8169_srv idle");
+        }
+    }
+
     // DRV-A: 把探测到的网卡组装成 NIC 表，只读映射进协议栈（域 21）。协议栈从此**不硬编码**
     // 网卡域号 / IO 页 VA / 网卡数量 —— 第 i 条 IO 页 = USER_BASE + 0x1A_0000 + i*4KiB
     // （与历史约定一致，回归逐字不变）。加一台网卡只需在这里追加一条。
@@ -648,6 +692,14 @@ pub extern "C" fn kernel_main() -> ! {
                 domain: e1000_domain,
                 io_vaddr: net::nic_io_vaddr(n as u64),
                 kind: net::NIC_KIND_E1000,
+            };
+            n += 1;
+        }
+        if r8169_found {
+            nics[n] = net::NicEntry {
+                domain: r8169_domain,
+                io_vaddr: net::nic_io_vaddr(n as u64),
+                kind: net::NIC_KIND_R8169,
             };
             n += 1;
         }
@@ -800,6 +852,11 @@ pub extern "C" fn kernel_main() -> ! {
     // 授权 (DRV-B): 协议栈 (域 21) 也可把 e1000 (域 24) 当第三台网卡 —— 同一套帧级 IPC。
     cap::grant(netstack_domain, cap::Capability::SendTo(e1000_domain));
     cap::grant(netstack_domain, cap::Capability::MapInto(e1000_domain));
+
+    // 授权 (r8169): 协议栈 (域 21) 也可把 r8169_srv (域 26) 当一台网卡 —— 帧级 IPC
+    // (SendTo + MapInto) 与其它网卡完全相同; 协议栈上层 socket API 不变。
+    cap::grant(netstack_domain, cap::Capability::SendTo(r8169_domain));
+    cap::grant(netstack_domain, cap::Capability::MapInto(r8169_domain));
 
     // 授权 (N8.2 拆分): httpd_srv (域 23) 经 netstack 用 TCP 原语 (SendTo + MapInto), 并持
     // 一条 `Net(80)` 端口能力 —— 监听 :80 时协议栈会用 `SYS_NET_OWNER` 核对归属, 越权不可伪造。

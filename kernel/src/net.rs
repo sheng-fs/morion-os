@@ -32,6 +32,8 @@ pub const NIC_KIND_VIRTIO_NET: u64 = 1;
 pub const NIC_KIND_E1000E: u64 = 2;
 /// 网卡型号：Intel e1000 82540EM（e1000_srv，域 24，DRV-B）。
 pub const NIC_KIND_E1000: u64 = 3;
+/// 网卡型号：Realtek RTL8168/8111（r8169_srv，域 26）。
+pub const NIC_KIND_R8169: u64 = 5;
 
 /// 一条网卡接线：驱动服务域 + 帧共享页 VA + 型号。
 #[repr(C)]

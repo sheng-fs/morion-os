@@ -2,6 +2,10 @@ use crate::common::*;
 use morion::syscall::*;
 use morion::{syscall, vfs};
 
+// 包管理 MVP (`pkg`)。放在 shell 模块内, 不新增 crate / lib.rs 条目。
+#[path = "pkg.rs"]
+mod pkg;
+
 // ===========================================================================
 // 域 8 — Shell (命令行解释器)
 // ===========================================================================
@@ -224,6 +228,7 @@ const COMMANDS: &[&str] = &[
     "mfs.fsck",
     "mfs.sync",
     "df",
+    "pkg",
     "part.create",
     "part.del",
     "part.wipe",
@@ -430,6 +435,16 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  mfs.fsck [--repair]  reconcile MFS inodes (report only; --repair reclaims)");
             println("  mfs.sync       flush MorionFS to disk now (prints the on-disk generation)");
             println("  df             show MorionFS space usage (/mfs)");
+            println("  pkg build <dir> <out.mpk>  pack a directory into an .mpk archive");
+            println("  pkg install <.mpk>  verify + unpack to /nix/store, then add a generation");
+            println("  pkg remove <name>  drop a package from the current generation");
+            println("  pkg list       list packages in the current generation");
+            println("  pkg info <name>  show store path / hash / manifest");
+            println("  pkg generations  list kept generations");
+            println("  pkg rollback   switch to the previous generation");
+            println("  pkg switch <N>  switch to generation N");
+            println("  pkg gc         delete store paths no generation references");
+            println("  pkg selftest   run the package-manager end-to-end self test");
             println(
                 "  part.create <nsid> <MiB> [mbr]  create a partition (disk-wide, blank = GPT)",
             );
@@ -486,6 +501,7 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "mfs.fsck" => shell_mfs_fsck(arg),
         "mfs.sync" => shell_mfs_sync(arg),
         "df" => shell_df(arg),
+        "pkg" => pkg::run(st.cwd_str(), arg),
         "part.create" => shell_part_create(arg),
         "part.del" => shell_part_delete(arg),
         "part.wipe" => shell_part_wipe(arg),
