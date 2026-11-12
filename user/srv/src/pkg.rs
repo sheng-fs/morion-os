@@ -6,14 +6,17 @@
 //!   故物理路径是 `/mfs/nix/store/...` (用户可见输出里把 `/mfs` 前缀去掉, 仍叫
 //!   `/nix/store/...`)。
 //! - **`.mpk`**: 自定义归档 = 条目表 (路径 + 内容) + 末尾 manifest。魔数 `MPK1`,
-//!   纯 no_std, 解析时对所有长度做越界校验。
+//!   纯 no_std, 解析时对所有长度做越界校验。manifest 的 `deps: [..]` 记录依赖包名,
+//!   旧 manifest 没有这一行时视为无依赖。
 //! - **哈希**: 对「文件清单 (相对路径 + 长度) + 内容」做 FNV-1a 64, 输出 16 位十六进制,
 //!   直接构成 store 目录名前缀。
 //! - **代际**: `/nix/var/nix/profiles/default` 每行一个 store 路径, 是当前视图;
 //!   历史代际保留在 `default-<N>`。切换 = 写临时文件 + `rename` 原子替换视图。
-//! - **GC**: 删除不被任何一代引用的 store 路径 (按引用图的可达性判断)。
+//! - **GC**: 从所有代际的根包出发, 沿 manifest 的 `deps` 引用图遍历, 删除不可达的
+//!   store 路径; 被任何一代 (或其依赖链) 引用的路径都保留。
 //!
-//! 这是最小闭环: 不做签名、远程仓库、依赖解析与沙盒构建。
+//! 这是最小闭环: 不做签名、远程仓库、版本求解与沙盒构建。依赖只按包名从本地仓库
+//! 目录 `/mfs/repo/*.mpk` 解析, 不做版本约束。
 
 use crate::common::print_sanitized;
 use morion::syscall::{print, print_u64, println};
@@ -51,6 +54,12 @@ const CHUNK: usize = 4096;
 
 /// store 物理根 (MFS 挂载点之下)。
 const STORE_ROOT: &str = "/mfs/nix/store";
+/// 本地依赖仓库: 安装时从这里找 `*.mpk` 补齐依赖。
+const REPO_DIR: &str = "/mfs/repo";
+/// 单个包最多声明的依赖数。
+const MAX_DEPS: usize = 8;
+/// 一次安装的依赖闭包最多包含的包数。
+const MAX_CLOSURE: usize = 16;
 /// 代际目录。
 const PROFILE_DIR: &str = "/mfs/nix/var/nix/profiles";
 /// 当前代际序号文件。
@@ -94,7 +103,22 @@ static mut GC_NAMES: [[u8; 64]; 24] = [[0; 64]; 24];
 static mut GC_LENS: [u8; 24] = [0; 24];
 static mut GC_IS_DIR: [u8; 24] = [0; 24];
 
+/// 一个包的依赖名列表 (manifest `deps` 字段)。
+#[derive(Clone, Copy)]
+struct DepSet {
+    names: [[u8; NAME_MAX]; MAX_DEPS],
+    lens: [u8; MAX_DEPS],
+    n: u8,
+}
+
+const DEPS_EMPTY: DepSet = DepSet {
+    names: [[0; NAME_MAX]; MAX_DEPS],
+    lens: [0; MAX_DEPS],
+    n: 0,
+};
+
 /// 一个包的元数据 (来自 manifest / 目录名)。
+#[derive(Clone, Copy)]
 struct PkgMeta {
     hash: u64,
     files: u32,
@@ -102,7 +126,36 @@ struct PkgMeta {
     name_len: u8,
     ver: [u8; VER_MAX],
     ver_len: u8,
+    deps: DepSet,
 }
+
+const PKG_META_EMPTY: PkgMeta = PkgMeta {
+    hash: 0,
+    files: 0,
+    name: [0; NAME_MAX],
+    name_len: 0,
+    ver: [0; VER_MAX],
+    ver_len: 0,
+    deps: DEPS_EMPTY,
+};
+
+/// 依赖解析后记住的一个包: 元数据 + 归档源路径 (安装阶段重新校验/展开)。
+#[derive(Clone, Copy)]
+struct ResolvedPkg {
+    meta: PkgMeta,
+    src: [u8; 128],
+    src_len: u8,
+}
+
+const RESOLVED_EMPTY: ResolvedPkg = ResolvedPkg {
+    meta: PKG_META_EMPTY,
+    src: [0; 128],
+    src_len: 0,
+};
+
+static mut RESOLVED: [ResolvedPkg; MAX_CLOSURE] = [RESOLVED_EMPTY; MAX_CLOSURE];
+static mut INSTALL_PATHS: [[u8; PATH_MAX + 32]; MAX_CLOSURE] = [[0; PATH_MAX + 32]; MAX_CLOSURE];
+static mut INSTALL_LENS: [u8; MAX_CLOSURE] = [0; MAX_CLOSURE];
 
 /// 安装结果: store 路径 + 元数据。
 struct StoreRef {
@@ -141,6 +194,18 @@ fn gen_out_mut() -> &'static mut [u8; GENBUF_MAX] {
 
 fn gens_mut() -> &'static mut [u32; MAX_GENS] {
     unsafe { &mut *core::ptr::addr_of_mut!(GENS) }
+}
+
+fn resolved_mut() -> &'static mut [ResolvedPkg; MAX_CLOSURE] {
+    unsafe { &mut *core::ptr::addr_of_mut!(RESOLVED) }
+}
+
+fn install_paths_mut() -> &'static mut [[u8; PATH_MAX + 32]; MAX_CLOSURE] {
+    unsafe { &mut *core::ptr::addr_of_mut!(INSTALL_PATHS) }
+}
+
+fn install_lens_mut() -> &'static mut [u8; MAX_CLOSURE] {
+    unsafe { &mut *core::ptr::addr_of_mut!(INSTALL_LENS) }
 }
 
 /// 逐字节打印 UTF-8 (路径只可能是 ASCII)。
@@ -650,8 +715,23 @@ fn hash_entries(list: &mut [Entry]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// 把依赖列表混进总摘要, 让同一份文件集合在不同依赖下得到不同的 store 路径。
+fn mix_deps(h: &mut u64, deps: &DepSet) {
+    fnv_update(h, &[deps.n]);
+    for i in 0..deps.n as usize {
+        fnv_update(h, &(deps.lens[i] as u32).to_le_bytes());
+        fnv_update(h, &deps.names[i][..deps.lens[i] as usize]);
+    }
+}
+
 /// 生成 manifest 文本。
-fn build_manifest(name: &[u8], ver: &[u8], hash: u64, list: &[Entry]) -> Option<usize> {
+fn build_manifest(
+    name: &[u8],
+    ver: &[u8],
+    hash: u64,
+    deps: &DepSet,
+    list: &[Entry],
+) -> Option<usize> {
     let buf = manifest_mut();
     let mut n = 0usize;
     let mut hx = [0u8; 16];
@@ -668,6 +748,16 @@ fn build_manifest(name: &[u8], ver: &[u8], hash: u64, list: &[Entry]) -> Option<
     let nn = write_dec(list.len() as u32, &mut num);
     push_bytes(buf, &mut n, &num[..nn])?;
     push_bytes(buf, &mut n, b"\n")?;
+    if deps.n > 0 {
+        push_str(buf, &mut n, "deps: [")?;
+        for i in 0..deps.n as usize {
+            if i > 0 {
+                push_str(buf, &mut n, ", ")?;
+            }
+            push_bytes(buf, &mut n, &deps.names[i][..deps.lens[i] as usize])?;
+        }
+        push_str(buf, &mut n, "]\n")?;
+    }
     for e in list {
         let mut eh = [0u8; 16];
         hex16(e.hash, &mut eh);
@@ -728,8 +818,8 @@ fn write_archive(out: &str, list: &[Entry], manifest: &[u8]) -> Result<(), &'sta
     Ok(())
 }
 
-/// `pkg build <dir> <out.mpk>` 的实现。
-fn build_archive(dir: &str, out: &str) -> Result<PkgMeta, &'static str> {
+/// `pkg build <dir> <out.mpk> [dep...]` 的实现。
+fn build_archive(dir: &str, out: &str, deps: &DepSet) -> Result<PkgMeta, &'static str> {
     if dir.len() > 90 || out.len() > 90 {
         return Err("path too long (max 90 bytes)");
     }
@@ -759,9 +849,10 @@ fn build_archive(dir: &str, out: &str) -> Result<PkgMeta, &'static str> {
     for e in list.iter() {
         fnv_update(&mut h, &e.hash.to_le_bytes());
     }
+    mix_deps(&mut h, deps);
 
-    let mlen =
-        build_manifest(name.as_bytes(), ver.as_bytes(), h, list).ok_or("manifest too large")?;
+    let mlen = build_manifest(name.as_bytes(), ver.as_bytes(), h, deps, list)
+        .ok_or("manifest too large")?;
     let manifest = manifest_mut();
     write_archive(out, list, &manifest[..mlen])?;
 
@@ -772,6 +863,7 @@ fn build_archive(dir: &str, out: &str) -> Result<PkgMeta, &'static str> {
         name_len: name.len() as u8,
         ver: [0; VER_MAX],
         ver_len: ver.len() as u8,
+        deps: *deps,
     };
     meta.name[..name.len()].copy_from_slice(name.as_bytes());
     meta.ver[..ver.len()].copy_from_slice(ver.as_bytes());
@@ -793,6 +885,35 @@ fn manifest_field<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
+/// 解析 `deps: [a, b]` (也接受空格分隔 / 无方括号的写法)。
+fn parse_deps(v: &[u8]) -> Result<DepSet, &'static str> {
+    let mut deps = DEPS_EMPTY;
+    for tok in v.split(|&b| b == b',' || b == b' ' || b == b'\t' || b == b'[' || b == b']') {
+        if tok.is_empty() {
+            continue;
+        }
+        if !valid_component(tok, NAME_MAX) {
+            return Err("manifest: bad dependency name");
+        }
+        let i = deps.n as usize;
+        if i >= MAX_DEPS {
+            return Err("manifest: too many dependencies");
+        }
+        deps.names[i][..tok.len()].copy_from_slice(tok);
+        deps.lens[i] = tok.len() as u8;
+        deps.n += 1;
+    }
+    Ok(deps)
+}
+
+/// 只取 manifest 的依赖字段 (GC 用); 没有 `deps` 行 = 无依赖 (兼容旧包)。
+fn manifest_deps(buf: &[u8]) -> Result<DepSet, &'static str> {
+    match manifest_field(buf, b"deps") {
+        Some(v) => parse_deps(v),
+        None => Ok(DEPS_EMPTY),
+    }
+}
+
 fn parse_manifest(buf: &[u8], count: u32) -> Result<PkgMeta, &'static str> {
     let name = manifest_field(buf, b"name").ok_or("manifest: missing name")?;
     let ver = manifest_field(buf, b"version").ok_or("manifest: missing version")?;
@@ -806,6 +927,7 @@ fn parse_manifest(buf: &[u8], count: u32) -> Result<PkgMeta, &'static str> {
     if files != count {
         return Err("manifest: file count mismatch");
     }
+    let deps = manifest_deps(buf)?;
     let mut meta = PkgMeta {
         hash,
         files,
@@ -813,6 +935,7 @@ fn parse_manifest(buf: &[u8], count: u32) -> Result<PkgMeta, &'static str> {
         name_len: name.len() as u8,
         ver: [0; VER_MAX],
         ver_len: ver.len() as u8,
+        deps,
     };
     meta.name[..name.len()].copy_from_slice(name);
     meta.ver[..ver.len()].copy_from_slice(ver);
@@ -891,6 +1014,7 @@ fn verify_archive(fd: u64, file_size: u64) -> Result<(PkgMeta, usize), &'static 
         return Err("read manifest failed");
     }
     let meta = parse_manifest(&manifest[..mlen], count as u32)?;
+    mix_deps(&mut h, &meta.deps);
     if meta.hash != h {
         return Err("content hash mismatch");
     }
@@ -982,11 +1106,8 @@ fn store_path(meta: &PkgMeta, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// `pkg install <.mpk>` 的实现: 校验 → 展开 → 追加一代。
-fn install_archive(src: &str) -> Result<StoreRef, &'static str> {
-    if src.len() > 90 {
-        return Err("path too long");
-    }
+/// 打开并校验一个 `.mpk`, 返回元数据 (不展开)。
+fn read_archive_meta(src: &str) -> Result<PkgMeta, &'static str> {
     let fd = vfs::open(src);
     if fd == u64::MAX {
         return Err("cannot open .mpk");
@@ -1001,43 +1122,273 @@ fn install_archive(src: &str) -> Result<StoreRef, &'static str> {
         vfs::close(fd);
         return Err("not a file");
     }
-    let file_size = st.size;
+    let r = verify_archive(fd, st.size);
+    vfs::close(fd);
+    r.map(|(meta, _)| meta)
+}
 
-    let (meta, mlen) = match verify_archive(fd, file_size) {
-        Ok(x) => x,
-        Err(e) => {
-            vfs::close(fd);
-            return Err(e);
+/// 在本地仓库 `/mfs/repo` 里按包名找一个 `*.mpk`, 找到时把路径写进 `out`。
+fn repo_find(name: &[u8], out: &mut [u8]) -> Option<usize> {
+    let fd = vfs::open(REPO_DIR);
+    if fd == u64::MAX {
+        return None;
+    }
+    let n = vfs::readdir_into(fd, vfs::SHELL_RESULT_BUF);
+    vfs::close(fd);
+    if n == u64::MAX {
+        return None;
+    }
+    let size = core::mem::size_of::<vfs::DirEntry>();
+    let count = n as usize / size;
+    let page = vfs::SHELL_RESULT_BUF as *const vfs::DirEntry;
+    for i in 0..count {
+        let de = unsafe { core::ptr::read_unaligned(page.add(i)) };
+        if de.is_dir != 0 {
+            continue;
         }
-    };
+        let mut fname = [0u8; 64];
+        let nl = match de_name(&de, &mut fname) {
+            Some(x) if x > 4 => x,
+            _ => continue,
+        };
+        if &fname[nl - 4..nl] != b".mpk" {
+            continue;
+        }
+        let mut full = [0u8; 128];
+        let fl = match join2(REPO_DIR, &fname[..nl], &mut full) {
+            Some(x) if x <= 90 => x,
+            _ => continue,
+        };
+        match read_archive_meta(as_str(&full[..fl])) {
+            Ok(meta) if &meta.name[..meta.name_len as usize] == name => {
+                if fl > out.len() {
+                    return None;
+                }
+                out[..fl].copy_from_slice(&full[..fl]);
+                return Some(fl);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// 依赖解析的递归状态 (栈深度 = 循环检测路径; missing 收集缺失的依赖名)。
+struct ResolveCtx {
+    stack: [[u8; NAME_MAX]; MAX_CLOSURE],
+    stack_lens: [u8; MAX_CLOSURE],
+    depth: usize,
+    missing: [[u8; NAME_MAX]; MAX_DEPS],
+    missing_lens: [u8; MAX_DEPS],
+    missing_n: usize,
+    count: usize,
+    order: [usize; MAX_CLOSURE],
+    order_n: usize,
+}
+
+impl ResolveCtx {
+    fn new() -> Self {
+        ResolveCtx {
+            stack: [[0; NAME_MAX]; MAX_CLOSURE],
+            stack_lens: [0; MAX_CLOSURE],
+            depth: 0,
+            missing: [[0; NAME_MAX]; MAX_DEPS],
+            missing_lens: [0; MAX_DEPS],
+            missing_n: 0,
+            count: 0,
+            order: [0; MAX_CLOSURE],
+            order_n: 0,
+        }
+    }
+
+    fn record_missing(&mut self, name: &[u8]) {
+        for k in 0..self.missing_n {
+            if &self.missing[k][..self.missing_lens[k] as usize] == name {
+                return;
+            }
+        }
+        if self.missing_n >= MAX_DEPS {
+            return;
+        }
+        let k = self.missing_n;
+        self.missing[k][..name.len()].copy_from_slice(name);
+        self.missing_lens[k] = name.len() as u8;
+        self.missing_n += 1;
+    }
+}
+
+/// 递归解析一个归档及其依赖; 返回它在 RESOLVED 里的下标。
+///
+/// 后序遍历 (依赖先入 order), 所以 order 末尾就是根包。
+fn resolve_one(src: &str, ctx: &mut ResolveCtx) -> Result<usize, &'static str> {
+    if ctx.depth >= MAX_CLOSURE {
+        return Err("dependency graph too deep");
+    }
+    let meta = read_archive_meta(src)?;
+    let name = &meta.name[..meta.name_len as usize];
+
+    for k in 0..ctx.depth {
+        if &ctx.stack[k][..ctx.stack_lens[k] as usize] == name {
+            print("pkg install: circular dependency: ");
+            for j in 0..ctx.depth {
+                print(as_str(&ctx.stack[j][..ctx.stack_lens[j] as usize]));
+                print(" -> ");
+            }
+            println(as_str(name));
+            return Err("circular dependency");
+        }
+    }
+    {
+        let pkgs = resolved_mut();
+        for (i, p) in pkgs.iter().enumerate().take(ctx.count) {
+            if &p.meta.name[..p.meta.name_len as usize] == name {
+                return Ok(i);
+            }
+        }
+    }
+    if ctx.count >= MAX_CLOSURE {
+        return Err("dependency graph too large");
+    }
+
+    ctx.stack[ctx.depth][..name.len()].copy_from_slice(name);
+    ctx.stack_lens[ctx.depth] = name.len() as u8;
+    ctx.depth += 1;
+    for d in 0..meta.deps.n as usize {
+        let dn = &meta.deps.names[d][..meta.deps.lens[d] as usize];
+        let mut dep_src = [0u8; 128];
+        match repo_find(dn, &mut dep_src) {
+            Some(dl) => {
+                let _ = resolve_one(as_str(&dep_src[..dl]), ctx)?;
+            }
+            None => ctx.record_missing(dn),
+        }
+    }
+    ctx.depth -= 1;
+
+    if ctx.count >= MAX_CLOSURE {
+        return Err("dependency graph too large");
+    }
+    if src.len() > 128 {
+        return Err("path too long");
+    }
+    let idx = ctx.count;
+    {
+        let pkgs = resolved_mut();
+        let mut pkg = RESOLVED_EMPTY;
+        pkg.meta = meta;
+        pkg.src[..src.len()].copy_from_slice(src.as_bytes());
+        pkg.src_len = src.len() as u8;
+        pkgs[idx] = pkg;
+    }
+    ctx.count += 1;
+    ctx.order[ctx.order_n] = idx;
+    ctx.order_n += 1;
+    Ok(idx)
+}
+
+/// `pkg install <.mpk>` 的实现: 解析依赖闭包 → 依次校验/展开 → 追加一代。
+///
+/// 依赖闭包里每个包只展开一次; 整个闭包写进同一代, 顺序为依赖在前、根包在后。
+fn install_archive(src: &str) -> Result<StoreRef, &'static str> {
+    if src.len() > 90 {
+        return Err("path too long");
+    }
+    let mut ctx = ResolveCtx::new();
+    resolve_one(src, &mut ctx)?;
+    if ctx.missing_n > 0 {
+        print("pkg install: missing dependencies: ");
+        for k in 0..ctx.missing_n {
+            if k > 0 {
+                print(" ");
+            }
+            print(as_str(&ctx.missing[k][..ctx.missing_lens[k] as usize]));
+        }
+        println("");
+        return Err("missing dependencies");
+    }
+    let root_k = ctx.order_n - 1;
+
+    let paths = install_paths_mut();
+    let lens = install_lens_mut();
+    let mut root_meta = PKG_META_EMPTY;
+    for k in 0..ctx.order_n {
+        let idx = ctx.order[k];
+        let (src_buf, src_len) = {
+            let pkgs = resolved_mut();
+            let mut p = [0u8; 128];
+            let pl = pkgs[idx].src_len as usize;
+            p[..pl].copy_from_slice(&pkgs[idx].src[..pl]);
+            (p, pl)
+        };
+        let src_s = as_str(&src_buf[..src_len]);
+
+        let fd = vfs::open(src_s);
+        if fd == u64::MAX {
+            return Err("cannot open .mpk");
+        }
+        if vfs::stat_into(src_s, vfs::SHELL_RESULT_BUF) != core::mem::size_of::<vfs::Stat>() as u64
+        {
+            vfs::close(fd);
+            return Err("cannot stat .mpk");
+        }
+        let st = unsafe { core::ptr::read_unaligned(vfs::SHELL_RESULT_BUF as *const vfs::Stat) };
+        let (meta, mlen) = match verify_archive(fd, st.size) {
+            Ok(x) => x,
+            Err(e) => {
+                vfs::close(fd);
+                return Err(e);
+            }
+        };
+        let mut store = [0u8; PATH_MAX + 32];
+        let sl = match store_path(&meta, &mut store) {
+            Some(x) => x,
+            None => {
+                vfs::close(fd);
+                return Err("store path too long");
+            }
+        };
+        if sl > 90 {
+            vfs::close(fd);
+            return Err("store path too long");
+        }
+        let store_s = as_str(&store[..sl]);
+        if !is_dir(store_s) {
+            if !ensure_dir(STORE_ROOT) || !ensure_dir(store_s) {
+                vfs::close(fd);
+                return Err("cannot create store directory");
+            }
+            if let Err(e) = unpack_archive(fd, st.size, store_s, mlen) {
+                let _ = rm_tree(store_s);
+                vfs::close(fd);
+                return Err(e);
+            }
+        }
+        vfs::close(fd);
+        paths[k][..sl].copy_from_slice(&store[..sl]);
+        lens[k] = sl as u8;
+        if k == root_k {
+            root_meta = meta;
+        }
+    }
+
+    let mut buf = [0u8; GENBUF_MAX];
+    let mut len = read_view_checked(&mut buf)?;
+    for k in 0..ctx.order_n {
+        let line = &paths[k][..lens[k] as usize];
+        len = append_line(&mut buf, len, line).ok_or("generation list too large")?;
+    }
+    let n = current_gen() + 1;
+    if !write_generation(n, &buf[..len]) {
+        return Err("cannot write generation");
+    }
 
     let mut store = [0u8; PATH_MAX + 32];
-    let sl = store_path(&meta, &mut store).ok_or("store path too long")?;
-    if sl > 90 {
-        vfs::close(fd);
-        return Err("store path too long");
-    }
-    let store_s = as_str(&store[..sl]);
-
-    if !is_dir(store_s) {
-        if !ensure_dir(STORE_ROOT) || !ensure_dir(store_s) {
-            vfs::close(fd);
-            return Err("cannot create store directory");
-        }
-        if let Err(e) = unpack_archive(fd, file_size, store_s, mlen) {
-            let _ = rm_tree(store_s);
-            vfs::close(fd);
-            return Err(e);
-        }
-    }
-    vfs::close(fd);
-
-    append_generation(store_s).map_err(|_| "cannot write generation")?;
-
+    let sl = lens[root_k] as usize;
+    store[..sl].copy_from_slice(&paths[root_k][..sl]);
     Ok(StoreRef {
         store,
         store_len: sl as u8,
-        meta,
+        meta: root_meta,
     })
 }
 
@@ -1304,20 +1655,13 @@ fn cmd_info(name: &str) {
     }
 }
 
-fn cmd_remove(name: &str) {
+/// 从当前视图里删掉某个包, 写出一代新视图; 返回 (删除条目数, 新代际号)。
+fn remove_from_view(name: &str) -> Result<(u32, u32), &'static str> {
     if !valid_component(name.as_bytes(), NAME_MAX) {
-        println("pkg remove: invalid package name");
-        return;
+        return Err("invalid package name");
     }
     let mut buf = [0u8; GENBUF_MAX];
-    let len = match read_view_checked(&mut buf) {
-        Ok(n) => n,
-        Err(e) => {
-            print("pkg remove: failed: ");
-            println(e);
-            return;
-        }
-    };
+    let len = read_view_checked(&mut buf)?;
     let out = gen_out_mut();
     let mut on = 0usize;
     let mut removed = 0usize;
@@ -1332,28 +1676,40 @@ fn cmd_remove(name: &str) {
             continue;
         }
         if on + line.len() + 1 > out.len() {
-            println("pkg remove: generation list too large");
-            return;
+            return Err("generation list too large");
         }
         out[on..on + line.len()].copy_from_slice(line);
         out[on + line.len()] = b'\n';
         on += line.len() + 1;
     }
     if removed == 0 {
-        print("pkg remove: not installed: ");
-        println(name);
-        return;
+        return Err("not installed");
     }
     let n = current_gen() + 1;
     if !write_generation(n, &out[..on]) {
-        println("pkg remove: cannot write generation");
-        return;
+        return Err("cannot write generation");
     }
-    print("pkg remove: ");
-    print(name);
-    print(" -> generation ");
-    print_u64(n as u64);
-    println("");
+    Ok((removed as u32, n))
+}
+
+fn cmd_remove(name: &str) {
+    match remove_from_view(name) {
+        Ok((_removed, n)) => {
+            print("pkg remove: ");
+            print(name);
+            print(" -> generation ");
+            print_u64(n as u64);
+            println("");
+        }
+        Err("not installed") => {
+            print("pkg remove: not installed: ");
+            println(name);
+        }
+        Err(e) => {
+            print("pkg remove: ");
+            println(e);
+        }
+    }
 }
 
 fn cmd_generations() {
@@ -1422,25 +1778,26 @@ fn cmd_rollback() {
     }
 }
 
-/// 该 store 路径是否被任一保留代际引用。
-///
-/// 读不到某个代际时按「仍被引用」处理 —— GC 宁可少删, 也不能误删活着的包。
-fn referenced(gens: &[u32], path: &str) -> bool {
-    let mut buf = [0u8; GENBUF_MAX];
-    for &g in gens {
-        match read_gen(g, &mut buf) {
-            Some(len) => {
-                if has_line(&buf[..len], path.as_bytes()) {
-                    return true;
-                }
-            }
-            None => return true,
-        }
+/// 读一个 store 条目的 manifest 依赖; 目录里没有 manifest 视为叶子包。
+fn store_entry_deps(path: &str) -> Result<DepSet, &'static str> {
+    let mut mp = [0u8; PATH_MAX + 32];
+    let ml = join2(path, MANIFEST_FILE.as_bytes(), &mut mp).ok_or("manifest path too long")?;
+    if ml > 90 {
+        return Err("manifest path too long");
     }
-    false
+    let mp_s = as_str(&mp[..ml]);
+    if !exists(mp_s) {
+        return Ok(DEPS_EMPTY);
+    }
+    let buf = manifest_mut();
+    let n = read_file(mp_s, buf).ok_or("store manifest unreadable")?;
+    manifest_deps(&buf[..n])
 }
 
-/// 删除不被任何一代引用的 store 路径; 返回 (删除数, 保留数)。
+/// 删除不可达的 store 路径; 返回 (删除数, 保留数)。
+///
+/// 根 = 所有代际视图里的每一行; 从根出发沿 manifest 的 `deps` 做可达性分析,
+/// 只有完全不可达的路径才会被删。任何代际读不到都拒绝 GC (引用图不完整)。
 fn gc_collect(verbose: bool) -> Result<(u32, u32), &'static str> {
     let ngen = scan_generations();
     let gens = gens_mut();
@@ -1478,6 +1835,69 @@ fn gc_collect(verbose: bool) -> Result<(u32, u32), &'static str> {
         dirs[i] = (de.is_dir != 0) as u8;
     }
 
+    let mut mark = [false; 24];
+    let mut done = [false; 24];
+
+    // 根: 每一代视图里的每个 store 路径。
+    let mut gbuf = [0u8; GENBUF_MAX];
+    for &g in gens {
+        let len = read_gen(g, &mut gbuf).ok_or("generation too large / unreadable")?;
+        for line in gbuf[..len].split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let base = match line.rsplit(|&b| b == b'/').next() {
+                Some(b) => b,
+                None => continue,
+            };
+            for i in 0..count {
+                let nl = lens[i] as usize;
+                if nl > 0 && base == &names[i][..nl] {
+                    mark[i] = true;
+                }
+            }
+        }
+    }
+
+    // 沿依赖边扩散, 直到不动点 (按包名匹配 store 条目; 同名多版本全部保留)。
+    loop {
+        let mut changed = false;
+        for i in 0..count {
+            if !mark[i] || done[i] {
+                continue;
+            }
+            done[i] = true;
+            let mut full = [0u8; PATH_MAX];
+            let fl = match join2(STORE_ROOT, &names[i][..lens[i] as usize], &mut full) {
+                Some(x) if x <= 90 => x,
+                _ => return Err("store path too long"),
+            };
+            let deps = store_entry_deps(as_str(&full[..fl]))?;
+            for d in 0..deps.n as usize {
+                let dn = &deps.names[d][..deps.lens[d] as usize];
+                for j in 0..count {
+                    if mark[j] {
+                        continue;
+                    }
+                    let mut p2 = [0u8; PATH_MAX];
+                    let l2 = match join2(STORE_ROOT, &names[j][..lens[j] as usize], &mut p2) {
+                        Some(x) if x <= 90 => x,
+                        _ => continue,
+                    };
+                    if let Some((_, pname, _)) = split_store(as_str(&p2[..l2])) {
+                        if pname.as_bytes() == dn {
+                            mark[j] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut removed = 0u32;
     let mut kept = 0u32;
     for i in 0..count {
@@ -1491,7 +1911,7 @@ fn gc_collect(verbose: bool) -> Result<(u32, u32), &'static str> {
             _ => continue,
         };
         let path = as_str(&full[..fl]);
-        if referenced(gens, path) {
+        if mark[i] {
             kept += 1;
             continue;
         }
@@ -1543,7 +1963,7 @@ fn selftest_inner() -> Result<(), &'static str> {
     let gen0 = current_gen();
     print("PKG1 stage 2: build -> ");
     println(a_mpk);
-    let meta_a = build_archive(a_dir, a_mpk)?;
+    let meta_a = build_archive(a_dir, a_mpk, &DEPS_EMPTY)?;
     let mut hx = [0u8; 16];
     hex16(meta_a.hash, &mut hx);
     print("PKG1 build: hash=");
@@ -1569,7 +1989,7 @@ fn selftest_inner() -> Result<(), &'static str> {
     }
 
     println("PKG1 stage 5: install second package (new generation)");
-    build_archive(b_dir, b_mpk)?;
+    build_archive(b_dir, b_mpk, &DEPS_EMPTY)?;
     let b = install_archive(b_mpk)?;
     if current_gen() != gen0 + 2 {
         return Err("generation after install B");
@@ -1614,7 +2034,165 @@ fn selftest_inner() -> Result<(), &'static str> {
     if !rm_tree("/mfs/pkgtest") {
         return Err("cleanup");
     }
+
+    // ---- PKG2: 依赖解析 + 引用图 GC (c -> b -> a) --------------------------
+    println("PKG2 stage 1: create dependency chain fixtures (c -> b -> a)");
+    let ca_dir = "/mfs/pkgtest2/chain-a-1.0";
+    let cb_dir = "/mfs/pkgtest2/chain-b-1.0";
+    let cc_dir = "/mfs/pkgtest2/chain-c-1.0";
+    let cd_dir = "/mfs/pkgtest2/chain-d-1.0";
+    let cx_dir = "/mfs/pkgtest2/chain-x-1.0";
+    let cy_dir = "/mfs/pkgtest2/chain-y-1.0";
+    let repo_a = "/mfs/repo/chain-a.mpk";
+    let repo_b = "/mfs/repo/chain-b.mpk";
+    let repo_c = "/mfs/repo/chain-c.mpk";
+    let repo_d = "/mfs/repo/chain-d.mpk";
+    let repo_x = "/mfs/repo/chain-x.mpk";
+    let repo_y = "/mfs/repo/chain-y.mpk";
+    let _ = rm_tree("/mfs/pkgtest2");
+    if !ensure_dir(alloc_join(ca_dir, "share")?)
+        || !ensure_dir(alloc_join(cb_dir, "share")?)
+        || !ensure_dir(alloc_join(cc_dir, "share")?)
+        || !ensure_dir(alloc_join(cd_dir, "share")?)
+        || !ensure_dir(alloc_join(cx_dir, "share")?)
+        || !ensure_dir(alloc_join(cy_dir, "share")?)
+        || !ensure_dir(REPO_DIR)
+    {
+        return Err("create dependency fixtures");
+    }
+    if !write_file(alloc_join(ca_dir, "share/a.txt")?, b"chain base\n")
+        || !write_file(alloc_join(cb_dir, "share/b.txt")?, b"chain middle\n")
+        || !write_file(alloc_join(cc_dir, "share/c.txt")?, b"chain top\n")
+        || !write_file(alloc_join(cd_dir, "share/d.txt")?, b"missing dep\n")
+        || !write_file(alloc_join(cx_dir, "share/x.txt")?, b"cycle x\n")
+        || !write_file(alloc_join(cy_dir, "share/y.txt")?, b"cycle y\n")
+    {
+        return Err("create dependency fixture files");
+    }
+
+    println("PKG2 stage 2: build chain archives into /mfs/repo");
+    let meta_a2 = build_archive(ca_dir, repo_a, &DEPS_EMPTY)?;
+    let deps_b = deps_from(&["chain-a"])?;
+    let meta_b2 = build_archive(cb_dir, repo_b, &deps_b)?;
+    let deps_c = deps_from(&["chain-b"])?;
+    let meta_c2 = build_archive(cc_dir, repo_c, &deps_c)?;
+    if meta_a2.deps.n != 0 {
+        return Err("legacy package gained dependencies");
+    }
+    let mut sa = [0u8; PATH_MAX + 32];
+    let la = store_path(&meta_a2, &mut sa).ok_or("store path too long")?;
+    let mut sb = [0u8; PATH_MAX + 32];
+    let lb = store_path(&meta_b2, &mut sb).ok_or("store path too long")?;
+    let mut sc = [0u8; PATH_MAX + 32];
+    let lc = store_path(&meta_c2, &mut sc).ok_or("store path too long")?;
+    println("PKG2 build: c deps=chain-b, b deps=chain-a, a deps=<none> (old manifest)");
+
+    println("PKG2 stage 3: install chain-c.mpk, expect b and a pulled from repo");
+    let gen1 = current_gen();
+    let _c = install_archive(repo_c)?;
+    if current_gen() != gen1 + 1 {
+        return Err("generation after dependency install");
+    }
+    if !is_dir(as_str(&sa[..la])) || !is_dir(as_str(&sb[..lb])) || !is_dir(as_str(&sc[..lc])) {
+        return Err("dependency store paths missing");
+    }
+    let mut vb = [0u8; GENBUF_MAX];
+    let vl = read_view(&mut vb);
+    if !has_line(&vb[..vl], &sa[..la])
+        || !has_line(&vb[..vl], &sb[..lb])
+        || !has_line(&vb[..vl], &sc[..lc])
+    {
+        return Err("dependency generation view incomplete");
+    }
+    println("PKG2 install: c + b + a in one generation");
+
+    println("PKG2 stage 4: remove chain-b from the view (store path must stay)");
+    let gen_before_remove = current_gen();
+    let (_n, gen_removed) = remove_from_view("chain-b")?;
+    if gen_removed != gen_before_remove + 1 || current_gen() != gen_removed {
+        return Err("generation after remove");
+    }
+    let vl = read_view(&mut vb);
+    if has_line(&vb[..vl], &sb[..lb]) {
+        return Err("chain-b still in current view");
+    }
+    if !is_dir(as_str(&sb[..lb])) {
+        return Err("remove deleted the store path");
+    }
+    println("PKG2 remove: chain-b left the view, store path kept");
+
+    println("PKG2 stage 5: gc keeps chain-b because chain-c still depends on it");
+    let (gr1, gk1) = gc_collect(false)?;
+    if !is_dir(as_str(&sa[..la])) || !is_dir(as_str(&sb[..lb])) || !is_dir(as_str(&sc[..lc])) {
+        return Err("gc removed a reachable dependency");
+    }
+    print("PKG2 gc: removed ");
+    print_u64(gr1 as u64);
+    print(", kept ");
+    print_u64(gk1 as u64);
+    println(" (chain-b retained via chain-c deps)");
+
+    println("PKG2 stage 6: rollback then gc keeps the whole dependency chain");
+    if !switch_to(gen_before_remove) || current_gen() != gen_before_remove {
+        return Err("rollback after dependency remove");
+    }
+    let (gr2, gk2) = gc_collect(false)?;
+    if !is_dir(as_str(&sb[..lb])) || !is_dir(as_str(&sa[..la])) {
+        return Err("gc after rollback removed a dependency");
+    }
+    print("PKG2 rollback: generation ");
+    print_u64(gen_before_remove as u64);
+    print(", gc removed ");
+    print_u64(gr2 as u64);
+    print(", kept ");
+    print_u64(gk2 as u64);
+    println("");
+
+    println("PKG2 stage 7: missing dependency is reported and rejected");
+    let deps_d = deps_from(&["chain-missing"])?;
+    build_archive(cd_dir, repo_d, &deps_d)?;
+    match install_archive(repo_d) {
+        Ok(_) => return Err("install accepted a missing dependency"),
+        Err(_) => println("PKG2 missing: rejected, missing dependency listed above"),
+    }
+
+    println("PKG2 stage 8: circular dependency is detected");
+    let deps_x = deps_from(&["chain-y"])?;
+    build_archive(cx_dir, repo_x, &deps_x)?;
+    let deps_y = deps_from(&["chain-x"])?;
+    build_archive(cy_dir, repo_y, &deps_y)?;
+    match install_archive(repo_x) {
+        Ok(_) => return Err("install accepted a dependency cycle"),
+        Err(_) => println("PKG2 cycle: rejected (chain-x -> chain-y -> chain-x)"),
+    }
+
+    println("PKG2 stage 9: clean dependency fixtures");
+    let mut ok = rm_tree("/mfs/pkgtest2");
+    for p in [repo_a, repo_b, repo_c, repo_d, repo_x, repo_y] {
+        if exists(p) && vfs::unlink(p) != 1 {
+            ok = false;
+        }
+    }
+    if !ok {
+        return Err("dependency cleanup");
+    }
+    println("PKG2 legacy: chain-a manifest had no deps and installed cleanly");
     Ok(())
+}
+
+/// 从字符串列表构造依赖集合 (自测 / 命令入口用)。
+fn deps_from(names: &[&str]) -> Result<DepSet, &'static str> {
+    let mut d = DEPS_EMPTY;
+    for name in names {
+        if !valid_component(name.as_bytes(), NAME_MAX) || d.n as usize >= MAX_DEPS {
+            return Err("bad dependency name");
+        }
+        let i = d.n as usize;
+        d.names[i][..name.len()].copy_from_slice(name.as_bytes());
+        d.lens[i] = name.len() as u8;
+        d.n += 1;
+    }
+    Ok(d)
 }
 
 /// 拼接短路径 (只在自测里用; 失败返回静态错误)。
@@ -1645,8 +2223,8 @@ pub fn selftest() {
 
 fn usage() {
     println("usage: pkg <command> [args]");
-    println("  build <dir> <out.mpk>  pack a <name>-<version> directory into an .mpk");
-    println("  install <.mpk>         verify, unpack into the store, create a generation");
+    println("  build <dir> <out.mpk> [dep...]  pack a <name>-<version> directory into an .mpk");
+    println("  install <.mpk>         resolve deps from /mfs/repo, unpack, create a generation");
     println("  remove <name>          drop a package from the current view (new generation)");
     println("  list                   list packages in the current generation");
     println("  info <name>            show store path / hash / manifest");
@@ -1659,13 +2237,30 @@ fn usage() {
 }
 
 fn cmd_build(cwd: &str, arg: &str) {
-    let Some(i) = arg.find(' ') else {
-        println("pkg build: usage: pkg build <dir> <out.mpk>");
-        return;
-    };
-    let (d, o) = (arg[..i].trim(), arg[i + 1..].trim());
-    if d.is_empty() || o.is_empty() {
-        println("pkg build: usage: pkg build <dir> <out.mpk>");
+    let mut deps = DEPS_EMPTY;
+    let mut bad = false;
+    let mut ntok = 0usize;
+    let mut d = "";
+    let mut o = "";
+    for tok in arg.split_whitespace() {
+        match ntok {
+            0 => d = tok,
+            1 => o = tok,
+            _ => {
+                if deps.n as usize >= MAX_DEPS || !valid_component(tok.as_bytes(), NAME_MAX) {
+                    bad = true;
+                } else {
+                    let i = deps.n as usize;
+                    deps.names[i][..tok.len()].copy_from_slice(tok.as_bytes());
+                    deps.lens[i] = tok.len() as u8;
+                    deps.n += 1;
+                }
+            }
+        }
+        ntok += 1;
+    }
+    if ntok < 2 || d.is_empty() || o.is_empty() || bad {
+        println("pkg build: usage: pkg build <dir> <out.mpk> [dependency...]");
         return;
     }
     let mut dir = [0u8; 128];
@@ -1698,7 +2293,7 @@ fn cmd_build(cwd: &str, arg: &str) {
     }
     let dir_s = as_str(&dir[..dn]);
     let out_s = as_str(&out[..on]);
-    match build_archive(dir_s, out_s) {
+    match build_archive(dir_s, out_s, &deps) {
         Ok(meta) => {
             let mut hx = [0u8; 16];
             hex16(meta.hash, &mut hx);
@@ -1712,6 +2307,8 @@ fn cmd_build(cwd: &str, arg: &str) {
             print(as_str(&meta.ver[..meta.ver_len as usize]));
             print(" files=");
             print_u64(meta.files as u64);
+            print(" deps=");
+            print_u64(meta.deps.n as u64);
             println("");
         }
         Err(e) => {

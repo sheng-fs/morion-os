@@ -99,6 +99,8 @@ HELLO_ELF     := $(OUT_DIR)/user/hello.elf
 # 预装图形应用 (第二批接线): 独立 crate → 独立 ELF, 打包成 .mex 由 shell `run` 加载。
 EDITOR_MEX    := $(OUT_DIR)/user/editor.mex
 FILES_MEX     := $(OUT_DIR)/user/files.mex
+CALC_MEX      := $(OUT_DIR)/user/calc.mex
+SYSINFO_MEX   := $(OUT_DIR)/user/sysinfo.mex
 EFIBOOT_IMG   := $(OUT_DIR)/efiboot.img
 ISO_IMAGE     := $(OUT_DIR)/morion-os.iso
 # 可引导 U 盘镜像 (Phase 0 / P0.4): 与 ISO 同源, 但额外叠了 GPT/ESP 混合布局。
@@ -242,7 +244,7 @@ $(HELLO_ELF): $(shell find user/hello -type f 2>/dev/null) $(shell find user/lib
 APP_SRC := $(shell find user/apps -type f 2>/dev/null) $(shell find user/libmorion -type f 2>/dev/null) user/linker.ld
 
 .PHONY: apps
-apps: $(EDITOR_MEX) $(FILES_MEX)
+apps: $(EDITOR_MEX) $(FILES_MEX) $(CALC_MEX) $(SYSINFO_MEX)
 
 $(EDITOR_MEX): $(APP_SRC)
 	@echo "==> 构建预装应用 editor (独立 ELF)..."
@@ -268,6 +270,32 @@ $(FILES_MEX): $(APP_SRC)
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
 	$(CP) target/x86_64-morion-user/release/morion-files $@
+	@echo "  ✓ 预装应用: $@"
+
+$(CALC_MEX): $(APP_SRC)
+	@echo "==> 构建预装应用 calc (独立 ELF)..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-calc \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-calc $@
+	@echo "  ✓ 预装应用: $@"
+
+$(SYSINFO_MEX): $(APP_SRC)
+	@echo "==> 构建预装应用 sysinfo (独立 ELF)..."
+	$(MKDIR) $(dir $@)
+	$(CARGO) build \
+		--target user/x86_64-morion-user.json \
+		--package morion-sysinfo \
+		--release \
+		-Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CP) target/x86_64-morion-user/release/morion-sysinfo $@
 	@echo "  ✓ 预装应用: $@"
 
 # 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
@@ -309,7 +337,7 @@ $(BOOT_EFI): $(BOOT_SRC) $(KERNEL_EMBED) $(VARIANT_FLAGS)
 # ISO 镜像构建
 # ============================================================
 .PHONY: iso
-iso: kernel boot $(SRV_STAMP) $(EDITOR_MEX) $(FILES_MEX) $(ISO_IMAGE)
+iso: kernel boot $(SRV_STAMP) $(EDITOR_MEX) $(FILES_MEX) $(CALC_MEX) $(SYSINFO_MEX) $(ISO_IMAGE)
 
 $(ISO_IMAGE):
 	@echo "==> 创建可启动 ISO 镜像..."
@@ -359,6 +387,8 @@ $(ISO_IMAGE):
 	mmd -i $(EFIBOOT_IMG) ::/apps
 	mcopy -o -i $(EFIBOOT_IMG) $(EDITOR_MEX) ::/apps/editor.mex
 	mcopy -o -i $(EFIBOOT_IMG) $(FILES_MEX) ::/apps/files.mex
+	mcopy -o -i $(EFIBOOT_IMG) $(CALC_MEX) ::/apps/calc.mex
+	mcopy -o -i $(EFIBOOT_IMG) $(SYSINFO_MEX) ::/apps/sysinfo.mex
 
 	$(CP) $(EFIBOOT_IMG) $(ISO_DIR)/efiboot.img
 
@@ -636,7 +666,7 @@ run-ide: iso $(DISK_IMG)
 #
 # 以及 `/system/services/*.elf` (E3c): 监督者 init 的**重启源** —— 它从这张根盘读回服务
 # 镜像, 用 `SYS_SPAWN_ELF_AT` 把退出的服务原地拉起来。故镜像依赖 $(SRV_STAMP)。
-$(NVME_IMG): $(HELLO_ELF) $(EDITOR_MEX) $(FILES_MEX) $(SRV_STAMP) Makefile
+$(NVME_IMG): $(HELLO_ELF) $(EDITOR_MEX) $(FILES_MEX) $(CALC_MEX) $(SYSINFO_MEX) $(SRV_STAMP) Makefile
 	@echo "==> 创建 NVMe 磁盘镜像 (FAT32$(if $(NVME_CLU), 簇 $(NVME_CLU) 扇区,)..."
 	$(MKDIR) $(OUT_DIR)
 	dd if=/dev/zero of=$(NVME_IMG) bs=1M count=64 status=none
@@ -649,9 +679,16 @@ $(NVME_IMG): $(HELLO_ELF) $(EDITOR_MEX) $(FILES_MEX) $(SRV_STAMP) Makefile
 	@printf 'long name read via VFAT LFN!\n' > $(OUT_DIR)/longname.txt
 	mcopy -i $(NVME_IMG) $(OUT_DIR)/longname.txt ::/"Long File Name.txt"
 	mcopy -o -i $(NVME_IMG) $(HELLO_ELF) ::/hello.mex
-	# 预装图形应用: 放在根卷, 供 shell `run /editor.mex` / `run /files.mex` 加载。
+	# 预装图形应用: 放在根卷, 供 shell `run /editor.mex` / `run /files.mex` /
+	# `run /calc.mex` / `run /sysinfo.mex` 加载。
 	mcopy -o -i $(NVME_IMG) $(EDITOR_MEX) ::/editor.mex
 	mcopy -o -i $(NVME_IMG) $(FILES_MEX) ::/files.mex
+	mcopy -o -i $(NVME_IMG) $(CALC_MEX) ::/calc.mex
+	mcopy -o -i $(NVME_IMG) $(SYSINFO_MEX) ::/sysinfo.mex
+	# 同时保留无后缀副本，让 shell 的 `run calc` / `run sysinfo` 也能直接加载
+	# （加载器只看 ELF 头，后缀只是提示；`run` 不会自动补 `.mex`）。
+	mcopy -o -i $(NVME_IMG) $(CALC_MEX) ::/calc
+	mcopy -o -i $(NVME_IMG) $(SYSINFO_MEX) ::/sysinfo
 	# 服务镜像 (E3c): init 的重启源。与 ESP 上那份同源 —— 都在 build/user/srv/。
 	mmd -i $(NVME_IMG) ::/system
 	mmd -i $(NVME_IMG) ::/system/services
@@ -757,6 +794,14 @@ check: $(KERNEL_EMBED)
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-calc \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
+	$(CARGO) check --package morion-sysinfo \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem
 	$(CARGO) check --package morion-boot --target $(BOOT_TARGET)
 
 .PHONY: fmt
@@ -777,6 +822,14 @@ clippy: $(KERNEL_EMBED)
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem -- -D warnings
 	$(CARGO) clippy --package morion-hello \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem -- -D warnings
+	$(CARGO) clippy --package morion-calc \
+		--target user/x86_64-morion-user.json -Z json-target-spec \
+		-Z build-std=core,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem -- -D warnings
+	$(CARGO) clippy --package morion-sysinfo \
 		--target user/x86_64-morion-user.json -Z json-target-spec \
 		-Z build-std=core,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem -- -D warnings

@@ -304,16 +304,26 @@ pub fn bind_dma_window(
 // 性能飞地: 运行期设备窗口映射 (§6.2 最小切片)
 // ---------------------------------------------------------------------------
 
-/// `SYS_ENCLAVE_MAP` 的错误码（从 `u64::MAX` 向下编号）。
+/// `SYS_ENCLAVE_MAP` 的错误码（从 `u64::MAX` 向下编号, 集中在此便于用户态逐一打印原因）。
 ///
 /// 成功返回值是**实际生效的 IOVA**（非 0、页对齐，且受 AGAW ≤ 57 约束），因此不会与这些
 /// 哨兵混淆。任何一步不支持都返回其中之一，并且**设备上下文保持原状** —— 既有驱动继续
 /// 走启动时建立的恒等窗口。
+///
+/// - `NO_DEVICE`     本域没有授权设备 / 申请的不是本域那台；
+/// - `NO_CAP`        缺少该设备 BAR 的 `Mmio` 能力；
+/// - `BAD_WINDOW`    IOVA / 长度非法、越界或超出已授权 DMA 块；
+/// - `UNSUPPORTED`   IOMMU 没打开、多 DRHD、页表建不起来等；
+/// - `CONFLICT`      BAR 窗口在本域被映射到了别的物理页；
+/// - `ALREADY_OWNED` 同一 BAR 已被飞地占用（含本域重复 attach；需先 `SYS_ENCLAVE_DETACH`）；
+/// - `NO_IOVA`       内核 IOVA 分配器窗口（64 MiB/域）已耗尽。
 pub const ENCLAVE_ERR_NO_DEVICE: u64 = u64::MAX;
 pub const ENCLAVE_ERR_NO_CAP: u64 = u64::MAX - 1;
 pub const ENCLAVE_ERR_BAD_WINDOW: u64 = u64::MAX - 2;
 pub const ENCLAVE_ERR_UNSUPPORTED: u64 = u64::MAX - 3;
 pub const ENCLAVE_ERR_CONFLICT: u64 = u64::MAX - 4;
+pub const ENCLAVE_ERR_ALREADY_OWNED: u64 = u64::MAX - 5;
+pub const ENCLAVE_ERR_NO_IOVA: u64 = u64::MAX - 6;
 
 /// 单次飞地窗口的长度上限（1 GiB）—— 先在这里挡住，避免拿一个巨大长度去逐页建表。
 const ENCLAVE_MAX_BYTES: u64 = 1 << 30;
@@ -321,15 +331,24 @@ const ENCLAVE_MAX_BYTES: u64 = 1 << 30;
 /// 判断 `[iova, iova + bytes)` 是否可作为飞地 DMA 窗口（纯函数，便于单测）。
 ///
 /// 规则沿用 `syscall::user_buf_ok` 的风格：起点/终点都要合法、长度非零、加法不溢出。
-/// 具体是：IOVA 非 0 且页对齐、长度非零且页对齐、整段不得落在**用户虚拟地址**空间
-/// （IOVA 是设备可见地址，不是 CPU 虚拟地址）、不超过单次上限、且不超出该设备已授权的
-/// DMA 块（`dma_bytes`）。
+/// 具体是：长度非 0、页对齐、不超过单次上限，且不超出该设备已授权的 DMA 块（`dma_bytes`）；
+/// `iova != 0` 时还要求 IOVA 页对齐、整段不得落在**用户虚拟地址**空间（IOVA 是设备可见
+/// 地址，不是 CPU 虚拟地址）。
+///
+/// `iova == 0` 表示**由内核自动分配**（[`crate::arch::iommu::alloc_iova`]），此处只校验长度，
+/// 地址合法性由分配器保证。
 fn enclave_window_ok(iova: u64, bytes: u64, dma_bytes: u64) -> bool {
-    if iova == 0 || bytes == 0 || bytes > ENCLAVE_MAX_BYTES {
+    if bytes == 0 || bytes > ENCLAVE_MAX_BYTES {
         return false;
     }
     if (iova & (PAGE - 1)) != 0 || (bytes & (PAGE - 1)) != 0 {
         return false;
+    }
+    if (dma_bytes & (PAGE - 1)) != 0 || bytes > dma_bytes {
+        return false;
+    }
+    if iova == 0 {
+        return true; // 自动分配：选址交给 IOMMU 分配器。
     }
     if paging::is_user_address(iova) {
         return false;
@@ -340,7 +359,7 @@ fn enclave_window_ok(iova: u64, bytes: u64, dma_bytes: u64) -> bool {
     if paging::is_user_address(end - 1) {
         return false;
     }
-    bytes <= dma_bytes && (dma_bytes & (PAGE - 1)) == 0
+    true
 }
 
 /// 确认 / 建立 **BAR 窗口**在 `domain` 里的映射（幂等）：已映射到同一物理页就当成功。
@@ -376,25 +395,68 @@ fn ensure_bar_window(domain: u64, bar_vaddr: u64, bar_paddr: u64, bar_bytes: u64
     true
 }
 
+// ---------------------------------------------------------------------------
+// 性能飞地: 设备独占 / 解绑
+// ---------------------------------------------------------------------------
+
+/// "设备已被飞地占用"的登记项（按 BAR 物理地址索引）。
+struct EnclaveOwner {
+    domain: u64,
+    bar_paddr: u64,
+    iova: u64,
+    bytes: u64,
+    /// IOVA 是否由内核自动分配（`detach` 时据此归还位图）。
+    auto_iova: bool,
+    /// 活着的 per-domain 窗口：`detach` 用它撤叶项（表页不回收）。
+    window: crate::arch::iommu::IovaWindow,
+}
+
+/// 飞地独占表（按 BAR 物理地址）。
+///
+/// 内核**不做** PCI 复位：登记 owner 之后，原驱动若再次访问设备由驱动侧自行检查；
+/// 这张表只负责拒绝**第二个域**把同一设备再绑到另一个 IOVA 窗口。
+static ENCLAVE_OWNERS: spin::Mutex<Vec<EnclaveOwner>> = spin::Mutex::new(Vec::new());
+
+/// 所有权判定结果（纯函数，便于单测）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OwnerState {
+    Free,
+    SameDomain,
+    OtherDomain,
+}
+
+fn owner_state(owner: Option<u64>, me: u64) -> OwnerState {
+    match owner {
+        None => OwnerState::Free,
+        Some(d) if d == me => OwnerState::SameDomain,
+        Some(_) => OwnerState::OtherDomain,
+    }
+}
+
+/// 定位调用域被授权、且被 `a1` 选中的设备：`(bus, dev, func, bar_paddr, cfg_paddr)`。
+fn enclave_binding(a1: u64) -> Option<(u8, u8, u8, u64, u64)> {
+    let me = crate::scheduler::current_domain();
+    let bindings = BINDINGS.lock();
+    let e = bindings.iter().find(|e| e.domain == me)?;
+    if !selects(a1, e.bus, e.dev, e.func) {
+        return None;
+    }
+    Some((e.bus, e.dev, e.func, e.bar_paddr, e.cfg_paddr))
+}
+
 /// `SYS_ENCLAVE_MAP` 的处理入口（性能飞地 §6.2 最小切片）。
 ///
-/// `a1` = 设备选择（[`DEVICE_SELF`] 或显式 `pci_addr`）；`a2` = 期望 IOVA（页对齐）；
-/// `a3` = 窗口字节数。成功返回**实际生效的 IOVA**，失败返回 `ENCLAVE_ERR_*`。
+/// `a1` = 设备选择（[`DEVICE_SELF`] 或显式 `pci_addr`）；`a2` = 期望 IOVA（页对齐；
+/// **`0` = 由内核自动分配**）；`a3` = 窗口字节数。成功返回**实际生效的 IOVA**，失败返回
+/// `ENCLAVE_ERR_*`。
 ///
-/// 顺序刻意如此：先把所有**只读校验**做完（设备归属 → `Mmio` 能力门禁 → 窗口合法性），
-/// 再幂等确认 BAR 映射，最后建独立 IOVA 窗口并切设备上下文。任何一步失败都**不触碰
-/// 设备上下文** —— 未调用本入口的域完全走原有恒等映射，行为零变化。
+/// 顺序刻意如此：先把所有**只读校验**做完（设备归属 → `Mmio` 能力门禁 → 设备独占 →
+/// 窗口合法性），再幂等确认 BAR 映射，最后建独立 IOVA 窗口并切设备上下文。任何一步失败
+/// 都**不触碰**设备上下文 —— 未调用本入口的域完全走原有恒等映射，行为零变化。
 pub fn syscall_enclave_map(a1: u64, a2: u64, a3: u64) -> u64 {
     let me = crate::scheduler::current_domain();
-    let (bus, dev, func, bar_paddr, cfg_paddr) = {
-        let bindings = BINDINGS.lock();
-        let Some(e) = bindings.iter().find(|e| e.domain == me) else {
-            return ENCLAVE_ERR_NO_DEVICE; // 本域没有授权设备。
-        };
-        if !selects(a1, e.bus, e.dev, e.func) {
-            return ENCLAVE_ERR_NO_DEVICE; // 申请的不是本域那台设备。
-        }
-        (e.bus, e.dev, e.func, e.bar_paddr, e.cfg_paddr)
+    let Some((bus, dev, func, bar_paddr, cfg_paddr)) = enclave_binding(a1) else {
+        return ENCLAVE_ERR_NO_DEVICE; // 本域没有授权设备 / 申请的不是本域那台设备。
     };
 
     // 能力门禁：只允许持有该设备 BAR `Mmio` 凭证的域（`grant` 一并签发）。
@@ -403,13 +465,27 @@ pub fn syscall_enclave_map(a1: u64, a2: u64, a3: u64) -> u64 {
         return ENCLAVE_ERR_NO_CAP;
     }
 
-    let iova = a2;
+    // 设备独占：同一 BAR 已被飞地占用（无论哪个域）时拒绝第二次 attach。
+    {
+        let owners = ENCLAVE_OWNERS.lock();
+        let owner = owners
+            .iter()
+            .find(|o| o.bar_paddr == bar_paddr)
+            .map(|o| o.domain);
+        if owner_state(owner, me) != OwnerState::Free {
+            crate::video::print("dev: enclave map denied (device already owned by domain ");
+            crate::video::print_u64(owner.unwrap_or(0));
+            crate::video::println(")");
+            return ENCLAVE_ERR_ALREADY_OWNED;
+        }
+    }
+
     let bytes = a3;
     let mut desc = unsafe { core::ptr::read_volatile(cfg_paddr as *const DeviceGrant) };
     if desc.magic != DEVICE_GRANT_MAGIC {
         return ENCLAVE_ERR_NO_DEVICE;
     }
-    if !enclave_window_ok(iova, bytes, desc.dma_bytes) {
+    if !enclave_window_ok(a2, bytes, desc.dma_bytes) {
         return ENCLAVE_ERR_BAD_WINDOW;
     }
     // 幂等：已绑定就返回既有窗口，不重复建表、不改设备上下文。
@@ -417,20 +493,40 @@ pub fn syscall_enclave_map(a1: u64, a2: u64, a3: u64) -> u64 {
         return desc.dma_iova;
     }
 
+    // IOVA 选址：`a2 == 0` 走每域位图分配器，否则沿用调用方指定值。
+    let auto_iova = a2 == 0;
+    let iova = if auto_iova {
+        match crate::arch::iommu::alloc_iova(me, bytes) {
+            Some(i) => i,
+            None => return ENCLAVE_ERR_NO_IOVA,
+        }
+    } else {
+        a2
+    };
+    let release_iova = || {
+        if auto_iova {
+            let _ = crate::arch::iommu::free_iova(me, iova, bytes);
+        }
+    };
+
     // 先确认 IOMMU 能给出独立上下文：不支持时**完全不碰** BAR 映射 / 设备上下文，
     // 立刻回错误 —— 这正是"不支持就保持原状"。
     let Some(mut window) = crate::arch::iommu::IovaWindow::create(me, iova, bytes) else {
+        release_iova();
         return ENCLAVE_ERR_UNSUPPORTED;
     };
 
     if !ensure_bar_window(me, desc.bar_vaddr, desc.bar_paddr, desc.bar_bytes) {
+        release_iova();
         return ENCLAVE_ERR_CONFLICT;
     }
     if !window.map_contiguous(iova, desc.dma_paddr, bytes) {
+        release_iova();
         return ENCLAVE_ERR_UNSUPPORTED;
     }
     if !window.attach_device(bus, dev, func) {
         let _ = window.unmap(iova, bytes);
+        release_iova();
         return ENCLAVE_ERR_UNSUPPORTED;
     }
 
@@ -439,12 +535,78 @@ pub fn syscall_enclave_map(a1: u64, a2: u64, a3: u64) -> u64 {
     desc.dma_iova_bytes = bytes;
     unsafe { core::ptr::write_volatile(cfg_paddr as *mut DeviceGrant, desc) };
 
+    // 登记独占：原驱动从此刻起不应再碰这台设备（内核不做 PCI 复位）。
+    ENCLAVE_OWNERS.lock().push(EnclaveOwner {
+        domain: me,
+        bar_paddr,
+        iova,
+        bytes,
+        auto_iova,
+        window,
+    });
+
     crate::video::print("dev: enclave window mapped iova=0x");
     crate::video::print_hex(iova);
     crate::video::print(" bytes=0x");
     crate::video::print_hex(bytes);
+    crate::video::print(if auto_iova { " auto" } else { "" });
     crate::video::println("");
     iova
+}
+
+/// `SYS_ENCLAVE_DETACH` 的处理入口：解除本域对设备的飞地独占并恢复默认恒等映射。
+///
+/// `a1` = 设备选择（同 `SYS_ENCLAVE_MAP`）。成功返回 `1`（含"本来就没占用"的幂等路径），
+/// 失败返回 `ENCLAVE_ERR_*`。顺序：先切回默认上下文，再撤 IOVA 叶项、归还自动分配的
+/// IOVA，最后清描述页 —— 设备任何时刻都不会指向一条已被撤掉的映射。
+pub fn syscall_enclave_detach(a1: u64, _a2: u64, _a3: u64) -> u64 {
+    let me = crate::scheduler::current_domain();
+    let Some((bus, dev, func, bar_paddr, cfg_paddr)) = enclave_binding(a1) else {
+        return ENCLAVE_ERR_NO_DEVICE;
+    };
+    if !crate::cap::has(me, crate::cap::Capability::Mmio(bar_paddr)) {
+        crate::video::println("dev: enclave detach denied (no Mmio capability)");
+        return ENCLAVE_ERR_NO_CAP;
+    }
+
+    let mut owner = {
+        let mut owners = ENCLAVE_OWNERS.lock();
+        let Some(idx) = owners.iter().position(|o| o.bar_paddr == bar_paddr) else {
+            return 1; // 没有占用：幂等成功。
+        };
+        if owners[idx].domain != me {
+            return ENCLAVE_ERR_ALREADY_OWNED; // 别的域占用，不能代拆。
+        }
+        owners.remove(idx)
+    };
+
+    // 1. 设备上下文切回启动时建立的默认恒等窗口。
+    let restored = crate::arch::iommu::detach_device(bus, dev, func);
+    // 2. 撤掉该窗口的 4 KiB 叶项（表页不回收）。
+    let _ = owner.window.unmap(owner.iova, owner.bytes);
+    // 3. 自动分配的 IOVA 归还位图。
+    if owner.auto_iova {
+        let _ = crate::arch::iommu::free_iova(me, owner.iova, owner.bytes);
+    }
+
+    // 4. 描述页回到"未绑定"（`dma_iova == 0` 是驱动与内核的共同哨兵）。
+    let mut desc = unsafe { core::ptr::read_volatile(cfg_paddr as *const DeviceGrant) };
+    if desc.magic == DEVICE_GRANT_MAGIC {
+        desc.dma_iova = 0;
+        desc.dma_iova_bytes = 0;
+        unsafe { core::ptr::write_volatile(cfg_paddr as *mut DeviceGrant, desc) };
+    }
+
+    if !restored {
+        crate::video::println("dev: enclave detach: context restore failed");
+        return ENCLAVE_ERR_UNSUPPORTED;
+    }
+    crate::video::print("dev: enclave detached bar=0x");
+    crate::video::print_hex(bar_paddr);
+    crate::video::print(" iova=0x");
+    crate::video::print_hex(owner.iova);
+    crate::video::println("");
+    1
 }
 
 /// 无该类型设备时的降级: 仅映射一个**零描述页**到约定地址, 让驱动读到
@@ -881,9 +1043,12 @@ mod tests {
         assert!(enclave_window_ok(IOVA, DMA, DMA));
         assert!(enclave_window_ok(IOVA, 4096, DMA)); // 子窗口允许
 
-        // IOVA 必须页对齐、且不能占用 0（DeviceGrant 的"未绑定"哨兵）。
+        // IOVA 0 = 自动分配：只校验长度（DMA 块可容纳即可）。
+        assert!(enclave_window_ok(0, 4096, DMA));
+        assert!(!enclave_window_ok(0, DMA + 4096, DMA));
+
+        // 显式 IOVA 必须页对齐。
         assert!(!enclave_window_ok(IOVA + 1, 4096, DMA));
-        assert!(!enclave_window_ok(0, 4096, DMA));
 
         // 长度非零且页对齐。
         assert!(!enclave_window_ok(IOVA, 0, DMA));
@@ -909,6 +1074,17 @@ mod tests {
         assert!(!enclave_window_ok(u64::MAX & !0xFFF, 0x2000, DMA));
     }
 
+    /// 设备独占: 空闲 / 本域幂等 / 别的域占用 三种判定。
+    #[test]
+    fn enclave_ownership_states() {
+        assert_eq!(owner_state(None, 7), OwnerState::Free);
+        assert_eq!(owner_state(Some(7), 7), OwnerState::SameDomain);
+        assert_eq!(owner_state(Some(7), 8), OwnerState::OtherDomain);
+        // 域 0 也是合法域，不能把"已登记 0"误判成空闲。
+        assert_eq!(owner_state(Some(0), 0), OwnerState::SameDomain);
+        assert_eq!(owner_state(Some(0), 1), OwnerState::OtherDomain);
+    }
+
     /// 能力门禁的判据是**精确匹配该 BAR 的 `Mmio` 凭证**: 别的 BAR / 别的能力种类都不认。
     #[test]
     fn enclave_capability_gate_requires_exact_mmio() {
@@ -921,15 +1097,17 @@ mod tests {
         assert_ne!(held, Capability::Fb);
     }
 
-    /// 五个错误码互不相同, 且都落在任何合法 IOVA 之上（AGAW ≤ 57 位）。
+    /// 七个错误码互不相同, 且都落在任何合法 IOVA 之上（AGAW ≤ 57 位）。
     #[test]
     fn enclave_error_codes_do_not_collide_with_iova() {
-        const ERRS: [u64; 5] = [
+        const ERRS: [u64; 7] = [
             ENCLAVE_ERR_NO_DEVICE,
             ENCLAVE_ERR_NO_CAP,
             ENCLAVE_ERR_BAD_WINDOW,
             ENCLAVE_ERR_UNSUPPORTED,
             ENCLAVE_ERR_CONFLICT,
+            ENCLAVE_ERR_ALREADY_OWNED,
+            ENCLAVE_ERR_NO_IOVA,
         ];
         for (i, a) in ERRS.iter().enumerate() {
             for b in &ERRS[i + 1..] {

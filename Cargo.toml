@@ -23,6 +23,9 @@ members = [
     # 预装图形应用 (第二批接线): 独立 crate → 独立 .mex, 由 shell `run` 从文件加载。
     "user/apps/editor",
     "user/apps/files",
+    # 预装图形应用 (第三批): 计算器与只读系统信息面板。
+    "user/apps/calc",
+    "user/apps/sysinfo",
 ]
 
 # 未来添加:

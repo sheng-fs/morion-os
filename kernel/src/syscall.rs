@@ -201,14 +201,23 @@ pub const SYS_CONSOLE_LINE_EDIT: u64 = 66;
 /// 当前值"的空操作。身份按域保存, 域槽位复用后回落到默认值 (见 [`cred_of`])。
 pub const SYS_CRED: u64 = 67;
 /// 性能飞地运行期**设备窗口映射**（§6.2 最小切片）: `rdi = 设备选择`（`u64::MAX` = 本域设备，
-/// 或 `bus<<16 | dev<<8 | func`）、`rsi = 期望 IOVA`（页对齐、非用户地址）、`rdx = 窗口字节数`。
+/// 或 `bus<<16 | dev<<8 | func`）、`rsi = 期望 IOVA`（页对齐、非用户地址；**`0` = 由内核
+/// 自动分配**，每域 64 MiB、4 KiB 粒度）、`rdx = 窗口字节数`。
 ///
 /// 成功返回**实际生效的 IOVA**（设备可见的 DMA 基址）；失败返回 `u64::MAX - n`
 /// （见 [`crate::device`] 的 `ENCLAVE_ERR_*`）。调用域必须持有该设备 BAR 的
-/// `Capability::Mmio`。实现在 [`crate::device::syscall_enclave_map`]。
+/// `Capability::Mmio`。同一 BAR 已被飞地占用（含重复 attach）时返回
+/// `ENCLAVE_ERR_ALREADY_OWNED`，须先 [`SYS_ENCLAVE_DETACH`]。
+/// 实现在 [`crate::device::syscall_enclave_map`]。
 ///
 /// **默认路径零变化**: 没有域调用它时，所有设备仍走启动时建立的恒等映射窗口。
 pub const SYS_ENCLAVE_MAP: u64 = 68;
+/// 性能飞地**解除设备独占**（§6.2）: `rdi = 设备选择`（同 [`SYS_ENCLAVE_MAP`]），`rsi/rdx` 保留。
+///
+/// 成功后设备上下文恢复为启动时的恒等窗口、IOVA 叶项撤销、自动分配的 IOVA 归还位图，
+/// 描述页的 `dma_iova` 清 0；返回 `1`（"本来就没占用"的幂等路径同样返回 `1`）。失败返回
+/// `ENCLAVE_ERR_*`。实现在 [`crate::device::syscall_enclave_detach`]。
+pub const SYS_ENCLAVE_DETACH: u64 = 69;
 
 /// 帧缓冲几何 (`SYS_FB_INFO` 写回用户的布局, 与用户态 `morion::syscall::FbInfo` 严格对应)。
 #[repr(C)]
@@ -1105,6 +1114,7 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_DEVICE_INFO => crate::device::syscall_info(a1, a2, a3),
         SYS_DEVICE_GRANT => crate::device::syscall_grant(a1, a2, a3),
         SYS_ENCLAVE_MAP => crate::device::syscall_enclave_map(a1, a2, a3),
+        SYS_ENCLAVE_DETACH => crate::device::syscall_enclave_detach(a1, a2, a3),
         SYS_CAP_AUDIT => {
             // 能力审计 (②): 持 `Spawn` 的可信域 (init 监督者) 枚举 `a1` 域第 `a2` 个能力槽,
             // 供其按最小权限策略核对引导期授权。非 `Spawn` 持有者一律拒绝 (返回 0, 与"空槽"

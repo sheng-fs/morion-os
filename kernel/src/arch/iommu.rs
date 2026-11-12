@@ -44,6 +44,7 @@
 use crate::arch::pci::PciDevice;
 use crate::memory::frame_allocator::allocate_frame;
 use crate::memory::paging::is_identity_mapped;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -798,6 +799,162 @@ fn flush_context_cache(base: u64) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// 飞地 IOVA 分配器（每域一张 4 KiB 粒度的位图窗口）
+// ---------------------------------------------------------------------------
+//
+// `SYS_ENCLAVE_MAP` 的 `a2 == 0` 表示"由内核选地址"。每个域各有一张**独立**的二级页表，
+// 所以各域可以共用同一段 IOVA 号段；这里只做**域内**的连续页分配，域间不会互相影响。
+
+/// 自动分配 IOVA 的每域窗口起点（1 GiB）。
+///
+/// 选 1 GiB 的理由：① 非 0（0 是 `DeviceGrant` 的"未绑定"哨兵）；② 避开用户虚拟地址空间
+/// （`paging::USER_SPACE_BASE` = 512 GiB）；③ 严格小于 4 GiB —— 本机 QEMU 的 `intel-iommu`
+/// 只翻译 < 4 GiB 的 IOVA（见 [`TARGET_WINDOW_LIMIT`] 的实测说明）。
+pub const ENCLAVE_IOVA_BASE: u64 = 1 << 30;
+
+/// 每域自动 IOVA 窗口的字节数（64 MiB = 16384 个 4 KiB 页）。
+pub const ENCLAVE_IOVA_BYTES: u64 = 64 << 20;
+
+/// 4 KiB 粒度的连续页位图（纯逻辑，单测覆盖）。
+///
+/// `1` = 已占用。分配采用首次适配（最低地址），释放要求整段都已占用 —— 部分释放返回
+/// `false` 且不改动任何位，避免把从未分配的页悄悄标记为空闲。
+struct IovaBitmap {
+    pages: u64,
+    words: Vec<u64>,
+}
+
+impl IovaBitmap {
+    fn new(pages: u64) -> Self {
+        Self {
+            pages,
+            words: vec![0u64; pages.div_ceil(64) as usize],
+        }
+    }
+
+    fn is_used(&self, page: u64) -> bool {
+        self.words[(page / 64) as usize] & (1u64 << (page % 64)) != 0
+    }
+
+    fn set_used(&mut self, page: u64, used: bool) {
+        let word = &mut self.words[(page / 64) as usize];
+        let bit = 1u64 << (page % 64);
+        if used {
+            *word |= bit;
+        } else {
+            *word &= !bit;
+        }
+    }
+
+    /// 找 `count` 个连续空闲页（首次适配）；成功返回起始页下标。
+    fn alloc(&mut self, count: u64) -> Option<u64> {
+        if count == 0 || count > self.pages {
+            return None;
+        }
+        let mut run = 0u64;
+        let mut start = 0u64;
+        for page in 0..self.pages {
+            if self.is_used(page) {
+                run = 0;
+                continue;
+            }
+            if run == 0 {
+                start = page;
+            }
+            run += 1;
+            if run == count {
+                for p in start..start + count {
+                    self.set_used(p, true);
+                }
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    /// 释放 `[page, page + count)`；越界或含未占用页时整体拒绝。
+    fn free(&mut self, page: u64, count: u64) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let Some(end) = page.checked_add(count) else {
+            return false;
+        };
+        if end > self.pages {
+            return false;
+        }
+        for p in page..end {
+            if !self.is_used(p) {
+                return false;
+            }
+        }
+        for p in page..end {
+            self.set_used(p, false);
+        }
+        true
+    }
+}
+
+/// 一个域的自动 IOVA 分配器。
+struct DomainIova {
+    domain: u64,
+    base: u64,
+    bitmap: IovaBitmap,
+}
+
+/// 每域自动 IOVA 分配器（首次使用时惰性创建）。
+///
+/// **默认路径零变化**：没有域请求 `a2 == 0` 时这张表始终为空。
+static IOVA_ALLOCATORS: spin::Mutex<Vec<DomainIova>> = spin::Mutex::new(Vec::new());
+
+/// 在 `domain` 的自动 IOVA 窗口里分配 `bytes`（4 KiB 对齐、非空、≤ [`ENCLAVE_IOVA_BYTES`]）。
+///
+/// 返回**实际 IOVA 基址**；窗口耗尽 / 参数非法返回 `None`。分配只占用位图，不建页表 ——
+/// 调用方随后用 [`IovaWindow::create`] 建窗口，失败时须调 [`free_iova`] 归还。
+pub fn alloc_iova(domain: u64, bytes: u64) -> Option<u64> {
+    if bytes == 0 || (bytes & !PAGE_MASK) != 0 || bytes > ENCLAVE_IOVA_BYTES {
+        return None;
+    }
+    let mut allocators = IOVA_ALLOCATORS.lock();
+    let idx = match allocators.iter().position(|a| a.domain == domain) {
+        Some(i) => i,
+        None => {
+            allocators.push(DomainIova {
+                domain,
+                base: ENCLAVE_IOVA_BASE,
+                bitmap: IovaBitmap::new(ENCLAVE_IOVA_BYTES >> 12),
+            });
+            allocators.len() - 1
+        }
+    };
+    let start = allocators[idx].bitmap.alloc(bytes >> 12)?;
+    Some(allocators[idx].base + (start << 12))
+}
+
+/// 归还 [`alloc_iova`] 分配的 `[iova, iova + bytes)`。
+///
+/// 段越界、非对齐或含未占用页返回 `false`（位图保持原样）。
+pub fn free_iova(domain: u64, iova: u64, bytes: u64) -> bool {
+    if bytes == 0 || (iova & !PAGE_MASK) != 0 || (bytes & !PAGE_MASK) != 0 {
+        return false;
+    }
+    let Some(offset) = iova.checked_sub(ENCLAVE_IOVA_BASE) else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(bytes) else {
+        return false;
+    };
+    if end > ENCLAVE_IOVA_BYTES {
+        return false;
+    }
+    let mut allocators = IOVA_ALLOCATORS.lock();
+    let Some(idx) = allocators.iter().position(|a| a.domain == domain) else {
+        return false;
+    };
+    allocators[idx].bitmap.free(offset >> 12, bytes >> 12)
+}
+
 /// 一个**独立 IOMMU 域**的 IOVA 窗口（性能飞地地基）。
 ///
 /// 窗口自带一张二级页表（4 KiB 叶，独立于 [`init`] 建好的恒等表）：只有
@@ -1260,5 +1417,66 @@ mod tests {
         assert!(!window_range_ok(base, limit, base, 0));
         assert!(!window_range_ok(base, limit, base, 0x1001));
         assert!(!window_range_ok(base, limit, u64::MAX & !0xFFF, 0x2000));
+    }
+
+    /// 位图分配器：首次适配、连续页、部分释放拒绝、越界拒绝。
+    #[test]
+    fn iova_bitmap_tracks_runs() {
+        let mut b = IovaBitmap::new(8);
+        assert_eq!(b.alloc(1), Some(0));
+        assert_eq!(b.alloc(2), Some(1));
+        assert_eq!(b.alloc(4), Some(3));
+        assert_eq!(b.alloc(1), Some(7)); // 最后一个空闲页
+        assert_eq!(b.alloc(1), None); // 窗口已满
+
+        // 释放中间两页后，最低地址的空洞优先被复用。
+        assert!(b.free(1, 2));
+        assert_eq!(b.alloc(2), Some(1));
+        // 再释放一次成功（两页都已占用）；重复释放已空闲的段则整体拒绝。
+        assert!(b.free(1, 2));
+        assert!(!b.free(1, 2));
+        // 越界 / 空长度 / 超窗口。
+        assert!(!b.free(7, 2));
+        assert!(!b.free(0, 0));
+        assert_eq!(b.alloc(0), None);
+        assert_eq!(b.alloc(9), None);
+
+        // 含未占用页的整段释放同样拒绝（不会把空闲页"再释放"一次）。
+        let mut gappy = IovaBitmap::new(4);
+        assert_eq!(gappy.alloc(2), Some(0));
+        assert!(!gappy.free(0, 4));
+        assert!(gappy.free(0, 2));
+        assert_eq!(gappy.alloc(4), Some(0));
+    }
+
+    /// 每域 IOVA 分配器：连续、不重叠、可回收；耗尽与非法长度返回 `None`。
+    #[test]
+    fn iova_allocator_reuses_freed_ranges() {
+        const D: u64 = 0xE000_0001; // 测试专用域号，避开真实域。
+        let a = alloc_iova(D, 0x1000).unwrap();
+        let b = alloc_iova(D, 0x2000).unwrap();
+        assert_eq!(a, ENCLAVE_IOVA_BASE);
+        assert_eq!(b, ENCLAVE_IOVA_BASE + 0x1000);
+        assert_eq!(b & 0xFFF, 0);
+
+        // 释放第一段后，分配器应把同一个最低地址还回来。
+        assert!(free_iova(D, a, 0x1000));
+        assert_eq!(alloc_iova(D, 0x1000), Some(a));
+        // 未分配页 / 越界 / 非对齐一律拒绝。
+        assert!(!free_iova(D, ENCLAVE_IOVA_BASE + 0x3000, 0x1000));
+        assert!(!free_iova(D, ENCLAVE_IOVA_BASE - 0x1000, 0x1000));
+        assert!(!free_iova(D, a + 1, 0x1000));
+
+        assert!(alloc_iova(D, ENCLAVE_IOVA_BYTES + 0x1000).is_none());
+        assert!(alloc_iova(D, 0).is_none());
+        assert!(alloc_iova(D, 0x1001).is_none());
+
+        // 把整张窗口一次分完；之后任何请求都应失败（窗口耗尽）。
+        assert!(free_iova(D, a, 0x1000));
+        assert!(free_iova(D, b, 0x2000));
+        let all = alloc_iova(D, ENCLAVE_IOVA_BYTES).unwrap();
+        assert_eq!(all, ENCLAVE_IOVA_BASE);
+        assert!(alloc_iova(D, 0x1000).is_none());
+        assert!(free_iova(D, all, ENCLAVE_IOVA_BYTES));
     }
 }

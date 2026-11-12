@@ -191,6 +191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "morion-calc"
+version = "0.1.0"
+dependencies = [
+ "morion",
+]
+
+[[package]]
 name = "morion-editor"
 version = "0.1.0"
 dependencies = [
@@ -230,6 +237,13 @@ name = "morion-srv"
 version = "0.1.0"
 dependencies = [
  "libdevice",
+ "morion",
+]
+
+[[package]]
+name = "morion-sysinfo"
+version = "0.1.0"
+dependencies = [
  "morion",
 ]
 

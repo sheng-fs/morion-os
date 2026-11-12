@@ -1,0 +1,14 @@
+[package]
+name = "morion-sysinfo"
+version = "0.1.0"
+edition = "2021"
+authors = ["Morion OS Team"]
+license = "MIT"
+description = "MorionOS 只读系统信息面板 (uname / 身份 / 域 / 内存 / MFS 用量)"
+
+[[bin]]
+name = "morion-sysinfo"
+path = "src/main.rs"
+
+[dependencies]
+morion = { path = "../../libmorion" }

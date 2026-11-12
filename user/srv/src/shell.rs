@@ -45,11 +45,131 @@ const ENV_EMPTY: EnvVar = EnvVar {
     val: [0; ENV_VAL_MAX],
 };
 
+// ---------------------------------------------------------------------------
+// 账户数据库与会话 (login / passwd / su / logout)
+// ---------------------------------------------------------------------------
+//
+// 账户文件存放在 MorionFS 的根目录, 由 shell 在启动时**额外**把 MFS 根挂到 `/etc`
+// (MFS 本身仍挂在 `/mfs`), 于是对用户可见的路径就是 `/etc/passwd` 与 `/etc/shadow`:
+//
+//   /etc/passwd   name:uid:gid:home        (每行一个账户)
+//   /etc/shadow   name:salt:hash           (salt / hash 为 16 位十六进制)
+//
+// 权限: `passwd` 0644 (所有用户可读, 登录需要), `shadow` 0600 且属主 0:0 —— 只有
+// uid 0 能读。文件服务按**真实内核身份**判定 (见 mfs_srv 的 `mfs_check_access`),
+// 所以 uid 1000 的进程读 `/etc/shadow` 会拿到 `EACCES`。
+//
+// 哈希: 加盐 FNV-1a 64 + 64 轮混合。**非密码学强度, 仅占位** —— 没有随机源、没有
+// 内存硬化、也没有抗 GPU 的设计; 真做认证应换成 Argon2/scrypt 一类的 KDF。
+const ACCT_DIR: &str = "/etc";
+const ACCT_PASSWD: &str = "/etc/passwd";
+const ACCT_SHADOW: &str = "/etc/shadow";
+/// 账户表最大条目数 (无堆分配, 固定槽位)。
+const ACCT_MAX: usize = 8;
+/// 用户名最大长度 (`/etc/passwd` 首字段)。
+const ACCT_NAME_MAX: usize = 16;
+/// 家目录最大长度。
+const ACCT_HOME_MAX: usize = 96;
+/// `/etc/passwd` 读取上限。
+const PASSWD_FILE_MAX: usize = 512;
+/// `/etc/shadow` 读取上限。
+const SHADOW_FILE_MAX: usize = 1024;
+/// 会话栈深度 (root → user → root 再加一层余量)。
+const SESSION_MAX: usize = 4;
+/// 口令 / 用户名的单次输入上限。
+const SECRET_MAX: usize = 64;
+/// 认证失败次数上限; 到顶后放弃并回到当前会话。
+const AUTH_TRIES: u32 = 3;
+
+/// 一条账户记录 (`/etc/passwd` 的一行)。
+#[derive(Clone, Copy)]
+struct Acct {
+    name_len: u8,
+    name: [u8; ACCT_NAME_MAX],
+    uid: u16,
+    gid: u16,
+    home_len: u8,
+    home: [u8; ACCT_HOME_MAX],
+}
+
+const ACCT_EMPTY: Acct = Acct {
+    name_len: 0,
+    name: [0; ACCT_NAME_MAX],
+    uid: 0,
+    gid: 0,
+    home_len: 0,
+    home: [0; ACCT_HOME_MAX],
+};
+
+impl Acct {
+    fn name(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.name[..self.name_len as usize]) }
+    }
+    fn home(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.home[..self.home_len as usize]) }
+    }
+}
+
+/// 一个登录会话: 身份 + 家目录 + 当时的 cwd (logout 时原样恢复)。
+#[derive(Clone, Copy)]
+struct Session {
+    uid: u16,
+    gid: u16,
+    name_len: u8,
+    name: [u8; ACCT_NAME_MAX],
+    home_len: u8,
+    home: [u8; ACCT_HOME_MAX],
+    cwd_len: u8,
+    cwd: [u8; CWD_MAX],
+}
+
+const SESSION_EMPTY: Session = Session {
+    uid: 0,
+    gid: 0,
+    name_len: 0,
+    name: [0; ACCT_NAME_MAX],
+    home_len: 0,
+    home: [0; ACCT_HOME_MAX],
+    cwd_len: 1,
+    cwd: [0; CWD_MAX],
+};
+
+impl Session {
+    fn name(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.name[..self.name_len as usize]) }
+    }
+    fn home(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.home[..self.home_len as usize]) }
+    }
+    fn cwd_str(&self) -> &str {
+        unsafe { core::str::from_utf8_unchecked(&self.cwd[..self.cwd_len as usize]) }
+    }
+}
+
+/// 由账户记录生成会话 (cwd 暂置 `/`, 由 `apply_session` 切家目录后再同步)。
+fn session_of(a: &Acct) -> Session {
+    let mut s = SESSION_EMPTY;
+    s.uid = a.uid;
+    s.gid = a.gid;
+    s.name_len = a.name_len;
+    s.name = a.name;
+    s.home_len = a.home_len;
+    s.home = a.home;
+    s.cwd[0] = b'/';
+    s.cwd_len = 1;
+    s
+}
+
 /// shell 运行时状态: 当前工作目录 (绝对路径, 以 '/' 开头) 与环境变量表。
 struct ShellState {
     cwd: [u8; CWD_MAX],
     cwd_len: usize,
     env: [EnvVar; ENV_SLOTS],
+    /// 当前会话身份。
+    session: Session,
+    /// 上一个会话 (logout 恢复用)。
+    stack: [Session; SESSION_MAX],
+    depth: usize,
 }
 
 impl ShellState {
@@ -91,6 +211,20 @@ impl ShellState {
         e.name_len = nb.len() as u8;
         e.val_len = vb.len() as u8;
         true
+    }
+
+    /// 把会话身份写进 `USER` / `HOME` (先拷到栈上, 避免同时借用 `self.session`)。
+    fn sync_session_env(&mut self) {
+        let mut uname = [0u8; ACCT_NAME_MAX];
+        let un = self.session.name_len as usize;
+        uname[..un].copy_from_slice(&self.session.name[..un]);
+        let mut uhome = [0u8; ACCT_HOME_MAX];
+        let hn = self.session.home_len as usize;
+        uhome[..hn].copy_from_slice(&self.session.home[..hn]);
+        let uname_s = unsafe { core::str::from_utf8_unchecked(&uname[..un]) };
+        let home_s = unsafe { core::str::from_utf8_unchecked(&uhome[..hn]) };
+        self.env_set("USER", uname_s);
+        self.env_set("HOME", home_s);
     }
 }
 
@@ -192,6 +326,10 @@ const COMMANDS: &[&str] = &[
     "whoami",
     "id",
     "su",
+    "login",
+    "passwd",
+    "logout",
+    "exit",
     "env",
     "export",
     "ls",
@@ -320,11 +458,34 @@ pub fn run() {
         cwd: [0; CWD_MAX],
         cwd_len: 1,
         env: [ENV_EMPTY; ENV_SLOTS],
+        session: SESSION_EMPTY,
+        stack: [SESSION_EMPTY; SESSION_MAX],
+        depth: 0,
     };
     st.cwd[0] = b'/';
-    st.env_set("USER", "root");
-    st.env_set("HOME", "/home/root");
     st.env_set("PATH", "/");
+
+    // 账户数据库: 把 MFS 根再挂到 `/etc` (MFS 本身仍挂 `/mfs`), 然后首次使用时生成
+    // 默认的 root / user。文件服务可能比 shell 起得晚, 故有界重试; 失败时 `login` /
+    // `passwd` 会明确报"账户数据库不可用", `su` 退回旧的"root 直接降权"语义。
+    shell_setup_accounts(true);
+
+    let start = acct_find_uid(0).unwrap_or_else(|| {
+        let mut a = ACCT_EMPTY;
+        a.uid = 0;
+        a.gid = 0;
+        let n = b"root";
+        a.name[..n.len()].copy_from_slice(n);
+        a.name_len = n.len() as u8;
+        let h = b"/home/root";
+        a.home[..h.len()].copy_from_slice(h);
+        a.home_len = h.len() as u8;
+        a
+    });
+    st.session = session_of(&start);
+    st.session.cwd[0] = b'/';
+    st.session.cwd_len = 1;
+    st.sync_session_env();
 
     // G4: **输入完全在用户态** —— 内核只把按键字节搬进队列, 行编辑/回显由
     // `morion::console::readline` 做 (它经 `SYS_KEY_READ` 阻塞, 有键才醒)。
@@ -393,7 +554,10 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
             println("  pwd            print working directory");
             println("  whoami         print the current user name");
             println("  id             print uid / gid of this process");
-            println("  su <user|uid>  switch identity (root only; users: root, user)");
+            println("  su [user|uid]  switch identity (target password; root may skip with an empty one)");
+            println("  login [user]   log in as a user (asks for that user's password)");
+            println("  passwd [user]  change a password (own password needs the old one)");
+            println("  logout         return to the previous session (alias: exit)");
             println("  env            print environment variables");
             println("  export K=V     set an environment variable");
             println("  ls [-l] [path] list directory (-l: long form)");
@@ -464,9 +628,12 @@ fn shell_exec(st: &mut ShellState, line: &[u8]) {
         "uname" => shell_uname(),
         "version" => shell_version(),
         "pwd" => println(st.cwd_str()),
-        "whoami" => shell_whoami(),
-        "id" => shell_id(),
+        "whoami" => shell_whoami(st),
+        "id" => shell_id(st),
         "su" => shell_su(st, arg),
+        "login" => shell_login(st, arg),
+        "passwd" => shell_passwd(st, arg),
+        "logout" | "exit" => shell_logout(st),
         "env" => shell_env(st),
         "export" => shell_export(st, arg),
         "ls" => shell_ls(st, if arg.is_empty() { "." } else { arg }),
@@ -1140,40 +1307,235 @@ fn shell_version() {
 }
 
 // ---------------------------------------------------------------------------
-// 多用户 (最小闭环): 身份查询 / 切换 + 进程内环境变量
+// 多用户: 账户数据库 (/etc/passwd, /etc/shadow) + 会话 (login/passwd/su/logout)
 // ---------------------------------------------------------------------------
+//
+// 设计说明 (重要):
+//   * 文件服务按**真实内核身份**判定权限; 内核的 `SYS_CRED` 只允许**降权**
+//     (uid 0 → 其它), 不允许在同一域内把身份再提回 0。
+//   * 因此 shell 作为**会话管理器**保持引导期身份 (uid 0): 登录/切换只改变 shell
+//     记录的会话身份与 USER/HOME/cwd。否则 root → user 之后 `logout` 永远回不到
+//     root (内核会拒绝), `passwd` 也无法再写 0600 的 /etc/shadow。
+//   * 账户文件的 0600 权限仍由 MFS 对**其它域**强制执行 (uid 1000 的应用读
+//     /etc/shadow 会得到 EACCES); shell 侧再按会话身份拦一次 (见 `cat` 的守卫)。
+//
+// 口令哈希: 加盐 FNV-1a 64 位 + 64 轮混合 —— **非密码学强度, 仅占位**。
 
-/// uid → 用户名; 未知 uid 返回 `None` (调用方打印数字)。
-fn shell_user_name(uid: u16) -> Option<&'static str> {
-    match uid {
-        0 => Some("root"),
-        1000 => Some("user"),
-        _ => None,
+/// 从文件读入最多 `out.len()` 字节; 失败返回 `None`。
+fn fs_read_file(path: &str, out: &mut [u8]) -> Option<usize> {
+    let fd = vfs::open(path);
+    if fd == u64::MAX {
+        return None;
+    }
+    let mut off = 0usize;
+    loop {
+        let left = out.len() - off;
+        if left == 0 {
+            break;
+        }
+        let want = left.min(4096) as u32;
+        let n = vfs::read_into(fd, off as u64, want, vfs::SHELL_RESULT_BUF);
+        if n == u64::MAX {
+            vfs::close(fd);
+            return None;
+        }
+        let n = n as usize;
+        if n == 0 {
+            break;
+        }
+        let take = n.min(left);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                vfs::SHELL_RESULT_BUF as *const u8,
+                out[off..].as_mut_ptr(),
+                take,
+            );
+        }
+        off += take;
+        if n < want as usize {
+            break;
+        }
+    }
+    vfs::close(fd);
+    Some(off)
+}
+
+/// 覆盖写整个文件 (先截断), 单次最多一页; 成功返回 true。
+fn fs_write_file(path: &str, data: &[u8]) -> bool {
+    let fd = vfs::creat(path);
+    if fd == u64::MAX {
+        return false;
+    }
+    if vfs::truncate(fd, 0) == u64::MAX {
+        vfs::close(fd);
+        return false;
+    }
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = (data.len() - off).min(4096);
+        let r = vfs::write_into(fd, off as u64, &data[off..off + n], vfs::SHELL_WRITE_BUF);
+        if r == u64::MAX || r as usize != n {
+            vfs::close(fd);
+            return false;
+        }
+        off += n;
+    }
+    vfs::close(fd);
+    true
+}
+
+/// 路径是否可打开 (存在且可读)。
+fn fs_exists(path: &str) -> bool {
+    let fd = vfs::open(path);
+    if fd == u64::MAX {
+        false
+    } else {
+        vfs::close(fd);
+        true
     }
 }
 
-/// 打印用户名 (未知 uid 打 `uid:<数字>`)。
-fn print_user(uid: u16) {
-    match shell_user_name(uid) {
-        Some(name) => print(name),
-        None => {
-            print("uid:");
-            print_u64(uid as u64);
+/// 设置权限位与属主 (MFS; 只有 uid 0 能改属主)。成功返回 true。
+fn fs_set_mode_owner(path: &str, mode: u32, uid: u16, gid: u16) -> bool {
+    let m = vfs::chmod_into(path, mode, vfs::SHELL_RESULT_BUF);
+    let o = vfs::chown_into(path, uid, gid, vfs::SHELL_RESULT_BUF);
+    m == 1 && o == 1
+}
+
+/// 去掉行尾 / 行首的 ASCII 空白。
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let Some((&c, rest)) = b.split_first() {
+        if c.is_ascii_whitespace() {
+            b = rest;
+        } else {
+            break;
         }
+    }
+    while let Some((&c, _)) = b.split_last() {
+        if c.is_ascii_whitespace() {
+            b = &b[..b.len() - 1];
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+/// 解析十进制 u16 (字节切片)。
+fn parse_u16_bytes(b: &[u8]) -> Option<u16> {
+    parse_u16_dec(core::str::from_utf8(b).ok()?)
+}
+
+/// 解析 16 进制 u64 (最多 16 位)。
+fn parse_hex64(b: &[u8]) -> Option<u64> {
+    if b.is_empty() || b.len() > 16 {
+        return None;
+    }
+    let mut v = 0u64;
+    for &c in b {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | d as u64;
+    }
+    Some(v)
+}
+
+/// 把 `v` 写成 16 位小写十六进制。
+fn hex64(v: u64, out: &mut [u8; 16]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut i = out.len();
+    let mut x = v;
+    while i > 0 {
+        i -= 1;
+        out[i] = DIGITS[(x & 0xF) as usize];
+        x >>= 4;
     }
 }
 
-/// `su` 的目标解析: 支持 `root` / `user` 两个约定名, 以及十进制 uid
-/// (数字 uid 的 gid 取同值, 0 仍为 `0:0`)。
-fn parse_user(spec: &str) -> Option<(u16, u16)> {
-    match spec {
-        "root" => Some((0, 0)),
-        "user" | "morion" => Some((1000, 1000)),
-        _ => {
-            let uid = parse_u16_dec(spec)?;
-            Some((uid, if uid == 0 { 0 } else { uid }))
+/// 复制 `src` 到 `dst`, 返回实际长度 (最多 `dst.len()`)。
+fn copy_name(dst: &mut [u8], src: &[u8]) -> u8 {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n as u8
+}
+
+/// 读取并解析 `/etc/passwd`, 返回条目数。
+fn acct_load(out: &mut [Acct]) -> usize {
+    let mut text = [0u8; PASSWD_FILE_MAX];
+    let n = match fs_read_file(ACCT_PASSWD, &mut text) {
+        Some(n) => n,
+        None => return 0,
+    };
+    let mut count = 0usize;
+    for raw in text[..n].split(|&b| b == b'\n') {
+        if count >= out.len() {
+            break;
         }
+        let line = trim_ascii(raw);
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        // name:uid:gid:home
+        let mut fields: [&[u8]; 4] = [b"", b"", b"", b""];
+        let mut fi = 0usize;
+        for f in line.split(|&b| b == b':') {
+            if fi < fields.len() {
+                fields[fi] = f;
+                fi += 1;
+            }
+        }
+        if fi < 4 || fields[0].is_empty() {
+            continue;
+        }
+        let uid = match parse_u16_bytes(fields[1]) {
+            Some(v) => v,
+            None => continue,
+        };
+        let gid = match parse_u16_bytes(fields[2]) {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut a = ACCT_EMPTY;
+        a.name_len = copy_name(&mut a.name, fields[0]);
+        a.uid = uid;
+        a.gid = gid;
+        a.home_len = copy_name(&mut a.home, fields[3]);
+        out[count] = a;
+        count += 1;
     }
+    count
+}
+
+/// 按用户名查账户。
+fn acct_find(name: &str) -> Option<Acct> {
+    let mut list = [ACCT_EMPTY; ACCT_MAX];
+    let n = acct_load(&mut list);
+    let mut i = 0usize;
+    while i < n {
+        if list[i].name() == name {
+            return Some(list[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 按 uid 查账户。
+fn acct_find_uid(uid: u16) -> Option<Acct> {
+    let mut list = [ACCT_EMPTY; ACCT_MAX];
+    let n = acct_load(&mut list);
+    let mut i = 0usize;
+    while i < n {
+        if list[i].uid == uid {
+            return Some(list[i]);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 把 `uid` 的十进制写法写进 `out`, 返回长度。
@@ -1196,28 +1558,268 @@ fn uid_decimal(uid: u16, out: &mut [u8]) -> usize {
     m
 }
 
-/// 家目录约定 `/home/<user>`, 写进 `out`, 返回长度。
-fn build_home(uid: u16, out: &mut [u8]) -> usize {
-    let mut n = 0usize;
-    for &b in b"/home/" {
-        out[n] = b;
-        n += 1;
+/// 解析 `su` / `login` 的目标: 先查账户表, 再按十进制 uid 查; `allow_unknown_uid`
+/// (仅无 `/etc/shadow` 的兼容模式) 允许切到账户表里没有的 uid。
+fn acct_resolve(spec: &str, allow_unknown_uid: bool) -> Option<Acct> {
+    if let Some(a) = acct_find(spec) {
+        return Some(a);
     }
-    match shell_user_name(uid) {
-        Some(name) => {
-            let b = name.as_bytes();
-            out[n..n + b.len()].copy_from_slice(b);
-            n + b.len()
+    let uid = parse_u16_dec(spec)?;
+    if let Some(a) = acct_find_uid(uid) {
+        return Some(a);
+    }
+    if !allow_unknown_uid {
+        return None;
+    }
+    let mut a = ACCT_EMPTY;
+    a.uid = uid;
+    a.gid = if uid == 0 { 0 } else { uid };
+    let mut tmp = [0u8; 8];
+    let n = uid_decimal(uid, &mut tmp);
+    let mut name = [0u8; ACCT_NAME_MAX];
+    let mut hn = 0usize;
+    // 名字仍按 uid 数字, 家目录 /home/<uid>。
+    name[..n].copy_from_slice(&tmp[..n]);
+    let prefix = b"/home/";
+    a.home[..prefix.len()].copy_from_slice(prefix);
+    hn += prefix.len();
+    a.home[hn..hn + n].copy_from_slice(&tmp[..n]);
+    hn += n;
+    a.name_len = n as u8;
+    a.name = name;
+    a.home_len = hn as u8;
+    Some(a)
+}
+
+/// 加盐 FNV-1a 64 位混合 (**非密码学强度, 仅占位**)。
+fn fnv1a(h: u64, bytes: &[u8]) -> u64 {
+    let mut x = h;
+    for &b in bytes {
+        x ^= b as u64;
+        x = x.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    x
+}
+
+/// 口令 → 64 位哈希。`salt` 让相同口令在不同账户 / 不同次修改下不同。
+fn kdf(password: &[u8], salt: u64) -> u64 {
+    let mut h = fnv1a(0xCBF2_9CE4_8422_2325 ^ salt, b"morion");
+    let mut round = 0u64;
+    while round < 64 {
+        h = fnv1a(h, password);
+        h = fnv1a(h, &salt.to_le_bytes());
+        h ^= round;
+        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        round += 1;
+    }
+    h
+}
+
+/// 生成盐。没有随机源, 只用计数器 + 用户名混合 —— **明确不是密码学随机**。
+fn new_salt(name: &str, uid: u16) -> u64 {
+    static mut SEQ: u64 = 0;
+    let seq = unsafe {
+        SEQ = SEQ.wrapping_add(1);
+        SEQ
+    };
+    let mut h = fnv1a(0x243F_6A88_85A3_08D3, name.as_bytes());
+    h = fnv1a(h, &uid.to_le_bytes());
+    h = fnv1a(h, &seq.to_le_bytes());
+    let mut x = h ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// 在 `shadow` 文本里查 `name` 的 `(salt, hash)`。
+fn shadow_lookup(name: &str) -> Option<(u64, u64)> {
+    let mut text = [0u8; SHADOW_FILE_MAX];
+    let n = fs_read_file(ACCT_SHADOW, &mut text)?;
+    for raw in text[..n].split(|&b| b == b'\n') {
+        let line = trim_ascii(raw);
+        if line.is_empty() {
+            continue;
         }
-        None => n + uid_decimal(uid, &mut out[n..]),
+        let mut it = line.split(|&b| b == b':');
+        let field = match it.next() {
+            Some(f) => f,
+            None => continue,
+        };
+        if field != name.as_bytes() {
+            continue;
+        }
+        let salt = match it.next().and_then(parse_hex64) {
+            Some(v) => v,
+            None => continue,
+        };
+        let hash = match it.next().and_then(parse_hex64) {
+            Some(v) => v,
+            None => continue,
+        };
+        return Some((salt, hash));
+    }
+    None
+}
+
+/// 校验口令。
+fn verify_password(name: &str, password: &[u8]) -> bool {
+    match shadow_lookup(name) {
+        Some((salt, hash)) => kdf(password, salt) == hash,
+        None => false,
     }
 }
 
-/// 切到家目录: 存在才 `cd`; 不存在只提示 (约定如此, 不自动创建)。
-fn enter_home(st: &mut ShellState, home: &str) {
+/// 追加一条 `name:salt:hash\n` 到 `out`, 返回写入长度。
+fn push_shadow_line(out: &mut [u8], name: &str, salt: u64, hash: u64) -> usize {
+    let mut n = 0usize;
+    let mut put = |src: &[u8], n: &mut usize| {
+        let k = src.len().min(out.len() - *n);
+        out[*n..*n + k].copy_from_slice(&src[..k]);
+        *n += k;
+    };
+    put(name.as_bytes(), &mut n);
+    put(b":", &mut n);
+    let mut salt_hex = [b'0'; 16];
+    hex64(salt, &mut salt_hex);
+    put(&salt_hex, &mut n);
+    put(b":", &mut n);
+    let mut hash_hex = [b'0'; 16];
+    hex64(hash, &mut hash_hex);
+    put(&hash_hex, &mut n);
+    put(b"\n", &mut n);
+    n
+}
+
+/// 更新 (或追加) `name` 的 shadow 行, 并保持 0600 / 0:0。
+fn shadow_update(name: &str, salt: u64, hash: u64) -> bool {
+    let mut text = [0u8; SHADOW_FILE_MAX];
+    let n = fs_read_file(ACCT_SHADOW, &mut text).unwrap_or(0);
+    let mut out = [0u8; SHADOW_FILE_MAX];
+    let mut o = 0usize;
+    let mut replaced = false;
+    for raw in text[..n].split(|&b| b == b'\n') {
+        let line = trim_ascii(raw);
+        if line.is_empty() {
+            continue;
+        }
+        let name_end = line.iter().position(|&b| b == b':').unwrap_or(line.len());
+        if &line[..name_end] == name.as_bytes() {
+            if replaced {
+                continue;
+            }
+            let k = push_shadow_line(&mut out[o..], name, salt, hash);
+            o += k;
+            replaced = true;
+        } else {
+            let k = line.len().min(out.len() - o);
+            out[o..o + k].copy_from_slice(&line[..k]);
+            o += k;
+            if o < out.len() {
+                out[o] = b'\n';
+                o += 1;
+            }
+        }
+    }
+    if !replaced {
+        let k = push_shadow_line(&mut out[o..], name, salt, hash);
+        o += k;
+    }
+    fs_write_file(ACCT_SHADOW, &out[..o]) && fs_set_mode_owner(ACCT_SHADOW, 0o600, 0, 0)
+}
+
+/// 启动时准备账户数据库: 把 MFS 根挂到 `/etc`, 首次使用时生成 root / user。
+///
+/// 文件服务可能比 shell 起得晚, 故有界重试; 失败只打印提示, `su` 会退回旧语义。
+/// 返回账户文件是否可用。
+fn shell_setup_accounts(announce: bool) -> bool {
+    let mut tries = 0u32;
+    while tries < 500 {
+        if fs_exists(ACCT_DIR) {
+            break;
+        }
+        let _ = vfs::mount(ACCT_DIR, vfs::MFS_DOMAIN);
+        sys_sleep(20);
+        tries += 1;
+    }
+    if !fs_exists(ACCT_DIR) {
+        if announce {
+            println(
+                "login: account database unavailable (MFS /etc mount failed); su stays drop-only",
+            );
+        }
+        return false;
+    }
+    if !fs_exists(ACCT_PASSWD) {
+        let def = b"root:0:0:/home/root\nuser:1000:1000:/home/user\n";
+        if !fs_write_file(ACCT_PASSWD, def) {
+            if announce {
+                println("login: cannot create /etc/passwd");
+            }
+            return false;
+        }
+    }
+    if !fs_exists(ACCT_SHADOW) {
+        // 默认口令 root/root、user/user —— 仅占位, 登录后请用 `passwd` 改掉。
+        let mut buf = [0u8; SHADOW_FILE_MAX];
+        let mut o = 0usize;
+        let defaults: [(&str, &[u8], u16); 2] = [("root", b"root", 0), ("user", b"user", 1000)];
+        for (name, pw, uid) in defaults {
+            let salt = new_salt(name, uid);
+            let k = push_shadow_line(&mut buf[o..], name, salt, kdf(pw, salt));
+            o += k;
+        }
+        if !fs_write_file(ACCT_SHADOW, &buf[..o]) {
+            if announce {
+                println("login: cannot create /etc/shadow");
+            }
+            return false;
+        }
+        if announce {
+            println("login: created default accounts root (uid 0) and user (uid 1000)");
+        }
+    }
+    let _ = fs_set_mode_owner(ACCT_PASSWD, 0o644, 0, 0);
+    let _ = fs_set_mode_owner(ACCT_SHADOW, 0o600, 0, 0);
+    // 家目录约定 `/home/<user>`: 不存在就建一个, 让登录后真的能切过去。
+    ensure_home_dir("/home");
+    ensure_home_dir("/home/root");
+    ensure_home_dir("/home/user");
+    if announce {
+        println("login: account database ready (/etc/passwd, /etc/shadow; shadow 0600)");
+    }
+    true
+}
+
+/// 建 `path` 目录 (已存在或失败都忽略)。按 `/home` → `/home/<user>` 的顺序调用。
+fn ensure_home_dir(path: &str) {
+    if !fs_exists(path) {
+        let _ = vfs::mkdir(path);
+    }
+}
+
+/// 账户数据库是否可用。
+///
+/// 只有**两个文件都不在** (从未初始化, 例如启动时 MFS 还没就绪) 才再尝试生成一次;
+/// 若 `passwd` 在而 `shadow` 被删掉, 视为用户主动移除口令库, 退回旧的 `su` 语义。
+fn accounts_ready() -> bool {
+    if fs_exists(ACCT_SHADOW) {
+        return true;
+    }
+    if fs_exists(ACCT_PASSWD) {
+        return false;
+    }
+    shell_setup_accounts(false)
+}
+
+/// 切到家目录: 存在且是目录才 `cd`; 否则只提示 (约定如此, 不自动创建)。
+fn enter_home(st: &mut ShellState, home: &str, who: &str) {
     let fd = vfs::open(home);
     if fd == u64::MAX {
-        print("su: home directory ");
+        print(who);
+        print(": home directory ");
         print(home);
         println(" not found (staying put; create it with mkdir if you want one)");
         return;
@@ -1225,7 +1827,8 @@ fn enter_home(st: &mut ShellState, home: &str) {
     let n = vfs::readdir_into(fd, vfs::SHELL_RESULT_BUF);
     vfs::close(fd);
     if n == u64::MAX {
-        print("su: home ");
+        print(who);
+        print(": home ");
         print(home);
         println(" is not a directory");
         return;
@@ -1233,74 +1836,324 @@ fn enter_home(st: &mut ShellState, home: &str) {
     st.set_cwd(home);
 }
 
-/// `whoami` — 打印内核记录的当前用户名。
-fn shell_whoami() {
-    match sys_cred_get() {
-        Some((uid, _)) => {
-            print_user(uid);
-            println("");
+/// 把当前会话 (含 cwd) 快照一份, 供 logout 恢复。
+fn snapshot_session(st: &ShellState) -> Session {
+    let mut s = st.session;
+    s.cwd = [0; CWD_MAX];
+    let n = st.cwd_len.min(CWD_MAX);
+    s.cwd[..n].copy_from_slice(&st.cwd[..n]);
+    s.cwd_len = n as u8;
+    s
+}
+
+/// 进入 `a` 对应的会话 (可选压栈), 设置 USER/HOME 并切家目录。
+fn apply_session(st: &mut ShellState, a: &Acct, push: bool) {
+    if push && st.depth < SESSION_MAX {
+        st.stack[st.depth] = snapshot_session(st);
+        st.depth += 1;
+    }
+    st.session = session_of(a);
+    let mut uname = [0u8; ACCT_NAME_MAX];
+    let un = copy_name(&mut uname, a.name().as_bytes());
+    let mut uhome = [0u8; ACCT_HOME_MAX];
+    let hn = copy_name(&mut uhome, a.home().as_bytes());
+    let uname_s = unsafe { core::str::from_utf8_unchecked(&uname[..un as usize]) };
+    let home_s = unsafe { core::str::from_utf8_unchecked(&uhome[..hn as usize]) };
+    st.env_set("USER", uname_s);
+    st.env_set("HOME", home_s);
+    enter_home(st, home_s, "login");
+    // 记录切换后的 cwd, 让 logout 恢复的是"离开时的位置"。
+    let n = st.cwd_len.min(CWD_MAX);
+    st.session.cwd[..n].copy_from_slice(&st.cwd[..n]);
+    st.session.cwd_len = n as u8;
+}
+
+/// 读一行不显示内容的口令 (只回显 `*`); 返回长度。Ctrl+C 返回 0。
+fn read_secret(buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    loop {
+        let c = sys_key_read();
+        if c == u64::MAX {
+            return n;
         }
-        None => println("whoami: SYS_CRED failed"),
+        if c > 0xFF {
+            continue;
+        }
+        let c = c as u8;
+        match c {
+            b'\r' | b'\n' => {
+                print("\n");
+                flush();
+                return n;
+            }
+            0x08 | 0x7F => {
+                if n > 0 {
+                    n -= 1;
+                    print("\x08 \x08");
+                    flush();
+                }
+            }
+            0x03 => {
+                print("^C\n");
+                flush();
+                return 0;
+            }
+            b if (0x20..=0x7E).contains(&b) && n < buf.len() => {
+                buf[n] = b;
+                n += 1;
+                print("*");
+                flush();
+            }
+            _ => {}
+        }
     }
 }
 
-/// `id` — 打印当前 uid / gid (与文件服务权限判定同源)。
-fn shell_id() {
-    match sys_cred_get() {
-        Some((uid, gid)) => {
-            print("uid=");
-            print_u64(uid as u64);
-            print("(");
-            print_user(uid);
-            print(") gid=");
-            print_u64(gid as u64);
-            print("(");
-            print_user(gid);
-            print(")");
-            println("");
-        }
-        None => println("id: SYS_CRED failed"),
+/// 读一行普通输入 (用户名等), 去掉首尾空白; 返回长度。
+fn read_plain(buf: &mut [u8]) -> usize {
+    let n = morion::console::readline(buf, "", COMMANDS);
+    if n == u64::MAX {
+        return 0;
     }
+    let n = n as usize;
+    let (start, k) = {
+        let s = unsafe { core::str::from_utf8_unchecked(&buf[..n]) };
+        let t = s.trim();
+        (t.as_ptr() as usize - buf.as_ptr() as usize, t.len())
+    };
+    buf.copy_within(start..start + k, 0);
+    k
 }
 
-/// `su <user|uid>` — 切换身份。只允许 root 降权 (没有口令机制, 非 root 一律拒绝),
-/// 切换成功后家目录 `/home/<user>` 存在就进去。
-fn shell_su(st: &mut ShellState, arg: &str) {
-    if arg.is_empty() {
-        println("su: usage: su <user|uid>   (users: root, user)");
+/// `login [user]` — 以指定用户身份登录 (需要该用户的口令, 3 次失败回到当前会话)。
+fn shell_login(st: &mut ShellState, arg: &str) {
+    if !accounts_ready() {
+        println("login: account database unavailable (no /etc/shadow)");
         return;
     }
-    let (uid, gid) = match parse_user(arg) {
-        Some(v) => v,
+    let mut namebuf = [0u8; ACCT_NAME_MAX];
+    let name: &str = if arg.is_empty() {
+        print("login: ");
+        flush();
+        let n = read_plain(&mut namebuf);
+        if n == 0 {
+            println("login: cancelled");
+            return;
+        }
+        unsafe { core::str::from_utf8_unchecked(&namebuf[..n]) }
+    } else {
+        arg
+    };
+    let acct = match acct_find(name) {
+        Some(a) => a,
+        None => {
+            print("login: unknown user: ");
+            println(name);
+            return;
+        }
+    };
+    let mut pw = [0u8; SECRET_MAX];
+    let mut tries = 0u32;
+    while tries < AUTH_TRIES {
+        print("Password: ");
+        flush();
+        let n = read_secret(&mut pw);
+        if verify_password(acct.name(), &pw[..n]) {
+            apply_session(st, &acct, true);
+            print("login: welcome, ");
+            println(acct.name());
+            return;
+        }
+        println("login: incorrect password");
+        tries += 1;
+    }
+    println("login: 3 failed attempts, staying in the current session");
+}
+
+/// `passwd [user]` — 改口令。改自己的要先验旧口令; 改别人只有 root 可以。
+fn shell_passwd(st: &mut ShellState, arg: &str) {
+    if !accounts_ready() {
+        println("passwd: account database unavailable (no /etc/shadow)");
+        return;
+    }
+    let mut own = [0u8; ACCT_NAME_MAX];
+    let on = copy_name(&mut own, st.session.name().as_bytes());
+    let own_s = unsafe { core::str::from_utf8_unchecked(&own[..on as usize]) };
+    let target = if arg.is_empty() { own_s } else { arg };
+    let acct = match acct_find(target) {
+        Some(a) => a,
+        None => {
+            print("passwd: unknown user: ");
+            println(target);
+            return;
+        }
+    };
+    let is_self = acct.name() == own_s;
+    if !is_self && st.session.uid != 0 {
+        println("passwd: permission denied (only root may change another user's password)");
+        return;
+    }
+    let mut pw = [0u8; SECRET_MAX];
+    if is_self {
+        let mut ok = false;
+        let mut tries = 0u32;
+        while tries < AUTH_TRIES {
+            print("Current password: ");
+            flush();
+            let n = read_secret(&mut pw);
+            if verify_password(acct.name(), &pw[..n]) {
+                ok = true;
+                break;
+            }
+            println("passwd: incorrect password");
+            tries += 1;
+        }
+        if !ok {
+            println("passwd: 3 failed attempts, password unchanged");
+            return;
+        }
+    }
+    let mut pw1 = [0u8; SECRET_MAX];
+    print("New password: ");
+    flush();
+    let n1 = read_secret(&mut pw1);
+    if n1 == 0 {
+        println("passwd: empty password not allowed");
+        return;
+    }
+    let mut pw2 = [0u8; SECRET_MAX];
+    print("Retype new password: ");
+    flush();
+    let n2 = read_secret(&mut pw2);
+    if pw1[..n1] != pw2[..n2] {
+        println("passwd: passwords do not match");
+        return;
+    }
+    let salt = new_salt(acct.name(), acct.uid);
+    if shadow_update(acct.name(), salt, kdf(&pw1[..n1], salt)) {
+        print("passwd: password updated for ");
+        println(acct.name());
+    } else {
+        println("passwd: failed to update /etc/shadow");
+    }
+}
+
+/// `su [user|uid]` — 切换会话身份。
+///
+/// * 有账户数据库: 非 root 切换必须输入**目标用户的口令** (3 次); root 可以空口令跳过。
+/// * 没有 `/etc/shadow` (兼容旧行为): 只有 root 可以切换, 由内核真实降权。
+fn shell_su(st: &mut ShellState, arg: &str) {
+    let has_db = accounts_ready();
+    let spec = if arg.is_empty() { "root" } else { arg };
+    let acct = match acct_resolve(spec, !has_db) {
+        Some(a) => a,
         None => {
             print("su: unknown user: ");
-            println(arg);
+            println(spec);
             return;
         }
     };
-    let (cur_uid, cur_gid) = match sys_cred_get() {
-        Some(v) => v,
-        None => {
-            println("su: cannot read current identity (SYS_CRED failed)");
+    if acct.uid == st.session.uid && acct.gid == st.session.gid {
+        print("su: already ");
+        println(acct.name());
+        return;
+    }
+    let mut pw = [0u8; SECRET_MAX];
+    if has_db {
+        let mut ok = false;
+        if st.session.uid == 0 {
+            // root 可以直接切换; 也接受输入目标口令 (空行 = 跳过)。
+            print("Password for ");
+            print(acct.name());
+            print(" (empty = skip): ");
+            flush();
+            let n = read_secret(&mut pw);
+            ok = n == 0 || verify_password(acct.name(), &pw[..n]);
+            if !ok {
+                println("su: incorrect password");
+                return;
+            }
+        } else {
+            let mut tries = 0u32;
+            while tries < AUTH_TRIES {
+                print("Password: ");
+                flush();
+                let n = read_secret(&mut pw);
+                if verify_password(acct.name(), &pw[..n]) {
+                    ok = true;
+                    break;
+                }
+                println("su: incorrect password");
+                tries += 1;
+            }
+            if !ok {
+                print("su: 3 failed attempts, staying as ");
+                println(st.session.name());
+                return;
+            }
+        }
+    } else {
+        // 兼容: 没有账户数据库时, 只有 root 可以 su (真实降权)。
+        if st.session.uid != 0 {
+            println("su: permission denied: only uid 0 may switch users (no password mechanism)");
             return;
         }
-    };
-    if cur_uid != 0 && (uid != cur_uid || gid != cur_gid) {
-        println("su: permission denied: only uid 0 may switch users (no password mechanism yet)");
-        return;
+        if !sys_cred_set(acct.uid, acct.gid) {
+            println("su: setuid failed (kernel rejected the change)");
+            return;
+        }
     }
-    if (uid, gid) != (cur_uid, cur_gid) && !sys_cred_set(uid, gid) {
-        println("su: setuid failed (kernel rejected the change)");
-        return;
-    }
-    let mut home = [0u8; CWD_MAX];
-    let hn = build_home(uid, &mut home);
-    let home = unsafe { core::str::from_utf8_unchecked(&home[..hn]) };
-    st.env_set("USER", arg);
-    st.env_set("HOME", home);
-    enter_home(st, home);
+    apply_session(st, &acct, true);
     print("su: now ");
-    print_user(uid);
+    println(acct.name());
+}
+
+/// `logout` / `exit` — 回到上一个会话 (栈空时给出提示)。
+fn shell_logout(st: &mut ShellState) {
+    if st.depth == 0 {
+        println("logout: no previous session (already at the top level)");
+        return;
+    }
+    let prev = st.stack[st.depth - 1];
+    if !fs_exists(ACCT_SHADOW) {
+        // 兼容旧语义: 恢复需要内核允许 (非 root 的提权会被拒绝)。
+        if !sys_cred_set(prev.uid, prev.gid) {
+            print("logout: cannot restore previous identity (SYS_CRED is drop-only); staying as ");
+            println(st.session.name());
+            return;
+        }
+    }
+    st.depth -= 1;
+    st.session = prev;
+    let mut uname = [0u8; ACCT_NAME_MAX];
+    let un = copy_name(&mut uname, prev.name().as_bytes());
+    let mut uhome = [0u8; ACCT_HOME_MAX];
+    let hn = copy_name(&mut uhome, prev.home().as_bytes());
+    let uname_s = unsafe { core::str::from_utf8_unchecked(&uname[..un as usize]) };
+    let home_s = unsafe { core::str::from_utf8_unchecked(&uhome[..hn as usize]) };
+    st.env_set("USER", uname_s);
+    st.env_set("HOME", home_s);
+    st.set_cwd(prev.cwd_str());
+    print("logout: back to ");
+    println(uname_s);
+}
+
+/// `whoami` — 打印当前**会话**用户名。
+fn shell_whoami(st: &ShellState) {
+    println(st.session.name());
+}
+
+/// `id` — 打印当前**会话** uid / gid 与用户名。
+fn shell_id(st: &ShellState) {
+    print("uid=");
+    print_u64(st.session.uid as u64);
+    print("(");
+    print(st.session.name());
+    print(") gid=");
+    print_u64(st.session.gid as u64);
+    print("(");
+    print(st.session.name());
+    print(")");
     println("");
 }
 
@@ -2302,6 +3155,12 @@ fn shell_cat(st: &ShellState, arg: &str) {
             return;
         }
     };
+    // `/etc/shadow` 只有 uid 0 可读: MFS 的 0600 拦得住其它域, 但 shell 自己以 uid 0
+    // 运行 (会话管理器), 故这里再按**会话身份**拦一次。
+    if path == ACCT_SHADOW && st.session.uid != 0 {
+        println("cat: /etc/shadow: permission denied (only uid 0 may read it)");
+        return;
+    }
     let fd = vfs::open(path);
     if fd == u64::MAX {
         print("cat: cannot open ");
