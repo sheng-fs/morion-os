@@ -205,6 +205,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "morion-enclave"
+version = "0.1.0"
+dependencies = [
+ "libdevice",
+ "morion",
+]
+
+[[package]]
 name = "morion-files"
 version = "0.1.0"
 dependencies = [
