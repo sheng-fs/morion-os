@@ -43,9 +43,21 @@
 //!
 //! ⚠️ 本步**只在固件存在 IOMMU 时生效**（QEMU 需 `-device intel-iommu`）；无 IOMMU 时直接
 //! 返回 `false`、行为与之前完全一致（回归因此不受影响）。
+//!
+//! # AMD-Vi（AMD IOMMU）
+//!
+//! Intel VT-d 之外还有一条 AMD 路径（真机是 AMD）。固件没有 DMAR、但有 ACPI **IVRS** 时
+//! 走 [`init_amdvi`]：解析 IVHD（0x10/0x11）拿到 IOMMU 寄存器基址，建 32 字节 DTE 的
+//! **Device Table**、命令环、事件环，再打开 `IOMMUEn | CmdBufEn | EvtLogEn`。每台设备
+//! 一条 DTE，指向**该设备独有**的 4 级 I/O 页表（与 VT-d 的 per-device 窗口同一安全属性：
+//! 只有 [`register_device_range`] 登记过的 BAR / DMA 块才有 4 KiB 叶项，其余地址无叶项 →
+//! DMA 被拒）。两份固件表同时存在时**优先已有 VT-d 路径**，AMD-Vi 不重复使能。
+//!
+//! 失败安全：没有 IVRS / IVHD 畸形 / 表页分配失败 / 寄存器块不在恒等映射内时都直接返回
+//! `false`（**不写** IOMMU 寄存器），行为与"没有 IOMMU"完全一致。
 
 use crate::arch::pci::PciDevice;
-use crate::memory::frame_allocator::allocate_frame;
+use crate::memory::frame_allocator::{allocate_frame, allocate_frames};
 use crate::memory::paging::is_identity_mapped;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -532,24 +544,50 @@ fn enumerate_drhds() -> Vec<u64> {
 // 初始化
 // ---------------------------------------------------------------------------
 
-/// 打开 IOMMU 的 DMA 重映射（E1b）。
+/// 打开 IOMMU 的 DMA 重映射。
+///
+/// 两条后端路线，**按固件表二选一**：
+/// 1. 有 `DMAR`（Intel VT-d）→ 走既有的 [`init_vtd`]（行为与本文件之前完全一致）；
+/// 2. 没有 `DMAR` 但有 `IVRS`（AMD-Vi）→ 走 [`init_amdvi`]；
+/// 3. 两者都没有 → 打印原因并返回 `false`（DMA 直通，行为不变）。
+///
+/// 同时存在 DMAR 与 IVRS 时只走 VT-d，**不会**重复使能两份硬件。
+///
+/// 返回是否真的把翻译打开（无 IOMMU / 表建不起来 / 使能位未生效 → `false`）。
+pub fn init(devices: &[PciDevice]) -> bool {
+    // SAFE 变体 = 真机首次 bring-up: **不打开** DMA 重映射。
+    //
+    // 真实固件的 DMAR/IVRS 与 QEMU 差别很大 (多单元 / 保留区间 / 显示引擎扫描输出也走
+    // IOMMU)。一旦打开翻译, 任何一次落在登记窗口外的固件设备 DMA 都会失败 —— 典型表现
+    // 就是**画面瞬间全黑** (CPU 还活着)。显示与存储路线都确认稳定后, 再用普通构建验证。
+    if crate::version::IS_SAFE {
+        crate::video::println("[OK] IOMMU: skipped in SAFE build (DMA remapping stays off)");
+        return false;
+    }
+
+    let dmar = crate::arch::acpi::probe_dmar();
+    if dmar.found && dmar.drhd_count != 0 {
+        return init_vtd(devices);
+    }
+
+    // 没有可用的 DMAR 时才尝试 AMD-Vi（互斥，避免同一台机器上两份 IOMMU 同时改写）。
+    if let Some(ivrs) = crate::arch::acpi::ivrs_table() {
+        return init_amdvi(devices, ivrs);
+    }
+
+    crate::video::println("[OK] IOMMU: no DMAR/IVRS in firmware, DMA remapping not enabled");
+    false
+}
+
+/// 打开 Intel VT-d 的 DMA 重映射（E1b）。
 ///
 /// `devices` 是 PCI 枚举结果 —— 每个功能点都会拿到一条 **translated** 上下文项；默认窗口
 /// 开局为空，随后由 `device::grant*` 调 [`register_device_range`] 逐段补入该设备的 BAR /
 /// DMA 物理范围（IOVA == 物理地址），阶段一内核与既有驱动照旧按物理地址 DMA 即可。
 ///
 /// 返回是否真的把翻译打开（无 IOMMU / 表建不起来 / `GSTS` 未生效 → `false`）。
-pub fn init(devices: &[PciDevice]) -> bool {
-    // SAFE 变体 = 真机首次 bring-up: **不打开** DMA 重映射。
-    //
-    // 真实固件的 DMAR 与 QEMU 差别很大 (多 DRHD / RMRR / 显示引擎扫描输出也走 IOMMU)。
-    // 一旦打开翻译, 任何一次落在登记窗口外的固件设备 DMA 都会失败 —— 典型表现就是
-    // **画面瞬间全黑** (CPU 还活着)。显示与存储路线都确认稳定后, 再用普通构建验证 E1b/E1c。
-    if crate::version::IS_SAFE {
-        crate::video::println("[OK] VT-d: skipped in SAFE build (DMA remapping stays off)");
-        return false;
-    }
-
+fn init_vtd(devices: &[PciDevice]) -> bool {
+    BACKEND.store(BACKEND_VTD, Ordering::Release);
     let dmar = crate::arch::acpi::probe_dmar();
     if !dmar.found || dmar.drhd_count == 0 {
         crate::video::println("[OK] VT-d: no IOMMU in firmware, DMA remapping not enabled");
@@ -887,6 +925,9 @@ pub fn register_device_range(
     bytes: u64,
     is_dma: bool,
 ) -> bool {
+    if BACKEND.load(Ordering::Acquire) == BACKEND_AMDVI {
+        return amdvi_register_device_range(bus, dev, func, paddr, bytes, is_dma);
+    }
     let aw = ENABLED_AW.load(Ordering::Acquire);
     if aw == 0 {
         return false;
@@ -1383,6 +1424,13 @@ impl IovaWindow {
     /// 只在**单 DRHD 且翻译已打开**时可用；否则打印一行原因并返回 `None`（调用方继续走
     /// 恒等映射）。空窗口没有任何叶项 —— 在 `map_contiguous` 之前，该域的设备 DMA 会被拒。
     pub fn create(domain: u64, iova_base: u64, bytes: u64) -> Option<Self> {
+        // AMD-Vi 本批只实现"启动期登记窗口"，没有把 per-domain 窗口接到 DTE 上。
+        if BACKEND.load(Ordering::Acquire) == BACKEND_AMDVI {
+            crate::video::println(
+                "[WARN] AMD-Vi: per-domain IOVA window unsupported, device keeps its window",
+            );
+            return None;
+        }
         let aw = ENABLED_AW.load(Ordering::Acquire);
         if aw == 0 {
             crate::video::println(
@@ -1598,6 +1646,12 @@ fn wait_gsts(base: u64, bits: u32) -> bool {
 /// 原子量就返回。读到的 `FSTS` 非零即算"有故障"——本机 QEMU 只置 `PPF`（bit 1）而**不置**
 /// `FRI`（bit 0），按位 0 判会漏掉所有故障。打印后把读到的位按 W1C 写回，让后续故障仍被记录。
 pub fn poll_faults() {
+    // AMD-Vi 的故障记录在**事件环**（Event Log），与 VT-d 的 FSTS/FRCD 完全不同的寄存器，
+    // 故这里按后端分流；两份状态只会有一份非 0。
+    if BACKEND.load(Ordering::Acquire) == BACKEND_AMDVI {
+        amdvi_poll_events();
+        return;
+    }
     let base = IOMMU_BASE.load(Ordering::Relaxed);
     if base == 0 || FAULT_REPORTS.load(Ordering::Relaxed) >= MAX_FAULT_REPORTS {
         return;
@@ -1691,9 +1745,846 @@ pub fn poll_faults() {
     unsafe { wr32(base, REG_FSTS, fsts) };
 }
 
+// ---------------------------------------------------------------------------
+// AMD-Vi（AMD IOMMU）
+// ---------------------------------------------------------------------------
+//
+// 依据（写死位域前逐条核对，避免凭记忆）：
+// - ACPI IVRS：ACPI 表头 36B + IVinfo(4B) + Reserved(8B) = **48B** 后是 IVHD/IVMD 块；
+//   IVHD 0x10 头 24B、0x11 头 40B（Linux `drivers/iommu/amd/init.c`
+//   `get_ivhd_header_size()`）；设备条目长度按 type 选：type < 0x80 → `4 << (type >> 6)`、
+//   0x48（特殊设备）是 8B、0xF0（ACPI HID）按 UID 长度（同文件 `ivhd_entry_length()`）。
+//   QEMU 11.1.3 实测生成的 IVRS 也落在这套口径内。
+// - MMIO 偏移：Device Table 0x00 / Command Buffer 0x08 / Event Log 0x10 / Control 0x18 /
+//   Ext Features 0x30 / Cmd Head 0x2000 / Cmd Tail 0x2008 / Evt Head 0x2010 /
+//   Evt Tail 0x2018 / Status 0x2020（AMD IOMMU spec 3.4；Linux
+//   `amd_iommu_types.h` 的 `MMIO_*_OFFSET`）。
+// - DTE 32B（256 位）：DW0 = V(bit0) | TV(bit1) | Mode[11:9] | HostPTRootPtr[51:12] |
+//   IR(bit61) | IW(bit62)；DW1 = DomainID[15:0]（QEMU `AMDVI_DEV_*` 与 Linux
+//   `DTE_FLAG_V/DTE_MODE_MASK/DTE_HOST_TRP/DTE_FLAG_IR/DTE_FLAG_IW/DTE_DOMID_MASK`）。
+// - I/O 页表：每级 512 项 × 8B；Present = bit0，权限 IR/IW = bits 61/62（**不是** x86 的
+//   1/2）；非叶项 NextLevel[11:9] = 下一级编号（4 级模式写 3/2/1），4 KiB 叶项
+//   NextLevel = 0（Linux `io_pgtable.c` 的 `PM_LEVEL_PDE()` / QEMU `AMDVI_PTE_*`）。
+// - 命令：16B，opcode 在 DW1[31:28]；INVALIDATE_DEVTAB_ENTRY = 0x02、INVALIDATE_IOMMU_PAGES
+//   = 0x03（DW1[15:0]=DomainID，DW2 bit0 = S=1 表示整个域）、COMPLETION_WAIT = 0x01
+//   （DW0 bit0 = store，地址在 DW0[31:3] + DW1[19:0]，StoreData 在 DW2/DW3）。
+// - 事件：16B，DeviceID 在 DW0（QEMU 放 bits 15:0，规范 3.11 放 bits 31:16 —— 解码时
+//   两者都认），事件码在 DW0 bits 63:60，故障地址在 DW1。
+
+/// IVRS 固定部分：ACPI 表头 36B + IVinfo 4B + Reserved 8B。
+const IVRS_HEADER_LEN: usize = 48;
+
+/// MMIO 寄存器（AMD IOMMU spec 3.4）。
+const AMDVI_REG_DEV_TABLE: u64 = 0x0000;
+const AMDVI_REG_CMD_BASE: u64 = 0x0008;
+const AMDVI_REG_EVT_BASE: u64 = 0x0010;
+const AMDVI_REG_CONTROL: u64 = 0x0018;
+const AMDVI_REG_EXT_FEATURES: u64 = 0x0030;
+const AMDVI_REG_CMD_HEAD: u64 = 0x2000;
+const AMDVI_REG_CMD_TAIL: u64 = 0x2008;
+const AMDVI_REG_EVT_HEAD: u64 = 0x2010;
+const AMDVI_REG_EVT_TAIL: u64 = 0x2018;
+const AMDVI_REG_STATUS: u64 = 0x2020;
+
+/// Control 位（spec 3.4.4）：IOMMU 总开关 / 事件日志 / 命令缓冲。
+const AMDVI_CONTROL_IOMMU_EN: u64 = 1 << 0;
+const AMDVI_CONTROL_EVT_LOG_EN: u64 = 1 << 2;
+const AMDVI_CONTROL_CMDBUF_EN: u64 = 1 << 12;
+
+/// Status bit 0 = 事件环溢出（W1C）。
+const AMDVI_STATUS_EVT_OVF: u64 = 1 << 0;
+
+/// 命令环 / 事件环：512 条 × 16B = 8 KiB（size 字段编码 0x9，spec 3.4.2/3.4.3）。
+const AMDVI_RING_BYTES: u64 = 8 * 1024;
+const AMDVI_RING_SIZE_CODE: u64 = 0x9;
+
+/// DTE = 32B（256 位）。
+const AMDVI_DTE_BYTES: u64 = 32;
+const AMDVI_DTE_V: u64 = 1 << 0;
+const AMDVI_DTE_TV: u64 = 1 << 1;
+const AMDVI_DTE_MODE_SHIFT: u64 = 9;
+/// Mode = 4 → 4 级页表（PAGE_MODE_4_LEVEL）。
+const AMDVI_DTE_MODE_4LEVEL: u64 = 4;
+const AMDVI_DTE_IR: u64 = 1 << 61;
+const AMDVI_DTE_IW: u64 = 1 << 62;
+/// DTE/PTE 地址位 [51:12]。
+const AMDVI_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+// DomainID 用设备自己的 DeviceID：v1 页表的 TLB 用 DomainID 打标签，**每台设备一张页表
+// 就必须给不同的 DomainID**（AMD 规范明确要求，否则不同页表会在 TLB 里互相别名）。
+// DeviceID 是 16 位，正好落进 DTE DW1[15:0] 与失效命令 DW1[15:0]。
+
+/// I/O 页表项（8B）。
+const AMDVI_PTE_BYTES: u64 = 8;
+const AMDVI_PTE_PR: u64 = 1 << 0;
+const AMDVI_PTE_IR: u64 = 1 << 61;
+const AMDVI_PTE_IW: u64 = 1 << 62;
+const AMDVI_PTE_FC: u64 = AMDVI_PTE_IR | AMDVI_PTE_IW;
+/// 4 级页表：顶级下标取 IOVA[47:39]，最低级取 [20:12]。
+const AMDVI_LEVELS: u64 = 4;
+const AMDVI_IOVA_BITS: u64 = 48;
+
+/// 命令 opcode（spec 2.4）。
+const AMDVI_CMD_COMPLETION_WAIT: u32 = 0x01;
+const AMDVI_CMD_INVAL_DEVTAB_ENTRY: u32 = 0x02;
+const AMDVI_CMD_INVAL_IOMMU_PAGES: u32 = 0x03;
+
+/// 后端选择：0 = 未启用、1 = VT-d、2 = AMD-Vi。`register_device_range` / `poll_faults`
+/// 据此分流；两份硬件状态不会同时非 0。
+static BACKEND: AtomicU64 = AtomicU64::new(0);
+const BACKEND_VTD: u64 = 1;
+const BACKEND_AMDVI: u64 = 2;
+
+static AMDVI_BASE: AtomicU64 = AtomicU64::new(0);
+static AMDVI_DEVTAB: AtomicU64 = AtomicU64::new(0);
+static AMDVI_DEVTAB_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static AMDVI_CMD_BUF: AtomicU64 = AtomicU64::new(0);
+static AMDVI_CMD_TAIL: AtomicU64 = AtomicU64::new(0);
+static AMDVI_EVT_BUF: AtomicU64 = AtomicU64::new(0);
+static AMDVI_EVT_HEAD: AtomicU64 = AtomicU64::new(0);
+/// 完成等待（COMPLETION_WAIT store）的 8B 信号量页。
+static AMDVI_SEM: AtomicU64 = AtomicU64::new(0);
+static AMDVI_SEM_VALUE: AtomicU64 = AtomicU64::new(0);
+/// 未授权设备落到的共享空 4 级页表（没有叶项 → DMA 被拒）。
+static AMDVI_EMPTY_TOP: AtomicU64 = AtomicU64::new(0);
+/// 事件日志去重 + 已报告条数。
+static AMDVI_LAST_FAULT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AMDVI_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// IVHD 里的一个设备范围（含两端）。0x01（全部设备）记为 `0x0000..=0xFFFF`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct IvhdRange {
+    start: u16,
+    end: u16,
+}
+
+/// 一个 IVHD 块（0x10 / 0x11）的摘要。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct IvhdInfo {
+    ivhd_type: u8,
+    flags: u8,
+    segment: u16,
+    devid: u16,
+    cap_offset: u16,
+    base: u64,
+    length: u16,
+    include_all: bool,
+    single_count: u32,
+    range_count: u32,
+}
+
+/// IVRS 表的解析结果（纯函数输出，便于单测）。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct IvrsSummary {
+    found: bool,
+    table_len: u32,
+    checksum_ok: bool,
+    ivinfo: u32,
+    ivhd_count: u32,
+    ivmd_count: u32,
+    exclusion_count: u32,
+    first_ivhd: IvhdInfo,
+    ranges: Vec<IvhdRange>,
+    /// IVMD 的排除区间（仅记录，不参与映射 —— 见报告里的剩余缺口）。
+    exclusions: Vec<PhysRange>,
+}
+
+fn ivrs_checksum_ok(t: &[u8]) -> bool {
+    t.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)) == 0
+}
+
+/// 解析 IVRS 表字节（纯函数：只看字节，不碰物理内存）。
+fn parse_ivrs(bytes: &[u8]) -> IvrsSummary {
+    let mut s = IvrsSummary::default();
+    if bytes.len() < IVRS_HEADER_LEN || !bytes.starts_with(b"IVRS") {
+        return s;
+    }
+    let len = le32(bytes, 4) as usize;
+    // 表长必须自洽且不超出实到字节数（畸形表只降级，不 panic）。
+    if len < IVRS_HEADER_LEN || len > bytes.len() {
+        return s;
+    }
+    let t = &bytes[..len];
+    s.found = true;
+    s.table_len = len as u32;
+    s.checksum_ok = ivrs_checksum_ok(t);
+    s.ivinfo = le32(t, 36);
+
+    let mut off = IVRS_HEADER_LEN;
+    while off + 4 <= len {
+        let ty = t[off];
+        let blen = le16(t, off + 2) as usize;
+        if blen < 4 || off + blen > len {
+            break;
+        }
+        match ty {
+            0x10 | 0x11 => {
+                let header = if ty == 0x10 { 24 } else { 40 };
+                if blen < header {
+                    // 头部都放不下：跳过这一块（表本身仍算找到）。
+                    off += blen;
+                    continue;
+                }
+                let mut info = IvhdInfo {
+                    ivhd_type: ty,
+                    flags: t[off + 1],
+                    segment: le16(t, off + 16),
+                    devid: le16(t, off + 4),
+                    cap_offset: le16(t, off + 6),
+                    base: le64(t, off + 8),
+                    length: blen as u16,
+                    ..Default::default()
+                };
+                let mut p = off + header;
+                let end = off + blen;
+                let mut range_start: Option<u16> = None;
+                while p + 4 <= end {
+                    let etype = t[p];
+                    let elen = if etype < 0x80 {
+                        4 << (etype >> 6)
+                    } else if etype == 0xf0 {
+                        // ACPI HID 条目：偏移 21 是 UID 长度。
+                        if p + 22 > end {
+                            break;
+                        }
+                        22 + t[p + 21] as usize
+                    } else {
+                        // 0x42/0x43/0x48 等扩展条目都是 8B。
+                        8
+                    };
+                    if elen < 4 || p + elen > end {
+                        break;
+                    }
+                    let dev = le16(t, p + 1);
+                    match etype {
+                        // 0x01 = 全部设备（4B）。等价于 0x0000..=0xFFFF 一整段。
+                        0x01 => {
+                            info.include_all = true;
+                            s.ranges.push(IvhdRange {
+                                start: 0x0000,
+                                end: 0xFFFF,
+                            });
+                        }
+                        // 0x02 = 单设备；0x46 = 扩展单设备（8B，devid 位置相同）。
+                        0x02 | 0x46 => {
+                            s.ranges.push(IvhdRange {
+                                start: dev,
+                                end: dev,
+                            });
+                            info.single_count += 1;
+                        }
+                        // 0x03 = 范围起点；0x47 = 扩展范围起点（8B）。
+                        0x03 | 0x47 => range_start = Some(dev),
+                        // 0x04 = 范围终点（4B）；0x44 = 扩展范围终点（8B）。
+                        0x04 | 0x44 => {
+                            if let Some(st) = range_start.take() {
+                                s.ranges.push(IvhdRange {
+                                    start: st.min(dev),
+                                    end: st.max(dev),
+                                });
+                                info.range_count += 1;
+                            }
+                        }
+                        // 0x42 = 别名设备（8B）：DeviceIDa 的请求走 DeviceIDb 的 DTE。
+                        0x42 => {
+                            let alias = le16(t, p + 4);
+                            s.ranges.push(IvhdRange {
+                                start: dev,
+                                end: dev,
+                            });
+                            s.ranges.push(IvhdRange {
+                                start: alias,
+                                end: alias,
+                            });
+                            info.single_count += 1;
+                        }
+                        // 0x43 = 别名范围起点（8B）。
+                        0x43 => {
+                            range_start = Some(dev);
+                            let alias = le16(t, p + 4);
+                            s.ranges.push(IvhdRange {
+                                start: alias,
+                                end: alias,
+                            });
+                        }
+                        // 0x48 = 特殊设备（IOAPIC/HPET，8B）：不是普通 DMA 设备，忽略。
+                        _ => {}
+                    }
+                    p += elen;
+                }
+                if s.ivhd_count == 0 {
+                    s.first_ivhd = info;
+                }
+                s.ivhd_count += 1;
+            }
+            // 0x20 = 全部设备 / 0x21 = 单设备 / 0x22 = 范围的 IVMD（32B）。
+            0x20..=0x22 => {
+                s.ivmd_count += 1;
+                // flags bit3 = 排除区间（IVMD_FLAG_EXCL_RANGE）。
+                if blen >= 32 && t[off + 1] & 0x08 != 0 {
+                    let base = le64(t, off + 16);
+                    let rlen = le64(t, off + 24);
+                    if let Some(r) = align_range(base, rlen) {
+                        s.exclusions.push(r);
+                        s.exclusion_count += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        off += blen;
+    }
+    s
+}
+
+/// `bus:dev.func` → DeviceID（16 位，bus << 8 | dev << 3 | func）。
+fn sid_of(bus: u8, dev: u8, func: u8) -> u16 {
+    ((bus as u16) << 8) | (((dev as u16) & 0x1F) << 3) | ((func as u16) & 0x7)
+}
+
+/// 分配 `count` 个**物理连续**帧并整段清零（表 / 环必须全 0 起步）。
+fn alloc_zeroed_frames(count: u64) -> Option<u64> {
+    let pa = allocate_frames(count as usize)?;
+    // SAFETY: 分配器交出的帧都在恒等映射内；整段已标记为本次占用。
+    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, (count * TABLE_BYTES) as usize) };
+    Some(pa)
+}
+
+/// DTE DW0：V | TV | Mode=4 | HostPTRootPtr | IR | IW。
+fn dte_lo(root: u64) -> u64 {
+    AMDVI_DTE_V
+        | AMDVI_DTE_TV
+        | (AMDVI_DTE_MODE_4LEVEL << AMDVI_DTE_MODE_SHIFT)
+        | (root & AMDVI_ADDR_MASK)
+        | AMDVI_DTE_IR
+        | AMDVI_DTE_IW
+}
+
+/// 写一条 DTE（32B）。DomainID = 该设备的 DeviceID（见上面的 TLB 别名说明）。
+fn dte_write(devtab: u64, sid: u64, root: u64) {
+    let at = devtab + sid * AMDVI_DTE_BYTES;
+    write_pa64(at, dte_lo(root));
+    write_pa64(at + 8, sid & 0xFFFF);
+    write_pa64(at + 16, 0);
+    write_pa64(at + 24, 0);
+}
+
+/// 第 `level` 级（0 = 4KiB 叶级）的页表下标；4 级模式顶级 level = 3。
+fn amdvi_index(iova: u64, level: u64) -> u64 {
+    (iova >> (12 + 9 * level)) & 0x1FF
+}
+
+fn amdvi_read_pte(table_pa: u64, idx: u64) -> u64 {
+    // SAFETY: 调用方保证 `table_pa` 是已分配的恒等映射表页。
+    unsafe { core::ptr::read_volatile((table_pa + idx * AMDVI_PTE_BYTES) as *const u64) }
+}
+
+fn amdvi_write_pte(table_pa: u64, idx: u64, val: u64) {
+    // SAFETY: 同上。
+    unsafe { core::ptr::write_volatile((table_pa + idx * AMDVI_PTE_BYTES) as *mut u64, val) };
+}
+
+/// 非叶项：指向下一级页表，NextLevel = 当前级（3/2/1），带 IR/IW（权限逐级 AND 累积）。
+fn amdvi_pde(next_pa: u64, level: u64) -> u64 {
+    (next_pa & AMDVI_ADDR_MASK) | (level << 9) | AMDVI_PTE_PR | AMDVI_PTE_FC
+}
+
+/// 4 KiB 叶项：NextLevel = 0（叶子标记），带 IR/IW。
+fn amdvi_pte_4k(paddr: u64) -> u64 {
+    (paddr & AMDVI_ADDR_MASK) | AMDVI_PTE_PR | AMDVI_PTE_FC
+}
+
+/// 把 `paddr` 恒等映射到 4 KiB 页 `iova`（中间表按需分配）。已存在的叶项返回 `false`。
+fn amdvi_map_4k(top_pa: u64, iova: u64, paddr: u64) -> bool {
+    if iova >= (1u64 << AMDVI_IOVA_BITS) || paddr >= (1u64 << AMDVI_IOVA_BITS) {
+        return false;
+    }
+    let mut table = top_pa;
+    let mut level = AMDVI_LEVELS - 1;
+    while level > 0 {
+        let idx = amdvi_index(iova, level);
+        let e = amdvi_read_pte(table, idx);
+        if e & AMDVI_PTE_PR == 0 {
+            let Some(next) = alloc_zeroed_page() else {
+                return false;
+            };
+            amdvi_write_pte(table, idx, amdvi_pde(next, level));
+            table = next;
+        } else {
+            // 非叶项的 NextLevel 必须正好是当前级；大页/叶项不能再下钻。
+            if ((e >> 9) & 0x7) != level {
+                return false;
+            }
+            table = e & AMDVI_ADDR_MASK;
+        }
+        level -= 1;
+    }
+    let idx = amdvi_index(iova, 0);
+    if amdvi_read_pte(table, idx) & AMDVI_PTE_PR != 0 {
+        return false; // 已有叶项：拒绝重复映射（避免泄漏）。
+    }
+    amdvi_write_pte(table, idx, amdvi_pte_4k(paddr));
+    true
+}
+
+/// 读 `iova` 处的 4 KiB 叶项物理地址（不存在 / 遇到非 4 级路径返回 `None`）。
+fn amdvi_leaf_4k_pa(top_pa: u64, iova: u64) -> Option<u64> {
+    if iova >= (1u64 << AMDVI_IOVA_BITS) {
+        return None;
+    }
+    let mut table = top_pa;
+    let mut level = AMDVI_LEVELS - 1;
+    while level > 0 {
+        let e = amdvi_read_pte(table, amdvi_index(iova, level));
+        if e & AMDVI_PTE_PR == 0 || ((e >> 9) & 0x7) != level {
+            return None;
+        }
+        table = e & AMDVI_ADDR_MASK;
+        level -= 1;
+    }
+    let e = amdvi_read_pte(table, amdvi_index(iova, 0));
+    if e & AMDVI_PTE_PR == 0 {
+        None
+    } else {
+        Some(e & AMDVI_ADDR_MASK)
+    }
+}
+
+/// 把一段页对齐范围逐页恒等映射进该设备的 4 级页表。
+fn amdvi_map_range_into(top_pa: u64, range: PhysRange) -> bool {
+    let mut pa = range.base;
+    while pa < range.end() {
+        if !amdvi_map_4k(top_pa, pa, pa) && amdvi_leaf_4k_pa(top_pa, pa) != Some(pa) {
+            return false;
+        }
+        pa += TABLE_BYTES;
+    }
+    true
+}
+
+/// 建覆盖 `[0, limit)` 的**恒等** 4 级页表（4 KiB 叶），返回顶层表物理地址。
+///
+/// 只给 E1c 的目标设备（NVMe）用：现有 VT-d 路径对这台设备同样是 `[0, TARGET_WINDOW_LIMIT)`
+/// 的整段窗口（见 [`build_window_slpt`]），因为用户态块驱动除了授权 DMA 块，还会用
+/// `SYS_ALLOC_PAGE` 拿的临时页做 PRP（那些页不是 `device::grant*` 的登记范围）。窗口外的
+/// 地址仍然没有叶项 —— E1c 的越界探针（打在 3 GiB 整）照旧被拒。
+fn build_amdvi_ident_top(limit: u64) -> Option<u64> {
+    let top = alloc_zeroed_page()?;
+    let mut pa = 0u64;
+    while pa < limit {
+        if !amdvi_map_4k(top, pa, pa) && amdvi_leaf_4k_pa(top, pa) != Some(pa) {
+            return None;
+        }
+        pa += TABLE_BYTES;
+    }
+    Some(top)
+}
+
+/// 往命令环里放一条 16B 命令并推进 Tail（spec 3.4.2：head/tail 是环内字节偏移）。
+fn amdvi_submit(base: u64, cmd: [u32; 4]) {
+    let buf = AMDVI_CMD_BUF.load(Ordering::Acquire);
+    if buf == 0 {
+        return;
+    }
+    let tail = AMDVI_CMD_TAIL.load(Ordering::Relaxed);
+    let at = buf + tail;
+    // SAFETY: 命令环是启动期分配的恒等映射 8 KiB 连续帧，`tail` 始终 16B 对齐且 < 8 KiB。
+    unsafe {
+        for (i, w) in cmd.iter().enumerate() {
+            core::ptr::write_volatile((at + i as u64 * 4) as *mut u32, *w);
+        }
+    }
+    // 命令内容必须先对 IOMMU 可见，再推进 Tail。
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let next = (tail + 16) % AMDVI_RING_BYTES;
+    AMDVI_CMD_TAIL.store(next, Ordering::Relaxed);
+    // SAFETY: 寄存器块已确认在恒等映射内。
+    unsafe { wr64(base, AMDVI_REG_CMD_TAIL, next) };
+}
+
+/// 发一条 COMPLETION_WAIT（store 语义）并轮询信号量；超时退化看命令环 head 是否追上 tail。
+fn amdvi_completion_wait(base: u64) -> bool {
+    let sem = AMDVI_SEM.load(Ordering::Acquire);
+    if sem != 0 {
+        write_pa64(sem, 0);
+        let token = AMDVI_SEM_VALUE.fetch_add(1, Ordering::Relaxed) + 1;
+        // DW0[31:3] = StoreAddress[31:3]，bit0 = store；DW1[19:0] = StoreAddress[51:32]，
+        // DW1[31:28] = opcode；DW2/DW3 = StoreData。
+        let lo = ((sem as u32) & !0x7) | 1;
+        let hi = (AMDVI_CMD_COMPLETION_WAIT << 28)
+            | (((sem >> 32) as u32) & 0xF_FFFF);
+        amdvi_submit(base, [lo, hi, token as u32, (token >> 32) as u32]);
+        let mut spins = 0u32;
+        while spins < 2_000_000 {
+            // SAFETY: 信号量页在恒等映射内。
+            if unsafe { core::ptr::read_volatile(sem as *const u64) } == token {
+                return true;
+            }
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
+    // 兜底：命令环被硬件消费到 head == tail，也视为前面的失效命令已完成。
+    let tail = AMDVI_CMD_TAIL.load(Ordering::Acquire);
+    // SAFETY: 同上。
+    let head = unsafe { rd64(base, AMDVI_REG_CMD_HEAD) } & (AMDVI_RING_BYTES - 1);
+    head == tail
+}
+
+/// 失效该设备的 DTE 缓存 + 整个域的 IOTLB，并等命令完成。
+fn amdvi_flush(base: u64, sid: u16) -> bool {
+    // INVALIDATE_DEVTAB_ENTRY：DW0[15:0] = DeviceID，DW1[31:28] = opcode。
+    amdvi_submit(base, [sid as u32, AMDVI_CMD_INVAL_DEVTAB_ENTRY << 28, 0, 0]);
+    // INVALIDATE_IOMMU_PAGES：DW1[15:0] = DomainID（= 该设备 SID）、[31:28] = opcode；
+    // DW2 bit0 = S=1 表示失效该域**全部**页。
+    amdvi_submit(
+        base,
+        [
+            0,
+            (sid as u32) | (AMDVI_CMD_INVAL_IOMMU_PAGES << 28),
+            1,
+            0,
+        ],
+    );
+    amdvi_completion_wait(base)
+}
+
+/// 初始化 AMD-Vi：只有固件给了可用 IVRS 时才走到这里。
+///
+/// 返回是否真的打开 `IOMMUEn`。任何一步失败都**不写** IOMMU 寄存器并返回 `false`。
+fn init_amdvi(devices: &[PciDevice], table: &[u8]) -> bool {
+    let ivrs = parse_ivrs(table);
+    if !ivrs.found {
+        crate::video::println("[WARN] AMD-Vi: malformed IVRS header/length, DMA remapping not enabled");
+        return false;
+    }
+    if !ivrs.checksum_ok {
+        crate::video::println("[WARN] AMD-Vi: IVRS checksum mismatch, DMA remapping not enabled");
+        return false;
+    }
+    if ivrs.ivhd_count == 0 || ivrs.first_ivhd.base == 0 {
+        crate::video::println("[WARN] AMD-Vi: no usable IVHD block, DMA remapping not enabled");
+        return false;
+    }
+    if devices.is_empty() {
+        crate::video::println("[WARN] AMD-Vi: no PCI devices enumerated, DMA remapping not enabled");
+        return false;
+    }
+
+    let h = ivrs.first_ivhd;
+    if ivrs.ivhd_count > 1 {
+        crate::video::print("[WARN] AMD-Vi: ");
+        crate::video::print_u64(ivrs.ivhd_count as u64);
+        crate::video::print(" IVHD units (multi-unit unsupported), using first mmio=0x");
+        crate::video::print_hex(h.base);
+        crate::video::println("");
+    }
+    let base = h.base;
+    // 寄存器块必须落在内核恒等映射内（与 VT-d 同一前提）。
+    if !is_identity_mapped(base, 0x4000) {
+        crate::video::println("[WARN] AMD-Vi: IOMMU register block outside identity map, skipping");
+        return false;
+    }
+
+    let efr = unsafe { rd64(base, AMDVI_REG_EXT_FEATURES) };
+    crate::video::print("[OK] AMD-Vi: IVRS ivinfo=0x");
+    crate::video::print_hex(ivrs.ivinfo as u64);
+    crate::video::print(" ivhd=0x");
+    crate::video::print_hex(h.ivhd_type as u64);
+    crate::video::print(" seg=");
+    crate::video::print_u64(h.segment as u64);
+    crate::video::print(" mmio=0x");
+    crate::video::print_hex(base);
+    crate::video::print(" efr=0x");
+    crate::video::print_hex(efr);
+    crate::video::print(" ranges=");
+    crate::video::print_u64(ivrs.ranges.len() as u64);
+    crate::video::print(" ivmd=");
+    crate::video::print_u64(ivrs.ivmd_count as u64);
+    crate::video::print(" excl=");
+    crate::video::print_u64(ivrs.exclusion_count as u64);
+    crate::video::println("");
+
+    // 设备表按**实际枚举到的最大 DeviceID** 定尺寸：DTE 32B，尺寸字段是
+    // `(表字节数 / 4KiB) - 1`（spec 3.4.1）。
+    let max_sid = devices
+        .iter()
+        .map(|d| sid_of(d.bus, d.dev, d.func) as u64)
+        .max()
+        .unwrap_or(0);
+    let entries = max_sid + 1;
+    let dt_pages = (entries * AMDVI_DTE_BYTES).div_ceil(TABLE_BYTES);
+    let Some(devtab) = alloc_zeroed_frames(dt_pages) else {
+        crate::video::println("[WARN] AMD-Vi: cannot allocate device table, DMA remapping not enabled");
+        return false;
+    };
+    let Some(empty_top) = alloc_zeroed_page() else {
+        crate::video::println("[WARN] AMD-Vi: cannot allocate empty page table, DMA remapping not enabled");
+        return false;
+    };
+    let Some(cmd_buf) = alloc_zeroed_frames(AMDVI_RING_BYTES / TABLE_BYTES) else {
+        crate::video::println("[WARN] AMD-Vi: cannot allocate command buffer, DMA remapping not enabled");
+        return false;
+    };
+    let Some(evt_buf) = alloc_zeroed_frames(AMDVI_RING_BYTES / TABLE_BYTES) else {
+        crate::video::println("[WARN] AMD-Vi: cannot allocate event log, DMA remapping not enabled");
+        return false;
+    };
+    let Some(sem) = alloc_zeroed_page() else {
+        crate::video::println("[WARN] AMD-Vi: cannot allocate completion semaphore, DMA remapping not enabled");
+        return false;
+    };
+
+    // E1c 目标设备（NVMe）：与 VT-d 路径一致，给 `[0, 3 GiB)` 的整段恒等窗口。
+    // 用户态块驱动的 PRP 临时页（`SYS_ALLOC_PAGE`）不在 `device::grant*` 的登记范围里，
+    // 只按 BAR/DMA 块映射会让卷扫描的读全部 CQE 失败；VT-d 侧正是靠这条整段窗口兜住的。
+    let target = crate::arch::pci::find_nvme(devices).map(|(b, d, f, _)| (b, d, f));
+    let target_sid = target.map(|(b, d, f)| sid_of(b, d, f) as u64);
+    let target_top = if let Some(tid) = target_sid {
+        TARGET_SID.store(tid, Ordering::Relaxed);
+        let Some(top) = build_amdvi_ident_top(TARGET_WINDOW_LIMIT) else {
+            crate::video::println("[WARN] AMD-Vi: cannot allocate target page tables, DMA remapping not enabled");
+            return false;
+        };
+        TARGET_TOP.store(top, Ordering::Release);
+        Some(top)
+    } else {
+        TARGET_TOP.store(0, Ordering::Release);
+        None
+    };
+
+    // 每台枚举到的设备都拿一条**有效** DTE，指向共享空表：V=0 会让未授权设备报
+    // "illegal device table entry"，空表则表现为正常的 IO page fault —— 与 VT-d 的
+    // "translated + 空窗口" 一一对应。授权后 DTE 再切到该设备独有的页表。
+    for d in devices {
+        let sid = sid_of(d.bus, d.dev, d.func) as u64;
+        let root = if Some(sid) == target_sid {
+            target_top.unwrap_or(empty_top)
+        } else {
+            empty_top
+        };
+        dte_write(devtab, sid, root);
+    }
+
+    // 先把表地址写进寄存器，再打开三个使能位。
+    unsafe {
+        wr64(base, AMDVI_REG_DEV_TABLE, devtab | (dt_pages - 1));
+        wr64(base, AMDVI_REG_CMD_BASE, cmd_buf | (AMDVI_RING_SIZE_CODE << 56));
+        wr64(base, AMDVI_REG_EVT_BASE, evt_buf | (AMDVI_RING_SIZE_CODE << 56));
+        wr64(base, AMDVI_REG_CMD_HEAD, 0);
+        wr64(base, AMDVI_REG_CMD_TAIL, 0);
+        wr64(base, AMDVI_REG_EVT_HEAD, 0);
+        wr64(base, AMDVI_REG_EVT_TAIL, 0);
+    }
+    AMDVI_BASE.store(base, Ordering::Release);
+    AMDVI_DEVTAB.store(devtab, Ordering::Release);
+    AMDVI_DEVTAB_ENTRIES.store(entries, Ordering::Release);
+    AMDVI_CMD_BUF.store(cmd_buf, Ordering::Release);
+    AMDVI_CMD_TAIL.store(0, Ordering::Release);
+    AMDVI_EVT_BUF.store(evt_buf, Ordering::Release);
+    AMDVI_EVT_HEAD.store(0, Ordering::Release);
+    AMDVI_SEM.store(sem, Ordering::Release);
+    AMDVI_EMPTY_TOP.store(empty_top, Ordering::Release);
+    DEVICE_WINDOWS.lock().clear();
+
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let ctrl = unsafe { rd64(base, AMDVI_REG_CONTROL) };
+    let want = ctrl | AMDVI_CONTROL_IOMMU_EN | AMDVI_CONTROL_EVT_LOG_EN | AMDVI_CONTROL_CMDBUF_EN;
+    unsafe { wr64(base, AMDVI_REG_CONTROL, want) };
+    let got = unsafe { rd64(base, AMDVI_REG_CONTROL) };
+    if got & AMDVI_CONTROL_IOMMU_EN == 0 {
+        crate::video::print("[WARN] AMD-Vi: IOMMUEn did not take effect (control=0x");
+        crate::video::print_hex(got);
+        crate::video::println(")");
+        return false;
+    }
+
+    BACKEND.store(BACKEND_AMDVI, Ordering::Release);
+    let status = unsafe { rd64(base, AMDVI_REG_STATUS) };
+    crate::video::print("[OK] AMD-Vi: enabled devtab=0x");
+    crate::video::print_hex(devtab);
+    crate::video::print(" entries=");
+    crate::video::print_u64(entries);
+    crate::video::print(" pages=");
+    crate::video::print_u64(dt_pages);
+    crate::video::print(" cmd=0x");
+    crate::video::print_hex(cmd_buf);
+    crate::video::print(" evt=0x");
+    crate::video::print_hex(evt_buf);
+    crate::video::print(" status=0x");
+    crate::video::print_hex(status);
+    crate::video::print(" target=");
+    match target_sid {
+        Some(sid) => {
+            crate::video::print_hex(sid);
+            crate::video::print("/win=0x");
+            crate::video::print_hex(TARGET_WINDOW_LIMIT);
+        }
+        None => crate::video::print("none"),
+    }
+    crate::video::println(" (per-device 4-level tables, registered ranges only)");
+    true
+}
+
+/// AMD-Vi 版 [`register_device_range`]：把一段 BAR / DMA 块补进该设备独有的 4 级页表。
+fn amdvi_register_device_range(
+    bus: u8,
+    dev: u8,
+    func: u8,
+    paddr: u64,
+    bytes: u64,
+    is_dma: bool,
+) -> bool {
+    let base = AMDVI_BASE.load(Ordering::Acquire);
+    let devtab = AMDVI_DEVTAB.load(Ordering::Acquire);
+    if base == 0 || devtab == 0 {
+        return false;
+    }
+    let sid = sid_of(bus, dev, func);
+    // E1c 目标设备（NVMe）已经拿到 `[0, 3 GiB)` 的整段恒等窗口：BAR/DMA 块都在其中
+    // （BAR 只被 CPU 访问，不需要 IOMMU 叶项），与 VT-d 路径的处理一致。
+    if is_target_sid(sid as u64) {
+        return true;
+    }
+    if sid as u64 >= AMDVI_DEVTAB_ENTRIES.load(Ordering::Acquire) {
+        crate::video::print("[WARN] AMD-Vi: ");
+        print_bdf(bus, dev, func);
+        crate::video::println(" outside the device table, not mapped");
+        return false;
+    }
+    let Some(range) = align_range(paddr, bytes) else {
+        return false;
+    };
+    if !range_within_agaw(range, AMDVI_IOVA_BITS) {
+        // 高于 48 位的 BAR（只被 CPU 访问、不是 DMA 落点）跳过；DMA 块越界属配置错误。
+        if is_dma {
+            crate::video::print("[WARN] AMD-Vi: ");
+            print_bdf(bus, dev, func);
+            crate::video::print(" dma range 0x");
+            crate::video::print_hex(range.base);
+            crate::video::println(" exceeds the 48-bit IOVA window, not mapped");
+        }
+        return false;
+    }
+
+    let Some((top, _created)) = device_window_add(sid as u64, range) else {
+        crate::video::print("[WARN] AMD-Vi: cannot allocate page table for ");
+        print_bdf(bus, dev, func);
+        crate::video::println("");
+        return false;
+    };
+    if !amdvi_map_range_into(top, range) {
+        crate::video::print("[WARN] AMD-Vi: cannot map ");
+        print_bdf(bus, dev, func);
+        crate::video::print(if is_dma { " dma range 0x" } else { " bar range 0x" });
+        crate::video::print_hex(range.base);
+        crate::video::println("; device DMA stays denied");
+        return false;
+    }
+
+    // DTE 指向该设备独有的页表；随后失效 DTE 缓存 + 该域 IOTLB。
+    core::sync::atomic::fence(Ordering::SeqCst);
+    dte_write(devtab, sid as u64, top);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if !amdvi_flush(base, sid) {
+        crate::video::println("[WARN] AMD-Vi: invalidate/completion-wait timed out after grant");
+    }
+    crate::video::print("[OK] AMD-Vi: grant ");
+    print_bdf(bus, dev, func);
+    crate::video::print(if is_dma { " dma [0x" } else { " bar [0x" });
+    crate::video::print_hex(range.base);
+    crate::video::print(",0x");
+    crate::video::print_hex(range.end());
+    crate::video::println(") mapped");
+    true
+}
+
+/// 事件码 → 可读原因（AMD IOMMU spec 2.5）。
+fn amdvi_event_reason(code: u8) -> &'static str {
+    match code {
+        1 => "illegal device table entry",
+        2 => "I/O page fault",
+        3 => "device table hardware error",
+        4 => "page table hardware error",
+        5 => "illegal command",
+        6 => "command buffer hardware error",
+        _ => "unknown",
+    }
+}
+
+/// 轮询 AMD-Vi 事件环并打印故障（由空闲任务调用，与 VT-d 的 [`poll_faults`] 同一钩子）。
+///
+/// 事件是 16B：DeviceID 在 DW0（QEMU 用 bits 15:0，规范 3.11 用 bits 31:16 —— 两处都认），
+/// 事件码在 DW0 bits 63:60，故障地址在 DW1。软件维护 Head（消费位置），硬件维护 Tail
+/// （写入位置），处理完必须把 Head 写回，否则事件会堆积到溢出。
+fn amdvi_poll_events() {
+    let base = AMDVI_BASE.load(Ordering::Relaxed);
+    let buf = AMDVI_EVT_BUF.load(Ordering::Relaxed);
+    if base == 0 || buf == 0 {
+        return;
+    }
+    let mut head = AMDVI_EVT_HEAD.load(Ordering::Relaxed) & (AMDVI_RING_BYTES - 1);
+    let tail = unsafe { rd64(base, AMDVI_REG_EVT_TAIL) } & (AMDVI_RING_BYTES - 1);
+    if head == tail {
+        return;
+    }
+    let mut handled = 0u32;
+    while head != tail && handled < 8 {
+        // SAFETY: 事件环是启动期分配的恒等映射 8 KiB 连续帧，head 为 16B 对齐偏移。
+        let w0 = unsafe { core::ptr::read_volatile((buf + head) as *const u64) };
+        let w1 = unsafe { core::ptr::read_volatile((buf + head + 8) as *const u64) };
+        let hi_dev = (w0 >> 16) & 0xFFFF;
+        let devid = if hi_dev != 0 { hi_dev } else { w0 & 0xFFFF };
+        let code = ((w0 >> 60) & 0xF) as u8;
+        let iova = w1;
+
+        let sig = (devid << 40) | ((code as u64) << 32) | (iova & 0xFFFF_FFFF);
+        if sig != AMDVI_LAST_FAULT.load(Ordering::Relaxed)
+            && AMDVI_FAULTS.load(Ordering::Relaxed) < MAX_FAULT_REPORTS
+        {
+            AMDVI_LAST_FAULT.store(sig, Ordering::Relaxed);
+            AMDVI_FAULTS.fetch_add(1, Ordering::Relaxed);
+            crate::video::print("[WARN] AMD-Vi: fault sid=0x");
+            crate::video::print_hex(devid);
+            crate::video::print(" iova=0x");
+            crate::video::print_hex(iova);
+            crate::video::print(" code=0x");
+            crate::video::print_hex(code as u64);
+            crate::video::print(" (");
+            crate::video::print(amdvi_event_reason(code));
+            crate::video::print(")");
+            if device_window_top(devid).is_some() || is_target_sid(devid) {
+                crate::video::print(" granted-device");
+            }
+            crate::video::println("");
+        }
+
+        head = (head + 16) % AMDVI_RING_BYTES;
+        handled += 1;
+    }
+    AMDVI_EVT_HEAD.store(head, Ordering::Release);
+    // SAFETY: 寄存器块已确认在恒等映射内；写 Head 是软件消费事件的方式。
+    unsafe { wr64(base, AMDVI_REG_EVT_HEAD, head) };
+    let status = unsafe { rd64(base, AMDVI_REG_STATUS) };
+    if status & AMDVI_STATUS_EVT_OVF != 0 {
+        // W1C 清溢出位；事件已尽量消费，避免硬件停止记录后续故障。
+        unsafe { wr64(base, AMDVI_REG_STATUS, AMDVI_STATUS_EVT_OVF) };
+        crate::video::println("[WARN] AMD-Vi: event log overflow (some faults were dropped)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn put16(b: &mut [u8], off: usize, v: u16) {
+        b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put32(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put64(b: &mut [u8], off: usize, v: u64) {
+        b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
 
     #[test]
     fn root_and_context_entry_fields() {
@@ -1997,5 +2888,175 @@ mod tests {
         assert_eq!(all, ENCLAVE_IOVA_BASE);
         assert!(alloc_iova(D, 0x1000).is_none());
         assert!(free_iova(D, all, ENCLAVE_IOVA_BYTES));
+    }
+
+    // -----------------------------------------------------------------------
+    // AMD-Vi
+    // -----------------------------------------------------------------------
+
+    /// 合成一张 IVRS：48B 固定头 + 一个 IVHD 块（0x10 头 24B / 0x11 头 40B）+ 可选 IVMD。
+    fn synth_ivrs(ivhd_type: u8, entries: &[u8], ivmd: bool) -> Vec<u8> {
+        let header = if ivhd_type == 0x10 { 24 } else { 40 };
+        let ivhd_len = header + entries.len();
+        let total = 48 + ivhd_len + if ivmd { 32 } else { 0 };
+        let mut t = vec![0u8; total];
+        t[0..4].copy_from_slice(b"IVRS");
+        put32(&mut t, 4, total as u32);
+        t[8] = 2; // revision
+        put32(&mut t, 36, 0x1234); // IVinfo
+        t[48] = ivhd_type;
+        t[49] = 0x10; // flags（内容不解析，仅记录）
+        put16(&mut t, 50, ivhd_len as u16);
+        put16(&mut t, 52, 0x0000); // IOMMU DeviceID
+        put16(&mut t, 54, 0x40); // Capability offset
+        put64(&mut t, 56, 0xFED8_0000); // IOMMU MMIO base
+        put16(&mut t, 64, 0); // PCI segment
+        let entry_off = 48 + header;
+        t[entry_off..entry_off + entries.len()].copy_from_slice(entries);
+        if ivmd {
+            let off = 48 + ivhd_len;
+            t[off] = 0x21;
+            t[off + 1] = 0x08; // EXCL_RANGE
+            put16(&mut t, off + 2, 32);
+            put64(&mut t, off + 16, 0x1_0000);
+            put64(&mut t, off + 24, 0x3000);
+        }
+        // ACPI 校验和：整表各字节相加为 0（校验和字段在偏移 9）。
+        let sum = t
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 9)
+            .fold(0u8, |a, (_, &b)| a.wrapping_add(b));
+        t[9] = 0u8.wrapping_sub(sum);
+        t
+    }
+
+    fn ivhd_entry(kind: u8, devid: u16) -> [u8; 4] {
+        [kind, (devid & 0xFF) as u8, (devid >> 8) as u8, 0]
+    }
+
+    /// IVHD 0x10：单设备（0x02）+ 范围（0x03/0x04）+ IVMD 排除区间。
+    #[test]
+    fn parses_ivhd_10_single_and_range() {
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&ivhd_entry(0x02, 0x1234));
+        entries.extend_from_slice(&ivhd_entry(0x03, 0x0200));
+        entries.extend_from_slice(&ivhd_entry(0x04, 0x02FF));
+        let t = synth_ivrs(0x10, &entries, true);
+
+        let s = parse_ivrs(&t);
+        assert!(s.found && s.checksum_ok);
+        assert_eq!(s.table_len, t.len() as u32);
+        assert_eq!(s.ivinfo, 0x1234);
+        assert_eq!(s.ivhd_count, 1);
+        let h = s.first_ivhd;
+        assert_eq!(h.ivhd_type, 0x10);
+        assert_eq!(h.base, 0xFED8_0000);
+        assert_eq!(h.segment, 0);
+        assert!(!h.include_all);
+        assert_eq!(h.single_count, 1);
+        assert_eq!(h.range_count, 1);
+        // 单设备 + 整段（含端点按 devid 排序）。
+        assert_eq!(
+            s.ranges,
+            vec![
+                IvhdRange { start: 0x1234, end: 0x1234 },
+                IvhdRange { start: 0x0200, end: 0x02FF },
+            ]
+        );
+        // IVMD 排除区间被记录（页对齐）。
+        assert_eq!(s.ivmd_count, 1);
+        assert_eq!(s.exclusion_count, 1);
+        assert_eq!(
+            s.exclusions,
+            vec![PhysRange { base: 0x1_0000, len: 0x3000 }]
+        );
+    }
+
+    /// IVHD 0x11（40B 头）：0x01 全部设备 + 0x42 别名设备；且 0x42 是 8B 条目。
+    #[test]
+    fn parses_ivhd_11_all_and_alias() {
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&ivhd_entry(0x01, 0));
+        entries.extend_from_slice(&[0x42, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00]);
+        let t = synth_ivrs(0x11, &entries, false);
+
+        let s = parse_ivrs(&t);
+        assert!(s.found && s.checksum_ok);
+        assert_eq!(s.first_ivhd.ivhd_type, 0x11);
+        assert!(s.first_ivhd.include_all);
+        assert_eq!(s.first_ivhd.single_count, 1);
+        assert_eq!(
+            s.ranges,
+            vec![
+                IvhdRange { start: 0x0000, end: 0xFFFF },
+                IvhdRange { start: 0x0100, end: 0x0100 },
+                IvhdRange { start: 0x0200, end: 0x0200 },
+            ]
+        );
+        assert_eq!(s.ivmd_count, 0);
+    }
+
+    /// 长度越界：整表声明过长 → 整表不认；IVHD 块越长 → 跳过该块；条目越界 → 停止扫描。
+    #[test]
+    fn rejects_malformed_ivrs() {
+        // 签名不对。
+        let mut t = synth_ivrs(0x10, &ivhd_entry(0x02, 1), false);
+        t[0] = b'X';
+        assert!(!parse_ivrs(&t).found);
+        // 声明长度 > 实到字节数。
+        let mut t = synth_ivrs(0x10, &ivhd_entry(0x02, 1), false);
+        put32(&mut t, 4, 9999);
+        assert!(!parse_ivrs(&t).found);
+        // IVHD 块长度越过表尾：表仍算找到，但该块不被计数。
+        let mut t = synth_ivrs(0x10, &ivhd_entry(0x02, 1), false);
+        put16(&mut t, 50, 0x7FFF);
+        let s = parse_ivrs(&t);
+        assert!(s.found);
+        assert_eq!(s.ivhd_count, 0);
+        // IVHD 头部之后只剩 1 字节的条目：块被计数，但条目扫描停止且不越界 panic。
+        let t = synth_ivrs(0x10, &[0x02], false);
+        let s = parse_ivrs(&t);
+        assert!(s.found);
+        assert_eq!(s.ivhd_count, 1);
+        assert!(s.ranges.is_empty());
+    }
+
+    /// DTE / 4 级页表位域：V/TV/Mode=4/Root/IR/IW；叶项 NextLevel=0，非叶项 NextLevel=级号。
+    #[test]
+    fn amdvi_dte_and_pte_fields() {
+        let root = 0x1234_5000u64;
+        let lo = dte_lo(root);
+        assert_eq!(lo & AMDVI_DTE_V, AMDVI_DTE_V);
+        assert_eq!(lo & AMDVI_DTE_TV, AMDVI_DTE_TV);
+        assert_eq!((lo >> AMDVI_DTE_MODE_SHIFT) & 0x7, 4); // 4 级
+        assert_eq!(lo & AMDVI_ADDR_MASK, root);
+        assert_eq!(lo & AMDVI_DTE_IR, AMDVI_DTE_IR);
+        assert_eq!(lo & AMDVI_DTE_IW, AMDVI_DTE_IW);
+
+        // 4 KiB 叶项：Present + IR/IW，NextLevel = 0（叶子）。
+        let pte = amdvi_pte_4k(0xABCD_E000);
+        assert_eq!(pte & AMDVI_PTE_PR, AMDVI_PTE_PR);
+        assert_eq!((pte >> 9) & 0x7, 0);
+        assert_eq!(pte & AMDVI_ADDR_MASK, 0xABCD_E000);
+        assert_eq!(pte & (AMDVI_PTE_IR | AMDVI_PTE_IW), AMDVI_PTE_FC);
+
+        // 非叶项：NextLevel = 当前级（4 级模式 → 3/2/1）。
+        for level in 1..=3u64 {
+            let e = amdvi_pde(0x2000_1000, level);
+            assert_eq!((e >> 9) & 0x7, level);
+            assert_eq!(e & AMDVI_PTE_PR, AMDVI_PTE_PR);
+            assert_eq!(e & AMDVI_ADDR_MASK, 0x2000_1000);
+        }
+
+        // 各级下标都取 9 位（4 级：顶级 IOVA[47:39] … 叶级 [20:12]）。
+        assert_eq!(amdvi_index(1 << 39, 3), 1);
+        assert_eq!(amdvi_index(1 << 30, 2), 1);
+        assert_eq!(amdvi_index(1 << 21, 1), 1);
+        assert_eq!(amdvi_index(0x1000, 0), 1);
+
+        // SID 编码：bus << 8 | dev << 3 | func。
+        assert_eq!(sid_of(0, 2, 0), 0x10);
+        assert_eq!(sid_of(1, 0x1F, 7), 0x01FF);
     }
 }

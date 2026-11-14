@@ -227,6 +227,15 @@ fn find_dmar(rsdp: u64) -> Option<&'static [u8]> {
     find_table(rsdp, b"DMAR")
 }
 
+/// 定位 ACPI **IVRS** 表（AMD-Vi 的 IOMMU 描述表）并返回整表字节。
+///
+/// IVRS 的解析（IVHD 0x10/0x11 + IVMD）在 `arch::iommu` 里以纯函数完成 —— 这里只负责
+/// 从 RSDP → XSDT/RSDT 找到表。固件没给 RSDP / 没给 IVRS（如 QEMU 未开 `amd-iommu`）时
+/// 返回 `None`，调用方据此保持原有的 DMA 直通行为。
+pub fn ivrs_table() -> Option<&'static [u8]> {
+    find_table(crate::bootinfo::get().rsdp_addr(), b"IVRS")
+}
+
 /// 探测 DMAR（E1a）。引导器没给 RSDP / 固件没给 DMAR 时返回 `found = false` 的空摘要。
 pub fn probe_dmar() -> DmarSummary {
     let rsdp = crate::bootinfo::get().rsdp_addr();
