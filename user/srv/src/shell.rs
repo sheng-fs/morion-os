@@ -231,6 +231,27 @@ impl ShellState {
 /// 解析结果静态缓冲 (单域单线程; 调用方须在下次解析前消费返回的字符串)。
 static mut PATH_BUF: [u8; PATH_MAX] = [0u8; PATH_MAX];
 
+/// `run <名字>` 的 `/apps/` 回退缓冲。真机镜像把应用放在 `/apps/` 下，
+/// 而用户习惯直接敲 `run calc`，所以要能补全目录与 `.mex` 后缀。
+static mut APP_BUF: [u8; PATH_MAX] = [0u8; PATH_MAX];
+
+/// 拼一个应用候选路径 `/apps/<name><suffix>`，写入静态缓冲。
+fn app_candidate(name: &str, suffix: &str) -> Option<&'static str> {
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(APP_BUF);
+        let mut n = 0usize;
+        for part in ["/apps/", name, suffix] {
+            let b = part.as_bytes();
+            if n + b.len() > buf.len() {
+                return None;
+            }
+            buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        Some(core::str::from_utf8_unchecked(&buf[..n]))
+    }
+}
+
 /// 把 `arg` 相对 `cwd` 解析为归一化的绝对路径, 写入 `out`, 返回长度。
 /// `arg` 以 '/' 开头时按绝对路径处理; 处理 "." / ".." 与重复 '/'。越界返回 None。
 fn join_path(cwd: &str, arg: &str, out: &mut [u8]) -> Option<usize> {
@@ -465,9 +486,9 @@ pub fn run() {
     st.cwd[0] = b'/';
     st.env_set("PATH", "/");
 
-    // 账户数据库: 把 MFS 根再挂到 `/etc` (MFS 本身仍挂 `/mfs`), 然后首次使用时生成
-    // 默认的 root / user。文件服务可能比 shell 起得晚, 故有界重试; 失败时 `login` /
-    // `passwd` 会明确报"账户数据库不可用", `su` 退回旧的"root 直接降权"语义。
+    // 账户数据库: 挂到 `/etc` 并首次生成默认 root / user。
+    // 挂载点 `/etc` 由镜像构建时预创建（见 Makefile 的 ESP 目录），运行期不再 mkdir：
+    // 真机启动早期文件服务可能正忙，逐目录探测会把 shell 卡在 SYS_CALL 上。
     shell_setup_accounts(true);
 
     let start = acct_find_uid(0).unwrap_or_else(|| {
@@ -1730,27 +1751,24 @@ fn shadow_update(name: &str, salt: u64, hash: u64) -> bool {
     fs_write_file(ACCT_SHADOW, &out[..o]) && fs_set_mode_owner(ACCT_SHADOW, 0o600, 0, 0)
 }
 
-/// 启动时准备账户数据库: 把 MFS 根挂到 `/etc`, 首次使用时生成 root / user。
+/// 启动时准备账户数据库: 把 tmpfs 挂到 `/etc`, 首次使用时生成 root / user。
 ///
-/// 文件服务可能比 shell 起得晚, 故有界重试; 失败只打印提示, `su` 会退回旧语义。
-/// 返回账户文件是否可用。
+/// 账户只在本会话有效（没有可用的持久卷时，这是唯一不会阻塞启动的选择）。
 fn shell_setup_accounts(announce: bool) -> bool {
-    let mut tries = 0u32;
-    while tries < 500 {
-        if fs_exists(ACCT_DIR) {
-            break;
-        }
-        let _ = vfs::mount(ACCT_DIR, vfs::MFS_DOMAIN);
-        sys_sleep(20);
-        tries += 1;
-    }
+    // 账户库固定放 tmpfs（RAM）。
+    //
+    // 不再尝试挂 MFS：真机没有 MFS 分区时，`/etc` 的挂表项会指向一个没有卷的服务，
+    // 对它的任何访问都会阻塞在 SYS_CALL 上（内核没有调用超时），shell 启动就卡住。
+    // 代价是账户/口令只在本次会话有效 —— 明确打印，不假装持久。
+    let _ = vfs::mount(ACCT_DIR, vfs::TMPFS_DOMAIN);
     if !fs_exists(ACCT_DIR) {
         if announce {
-            println(
-                "login: account database unavailable (MFS /etc mount failed); su stays drop-only",
-            );
+            println("login: account database unavailable (tmpfs /etc mount failed)");
         }
         return false;
+    }
+    if announce {
+        println("login: account db in RAM (session-only) - run 'passwd' to change");
     }
     if !fs_exists(ACCT_PASSWD) {
         let def = b"root:0:0:/home/root\nuser:1000:1000:/home/user\n";
@@ -2227,10 +2245,25 @@ fn shell_run(st: &ShellState, arg: &str) {
             return;
         }
     };
-    match morion::exec::spawn_file(path) {
+    let mut used = path;
+    let mut dom = morion::exec::spawn_file(path);
+    // 真机镜像把预装应用放在 `/apps/` 下；`run calc` 这种裸名字额外试
+    // `/apps/<name>.mex` 与 `/apps/<name>`，避免用户必须记住完整路径。
+    if dom.is_none() && !arg.contains('/') {
+        for suffix in [".mex", ""] {
+            if let Some(p) = app_candidate(arg, suffix) {
+                dom = morion::exec::spawn_file(p);
+                if dom.is_some() {
+                    used = p;
+                    break;
+                }
+            }
+        }
+    }
+    match dom {
         Some(domain) => {
             print("run: loaded ");
-            print(path);
+            print(used);
             print(" -> new domain ");
             print_u64(domain);
             println("");

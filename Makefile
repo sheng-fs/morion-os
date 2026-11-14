@@ -390,6 +390,15 @@ $(ISO_IMAGE):
 	mcopy -o -i $(EFIBOOT_IMG) $(CALC_MEX) ::/apps/calc.mex
 	mcopy -o -i $(EFIBOOT_IMG) $(SYSINFO_MEX) ::/apps/sysinfo.mex
 
+	# 预创建运行期挂载点/家目录。真机是"新鲜烧录"的 FAT32 根卷，若这些目录不存在，
+	# `cd /mnt0`、`su user`（切 /home/user）都会失败；构建期建好，运行期零开销。
+	mmd -i $(EFIBOOT_IMG) ::/mnt
+	mmd -i $(EFIBOOT_IMG) ::/mnt0
+	mmd -i $(EFIBOOT_IMG) ::/home
+	mmd -i $(EFIBOOT_IMG) ::/home/root
+	mmd -i $(EFIBOOT_IMG) ::/home/user
+	mmd -i $(EFIBOOT_IMG) ::/etc
+
 	$(CP) $(EFIBOOT_IMG) $(ISO_DIR)/efiboot.img
 
 	# 生成 ISO (EFI El Torito 启动, 指向 ESP 镜像)
