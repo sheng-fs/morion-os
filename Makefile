@@ -89,7 +89,7 @@ BOOT_EFI      := $(OUT_DIR)/boot/morion-boot.efi
 # 用户态系统服务 (E2b): 每个服务都是**独立程序** (独立 crate bin → 独立 ELF)。
 # E3b 起它们**不再嵌进内核**: 由 UEFI 引导器从 ESP 的 EFI/morion/services/ 读入内存,
 # 经 BootInfo 模块表交给内核按固定域号加载 —— 故内核不依赖 $(SRV_ELFS), 只有 ISO 需要。
-SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv httpd_srv e1000_srv wifi_srv r8169_srv
+SRV_NAMES     := sender receiver pager echo kbd block_srv fat32_srv app shell mount_srv tmpfs_srv mfs_srv ext2_srv exfat_srv init gfx_srv net_srv virtio_blk_srv ahci_srv xhci_srv iso9660_srv netstack_srv e1000e_srv httpd_srv e1000_srv wifi_srv r8169_srv hda_srv
 SRV_DIR       := $(OUT_DIR)/user/srv
 SRV_ELFS      := $(addprefix $(SRV_DIR)/,$(addsuffix .elf,$(SRV_NAMES)))
 SRV_STAMP     := $(SRV_DIR)/.built
@@ -300,7 +300,7 @@ $(SYSINFO_MEX): $(APP_SRC)
 
 # 14 个服务 ELF: `morion-srv` 一次构建 14 个 bin, 再逐个拷成 `<name>.elf`
 # (内核 `SERVICE_ELFS` 按名 include_bytes!)。用 stamp 让"多产物一次构建"只跑一遍。
-SRV_SRC := $(shell find user/srv user/libmorion user/libdevice -type f 2>/dev/null) user/linker.ld
+SRV_SRC := $(shell find user/srv user/libmorion user/libdevice user/libdevmodel user/drivers -type f 2>/dev/null) user/linker.ld
 $(SRV_STAMP): $(SRV_SRC) $(VARIANT_FLAGS)
 	@echo "==> 构建用户态服务 (E2b: 14 个独立 ELF)..."
 	$(MKDIR) $(SRV_DIR)
@@ -510,9 +510,11 @@ run-nokvm: iso
 #   再挂一台 AHCI/SATA 盘 ($(AHCI_IMG), q35 自带的 ich9-ahci) 给域 18 的 ahci_srv (D4) 做只读自测。
 #   另挂一台 xHCI 控制器 (qemu-xhci) + usb-storage 盘 ($(USB_IMG)) 给域 19 的 xhci_srv (03c)。
 #   nsid=8 -> $(ISO_IMG)   (morion-os.iso 的只读副本, 整盘 ISO9660, 挂 /cdrom, 域 20 的 iso9660_srv)。
+#   intel-hda + hda-duplex 给域 27 的 hda_srv (通用 HDA 音频): 音频后端用 `wav` 落成
+#   $(OUT_DIR)/hda-out.wav —— `none` 后端不驱动 DMA 计时器, SDnLPIB 恒 0, 无法验证播放。
 .PHONY: run-nvme
 run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPARE_IMG) $(PT_IMG) $(VBLK_IMG) $(AHCI_IMG) $(USB_IMG) $(ISO_IMG)
-	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试, nsid8=ISO9660)..."
+	@echo "==> 启动 QEMU (q35 + NVMe, nsid1=FAT32, nsid2=MFS, nsid3=ext2, nsid4=分区盘, nsid5=exFAT, nsid6=空白, nsid7=分区表测试, nsid8=ISO9660, intel-hda+hda-duplex)..."
 	$(QEMU) \
 		-machine q35 \
 		$(IOMMU_ARG) \
@@ -549,6 +551,9 @@ run-nvme: iso $(NVME_IMG) $(MFS_IMG) $(EXT2_IMG) $(PARTS_IMG) $(EXFAT_IMG) $(SPA
 		-drive file=$(USB_IMG),if=none,id=usb0,format=raw \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,drive=usb0 \
+		-audiodev wav,id=snd0,path=$(OUT_DIR)/hda-out.wav \
+		-device intel-hda \
+		-device hda-duplex,audiodev=snd0 \
 		-vga virtio \
 		-no-reboot \
 		-d guest_errors

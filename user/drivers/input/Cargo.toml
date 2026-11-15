@@ -1,0 +1,14 @@
+[package]
+name = "morion-input"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 通用输入驱动: PS/2 鼠标 + I2C-HID 传输层契约"
+
+[lib]
+name = "morion_input"
+path = "src/lib.rs"
+
+[dependencies]
+libdevmodel = { path = "../../libdevmodel" }

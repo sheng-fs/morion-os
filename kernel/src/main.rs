@@ -368,6 +368,8 @@ pub extern "C" fn kernel_main() -> ! {
     // 通用设备授权; 全轮询 (RTL8168 常态用 INTx/MSI, 本内核只有 MSI-X 通路), 不申请向量。
     // 驱动从**多实例槽 0** 读授权 (`DeviceGrant::load_at(0)`), 故内核用 `grant_slot(.., 0)`。
     let r8169_domain = domain::create();
+    // 域 27 — hda_srv (通用 HDA 音频驱动): 走通用设备授权, 全轮询 (不申请中断向量)。
+    let hda_domain = domain::create();
 
     // 初始化 IPC 邮箱、能力表与分页器映射 (数量 = 引导域数量)。
     // 用 `BOOT_DOMAINS` 而不是字面量: 这些表按**域 id 下标**访问, 建域数与表长度必须一致,
@@ -377,12 +379,8 @@ pub extern "C" fn kernel_main() -> ! {
     cap::init(boot_domains);
     net::init();
     pager::init(boot_domains, pager_domain);
-    // 域 26 (r8169_srv) 超出 BOOT_DOMAINS 的表长, 故按运行时建域的方式补齐三张按域 id
-    // 索引的表 —— 否则对它的能力授权 / 邮箱访问会越界 panic。它随后由引导器的模块表
-    // 用 `exec::spawn_elf_at` 载入 (不经 `SYS_SPAWN_ELF`, 不会重建这些行)。
-    cap::add_domain(r8169_domain);
-    ipc::add_domain(r8169_domain);
-    pager::add_domain(r8169_domain, pager_domain);
+    // 注意: 域 26 (r8169_srv) 与域 27 (hda_srv) 都在 `BOOT_DOMAINS`(28) 内, 三张按域 id
+    // 索引的表已由上面的 init 覆盖, 无需再单独补行。
 
     // 授权: sender 可向 receiver 发送 + 共享内存。
     cap::grant(sender_domain, cap::Capability::SendTo(receiver_domain));
@@ -509,7 +507,9 @@ pub extern "C" fn kernel_main() -> ! {
     cap::grant(exfat_domain, cap::Capability::SendTo(mount_domain));
     // mfs_srv 也要上报额外卷: 真盘上可以有多块 MFS 卷, 除主卷 (/mfs) 外的挂到 `/usb<卷号>`。
     cap::grant(mfs_domain, cap::Capability::SendTo(mount_domain));
-    video::println("[OK] IPC + capability + pager initialized (21 domains)");
+    video::print("[OK] IPC + capability + pager initialized (");
+    video::print_u64(boot_domains as u64);
+    video::println(" domains)");
 
     // 探测 NVMe 控制器并把设备**通用地**授权给 block 域（D1: 通用设备授权）:
     // 内核只负责 BAR 映射 / DMA 分配 / MSI-X / 能力签发, NVMe 的队列排版与协议在驱动里。
@@ -658,6 +658,32 @@ pub extern "C" fn kernel_main() -> ! {
             // （magic=0 → 驱动自行打印 idle），避免读到未映射地址触发缺页。
             device::grant_empty_multi_from(r8169_domain, 0);
             video::println("[OK] no r8169 controller, r8169_srv idle");
+        }
+    }
+
+    // 探测 HDA 音频控制器并授权给域 27（通用驱动: Intel/AMD 同规范）。
+    // BAR0 为 16 KiB MMIO 窗口 → 取 4 页; DMA 8 页 (CORB/RIRB/BDL/PCM 由驱动切分)。
+    // 第一版全轮询（播放位置读 SDnLPIB），不申请中断向量。
+    match arch::pci::find_hda(&pci_devices) {
+        Some((bus, dev, func, bar0)) => {
+            device::grant(device::GrantRequest {
+                domain: hda_domain,
+                bus,
+                dev,
+                func,
+                bar_paddr: bar0,
+                bar_pages: 4,
+                dma_pages: 8,
+                msix_vectors: 0,
+                label: "hda",
+            });
+            video::print("[OK] HDA controller BAR0=0x");
+            video::print_hex(bar0);
+            video::println("");
+        }
+        None => {
+            device::grant_empty(hda_domain);
+            video::println("[OK] no HDA controller, hda_srv idle");
         }
     }
 
@@ -906,7 +932,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 空闲任务兜底 (归属 sender 域)。
     scheduler::spawn(task_idle, sender_domain);
-    video::println("[OK] 16 service tasks + idle task spawned");
+    video::print("[OK] ");
+    video::print_u64(domain::BOOT_DOMAINS);
+    video::println(" service tasks + idle task spawned");
     video::println("");
     // 启动 LOGO (日志末尾, shell 提示符之前)。
     video::print_logo();

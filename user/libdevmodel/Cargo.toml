@@ -1,0 +1,11 @@
+[package]
+name = "libdevmodel"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 通用驱动模型: 设备描述 / 驱动契约 / 音频·输入·无线能力接口 / 可覆盖注册表"
+
+[lib]
+name = "libdevmodel"
+path = "src/lib.rs"

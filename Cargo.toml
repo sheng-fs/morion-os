@@ -16,6 +16,13 @@ members = [
     "user/libmorion",
     # 用户态设备驱动公共库 (LibDevice, D2): 通用设备授权描述 / MMIO 原语 / MSI-X 表。
     "user/libdevice",
+    # 通用驱动模型 (LibDevModel): 设备归一化描述 / 驱动契约 / 音频·输入·无线能力接口 /
+    # 可覆盖注册表 —— 通用驱动与厂商专有驱动的共同底座（不依赖 libdevice，零依赖）。
+    "user/libdevmodel",
+    # 三个通用驱动 (可被厂商专有驱动按注册表覆盖): HDA 音频 / 输入 / 无线。
+    "user/drivers/hda",
+    "user/drivers/input",
+    "user/drivers/wlan",
     # 可执行文件加载的演示程序 (E1): 独立 crate → 独立 ELF, 由 SYS_SPAWN_ELF 运行时载入。
     "user/hello",
     # 用户态系统服务 (E2b): 14 个服务各自独立 crate → 各自独立 ELF。

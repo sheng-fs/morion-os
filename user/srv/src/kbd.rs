@@ -1,5 +1,7 @@
 use crate::common::Message;
+use libdevmodel::{DeviceInfo, Driver, DriverError, InputEvent, InputOps};
 use morion::syscall::*;
+use morion_input::{Ps2MouseDriver, Ps2Port};
 
 /// scancode set 1 基础键 → (无 shift, 有 shift) 字节；`0` 表示非字符键。
 /// 索引即 scancode (0..0x60)。修饰键 (shift/ctrl/alt/caps) 与扩展键不在此列。
@@ -197,6 +199,32 @@ impl Decoder {
     }
 }
 
+/// i8042 是**一个共享的硬件协议**（数据口 0x60 / 命令口 0x64）：键盘与鼠标的
+/// 初始化 ACK、配置字节都走同一个输出缓冲。两个进程各开一个「输入服务」会互相
+/// 吃掉对方的 ACK（实测：AUX 初始化超时），所以 PS/2 键盘与鼠标由**同一个服务**
+/// （本域，域 4）持有；鼠标协议/解码复用 `morion_input`，这里只提供端口实现。
+struct KernelPs2;
+
+impl Ps2Port for KernelPs2 {
+    fn status(&mut self) -> u8 {
+        sys_port_in8(PS2_STATUS)
+    }
+
+    fn read_data(&mut self) -> u8 {
+        sys_port_in8(PS2_DATA)
+    }
+
+    fn write_data(&mut self, b: u8) -> Result<(), DriverError> {
+        sys_port_out8(PS2_DATA, b);
+        Ok(())
+    }
+
+    fn write_cmd(&mut self, b: u8) -> Result<(), DriverError> {
+        sys_port_out8(PS2_STATUS, b);
+        Ok(())
+    }
+}
+
 /// 域 4 — 用户态键盘驱动: 注册接收 IRQ1, 循环取 scancode, 解码成字节推进内核键队列。
 ///
 /// **G4 起内核不解释按键**: 这里只做 scancode → 字节的翻译 —— 可打印字符按 shift 状态取
@@ -209,6 +237,33 @@ impl Decoder {
 ///     8259A, 中断根本到不了 CPU; 但按键字节仍躺在 0x60 的输出缓冲里, 轮询状态口的 OBF
 ///     位就能取出来。IRQ 正常时内核已在中断里读走字节, 这里读不到 (OBF=0), 不会重复。
 pub fn run() {
+    // 先初始化 PS/2 鼠标：此时**还没注册 IRQ1**，内核的中断处理器不会读走 i8042 的
+    // 控制器响应字节（配置字节 AUX=0，会被 IRQ1 当成键盘数据取走，导致初始化超时）。
+    let mut mouse = Ps2MouseDriver::new(KernelPs2);
+    match Driver::start(&mut mouse, &DeviceInfo::ps2()) {
+        Ok(()) => {
+            print("INPUT1 ps2 aux enabled wheel=");
+            print(if mouse.wheel_enabled() { "1" } else { "0" });
+            print(" kind=");
+            println(mouse.kind_name());
+        }
+        Err(e) => {
+            print("INPUT1 ps2 aux init FAILED: ");
+            println(match e {
+                DriverError::NotSupported => "NotSupported",
+                DriverError::NotFound => "NotFound",
+                DriverError::Timeout => "Timeout",
+                DriverError::Io => "Io",
+                DriverError::BadState => "BadState",
+                DriverError::Busy => "Busy",
+                DriverError::Invalid => "Invalid",
+                DriverError::Other(s) => s,
+            });
+        }
+    }
+    let mut mouse_events = 0u64;
+    let mut evs = [InputEvent::Motion { dx: 0, dy: 0 }; 8];
+
     if sys_register_irq(1) != 1 {
         println("kbd: register irq1 FAILED");
         return;
@@ -238,14 +293,26 @@ pub fn run() {
             got = true;
         }
 
-        // 路径 2: 直接轮询 i8042 (鼠标/AUX 的字节要丢掉, 否则鼠标一动就凭空冒字符)。
+        // 路径 2: 直接轮询 i8042。**AUX（鼠标）字节留给下面的鼠标驱动** ——
+        // 两者在同一个服务里顺序消费同一个输出缓冲，不会再出现跨进程抢字节。
+        // 键盘字节由这里读走；AUX 字节最多滞留一个轮询周期。
         let st = sys_port_in8(PS2_STATUS);
-        if st != u8::MAX && st & PS2_OBF != 0 {
-            let from_mouse = st & PS2_AUX != 0;
+        if st != u8::MAX && st & PS2_OBF != 0 && st & PS2_AUX == 0 {
             let b = sys_port_in8(PS2_DATA);
-            if !from_mouse && b != u8::MAX {
+            if b != u8::MAX {
                 dec.feed(b);
                 got = true;
+            }
+        }
+
+        // 路径 3: PS/2 鼠标事件（通用输入驱动）。事件目前只做计数/首次日志 ——
+        // 把指针事件接到 GUI 是下一步（需要 shell/gfx 的输入路由），驱动层已就绪。
+        if let Ok(n) = mouse.poll(&mut evs) {
+            if n > 0 {
+                if mouse_events == 0 {
+                    println("INPUT2 ps2 mouse event received");
+                }
+                mouse_events += n as u64;
             }
         }
 

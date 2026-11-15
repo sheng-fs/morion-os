@@ -20,6 +20,10 @@ const REG_STATUS: u8 = 0x06;
 const REG_CAP_PTR: u8 = 0x34;
 /// 命令寄存器 bit10: 禁用 INTx 中断。
 const CMD_INTX_DISABLE: u16 = 1 << 10;
+/// 命令寄存器 bit1: 打开内存空间 (MMIO BAR 生效)。
+const CMD_MEMORY_SPACE: u16 = 1 << 1;
+/// 命令寄存器 bit2: 打开总线主控 (设备可以做 DMA)。
+const CMD_BUS_MASTER: u16 = 1 << 2;
 /// 状态寄存器 bit4: 能力链表存在。
 const STATUS_CAP_LIST: u16 = 1 << 4;
 /// 能力 ID: MSI-X。
@@ -239,6 +243,24 @@ pub fn find_r8169(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
     None
 }
 
+/// 在枚举结果中查找 **HDA 音频控制器** (多媒体控制器 class `04`, subclass `03`),
+/// 返回其 PCI 位置与 **BAR0** 的物理基址。
+///
+/// Intel HDA 与 AMD 平台同规范，故只按 class/subclass 匹配、不限定 VID:PID ——
+/// 用户态通用驱动 (`user/drivers/hda`) 的 `probe` 用同一判据。
+/// QEMU `-device intel-hda` 的 BAR0 为 16 KiB MMIO 窗口。
+pub fn find_hda(devices: &[PciDevice]) -> Option<(u8, u8, u8, u64)> {
+    for d in devices {
+        if d.class != 0x04 || d.subclass != 0x03 {
+            continue;
+        }
+        if let Some(bar0) = read_bar0(d.bus, d.dev, d.func) {
+            return Some((d.bus, d.dev, d.func, bar0));
+        }
+    }
+    None
+}
+
 /// 在枚举结果中查找 **virtio-blk** (存储控制器 class `01`, vendor `1AF4`, device `1042`/`1001`),
 /// 返回其 PCI 位置与 **virtio-modern 配置 BAR (BAR4)** 的物理基址。
 ///
@@ -377,6 +399,23 @@ pub fn find_msix(bus: u8, dev: u8, func: u8) -> Option<MsixCap> {
 /// 置命令寄存器的 INTx 禁用位 (启用 MSI/MSI-X 前的标准动作: 避免两者同时触发)。
 pub fn disable_intx(bus: u8, dev: u8, func: u8) {
     config_update_word(bus, dev, func, REG_COMMAND, 0, CMD_INTX_DISABLE);
+}
+
+/// 打开内存空间与总线主控。
+///
+/// 设备授权（`device::grant`）在把 BAR/DMA 交给驱动前调用一次：MMIO 需要
+/// Memory Space，任何 DMA（NVMe 队列、HDA 的 CORB/RIRB、网卡描述符环）需要
+/// Bus Master。固件通常会替我们打开，但这不是 ABI 保证 —— 真机上漏掉会让
+/// 队列永远不动，表现为驱动静默超时。
+pub fn enable_memory_and_bus_master(bus: u8, dev: u8, func: u8) {
+    config_update_word(
+        bus,
+        dev,
+        func,
+        REG_COMMAND,
+        0,
+        CMD_MEMORY_SPACE | CMD_BUS_MASTER,
+    );
 }
 
 /// 打开 MSI-X: 置消息控制寄存器 bit15 (Enable) 并清 bit14 (Function Mask)。

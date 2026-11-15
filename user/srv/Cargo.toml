@@ -52,6 +52,7 @@ default = [
     "svc-httpd_srv",
     "svc-wifi_srv",
     "svc-r8169_srv",
+    "svc-hda_srv",
 ]
 svc-sender = []
 svc-receiver = []
@@ -80,6 +81,7 @@ svc-e1000_srv = []
 svc-httpd_srv = []
 svc-wifi_srv = []
 svc-r8169_srv = []
+svc-hda_srv = []
 
 [[bin]]
 name = "sender"
@@ -216,8 +218,19 @@ name = "r8169_srv"
 path = "src/bin/r8169_srv.rs"
 required-features = ["svc-r8169_srv"]
 
+[[bin]]
+name = "hda_srv"
+path = "src/bin/hda_srv.rs"
+required-features = ["svc-hda_srv"]
+
 [dependencies]
 # 用户态运行库: 入口样板 (crt0) / panic 处理 / 打印 / syscall / libvfs。
 morion = { path = "../libmorion" }
 # 设备驱动公共库 (D2): 通用设备授权描述 / MMIO 原语 / MSI-X 表。
 libdevice = { path = "../libdevice" }
+# 通用驱动模型: 设备描述 / 驱动契约 / 音频·输入·无线能力接口。
+libdevmodel = { path = "../libdevmodel" }
+# 三个通用驱动（可被厂商专有驱动按注册表覆盖）。
+morion-hda = { path = "../drivers/hda" }
+morion-input = { path = "../drivers/input" }
+morion-wlan = { path = "../drivers/wlan" }

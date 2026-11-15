@@ -1023,7 +1023,7 @@ struct ServiceModule {
 
 /// 服务清单: `(固定域号, 文件名)`。域号是 ABI（libvfs / shell 写死了服务域号），
 /// 故这里与 `kernel/src/main.rs` 建域的顺序必须一致。
-const SERVICE_FILES: [(u64, &str); 27] = [
+const SERVICE_FILES: [(u64, &str); 28] = [
     (0, "sender"),
     (1, "receiver"),
     (2, "pager"),
@@ -1050,9 +1050,11 @@ const SERVICE_FILES: [(u64, &str); 27] = [
     (23, "httpd_srv"),
     (24, "e1000_srv"),
     (25, "wifi_srv"),
-    // 域 26: 超出内核 `BOOT_DOMAINS`(26) 的引导服务 —— 内核按运行时域补表后仍用
+    // 域 26: 超出旧 `BOOT_DOMAINS`(26) 的引导服务 —— 内核按运行时域补表后仍用
     // `exec::spawn_elf_at` 原地载入 (域号固定)。
     (26, "r8169_srv"),
+    // 域 27: 通用驱动服务 —— HDA 音频（PS/2 鼠标并入 kbd_srv：i8042 只能有一个协议所有者）。
+    (27, "hda_srv"),
 ];
 
 /// 服务 ELF 在 ESP 里的目录。

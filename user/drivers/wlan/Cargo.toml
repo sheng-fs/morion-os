@@ -1,0 +1,14 @@
+[package]
+name = "morion-wlan"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 通用 WLAN station 模型 + 固件加载契约 + 厂商驱动槽"
+
+[lib]
+name = "morion_wlan"
+path = "src/lib.rs"
+
+[dependencies]
+libdevmodel = { path = "../../libdevmodel" }

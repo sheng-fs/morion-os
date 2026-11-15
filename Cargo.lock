@@ -154,6 +154,10 @@ name = "libdevice"
 version = "0.1.0"
 
 [[package]]
+name = "libdevmodel"
+version = "0.1.0"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -220,10 +224,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "morion-hda"
+version = "0.1.0"
+dependencies = [
+ "libdevice",
+ "libdevmodel",
+]
+
+[[package]]
 name = "morion-hello"
 version = "0.1.0"
 dependencies = [
  "morion",
+]
+
+[[package]]
+name = "morion-input"
+version = "0.1.0"
+dependencies = [
+ "libdevmodel",
 ]
 
 [[package]]
@@ -245,7 +264,11 @@ name = "morion-srv"
 version = "0.1.0"
 dependencies = [
  "libdevice",
+ "libdevmodel",
  "morion",
+ "morion-hda",
+ "morion-input",
+ "morion-wlan",
 ]
 
 [[package]]
@@ -253,6 +276,13 @@ name = "morion-sysinfo"
 version = "0.1.0"
 dependencies = [
  "morion",
+]
+
+[[package]]
+name = "morion-wlan"
+version = "0.1.0"
+dependencies = [
+ "libdevmodel",
 ]
 
 [[package]]

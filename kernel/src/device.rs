@@ -163,6 +163,10 @@ fn grant_at(
     let bar_paddr = req.bar_paddr & !(PAGE - 1);
     let dma_pages = req.dma_pages.max(1);
 
+    // -1. 打开 Memory Space + Bus Master：MMIO 与 DMA 的硬件前提。固件通常已经打开，
+    //     但真机上不能假设；漏掉时表现为队列/CORB 永远不动，驱动只能超时。
+    crate::arch::pci::enable_memory_and_bus_master(req.bus, req.dev, req.func);
+
     // 0. MSI-X。必须在写描述结构之前完成: 向量 / 表位置要写进描述。
     let msix = setup_msix(
         req.domain,

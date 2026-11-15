@@ -79,10 +79,10 @@ const R8169_DOMAIN: u64 = 26;
 ///
 /// 规则只有两种, 且**默认拒绝**写在 `holder_allowed` 的兜底分支里:
 /// - [`Rule::Routine`]: 常规流通能力 (`SendTo` / `MapInto`), 任意存活域可持有 ——
-///   包括运行时 `SYS_SPAWN_ELF` 建的 27/28… 域 (它们按设计就要访问文件服务);
+///   包括运行时 `SYS_SPAWN_ELF` 建的 28… 域 (它们按设计就要访问文件服务);
 /// - [`Rule::Only`]: 特权能力, **只有列出的静态域**可持有。
 ///
-/// **动态域 (≥ 27) 的判定规则**: 它们不会出现在任何 `Only` 白名单里 (白名单只列
+/// **动态域 (≥ 28) 的判定规则**: 它们不会出现在任何 `Only` 白名单里 (白名单只列
 /// 静态域号), 故一旦持有 `Spawn` / `MMIO` / `Fb` / `IoPort` / `Irq` / `Net` 中
 /// 任意一种, 审计即记 `VIOLATION`。这不是"忘了登记"——新加的运行时域**必须**
 /// 走 `Routine` 种类; 要授予特权能力, 得同时在这里显式登记它的域号 (并说明理由)。
@@ -107,13 +107,13 @@ const POLICY: [(u64, Rule); 8] = [
     // / vblk(17, MSI-X)。
     (CAP_KIND_IRQ, Rule::Only(&[4, 5, 16, 17])),
     // MMIO: 仅设备驱动 block(5) / net(16) / vblk(17) / ahci(18) / xhci(19) / e1000e(22)
-    // / e1000(24) / **r8169(26)**。
-    (CAP_KIND_MMIO, Rule::Only(&[5, 16, 17, 18, 19, 22, 24, R8169_DOMAIN])),
+    // / e1000(24) / r8169(26) / **hda(27)**。
+    (CAP_KIND_MMIO, Rule::Only(&[5, 16, 17, 18, 19, 22, 24, R8169_DOMAIN, 27])),
     // 造进程: 仅 app(7) / shell(8) / init(14) —— 其余域一概不该有。
     (CAP_KIND_SPAWN, Rule::Only(&[7, 8, 14])),
     // 帧缓冲: 全局唯一凭证, 仅 gfx_srv(15)。
     (CAP_KIND_FB, Rule::Only(&[15])),
-    // I/O 端口: 仅 block(5, IDE PIT) / kbd(4, PS/2) / mfs(11) / exfat(13) (CMOS RTC)。
+    // I/O 端口: block(5, IDE PIT) / kbd(4, PS/2 键盘+鼠标) / mfs(11) / exfat(13) (CMOS RTC)。
     (CAP_KIND_IO_PORT, Rule::Only(&[4, 5, 11, 13])),
     // 网络端口: 仅 app(7) / shell(8) 的客户端源端口段 + httpd(23) 的 :80。
     (CAP_KIND_NET, Rule::Only(&[7, 8, 23])),

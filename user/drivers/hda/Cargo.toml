@@ -1,0 +1,15 @@
+[package]
+name = "morion-hda"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+license.workspace = true
+description = "MorionOS 通用 HDA 音频驱动 (Intel HDA / AMD 同规范), 编解码器可替换"
+
+[lib]
+name = "morion_hda"
+path = "src/lib.rs"
+
+[dependencies]
+libdevmodel = { path = "../../libdevmodel" }
+libdevice = { path = "../../libdevice" }
