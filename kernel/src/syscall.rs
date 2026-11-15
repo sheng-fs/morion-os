@@ -270,6 +270,58 @@ const XHCI_DOMAIN: u64 = 19;
 /// 键盘输入能力 —— 用**现有**能力模型表达, 不新增能力种类。
 const KBD_IRQ: u8 = 1;
 
+/// 引导期监督者 `init` 的固定域号 (与 `main.rs` 建域顺序一致)。
+///
+/// `init` 负责原地重启服务域，但它并不是这些域的**分页器**（引导期分页器统一是
+/// 域 2），故「重启权限 = 分页器」这条通用规则需要给监督者留一个显式例外。
+const INIT_DOMAIN: u64 = 14;
+
+/// `SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 的权限判据 (**纯函数**, 便于单测):
+/// 只有**监督者**或**目标域的分页器**能原地换掉一个已存在域的镜像。
+///
+/// 不加这条限制时，任何持 `Spawn` 的域（shell / app）都能把服务域（如 gfx_srv）
+/// 的地址空间换成自己的 ELF —— 目标域的**能力表不变**，等于借壳继承它的特权，
+/// 是明确的跨域提权路径。`SYS_DOMAIN_DESTROY` 早已用"谁加载谁负责"约束，这里补齐。
+fn restart_allowed_with(from: u64, pager_of_target: Option<u64>) -> bool {
+    from == INIT_DOMAIN || pager_of_target == Some(from)
+}
+
+/// `SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 的实时门禁。
+fn restart_allowed(from: u64, target: u64) -> bool {
+    restart_allowed_with(from, crate::pager::of(target))
+}
+
+/// 控制台类操作（清屏 / 滚动 / 行编辑 / 查询接管状态）的合法域 (**纯函数**)。
+///
+/// 合法集合 = 键盘输入源（`kbd_srv` / `xHCI` / 持 `Irq(1)` 的域，它们负责滚动）
+/// ∪ `Spawn` 持有者（shell / app，终端前端）∪ `Fb` 持有者（gfx_srv，屏幕接管方）。
+/// 运行时 `SYS_SPAWN_ELF` 建的普通应用三者皆无，不能改写/清空共享控制台。
+fn console_access_allowed_with(
+    domain: u64,
+    holds_kbd_irq: bool,
+    holds_spawn: bool,
+    holds_fb: bool,
+) -> bool {
+    key_push_allowed_with(domain, holds_kbd_irq) || holds_spawn || holds_fb
+}
+
+/// 控制台类操作的实时门禁 (查能力表)。
+fn console_access_allowed(domain: u64) -> bool {
+    console_access_allowed_with(
+        domain,
+        crate::cap::has(domain, crate::cap::Capability::Irq(KBD_IRQ)),
+        crate::cap::has(domain, crate::cap::Capability::Spawn),
+        crate::cap::has(domain, crate::cap::Capability::Fb),
+    )
+}
+
+/// 内核日志读取门禁: 仅 `Spawn` 持有者（shell / app / init）。
+///
+/// 日志里可能含物理地址、设备 BAR、路径等诊断信息，不向任意运行时应用开放。
+fn log_read_allowed(domain: u64) -> bool {
+    crate::cap::has(domain, crate::cap::Capability::Spawn)
+}
+
 /// 当前任务的内核栈顶 — 由调度器在切换任务时更新, `syscall_entry` 汇编读取。
 #[no_mangle]
 static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
@@ -962,7 +1014,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
         }
         SYS_CLEAR => {
-            // 清屏并复位内核终端状态 (历史 / 当前行)。
+            // 清屏/复位内核终端状态会破坏共享控制台，只给终端前端与屏幕接管方。
+            if !console_access_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
             crate::video::clear_screen();
             1
         }
@@ -1059,6 +1114,11 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             if !crate::cap::has(from, crate::cap::Capability::Spawn) {
                 return u64::MAX;
             }
+            // 「谁加载谁负责」: 只有监督者或目标域的分页器能换掉它的镜像，
+            // 否则持 Spawn 的 shell/app 可借壳继承服务域的能力 (跨域提权)。
+            if !restart_allowed(from, a1) {
+                return u64::MAX;
+            }
             let Some(image) = user_elf_image(a2, a3) else {
                 return u64::MAX;
             };
@@ -1069,6 +1129,9 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 不给用户态传地址, 故除了域号无需别的参数。
             let from = crate::scheduler::current_domain();
             if !crate::cap::has(from, crate::cap::Capability::Spawn) {
+                return u64::MAX;
+            }
+            if !restart_allowed(from, a1) {
                 return u64::MAX;
             }
             let Some(image) = boot_module_image(a1) else {
@@ -1149,7 +1212,13 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             crate::video::take_over();
             1
         }
-        SYS_CONSOLE_READY => crate::video::is_taken_over() as u64,
+        SYS_CONSOLE_READY => {
+            // 控制台状态属于终端前端/屏幕接管方，不向任意运行时应用暴露。
+            if !console_access_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
+            crate::video::is_taken_over() as u64
+        }
         SYS_KEY_PUSH => {
             // 键盘域 (或显式持有键盘中断能力的域) 推一个按键字节进来; 内核只做搬运。
             // 无门禁时任意域都能伪造键盘输入 (可替用户敲命令), 故其它域一律拒绝。
@@ -1174,6 +1243,10 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
         SYS_KEY_TRY_READ => crate::key::pop().map_or(u64::MAX, |c| c as u64),
         SYS_CONSOLE_SCROLL => {
+            // 滚动共享控制台: 合法来源是键盘输入域与终端前端 (见 console_access_allowed)。
+            if !console_access_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
             let delta = a1 as i64;
             if delta > 0 {
                 crate::video::scroll_up(delta as usize);
@@ -1261,8 +1334,16 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             // 只读查询端口归属域 (供 netstack 核对 bind 请求的调用者)。
             crate::net::owner(a1 as u16)
         }
-        SYS_LOG_TOTAL => crate::klog::total(),
+        SYS_LOG_TOTAL => {
+            if !log_read_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
+            crate::klog::total()
+        }
         SYS_LOG_READ => {
+            if !log_read_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
             // klog::handle_read 只做范围校验; 这里补上逐页"已映射"确认 —— 坏指针
             // 不能让内核在 Ring0 缺页。长度按 handle_read 的 1 MiB 上限对齐。
             if !user_buf_ok(a1, a2.min(LOG_READ_MAX)) {
@@ -1270,8 +1351,17 @@ extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             }
             crate::klog::handle_read(a1, a2, a3)
         }
-        SYS_LOG_OLDEST => crate::klog::oldest(),
+        SYS_LOG_OLDEST => {
+            if !log_read_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
+            crate::klog::oldest()
+        }
         SYS_CONSOLE_LINE_EDIT => {
+            // 行编辑标志会影响所有终端读者，只给终端前端/屏幕接管方。
+            if !console_access_allowed(crate::scheduler::current_domain()) {
+                return 0;
+            }
             crate::video::set_line_edit(a1);
             0
         }
@@ -1425,5 +1515,44 @@ mod tests {
             );
         }
         assert!(key_push_allowed_with(8, true), "显式持有 Irq(1) 的域放行");
+    }
+
+    /// `SYS_SPAWN_ELF_AT` / `_MODULE` 门禁: 监督者或**目标域的分页器**才能原地换镜像。
+    /// 否则持 `Spawn` 的 shell / app 可借壳继承服务域能力 (跨域提权)。
+    #[test]
+    fn restart_requires_supervisor_or_pager() {
+        // 监督者 init 对任何域都放行 (它统管引导期服务)。
+        assert!(restart_allowed_with(INIT_DOMAIN, Some(2)));
+        assert!(restart_allowed_with(INIT_DOMAIN, None));
+
+        // 加载者 = 目标域的分页器: 允许 (shell 重启自己 spawn 的子进程)。
+        assert!(restart_allowed_with(8, Some(8)));
+        assert!(restart_allowed_with(7, Some(7)));
+
+        // shell / app 不是服务域的分页器 (引导期统一由域 2 分页): 必须拒绝。
+        assert!(!restart_allowed_with(8, Some(2)));
+        assert!(!restart_allowed_with(7, Some(2)));
+        assert!(!restart_allowed_with(8, None));
+        assert!(!restart_allowed_with(100, None));
+    }
+
+    /// 控制台类操作门禁: 键盘输入域 / `Spawn` / `Fb` 三类之外一律拒绝。
+    #[test]
+    fn console_access_is_limited_to_frontends_and_input_sources() {
+        // 键盘输入源: kbd 与 xHCI 是固定域号, 不需要额外能力。
+        assert!(console_access_allowed_with(KBD_DOMAIN, false, false, false));
+        assert!(console_access_allowed_with(XHCI_DOMAIN, false, false, false));
+        // 终端前端 (Spawn) / 屏幕接管方 (Fb)。
+        assert!(console_access_allowed_with(8, false, true, false));
+        assert!(console_access_allowed_with(15, false, false, true));
+        // 显式持有键盘中断能力的域。
+        assert!(console_access_allowed_with(100, true, false, false));
+        // 运行时普通应用: 三者皆无。
+        for domain in [100, 101, 200] {
+            assert!(
+                !console_access_allowed_with(domain, false, false, false),
+                "域 {domain} 不应能改写共享控制台"
+            );
+        }
     }
 }
