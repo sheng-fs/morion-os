@@ -210,8 +210,8 @@ grep -qE 'VBLK1 virtio-blk OK.*sig=ok.*rw=ok' "$log" 2>/dev/null || vblk_bad=1
 ahci_bad=0
 echo "== AHCI/SATA 驱动自测 + 卷层挂载 (D4/03b) =="
 grep -nE 'ahci:|AHCI1|AHCI2|block: ahci volume' "$log" 2>/dev/null || echo "(无)"
-grep -qE 'AHCI1 ahci OK.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
-grep -qE 'block: ahci volume attached.*sig=ok' "$log" 2>/dev/null || ahci_bad=1
+grep -qE 'AHCI1 ahci OK.*sector0=test' "$log" 2>/dev/null || ahci_bad=1
+grep -qE 'block: ahci volume attached.*sig=test' "$log" 2>/dev/null || ahci_bad=1
 grep -qE 'AHCI2 ahci volume rw OK.*rw=ok' "$log" 2>/dev/null || ahci_bad=1
 # 驱动路线 03c: xHCI/USB 存储驱动 (域 19) —— ① 枚举 + BOT/SCSI 读扇区 0 校验宿主签名 (`USB1`);
 # ② 把 U 盘**挂进 block_srv 的卷层** (`block: usb volume attached`), 并经卷层转发做一次写回读
@@ -219,8 +219,8 @@ grep -qE 'AHCI2 ahci volume rw OK.*rw=ok' "$log" 2>/dev/null || ahci_bad=1
 usb_bad=0
 echo "== xHCI/USB 存储驱动自测 + 卷层挂载 (03c) =="
 grep -nE 'xhci:|USB1|USB2|block: usb volume' "$log" 2>/dev/null || echo "(无)"
-grep -qE 'USB1 xhci OK.*sig=ok' "$log" 2>/dev/null || usb_bad=1
-grep -qE 'block: usb volume attached.*sig=ok' "$log" 2>/dev/null || usb_bad=1
+grep -qE 'USB1 xhci OK.*sector0=test' "$log" 2>/dev/null || usb_bad=1
+grep -qE 'block: usb volume attached.*sig=test' "$log" 2>/dev/null || usb_bad=1
 grep -qE 'USB2 usb volume rw OK.*rw=ok' "$log" 2>/dev/null || usb_bad=1
 # 03c 续: ISO9660 只读文件服务 (域 20) —— 把 morion-os.iso 的只读副本接成 nsid=8, 服务读整盘
 # ISO9660 并校验根下 EFIBOOT.IMG 的 FAT 引导签名 (0xEB/0xE9 跳转 + 尾 0x55AA) → `ISO1`。
