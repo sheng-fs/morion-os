@@ -36,7 +36,7 @@
 | 元数据 40 B，末尾 `+32` 是 **8 字节保留区** | 布局注释 `mfs_srv.rs:95-107`；偏移函数 `mfs_meta_off` `mfs_srv.rs:1824-1831` |
 | **「能力即句柄」已落地**：open/creat 签发内核句柄，每次 I/O 前校验 | `kernel/src/cap.rs:93-203`（句柄表）；`vfs.rs:351-363`（fd 打包）、`vfs.rs:381-391`（`cap_guard`）、`vfs.rs:620-638`（`wrap_open`） |
 | 能力类型仅资源类（`SendTo/MapInto/Irq/Mmio/IoPort/Fb/Spawn`），**没有身份/凭证** | `kernel/src/cap.rs:13-42` |
-| 引导期域数 `BOOT_DOMAINS = 18`（流 03 合入后成 19），域号会**复用** | `kernel/src/domain.rs:33-47` |
+| 引导期域数 `BOOT_DOMAINS = 28`（04b 设计时为 18/19，此后随 net / IOMMU / 驱动服务扩容到 28），域号会**复用** | `kernel/src/domain.rs:43` |
 | 架构规划了「认证服务 + 能力模型」，尚未实现 | `docs/architecture.md:134-142`、`:56` |
 
 **缺口一句话**：I/O 路径已经知道「你有没有这个打开对象」（能力），但**不知道该以谁的名义做**（没有 uid/gid）、也**不检查**能否做（`mode` 不参与判定）。

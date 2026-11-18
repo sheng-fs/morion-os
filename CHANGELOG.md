@@ -6,6 +6,35 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 2026-11-15
+
+**AMD-Vi、通用驱动三件套与原地重启/控制台安全加固。**
+
+### 新增
+
+- **AMD-Vi（AMD 平台 DMA 隔离）**：解析 ACPI IVRS，建 32 B Device Table 与每设备
+  4 级 I/O 页表，只映射已授权的 BAR/DMA 范围；使能命令缓冲/事件日志并在授权后失效；
+  无 IVRS 或初始化失败时完全回退；DMAR 与 IVRS 同时存在时 VT-d 优先。
+- **通用驱动模型 `libdevmodel`**：`Driver` 契约 + `AudioOps`/`InputOps`/`WlanOps` +
+  可覆盖注册表，厂商专有驱动可按优先级替换通用实现。
+- **通用 HDA 音频**（`hda_srv`，域 27）：CORB/RIRB、通用 codec 发现、BDL 播放，
+  26 款 codec / 19 款控制器芯片表。
+- **通用输入**：PS/2 鼠标（3/4 字节包 + `GET_ID`）与 I2C-HID 触摸板协议/厂商表，
+  并入 `kbd`。
+- **通用 WLAN 抽象**：station 状态机、固件契约、24 款芯片 PCI ID 表 + 厂商注册槽。
+
+### 修复
+
+- **原地重启跨域提权**：`SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 仅允许监督者
+  `init` 或目标域的分页器调用，阻止持 `Spawn` 的 `shell`/`app` 借壳继承服务能力。
+- **控制台/日志门禁**：`SYS_CLEAR` / `SYS_CONSOLE_*` 仅对键盘输入域、终端前端与
+  屏幕接管方开放；`SYS_LOG_*` 仅 `Spawn` 持有者可读。
+
+### 验证
+
+- `make check` / clippy 全过；内核单测 72 passed；QEMU 全量回归（`scripts/fs-regress.sh`）。
+- **真机待验证**：AMD-Vi、HDA/输入/WLAN 通用驱动、r8169 真机网卡。
+
 ## [Unreleased] — 2026-11-09
 
 **USB/exFAT 写入持久化与签名诊断修复。**

@@ -15,7 +15,7 @@
 ```bash
 # 每个新终端 / 每个会话都先执行（这台机器的 shell PATH 里没有 cargo）
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:$HOME/.cargo/bin"
-cd /home/jinjun/文档/morion-os
+cd /home/jinjun/桌面/morion-os
 
 # 最小自检（约 1 分钟）
 cargo fmt --all -- --check && make check && make clippy
@@ -42,7 +42,7 @@ cargo test --lib -p morion-kernel          # 期望 36 passed
 
 ```bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:$HOME/.cargo/bin"
-cd /home/jinjun/文档/morion-os
+cd /home/jinjun/桌面/morion-os
 
 # ① 静态检查（必须 0 warning）
 cargo fmt --all && make fmt && make check && make clippy
@@ -60,13 +60,14 @@ OUT_DIR=build bash scripts/fs-regress.sh /tmp/regress.log
 **判据**（缺一不可）：
 
 - `SELFTEST DONE` ≥ 1；`FAILED` / `PANIC` = 0
-- `[OK] 26 service ELFs loaded`
+- `[OK] 28 service ELFs loaded`
 - **`irq_cmds == cmds` 且 `poll_cmds = 0`**（**不要硬比历史数字**：`cmds` 的绝对值会随块层
   缓存 / 预读、新增自测而变化；判的是**两者相等**且**没有退化成轮询**）
 - `VBLK1 virtio-blk OK, cap=2048, sector0 sig=MORION-VBLK-TST!, sig=ok, rw=ok`
 - `NET1 virtio-net up, MAC=52:54:00:12:34:56, ARP reply OK`
-- `AHCI1 ahci OK, cap=2048, sector0 sig=MORION-AHCI-TST!, sig=ok`（测试盘由 Makefile 的
-  `AHCI_IMG` 规则生成，**`fs-regress.sh` 自己会挂它**）
+- `AHCI1 ahci OK, cap=2048, sector0=test` + `block: ahci volume attached … sig=test`（测试盘由
+  Makefile 的 `AHCI_IMG` 规则生成，**`fs-regress.sh` 自己会挂它**；`sector0=test` 表示扇区 0
+  命中宿主预写签名，对应旧日志里的 `sig=ok`）
 - `sgdisk -v build/pt.img` → `No problems found`
 
 **改到驱动 / IOMMU 的，再跑一遍开 IOMMU 的版本**：
@@ -188,7 +189,7 @@ OUT_DIR=build/nogui bash scripts/fs-regress.sh /tmp/nogui.log
 
 | 脚本 | 角色 |
 |---|---|
-| `scripts/fs-regress.sh` | **门禁第 ④ 条**：全量 QEMU 回归 + 判据汇总（含 `AHCI1 … sig=ok`）。每轮重置 `spare/pt/vblk/ahci`，并就地往 `nvme.img` 补 `hello.mex` 与服务镜像 |
+| `scripts/fs-regress.sh` | **门禁第 ④ 条**：全量 QEMU 回归 + 判据汇总（含 `AHCI1 … sector0=test`）。每轮重置 `spare/pt/vblk/ahci`，并就地往 `nvme.img` 补 `hello.mex` 与服务镜像 |
 | `scripts/probe-shell.sh` | 注入探针：起机 + 经 QEMU monitor 敲 shell 命令，~1 分钟出结果（4 个开关见 §3） |
 | `scripts/fsck-leak.sh` | `mfs.fsck --repair` 的泄漏回收用例（宿主改镜像 + 三轮启动，~17 分钟；判定只看 `mfs.fsck:` 三行） |
 | `scripts/usb-rw.sh` | 真机 U 盘端到端读写（`part.wipe` → `mkfs.mfs` → 写文件 → 只读重启读回 + 宿主解 MFS8 超级块） |

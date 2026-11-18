@@ -9,9 +9,11 @@
 | --- | --- |
 | `boot/` | UEFI 引导器 (crate: `morion-boot`)，加载内核 ELF 并跳转 |
 | `kernel/` | 微内核 (crate: `morion-kernel`)，`x86_64-unknown-none` |
-| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：26 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4/03b, SATA/AHCI 读写) / `xhci_srv` (03c, USB/xHCI 存储读写) / `iso9660_srv` (03c 续, ISO9660 只读文件服务, 挂 `/cdrom`) / `netstack_srv` (N6, 用户态 TCP/IP 协议栈 + socket 服务 + 端口能力门禁) / `e1000e_srv` (N9, 第二台真网卡 Intel 82574L) / `e1000_srv` (DRV-B, 第三台网卡 Intel 82540EM, 与 e1000e 共用 `intel_nic` 核心) / `httpd_srv` (N8.2, 客户机内建 HTTP 服务, 监听 `:80`) / `wifi_srv` (W1, 无线 station 服务 + 无线抽象层, 关联后暴露为普通以太链路) |
+| `user/srv/` | 用户态系统服务 (crate: `morion-srv`)：28 个服务各一个 `[[bin]]` → 各一份**独立 ELF**，内核引导期逐个载入各自固定域 (E2b)。含监督者 `init` (E3c)、图形服务 `gfx_srv` (G1) 与设备驱动服务 `net_srv` (N0–N3) / `virtio_blk_srv` (D3) / `ahci_srv` (D4/03b, SATA/AHCI 读写) / `xhci_srv` (03c, USB/xHCI 存储读写) / `iso9660_srv` (03c 续, ISO9660 只读文件服务, 挂 `/cdrom`) / `netstack_srv` (N6, 用户态 TCP/IP 协议栈 + socket 服务 + 端口能力门禁) / `e1000e_srv` (N9, 第二台真网卡 Intel 82574L) / `e1000_srv` (DRV-B, 第三台网卡 Intel 82540EM, 与 e1000e 共用 `intel_nic` 核心) / `httpd_srv` (N8.2, 客户机内建 HTTP 服务, 监听 `:80`) / `wifi_srv` (W1, 无线 station 服务 + 无线抽象层, 关联后暴露为普通以太链路) / `r8169_srv` (真机 Realtek RTL8168 有线网卡) / `hda_srv` (通用 Intel/AMD HDA 音频, 域 27) |
 | `user/libmorion/` | 用户态运行库 (crate: `morion`)：syscall / 打印 / libvfs / 入口样板 |
 | `user/libdevice/` | 用户态**设备驱动公共库** (crate: `libdevice`，D2/D2b)：通用设备授权描述 (`grant`) / MMIO 原语 (`mmio`) / MSI-X 表项 (`msix`) / virtio-modern 传输层与 vring (`virtio`) —— `block_srv` / `net_srv` / `virtio_blk_srv` / `ahci_srv` / `xhci_srv` 共用；只放"与我是服务还是飞地应用无关"的东西 |
+| `user/libdevmodel/` | 通用驱动模型 (crate: `libdevmodel`，零依赖)：设备归一化描述 (`device`) / `Driver` 契约 (`driver`) / 音频·输入·无线能力接口 `AudioOps`·`InputOps`·`WlanOps` (`ops`) / 可覆盖注册表 `Registry::register_override` (`registry`) —— 通用驱动与厂商专有驱动的共同底座 |
+| `user/drivers/` | 三个**可被厂商驱动覆盖**的通用驱动：`hda`（通用 Intel/AMD HDA 控制器 + codec 发现 + PCM + 芯片表）/ `input`（PS/2 鼠标 + I2C-HID 触摸板 + 厂商表）/ `wlan`（station 状态机 + 固件契约 + 24 款芯片表） |
 | `user/hello/` | 可执行文件加载的演示程序 (独立 ELF，运行时经 `SYS_SPAWN_ELF` 载入) |
 | `kernel_test/` | 早期引导测试用的小内核 (已弃用，保留) |
 | `docs/architecture.md` | 技术架构文档 |
@@ -48,7 +50,7 @@ UEFI 固件
 
 `BootInfo` 字段：`magic, version, fb_addr, fb_width, fb_height, fb_stride, fb_bpp, mmap_addr, mmap_entry_count, mmap_entry_size, svc_addr, svc_count, svc_entry_size, rsdp_addr, boot_disk_valid, boot_disk_dev, boot_disk_func`。
 
-**服务模块表（E3b）**：`svc_addr` 指向一张 `ServiceModule { domain, addr, len }` 数组（引导器放在 `LOADER_DATA` 页里），内核经 `BootInfo::service_modules()` 取用 —— `svc_entry_size` 是布局校验（两个独立编译的产物，字段不一致就判为不可用）。这是 26 个引导期服务的镜像来源（不再是内核 `include_bytes!`）。
+**服务模块表（E3b）**：`svc_addr` 指向一张 `ServiceModule { domain, addr, len }` 数组（引导器放在 `LOADER_DATA` 页里），内核经 `BootInfo::service_modules()` 取用 —— `svc_entry_size` 是布局校验（两个独立编译的产物，字段不一致就判为不可用）。这是 28 个引导期服务的镜像来源（不再是内核 `include_bytes!`）。
 
 **启动盘定位（真机收尾，version 5）**：引导器从**启动卷**的 Device Path 里取 `Pci` 节点的 `device/function`（`boot_disk_dev` / `boot_disk_func`，`boot_disk_valid` 表示是否识别成功），内核 `BootInfo::boot_disk()` 返回 `Option<(u8, u8)>`。`SAFE` 变体据此只保留「启动盘这条链上的块控制器」（class `0x01`），USB 控制器（class `0x0C`）永不裁剪 —— 真机上因此不会去碰内建 NVMe/SATA 上的其它磁盘。
 
@@ -175,6 +177,12 @@ UEFI 固件
 | 61 | `SYS_POWEROFF` | — | **ACPI S5 软关机**（真机收尾）：解析 FADT `PM1a/PM1b_CNT_BLK` 与 DSDT `_S5` 的 `SLP_TYP`，读-改-写 PM1 控制块（保留 `SCI_EN`，置 `SLP_EN`）；无 FADT 时回退 QEMU 经典口 `0x604`。门禁 `Capability::Spawn`（关机不可逆，只给可信域）。使用方 = shell `poweroff` |
 | 62 | `SYS_REBOOT` | — | **硬重启**（真机收尾）：i8042 `0xFE` → PCI 复位控制 `0xCF9`（`0x02`/`0x06`）→ 空 IDT + `int3` 三重故障兜底。门禁 `Capability::Spawn`。使用方 = shell `reboot` |
 | 63 | `SYS_KEY_TRY_READ` | — | **非阻塞取按键**（真机收尾）：键队列有字节则返回该字节，空队列返回 `u64::MAX`。供 `dmesg` 等长输出命令在行边界检查 `Ctrl+C` 中止。使用方 = shell `dmesg` |
+| 64 | `SYS_CONSOLE_SCROLL` | `rdi=带符号行数` | **内核终端日志回滚**（真机）：正数向上回看、负数向下。真机没有串口时内核终端是唯一日志窗口，USB HID 方向键由 `xhci_srv` 经此翻页；`gfx_srv` 接管屏幕后为空操作 |
+| 65 | `SYS_LOG_OLDEST` | — | **日志环形缓冲里还能读到的最老绝对偏移**（真机）：`dmesg` 必须从这里起步，否则偏移会被内核夹到最老处、导致日志被反复打印 |
+| 66 | `SYS_CONSOLE_LINE_EDIT` | `rdi!=0 开始 / 0 结束` | **控制台行编辑开关**（真机 SAFE 变体）：`rdi != 0` 让调用者成为编辑者，`0` 结束并补显编辑期间暂存的驱动日志，避免异步日志冲掉用户半打的命令 |
+| 67 | `SYS_CRED` | `rdi=操作, rsi=参数, rdx=参数` | **进程身份**（多用户）：`0` = 查自己（返回 `(uid<<32)\|gid`）、`1` = 设置自己、`2` = 查指定域（只读）。只有 `uid 0` 能切换成别的身份；身份按域保存，文件服务按 IPC 的 `msg.from` 判定发起者 |
+| 68 | `SYS_ENCLAVE_MAP` | `rdi=设备选择, rsi=期望 IOVA, rdx=窗口字节数` | **性能飞地运行期设备窗口映射**（§6.2 最小切片）：`rdi = u64::MAX` 表示本域设备（或 `bus<<16\|dev<<8\|func`）；`rsi = 0` 由内核自动分配（每域 64 MiB、4 KiB 粒度）。返回实际生效的 IOVA，失败返回 `u64::MAX - n`。须持有该设备 BAR 的 `Capability::Mmio`；同一 BAR 已被占用返回 `ENCLAVE_ERR_ALREADY_OWNED` |
+| 69 | `SYS_ENCLAVE_DETACH` | `rdi=设备选择` | **解除飞地设备独占**（§6.2）：恢复启动时的恒等窗口、撤销 IOVA 叶项、归还自动分配的 IOVA，并清空描述页 `dma_iova`；返回 `1`（幂等路径同样返回 `1`）或 `ENCLAVE_ERR_*` |
 
 ### MSR 配置（`syscall::init()`）
 
@@ -277,7 +285,7 @@ UEFI 固件
 
 - `elf::parse(bytes) -> Option<Image>`（**信任边界**：镜像字节完全由用户态提供，故每个字段先校验再用 —— magic / `ELFCLASS64` / `ELFDATA2LSB` / `ET_EXEC` / `EM_X86_64` / `e_phentsize == 56` / `e_phnum ≤ 32`；每段 `p_filesz ≤ p_memsz`、文件内容不越界、段整体落在 `[USER_SPACE_BASE, USER_SPACE_END)`；**入口必须落在某个已载入段内**。全程不分配资源、不 panic，非法即 `None`）
 - `exec::spawn_elf(image, loader) -> Option<u64>`（**运行时**：解析 → `domain::create()` + `cap/ipc/pager::add_domain(domain[, loader])` → 逐段映射 → 映射用户栈 → `try_spawn_user`；返回新域 id）
-- `exec::spawn_elf_at(domain, image) -> bool`（**引导期**：不建域、不登记全局表 —— 26 个服务域由内核按固定域号先建好并授权，这里只"解析 → 映射镜像与栈 → 起任务"。镜像由**引导器**从 ESP 的 `EFI/morion/services/<name>.elf` 读入 `LOADER_DATA` 页，经 `BootInfo` 的模块表交来（见 `bootinfo::ServiceModule`；E3b 起内核不再 `include_bytes!`），见 [kernel/src/main.rs](../../kernel/src/main.rs)。镜像以**物理地址**给出，内核靠恒等映射读它 —— 故载入前用 `paging::is_identity_mapped(addr, len)` 判可达性）
+- `exec::spawn_elf_at(domain, image) -> bool`（**引导期**：不建域、不登记全局表 —— 28 个服务域由内核按固定域号先建好并授权，这里只"解析 → 映射镜像与栈 → 起任务"。镜像由**引导器**从 ESP 的 `EFI/morion/services/<name>.elf` 读入 `LOADER_DATA` 页，经 `BootInfo` 的模块表交来（见 `bootinfo::ServiceModule`；E3b 起内核不再 `include_bytes!`），见 [kernel/src/main.rs](../../kernel/src/main.rs)。镜像以**物理地址**给出，内核靠恒等映射读它 —— 故载入前用 `paging::is_identity_mapped(addr, len)` 判可达性）
 - 失败清理（E2b 地基）：`spawn_elf` 映射或起任务任一步失败 → `domain::destroy(domain)` 把半成品域拆干净（地址空间 + 各全局表行）后返回 `None`，不再漏域漏页。
 - `elf::parse` 解析 `p_flags`（`PF_X`/`PF_W`）并**拒绝 `PF_W|PF_X` 的段**（W^X 的镜像侧前提）。
 - 映射要点：**分两遍** —— 先按「**页权限并集**」逐页建映射，再拷内容。这样相邻段共享边界页时，页权限在第一次映射时就已经是并集，不需要事后改页表项（`Mapper` 没有改标志的入口）。一页只映射一次，重复 map 会 panic；新页先**清零**再拷入文件内容（分配器不保证零，`.bss` 与段尾填充都依赖这一点）；物理地址 < 4 GiB 在恒等映射内，故可直接当指针写。
@@ -434,11 +442,30 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 > 只抽「**所有 virtio 设备都一样**」的那层；**设备语义**（网卡的包头/ARP、块设备的请求链）仍在
 > 各自驱动里。NVMe 的队列/协议状态机也仍未抽（等 E3 飞地这个第二消费者，避免过早设计接口）。
 
+### 通用驱动模型 libdevmodel 与三个可覆盖驱动（[user/libdevmodel](../../user/libdevmodel)、[user/drivers](../../user/drivers)）
+
+`libdevmodel` 是「通用驱动 ↔ 厂商专有驱动」的契约层，**零依赖**（不依赖 `libdevice` / `morion`）：
+
+- `device`：归一化设备描述（PCI 地址 / 厂商型号 / 类别）；
+- `driver`：`Driver` trait（probe / init / shutdown）与 `DriverError`；
+- `ops`：能力接口 `AudioOps`（`AudioFormat` / 播放 / drain）、`InputOps`（事件队列）、`WlanOps`
+  （`LinkState` / `Ssid` / `BssEntry` / 扫描 / 关联）；
+- `registry`：`Registry::register_override()` —— 厂商驱动按优先级注册后，服务层只认能力接口，
+  **不需要改服务或 IPC 契约**。
+
+三个通用驱动：
+
+| 驱动 | 覆盖内容 | 服务接入 |
+| --- | --- | --- |
+| [`hda`](../../user/drivers/hda) | 通用 Intel/AMD HDA 控制器（CORB/RIRB + 立即命令回退）、通用 codec 发现、BDL 播放；26 款 codec / 19 款控制器芯片表 | `hda_srv`（域 27），QEMU `intel-hda` 实测 `drain=ok` |
+| [`input`](../../user/drivers/input) | PS/2 鼠标（3/4 字节包、`GET_ID` 设备类型）、I2C-HID 触摸板协议与厂商表 | 并入 `kbd`（i8042 单一所有者） |
+| [`wlan`](../../user/drivers/wlan) | station 状态机、固件下载契约、扫描缓存、24 款无线芯片 PCI ID 表 + 厂商注册槽 | `wifi_srv`（域 25，当前 `NoRadioHw` 空后端） |
+
 ### 文件服务与挂载层（用户态）
 
 文件系统全部位于用户态，经 libvfs 统一接入（见 [user/libmorion/src/vfs.rs](../../user/libmorion/src/vfs.rs)）。
 
-- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv / 19 xhci_srv / 20 iso9660_srv / 21 netstack_srv / 22 e1000e_srv / 23 httpd_srv / 24 e1000_srv / 25 wifi_srv`（共 26 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
+- 域布局（[kernel/src/main.rs](../../kernel/src/main.rs)）：`5 block_srv / 6 fat32_srv / 7 app / 8 shell / 9 mount_srv / 10 tmpfs_srv / 11 mfs_srv / 12 ext2_srv / 13 exfat_srv / 14 init / 15 gfx_srv / 16 net_srv / 17 virtio_blk_srv / 18 ahci_srv / 19 xhci_srv / 20 iso9660_srv / 21 netstack_srv / 22 e1000e_srv / 23 httpd_srv / 24 e1000_srv / 25 wifi_srv / 26 r8169_srv / 27 hda_srv`（共 28 个域；`ipc::init`/`cap::init`/`pager::init` 一律按 `domain::BOOT_DOMAINS` 取数，避免"建域数 ≠ 表长度"导致按下标访问越界）。
 
 ### 网络（用户态协议栈 + 网卡驱动，N5–N9 / DRV-A/B）
 
@@ -691,3 +718,7 @@ MSI/MSI-X 的物理形式是**设备向 LAPIC 的「中断消息」地址写一�
 | 105 | **网络 DRV-B：第三台网卡 `e1000_srv`（Intel 82540EM）**：验证 DRV-A 收益 —— **加网卡不改协议栈**。① 把 e1000e_srv 的 8254x 驱动核心抽成共享模块 `intel_nic.rs`（`run(name, marker)`：复位 / EEPROM 读 MAC / 建 16B 传统 RX·TX 环 / 广播 ARP / 帧级 IPC 收发），`e1000e_srv` 与新的 `e1000_srv` 都只是薄壳；② 内核 `pci::find_e1000`（class `02` / vendor `8086` / device `100E` → BAR0）+ 建域 24 + 声明式 `device::grant`，`NIC_KIND_E1000=3` 追加进 NIC 表；③ netstack 读表即得 `nics=3`，协议栈**未改一字**。**踩到并修掉的三个坑**：① 82540EM 复位后需置 `CTRL.SLU`（Set Link Up）链路才通；② 自测单发一个 ARP 会因复位后首帧被丢而超时 → 改为像 `arp_learn_gw` 一样重试（最多 10 次、每次轮询 100 ms）；③ `cap-audit` 最小权限 MMIO 白名单需补域 24。`BOOT_DOMAINS` 24 → 25、`SUPERVISED` 14 → 15。取证 `NET15 e1000(82540EM) OK, MAC=52:54:00:dd:ee:ff, ARP reply OK` + `netstack: nic2 up (e1000 OK)` + `netstack: links=3 (virtio-net+e1000e+e1000)` + `app: NET21 udp via e1000 (nic2) OK` + `netstack: nic2 rx (icmp unreachable) OK`；四道门禁全过、全量回归 `REGRESS_EXIT=0`。（rtl8139 需内核补 I/O-BAR 授权通路，顺延。） | ✅ |
 | 106 | **网络完善：shell 网络命令 + 协议栈 op（`net` / `ping` / `ping6` / `dns`）**：把网络从「能用」补到「可诊断」。① 协议栈新增三个 socket 服务 op —— `NETS_OP_NETINFO=14`（链路状态快照 `NetLinkInfo{nic,kind,up,v4,gw4,mac,v6_up,v6,v6_gw}` 写共享页，`sock=u64::MAX` 取全部）、`NETS_OP_PING4=15`（`addr` = 目的 IPv4）、`NETS_OP_PING6=16`（`buf[0..16]` = 目的 IPv6）；`Link` 增 `kind` 供展示。② `sock_ping4`/`sock_ping6` 在协议栈内**同步**构造 ICMP/ICMPv6 echo（v4 新建 `build_echo4`/`is_echo_reply4`，v6 复用 `build_echo6`）并有界（1 s）等应答；ping6 目的为链路本地（`fe80::/10`）时源也用链路本地、下一跳取 RA 记录的 `gw6_mac`，全局目的才用 SLAAC 地址。③ `libmorion::net` 加 `link_infos`/`LinkInfo`、`ping4`/`ping6`、`parse_ipv4`/`parse_ipv6`（支持 `::` 压缩与末尾内嵌 v4）。④ shell 加 `net`（别名 `ifconfig`，打印各网卡 型号/MAC/IPv4/网关/IPv6/路由器）、`ping <ip|host>`（v6 字面量自动转 ping6）、`ping6 <ip|host>`、`dns <name>`（别名 `nslookup`，A + AAAA）。取证 `app: NET22 net status OK (links=3, nic0=virtio-net)` + `app: NET23 ping OK (10.0.2.2 replied)` + `app: NET24 ping6 OK (router replied)`；四道门禁全过、全量回归 `REGRESS_EXIT=0`。 | ✅ |
 | 107 | **网络 W1：无线抽象层（`wifi_srv` + L2 契约 + 802.11 控制面契约）**：**不做真驱动** —— QEMU 无 802.11 设备，真机需 vfio 直通 + 固件加载 + 完整 802.11/WPA 栈（体量≈一个子系统，plan-net-v6 §3.4）。① [common.rs](../../user/srv/src/common.rs) 固化 **L2 链路接口**契约（即 `NET_REQ_TX/RX/INFO`；上层只见「一条以太链路」、不知 L2 种类），并加 `NIC_KIND_WIFI=4`；② 新增 `wifi_srv`（**域 25**，无设备、纳入监督）—— 定义「station **关联成功后**以 `NIC_KIND_WIFI` 注册为 NIC 表一条普通 `Link`」的模型（抽象层不注册，因无 radio），并把 L2 / 控制面两类请求分发（`wifi_serve`/`l2_serve`）；③ 控制面 IPC 契约 `WIFI_REQ_TAG="WIFI"` + `WIFI_OP_STATUS=0/SCAN=1/ASSOC=2/DISCONNECT=3`（`WifiReq/WifiStatus/WifiBss`），本轮**空实现**（无 radio：status 报 `radio=0`、scan 返 0 条、assoc 返 0）；④ 客户端库 `morion::wifi`（`status/scan/assoc/disconnect`，控制面共享页 `USER_BASE + 0xA0_0000 + domain_id*4 KiB`）；⑤ shell 加 `wifi [status|scan|connect <ssid> [psk]]`。内核授 shell/app/netstack `SendTo+MapInto(wifi_srv)`（netstack 那条为「关联后即链路」预留）。`BOOT_DOMAINS` 25 → 26、`SUPERVISED` 15 → 16。取证 `WIFI0 wifi_srv up (abstraction only: no radio, no firmware)` + `app: NET25 wifi abstraction OK (status round-trip, radio=0)`；四道门禁全过、全量回归 `REGRESS_EXIT=0`。真机接入时只换 radio 后端，契约不变。 | ✅ |
+| 108 | **2026-11-12 批次补记：多用户 / 应用 / 包管理 / 飞地 IOVA / 网络安全 / USB 热插拔**：① 多用户身份与登录口令（`SYS_CRED`(67) + shell `su/login/passwd/logout`）；② 图形控件库与预装应用骨架（`calc` / `sysinfo` / `editor` / `files`）；③ Nix 式包管理 MVP（依赖解析、引用 GC）；④ 飞地 IOVA 分配与设备独占（`SYS_ENCLAVE_MAP`(68) / `SYS_ENCLAVE_DETACH`(69) 及其错误码）；⑤ 安全边界加固（能力 / 域 / IPC、用户拷贝与 W^X、文件系统路径与权限语义、fd 归属、FAT 写权限）；⑥ USB：Hub 下游枚举、根端口热插拔与启动提速；⑦ 构建期预创建挂载点、账户库改 tmpfs、`run` 支持 `/apps` 简名；⑧ 预装应用与飞地示例纳入 `make check`。验证：QEMU 回归 + 内核单测；**真机未整体验证**（r8169 依赖真机，见 [plan-net-real.md](plan-net-real.md)）。 | ✅ |
+| 109 | **IOMMU E1d：AMD-Vi（AMD 平台 DMA 隔离）**：把 E1a–E1c 的 Intel VT-d 路径扩成双平台。① [`arch/acpi.rs`](../../kernel/src/arch/acpi.rs) 解析 **IVRS**（IVHD `0x10`/`0x11`、设备范围 / 别名条目、IVMD），合成表有单测；② [`arch/iommu.rs`](../../kernel/src/arch/iommu.rs) 新增 AMD-Vi：**Device Table 32 B DTE** + 每设备 **4 级 I/O 页表**，只映射已授权的 BAR / DMA 范围（不再恒等覆盖）；③ 使能 IOMMU、命令缓冲、事件日志，授权后发 `DEVTAB` + `IOMMU_PAGES` 失效并等待完成；④ 事件环轮询打印 fault；无 IVRS 或初始化失败时**完全回退**，不影响启动；⑤ 同时存在 DMAR 与 IVRS 时 **VT-d 优先**。验证：QEMU / 内核单测；**真机（AMD 平台）尚未验证**。 | ✅ |
+| 110 | **驱动通用化：`libdevmodel` + HDA / 输入 / WLAN 三件套**：① 新增零依赖 [`user/libdevmodel`](../../user/libdevmodel)：设备描述 / `Driver` 契约 / `AudioOps`·`InputOps`·`WlanOps` / 可覆盖 `Registry` —— 厂商专有驱动按优先级替换通用实现，服务层与 IPC 契约不变；② **HDA**：CORB/RIRB + 立即命令回退、通用 codec 发现、BDL 播放，26 款 codec / 19 款控制器芯片表，新增 `hda_srv`（**域 27**），QEMU `intel-hda` 实测 `drain=ok`；③ **输入**：PS/2 鼠标（3/4 字节包 + `GET_ID` 设备类型）、I2C-HID 触摸板协议与厂商表，并入 `kbd`（i8042 单一所有者）；④ **WLAN**：station 状态机 / 固件契约 / 24 款芯片 PCI ID 表 + 厂商注册槽，`wifi_srv` 接入通用层（仍是 `NoRadioHw` 空后端）。⑤ 内核 `device::grant` 显式开启 Memory Space / Bus Master；`BOOT_DOMAINS` → **28**；Makefile 的 QEMU 增加 `intel-hda` + wav 音频后端。验证：QEMU（HDA 实测、其余编译与回归）；**真机未验证**。 | ✅ |
+| 111 | **安全加固：原地重启提权 + 控制台/日志门禁**：① `SYS_SPAWN_ELF_AT` / `SYS_SPAWN_ELF_MODULE` 仅允许**监督者 `init`** 或**目标域的分页器**调用 —— 阻止持 `Spawn` 的 `shell` / `app` 把服务域镜像换成自己的 ELF、借壳继承服务能力；② `SYS_CLEAR` / `SYS_CONSOLE_READY` / `SYS_CONSOLE_SCROLL` / `SYS_CONSOLE_LINE_EDIT` 仅对键盘输入域、`Spawn` 终端前端与 `Fb` 屏幕接管方开放，运行时普通应用不能再改写共享控制台；③ `SYS_LOG_TOTAL` / `SYS_LOG_READ` / `SYS_LOG_OLDEST` 仅 `Spawn` 持有者可读（日志含 BAR / DMA 等诊断信息）；④ 新增纯函数门禁 + 2 组单测，`architecture.md` 同步实现现状。验证：内核 72 tests、`make check`/`clippy`、QEMU `cap-audit OK` + gfx/shell/app 回归；**真机未验证**。 | ✅ |
