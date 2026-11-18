@@ -3536,12 +3536,21 @@ fn sock_sendto(st: &mut Stack, req: &NetSReq) -> u64 {
         deliver(st, ln, dport, req.buf, req.len); // 本机租约地址 → 栈内回环
         return 1;
     }
-    // 发送前按目的地址选接口（子网匹配优先，其次默认路由）。
-    let nic = match route_link(st, dst) {
-        Some(n) => n,
-        None => {
-            no_route(dst);
-            return 0;
+    // 显式绑定了网卡的 socket 优先走该网卡（N9.2 / DRV-B 的 nic1 / nic2 取证依赖它）；
+    // 目的不在该网卡子网内时，再按目的地址选接口（子网匹配优先，其次默认路由）。
+    let nic = if sock_nic < st.nics
+        && st.links[sock_nic].up
+        && st.dhcp[sock_nic].state == DHCP_BOUND
+        && in_subnet(dst, st.dhcp[sock_nic].ip, st.dhcp[sock_nic].mask)
+    {
+        sock_nic
+    } else {
+        match route_link(st, dst) {
+            Some(n) => n,
+            None => {
+                no_route(dst);
+                return 0;
+            }
         }
     };
     if !st.links[nic].up {
